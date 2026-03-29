@@ -1,0 +1,40 @@
+[package]
+name = "aeon-engine"
+description = "Pipeline orchestrator and SPSC wiring for Aeon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+aeon-types = { workspace = true }
+bytes = { workspace = true }
+rtrb = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+core_affinity = { workspace = true }
+
+[dev-dependencies]
+aeon-connectors = { workspace = true, features = ["kafka"] }
+criterion = { workspace = true }
+rdkafka = { workspace = true }
+uuid = { workspace = true }
+smallvec = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[[bench]]
+name = "blackhole_bench"
+harness = false
+
+[[bench]]
+name = "redpanda_bench"
+harness = false
+
+[[bench]]
+name = "pipeline_components_bench"
+harness = false
+
+[[bench]]
+name = "partition_scaling_bench"
+harness = false

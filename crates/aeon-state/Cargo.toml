@@ -1,0 +1,22 @@
+[package]
+name = "aeon-state"
+description = "Multi-tier state management for Aeon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+aeon-types = { workspace = true }
+bytes = { workspace = true }
+dashmap = { workspace = true }
+bincode = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[[bench]]
+name = "state_bench"
+harness = false

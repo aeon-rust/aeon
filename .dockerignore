@@ -1,0 +1,15 @@
+target/
+.git/
+*.md
+!README.md
+docker/
+docs/
+benches/
+tests/
+*.log
+.env*
+.vscode/
+.idea/
+node_modules/
+samples/processors/rust-wasm/target/
+samples/processors/assemblyscript-wasm/node_modules/

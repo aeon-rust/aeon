@@ -1,0 +1,12 @@
+apiVersion: 1
+
+providers:
+  - name: Aeon
+    orgId: 1
+    folder: Aeon
+    type: file
+    disableDeletion: false
+    editable: true
+    options:
+      path: /etc/grafana/provisioning/dashboards
+      foldersFromFilesStructure: false

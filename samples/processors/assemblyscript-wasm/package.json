@@ -1,0 +1,23 @@
+{
+  "name": "assemblyscript-wasm",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "build": "asc assembly/index.ts --outFile build/processor.wasm --optimize --exportStart '' --runtime stub --noAssert --initialMemory 4 --maximumMemory 8",
+    "build:debug": "asc assembly/index.ts --outFile build/processor-debug.wasm --exportStart '' --runtime stub --initialMemory 4 --maximumMemory 8"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "devDependencies": {
+    "assemblyscript": "^0.28.11"
+  },
+  "exports": {
+    ".": {
+      "import": "./build/release.js",
+      "types": "./build/release.d.ts"
+    }
+  }
+}

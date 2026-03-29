@@ -1,0 +1,84 @@
+[workspace]
+resolver = "2"
+exclude = [
+    "samples/processors/rust-wasm",
+]
+members = [
+    "crates/aeon-types",
+    "crates/aeon-io",
+    "crates/aeon-state",
+    "crates/aeon-wasm",
+    "crates/aeon-connectors",
+    "crates/aeon-engine",
+    "crates/aeon-cluster",
+    "crates/aeon-crypto",
+    "crates/aeon-observability",
+    "crates/aeon-cli",
+    "samples/processors/rust-native",
+    "samples/e2e-pipeline",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# Core
+bytes = "1"
+smallvec = "1"
+uuid = { version = "1", features = ["v7"] }
+thiserror = "2"
+anyhow = "1"
+
+# Async
+tokio = { version = "1", features = ["full"] }
+
+# Hot-path
+rtrb = "0.3"
+memchr = "2"
+core_affinity = "0.8"
+
+# State
+dashmap = "6"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+
+# Kafka / Redpanda
+rdkafka = { version = "0.36", features = ["cmake-build"] }
+
+# Wasm runtime
+wasmtime = "29"
+
+# Cluster / Consensus
+openraft = { version = "0.9", features = ["serde", "storage-v2"] }
+quinn = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2"
+rcgen = "0.14"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Testing
+criterion = { version = "0.5", features = ["html_reports"] }
+
+# Workspace internal
+aeon-types = { path = "crates/aeon-types" }
+aeon-io = { path = "crates/aeon-io" }
+aeon-state = { path = "crates/aeon-state" }
+aeon-engine = { path = "crates/aeon-engine" }
+aeon-connectors = { path = "crates/aeon-connectors" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+
+[profile.bench]
+inherits = "release"
+debug = true

@@ -1,0 +1,23 @@
+[package]
+name = "aeon-wasm"
+description = "Wasmtime processor runtime for Aeon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+aeon-types = { workspace = true }
+bytes = { workspace = true }
+smallvec = { workspace = true }
+wasmtime = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+uuid = { workspace = true }
+
+[[bench]]
+name = "wasm_bench"
+harness = false

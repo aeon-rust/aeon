@@ -1,0 +1,12 @@
+[package]
+name = "aeon-observability"
+description = "Prometheus, Jaeger, and Loki integration for Aeon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+aeon-types = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

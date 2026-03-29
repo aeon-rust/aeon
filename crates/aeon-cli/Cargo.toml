@@ -1,0 +1,15 @@
+[package]
+name = "aeon-cli"
+description = "CLI binary entrypoint for Aeon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "aeon"
+path = "src/main.rs"
+
+[dependencies]
+aeon-types = { workspace = true }
+anyhow = { workspace = true }
