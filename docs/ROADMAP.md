@@ -235,7 +235,7 @@ proportionally, with clean upgrade/downgrade?**
 - Two-phase partition transfer: cutover pause <100ms
 - QUIC 0-RTT reconnection verified
 
-### Phase 9 — Cryptographic Integrity (PoH + Merkle)
+### Phase 9 — Cryptographic Integrity (PoH + Merkle) ✅ (2026-03-30)
 
 - Proof of History: per-partition hash chains, global PoH checkpoints via Raft leader
 - Batch Merkle trees (SHA-512, Ed25519-signed roots)
@@ -382,14 +382,14 @@ WebTransport Datagram source must require explicit `overflow: accept-loss` confi
 | Phase 6 — Observability | 2026-03-28 | Histograms, logging, per-partition metrics, Grafana dashboard, 34 tests |
 | Phase 7 — Wasm Runtime | 2026-03-28 | Wasmtime, host functions, WIT contract, ~794K wasm events/sec, 21 tests |
 
-**Total workspace tests**: 289 passing | **Clippy**: clean | **Rustfmt**: clean
+**Total workspace tests**: 283+ passing | **Clippy**: clean | **Rustfmt**: clean
 
 ### Gate 2 — In Progress (Phases 8–10)
 
 | Phase | Completed | Key Result |
 |-------|-----------|------------|
 | Phase 8 — Cluster + QUIC | 2026-03-29 | openraft, quinn QUIC, mTLS, partition manager, 3-node replication, 72 tests |
-| Phase 9 — PoH + Merkle | — | Not started |
+| Phase 9 — PoH + Merkle | 2026-03-30 | SHA-512 Merkle trees, Ed25519 signing, MMR, per-partition PoH chains, 71 tests |
 | Phase 10 — Security & Crypto | — | Not started |
 
 ### Benchmark Summary
@@ -405,7 +405,49 @@ WebTransport Datagram source must require explicit `overflow: accept-loss` confi
 | L1 state put | 7.7M ops/sec | — | Baseline |
 | L1 state get | 7.2M ops/sec | — | Baseline |
 
-**Next step**: Phase 9 — Cryptographic Integrity (PoH + Merkle)
+### Crypto Benchmarks (Phase 9)
+
+| Operation | Time |
+|-----------|------|
+| SHA-512 (64B) | 275ns |
+| SHA-512 (1KB) | 2.3µs |
+| Merkle tree build (100 events) | 81µs |
+| Merkle tree build (1K events) | 825µs |
+| Merkle proof verify | 5.5µs |
+| MMR append (10K) | 5.8ms |
+| PoH append batch (100 events, unsigned) | 87µs |
+| PoH append batch (100 events, signed) | 103µs |
+| Ed25519 sign | 17µs |
+| Ed25519 verify | 37µs |
+
+### Cluster Benchmarks (Phase 8)
+
+**Single-Node:**
+
+| Metric | Result |
+|--------|--------|
+| Bootstrap (16 partitions) | 16.8ms |
+| Single propose latency | 0.067ms (67µs) |
+| Throughput (1K proposals) | 11,874 proposals/sec |
+
+**Three-Node (QUIC):**
+
+| Metric | Result |
+|--------|--------|
+| Cluster formation | 66.8ms |
+| Single commit latency | 0.553ms |
+| Throughput (200 proposals) | 3,453 proposals/sec |
+| Replication convergence (50 entries) | 11.7ms |
+
+**Partition Rebalance (pure computation):**
+
+| Configuration | Time |
+|---------------|------|
+| 16 partitions / 3 nodes | 4.5µs |
+| 256 partitions / 5 nodes | 18.5µs |
+| 1024 partitions / 10 nodes | 59.4µs |
+
+**Next step**: Phase 10 — Security & Crypto (or re-evaluate sequence based on benchmarks)
 
 ---
 

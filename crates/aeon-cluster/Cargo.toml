@@ -35,3 +35,8 @@ dashmap = { workspace = true, optional = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 rcgen = { workspace = true }
+
+[[bench]]
+name = "cluster_bench"
+harness = false
+required-features = ["cluster"]
