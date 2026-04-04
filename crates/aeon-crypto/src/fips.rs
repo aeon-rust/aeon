@@ -55,9 +55,7 @@ pub fn assert_fips_approved(algorithm: &str) -> Result<(), aeon_types::AeonError
         return Ok(());
     }
     Err(aeon_types::AeonError::Crypto {
-        message: format!(
-            "algorithm '{algorithm}' is not approved in FIPS 140-3 mode"
-        ),
+        message: format!("algorithm '{algorithm}' is not approved in FIPS 140-3 mode"),
         source: None,
     })
 }

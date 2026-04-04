@@ -50,7 +50,6 @@ impl ClusterSnapshot {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

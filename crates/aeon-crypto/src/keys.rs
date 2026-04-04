@@ -213,15 +213,14 @@ impl KeyProvider for FileKeyProvider {
     }
 
     fn list_keys(&self) -> Result<Vec<String>, aeon_types::AeonError> {
-        let entries = std::fs::read_dir(&self.base_dir).map_err(|e| {
-            aeon_types::AeonError::Crypto {
+        let entries =
+            std::fs::read_dir(&self.base_dir).map_err(|e| aeon_types::AeonError::Crypto {
                 message: format!(
                     "failed to read key directory '{}': {e}",
                     self.base_dir.display()
                 ),
                 source: None,
-            }
-        })?;
+            })?;
 
         Ok(entries
             .filter_map(|e| e.ok())
@@ -293,7 +292,10 @@ mod tests {
 
     #[test]
     fn hex_decode_valid() {
-        assert_eq!(hex_decode("deadbeef").unwrap(), vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(
+            hex_decode("deadbeef").unwrap(),
+            vec![0xDE, 0xAD, 0xBE, 0xEF]
+        );
         assert_eq!(hex_decode("00ff").unwrap(), vec![0x00, 0xFF]);
     }
 
@@ -320,9 +322,11 @@ mod tests {
     #[test]
     fn env_key_provider_missing_var() {
         let provider = EnvKeyProvider::new("AEON_MISSING");
-        assert!(provider
-            .load_key("nonexistent", KeyPurpose::Encryption)
-            .is_err());
+        assert!(
+            provider
+                .load_key("nonexistent", KeyPurpose::Encryption)
+                .is_err()
+        );
     }
 
     #[test]
@@ -344,12 +348,16 @@ mod tests {
     #[test]
     fn file_key_provider_path_traversal_rejected() {
         let provider = FileKeyProvider::new("/tmp");
-        assert!(provider
-            .load_key("../etc/shadow", KeyPurpose::Signing)
-            .is_err());
-        assert!(provider
-            .load_key("../../passwd", KeyPurpose::Signing)
-            .is_err());
+        assert!(
+            provider
+                .load_key("../etc/shadow", KeyPurpose::Signing)
+                .is_err()
+        );
+        assert!(
+            provider
+                .load_key("../../passwd", KeyPurpose::Signing)
+                .is_err()
+        );
     }
 
     #[test]

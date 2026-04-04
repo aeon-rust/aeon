@@ -7,8 +7,9 @@ license.workspace = true
 rust-version.workspace = true
 
 [features]
-default = ["native-loader"]
+default = ["native-loader", "rest-api"]
 native-loader = ["libloading", "aeon-native-sdk"]
+rest-api = ["axum", "serde_json", "serde"]
 
 [dependencies]
 aeon-types = { workspace = true }
@@ -23,6 +24,11 @@ core_affinity = { workspace = true }
 libloading = { version = "0.8", optional = true }
 aeon-native-sdk = { path = "../aeon-native-sdk", optional = true }
 
+# REST API (feature-gated)
+axum = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+
 [dev-dependencies]
 aeon-connectors = { workspace = true, features = ["kafka"] }
 criterion = { workspace = true }
@@ -30,6 +36,10 @@ rdkafka = { workspace = true }
 uuid = { workspace = true }
 smallvec = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tower = "0.5"
+axum = { workspace = true }
+serde_json = { workspace = true }
+serde = { workspace = true }
 
 [[bench]]
 name = "blackhole_bench"

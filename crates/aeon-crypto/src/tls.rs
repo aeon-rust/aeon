@@ -375,18 +375,18 @@ pub fn auto_generate_certs(
 
     if paths.all_exist() {
         // Reuse existing certs
-        let store = CertificateStore::from_pem_files(
-            &paths.node_cert,
-            &paths.node_key,
-            &paths.ca_cert,
-        )?;
+        let store =
+            CertificateStore::from_pem_files(&paths.node_cert, &paths.node_key, &paths.ca_cert)?;
         return Ok((store, paths));
     }
 
     // Ensure tls directory exists
     let tls_dir = data_dir.join("tls");
     std::fs::create_dir_all(&tls_dir).map_err(|e| AeonError::Config {
-        message: format!("failed to create tls directory '{}': {e}", tls_dir.display()),
+        message: format!(
+            "failed to create tls directory '{}': {e}",
+            tls_dir.display()
+        ),
     })?;
 
     // Collect SANs
@@ -437,8 +437,7 @@ pub fn auto_generate_certs(
         message: format!("failed to generate CA keypair: {e}"),
         source: None,
     })?;
-    let mut ca_params =
-        rcgen::CertificateParams::default();
+    let mut ca_params = rcgen::CertificateParams::default();
     ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     ca_params.distinguished_name.push(
         rcgen::DnType::CommonName,
@@ -449,10 +448,12 @@ pub fn auto_generate_certs(
         rcgen::DnValue::Utf8String("Aeon".into()),
     );
 
-    let ca_cert = ca_params.self_signed(&ca_key).map_err(|e| AeonError::Crypto {
-        message: format!("failed to self-sign CA cert: {e}"),
-        source: None,
-    })?;
+    let ca_cert = ca_params
+        .self_signed(&ca_key)
+        .map_err(|e| AeonError::Crypto {
+            message: format!("failed to self-sign CA cert: {e}"),
+            source: None,
+        })?;
 
     // Generate node cert signed by CA
     let node_key = rcgen::KeyPair::generate().map_err(|e| AeonError::Crypto {
@@ -481,11 +482,8 @@ pub fn auto_generate_certs(
     write_file(&paths.node_key, node_key.serialize_pem().as_bytes())?;
 
     // Load into CertificateStore
-    let store = CertificateStore::from_pem_files(
-        &paths.node_cert,
-        &paths.node_key,
-        &paths.ca_cert,
-    )?;
+    let store =
+        CertificateStore::from_pem_files(&paths.node_cert, &paths.node_key, &paths.ca_cert)?;
 
     Ok((store, paths))
 }
@@ -577,11 +575,7 @@ impl ConnectorTlsConfig {
     }
 
     /// Add client cert + key for mTLS.
-    pub fn with_client_cert(
-        mut self,
-        cert: impl Into<PathBuf>,
-        key: impl Into<PathBuf>,
-    ) -> Self {
+    pub fn with_client_cert(mut self, cert: impl Into<PathBuf>, key: impl Into<PathBuf>) -> Self {
         self.cert = Some(cert.into());
         self.key = Some(key.into());
         self
@@ -644,7 +638,10 @@ impl ConnectorTlsConfig {
                     pairs.push(("ssl.ca.location".into(), ca.display().to_string()));
                 }
                 if let Some(cert) = &self.cert {
-                    pairs.push(("ssl.certificate.location".into(), cert.display().to_string()));
+                    pairs.push((
+                        "ssl.certificate.location".into(),
+                        cert.display().to_string(),
+                    ));
                 }
                 if let Some(key) = &self.key {
                     pairs.push(("ssl.key.location".into(), key.display().to_string()));
@@ -703,9 +700,7 @@ mod tests {
     use std::io::Write;
 
     /// Generate a self-signed CA + node cert for testing.
-    fn generate_test_pem_files(
-        dir: &Path,
-    ) -> (PathBuf, PathBuf, PathBuf) {
+    fn generate_test_pem_files(dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
         // Generate CA
         let ca_key = rcgen::KeyPair::generate().unwrap();
         let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
@@ -716,11 +711,8 @@ mod tests {
 
         // Generate node cert signed by CA
         let node_key = rcgen::KeyPair::generate().unwrap();
-        let node_params =
-            rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
-        let node_cert = node_params
-            .signed_by(&node_key, &issuer)
-            .unwrap();
+        let node_params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let node_cert = node_params.signed_by(&node_key, &issuer).unwrap();
 
         // Write PEM files
         let cert_path = dir.join("node.pem");
@@ -1039,8 +1031,7 @@ mod tests {
 
     #[test]
     fn connector_tls_pem_valid_mtls() {
-        let config = ConnectorTlsConfig::pem("/ca.pem")
-            .with_client_cert("/cert.pem", "/key.pem");
+        let config = ConnectorTlsConfig::pem("/ca.pem").with_client_cert("/cert.pem", "/key.pem");
         assert!(config.is_tls_enabled());
         assert!(config.is_mtls());
         assert!(config.validate("test").is_ok());
@@ -1062,8 +1053,7 @@ mod tests {
 
     #[test]
     fn connector_tls_rdkafka_pairs_pem_mtls() {
-        let config = ConnectorTlsConfig::pem("/ca.pem")
-            .with_client_cert("/cert.pem", "/key.pem");
+        let config = ConnectorTlsConfig::pem("/ca.pem").with_client_cert("/cert.pem", "/key.pem");
         let pairs = config.to_rdkafka_config_pairs();
         assert_eq!(pairs.len(), 4); // protocol, ca, cert, key
         assert!(pairs.iter().any(|(k, _)| k == "security.protocol"));
@@ -1099,8 +1089,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let (cert, key, ca) = generate_test_pem_files(&dir);
 
-        let config = ConnectorTlsConfig::pem(&ca)
-            .with_client_cert(&cert, &key);
+        let config = ConnectorTlsConfig::pem(&ca).with_client_cert(&cert, &key);
         let rustls_config = config.build_rustls_client_config().unwrap();
         assert!(rustls_config.is_some());
 

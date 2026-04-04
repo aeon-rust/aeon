@@ -12,8 +12,8 @@
 
 use rdkafka::config::ClientConfig;
 use rdkafka::producer::{FutureProducer, FutureRecord};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 fn parse_args() -> Args {
@@ -182,9 +182,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Send all records, collecting delivery futures
         let mut delivery_futures = Vec::with_capacity(batch_count);
         for j in 0..batch_count {
-            let mut record = FutureRecord::to(&topic)
-                .key(&keys[j])
-                .payload(&payloads[j]);
+            let mut record = FutureRecord::to(&topic).key(&keys[j]).payload(&payloads[j]);
 
             if let Some(p) = args.partition {
                 record = record.partition(p);

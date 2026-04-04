@@ -8,12 +8,17 @@ pub mod dlq;
 pub mod health;
 pub mod metrics_server;
 pub mod pipeline;
+pub mod pipeline_manager;
 pub mod processor;
+pub mod registry;
 pub mod retry;
 pub mod shutdown;
 
 #[cfg(feature = "native-loader")]
 pub mod native_loader;
+
+#[cfg(feature = "rest-api")]
+pub mod rest_api;
 
 pub use affinity::{PipelineCores, available_cores, pin_to_core, pipeline_core_assignment};
 pub use batch_tuner::BatchTuner;
@@ -23,9 +28,14 @@ pub use dlq::{DeadLetterQueue, DlqConfig, DlqRecord};
 pub use health::{HealthState, serve_health};
 pub use metrics_server::serve_metrics;
 pub use pipeline::{PipelineConfig, PipelineMetrics, run, run_buffered};
+pub use pipeline_manager::PipelineManager;
 pub use processor::PassthroughProcessor;
+pub use registry::ProcessorRegistry;
 pub use retry::{RetryConfig, RetryOutcome, backoff_delay, retry_async, retry_sync};
 pub use shutdown::{ShutdownConfig, ShutdownCoordinator};
 
 #[cfg(feature = "native-loader")]
 pub use native_loader::NativeProcessor;
+
+#[cfg(feature = "rest-api")]
+pub use rest_api::{AppState, api_router, serve};

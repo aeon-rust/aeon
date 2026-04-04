@@ -13,16 +13,16 @@ mod inner {
     use std::ops::RangeBounds;
     use std::sync::Arc;
 
-    use openraft::storage::{LogFlushed, LogState, RaftLogReader, RaftLogStorage, RaftStateMachine};
+    use openraft::storage::{
+        LogFlushed, LogState, RaftLogReader, RaftLogStorage, RaftStateMachine,
+    };
     use openraft::storage::{RaftSnapshotBuilder, Snapshot, SnapshotMeta};
     use openraft::{Entry, LogId, StorageError, StoredMembership, Vote};
     use tokio::sync::RwLock;
 
     use crate::raft_config::AeonRaftConfig;
     use crate::snapshot::ClusterSnapshot;
-    use crate::types::{
-        ClusterRequest, ClusterResponse, NodeAddress, PartitionOwnership,
-    };
+    use crate::types::{ClusterRequest, ClusterResponse, NodeAddress, PartitionOwnership};
 
     // ─── Shared Log Data ──────────────────────────────────────────────
 
@@ -88,10 +88,7 @@ mod inner {
             self.clone()
         }
 
-        async fn save_vote(
-            &mut self,
-            vote: &Vote<u64>,
-        ) -> Result<(), StorageError<u64>> {
+        async fn save_vote(&mut self, vote: &Vote<u64>) -> Result<(), StorageError<u64>> {
             let mut v = self.data.vote.write().await;
             *v = Some(*vote);
             Ok(())
@@ -136,10 +133,7 @@ mod inner {
 
         async fn truncate(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
             let mut log = self.data.log.write().await;
-            let keys_to_remove: Vec<u64> = log
-                .range(log_id.index..)
-                .map(|(k, _)| *k)
-                .collect();
+            let keys_to_remove: Vec<u64> = log.range(log_id.index..).map(|(k, _)| *k).collect();
             for k in keys_to_remove {
                 log.remove(&k);
             }
@@ -149,10 +143,7 @@ mod inner {
         async fn purge(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
             let mut log = self.data.log.write().await;
             let mut last_purged = self.data.last_purged.write().await;
-            let keys_to_remove: Vec<u64> = log
-                .range(..=log_id.index)
-                .map(|(k, _)| *k)
-                .collect();
+            let keys_to_remove: Vec<u64> = log.range(..=log_id.index).map(|(k, _)| *k).collect();
             for k in keys_to_remove {
                 log.remove(&k);
             }
@@ -177,10 +168,7 @@ mod inner {
             Self {
                 state: ClusterSnapshot::default(),
                 last_applied_log: None,
-                last_membership: StoredMembership::new(
-                    None,
-                    openraft::Membership::new(vec![], ()),
-                ),
+                last_membership: StoredMembership::new(None, openraft::Membership::new(vec![], ())),
                 snapshot_idx: 0,
             }
         }
@@ -210,9 +198,9 @@ mod inner {
                                 .begin_transfer(*partition, *source, *target);
                             ClusterResponse::Ok
                         }
-                        Some(PartitionOwnership::Transferring { .. }) => ClusterResponse::Error(
-                            "partition already in transfer".to_string(),
-                        ),
+                        Some(PartitionOwnership::Transferring { .. }) => {
+                            ClusterResponse::Error("partition already in transfer".to_string())
+                        }
                         _ => ClusterResponse::Error(format!(
                             "partition {:?} not owned by node {}",
                             partition, source
@@ -267,27 +255,22 @@ mod inner {
     }
 
     impl RaftSnapshotBuilder<AeonRaftConfig> for Arc<StateMachineStore> {
-        async fn build_snapshot(
-            &mut self,
-        ) -> Result<Snapshot<AeonRaftConfig>, StorageError<u64>> {
+        async fn build_snapshot(&mut self) -> Result<Snapshot<AeonRaftConfig>, StorageError<u64>> {
             // We need interior mutability for snapshot_idx
             // For simplicity, use a fixed snapshot_id based on last_applied
             let snapshot_id = format!(
                 "snap-{}-{}",
-                self.last_applied_log
-                    .map(|l| l.index)
-                    .unwrap_or(0),
+                self.last_applied_log.map(|l| l.index).unwrap_or(0),
                 self.snapshot_idx,
             );
 
-            let data = self
-                .state
-                .to_bytes()
-                .map_err(|e| StorageError::from_io_error(
+            let data = self.state.to_bytes().map_err(|e| {
+                StorageError::from_io_error(
                     openraft::ErrorSubject::StateMachine,
                     openraft::ErrorVerb::Read,
                     std::io::Error::other(e.to_string()),
-                ))?;
+                )
+            })?;
 
             let snapshot = Snapshot {
                 meta: SnapshotMeta {
@@ -307,20 +290,12 @@ mod inner {
 
         async fn applied_state(
             &mut self,
-        ) -> Result<
-            (
-                Option<LogId<u64>>,
-                StoredMembership<u64, NodeAddress>,
-            ),
-            StorageError<u64>,
-        > {
+        ) -> Result<(Option<LogId<u64>>, StoredMembership<u64, NodeAddress>), StorageError<u64>>
+        {
             Ok((self.last_applied_log, self.last_membership.clone()))
         }
 
-        async fn apply<I>(
-            &mut self,
-            entries: I,
-        ) -> Result<Vec<ClusterResponse>, StorageError<u64>>
+        async fn apply<I>(&mut self, entries: I) -> Result<Vec<ClusterResponse>, StorageError<u64>>
         where
             I: IntoIterator<Item = Entry<AeonRaftConfig>> + Send,
             I::IntoIter: Send,
@@ -341,10 +316,8 @@ mod inner {
                         responses.push(resp);
                     }
                     openraft::EntryPayload::Membership(membership) => {
-                        self.last_membership = StoredMembership::new(
-                            Some(entry.log_id),
-                            membership,
-                        );
+                        self.last_membership =
+                            StoredMembership::new(Some(entry.log_id), membership);
                         responses.push(ClusterResponse::Ok);
                     }
                 }
@@ -377,12 +350,13 @@ mod inner {
             snapshot: Box<Cursor<Vec<u8>>>,
         ) -> Result<(), StorageError<u64>> {
             let data = snapshot.into_inner();
-            let state = ClusterSnapshot::from_bytes(&data)
-                .map_err(|e| StorageError::from_io_error(
+            let state = ClusterSnapshot::from_bytes(&data).map_err(|e| {
+                StorageError::from_io_error(
                     openraft::ErrorSubject::StateMachine,
                     openraft::ErrorVerb::Read,
                     std::io::Error::other(e.to_string()),
-                ))?;
+                )
+            })?;
 
             self.state = state;
             self.last_applied_log = meta.last_log_id;
@@ -398,14 +372,13 @@ mod inner {
                 return Ok(None);
             }
 
-            let data = self
-                .state
-                .to_bytes()
-                .map_err(|e| StorageError::from_io_error(
+            let data = self.state.to_bytes().map_err(|e| {
+                StorageError::from_io_error(
                     openraft::ErrorSubject::StateMachine,
                     openraft::ErrorVerb::Read,
                     std::io::Error::other(e.to_string()),
-                ))?;
+                )
+            })?;
 
             Ok(Some(Snapshot {
                 meta: SnapshotMeta {
@@ -413,9 +386,7 @@ mod inner {
                     last_membership: self.last_membership.clone(),
                     snapshot_id: format!(
                         "snap-{}-current",
-                        self.last_applied_log
-                            .map(|l| l.index)
-                            .unwrap_or(0),
+                        self.last_applied_log.map(|l| l.index).unwrap_or(0),
                     ),
                 },
                 snapshot: Box::new(Cursor::new(data)),
@@ -591,12 +562,9 @@ mod inner {
             // Install into fresh state machine
             let mut sm2 = StateMachineStore::new();
             let data = snapshot.snapshot.into_inner();
-            sm2.install_snapshot(
-                &snapshot.meta,
-                Box::new(Cursor::new(data)),
-            )
-            .await
-            .unwrap();
+            sm2.install_snapshot(&snapshot.meta, Box::new(Cursor::new(data)))
+                .await
+                .unwrap();
 
             assert_eq!(
                 sm2.state.partition_table.get(PartitionId::new(0)),

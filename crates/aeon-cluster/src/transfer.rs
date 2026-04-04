@@ -26,19 +26,11 @@ pub enum TransferState {
         total: u64,
     },
     /// Phase 2: Cutover (partition paused, final delta transfer).
-    Cutover {
-        source: NodeId,
-        target: NodeId,
-    },
+    Cutover { source: NodeId, target: NodeId },
     /// Transfer completed successfully.
-    Complete {
-        new_owner: NodeId,
-    },
+    Complete { new_owner: NodeId },
     /// Transfer was aborted.
-    Aborted {
-        reverted_to: NodeId,
-        reason: String,
-    },
+    Aborted { reverted_to: NodeId, reason: String },
 }
 
 impl TransferState {
@@ -158,16 +150,32 @@ mod tests {
         assert_eq!(t.state, TransferState::Idle);
 
         t.begin(1, 2).unwrap();
-        assert!(matches!(t.state, TransferState::BulkSync { source: 1, target: 2, .. }));
+        assert!(matches!(
+            t.state,
+            TransferState::BulkSync {
+                source: 1,
+                target: 2,
+                ..
+            }
+        ));
 
         t.update_progress(1000, 5000);
-        if let TransferState::BulkSync { progress, total, .. } = &t.state {
+        if let TransferState::BulkSync {
+            progress, total, ..
+        } = &t.state
+        {
             assert_eq!(*progress, 1000);
             assert_eq!(*total, 5000);
         }
 
         t.begin_cutover().unwrap();
-        assert!(matches!(t.state, TransferState::Cutover { source: 1, target: 2 }));
+        assert!(matches!(
+            t.state,
+            TransferState::Cutover {
+                source: 1,
+                target: 2
+            }
+        ));
 
         let owner = t.complete().unwrap();
         assert_eq!(owner, 2);
@@ -181,7 +189,10 @@ mod tests {
 
         let reverted = t.abort("test abort".to_string()).unwrap();
         assert_eq!(reverted, 1);
-        assert!(matches!(t.state, TransferState::Aborted { reverted_to: 1, .. }));
+        assert!(matches!(
+            t.state,
+            TransferState::Aborted { reverted_to: 1, .. }
+        ));
     }
 
     #[test]

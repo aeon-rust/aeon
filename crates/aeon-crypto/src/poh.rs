@@ -14,7 +14,7 @@
 use aeon_types::PartitionId;
 use serde::{Deserialize, Serialize};
 
-use crate::hash::{sha512, sha512_poh, Hash512};
+use crate::hash::{Hash512, sha512, sha512_poh};
 use crate::merkle::MerkleTree;
 use crate::mmr::MerkleMountainRange;
 use crate::signing::{SignedRoot, SigningKey};
@@ -350,10 +350,7 @@ pub struct PohCheckpoint {
 
 impl PohCheckpoint {
     /// Build a checkpoint from a set of partition chain heads.
-    pub fn build(
-        heads: &[(PartitionId, Hash512, u64)],
-        timestamp_nanos: i64,
-    ) -> Self {
+    pub fn build(heads: &[(PartitionId, Hash512, u64)], timestamp_nanos: i64) -> Self {
         let mut sorted = heads.to_vec();
         sorted.sort_by_key(|(p, _, _)| *p);
 
@@ -515,7 +512,9 @@ mod tests {
         let mut chain = make_chain(0);
         let key = SigningKey::generate();
 
-        let entry = chain.append_batch(&[b"signed-event"], 1000, Some(&key)).unwrap();
+        let entry = chain
+            .append_batch(&[b"signed-event"], 1000, Some(&key))
+            .unwrap();
 
         assert!(entry.signed_root.is_some());
         assert!(entry.verify_signature().unwrap());
@@ -591,8 +590,12 @@ mod tests {
         let mut node_a = make_chain(7);
         let key_a = SigningKey::generate();
 
-        let e0 = node_a.append_batch(&[b"from-a-0"], 1000, Some(&key_a)).unwrap();
-        let e1 = node_a.append_batch(&[b"from-a-1"], 2000, Some(&key_a)).unwrap();
+        let e0 = node_a
+            .append_batch(&[b"from-a-0"], 1000, Some(&key_a))
+            .unwrap();
+        let e1 = node_a
+            .append_batch(&[b"from-a-1"], 2000, Some(&key_a))
+            .unwrap();
 
         // Transfer
         let state = node_a.export_state();
@@ -600,7 +603,9 @@ mod tests {
         let key_b = SigningKey::generate();
 
         // Node B continues the chain
-        let e2 = node_b.append_batch(&[b"from-b-0"], 3000, Some(&key_b)).unwrap();
+        let e2 = node_b
+            .append_batch(&[b"from-b-0"], 3000, Some(&key_b))
+            .unwrap();
 
         // Chain continuity: e2 links to e1
         assert!(e2.verify_chain(&e1.hash));

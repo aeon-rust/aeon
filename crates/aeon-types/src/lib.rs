@@ -8,6 +8,7 @@ pub mod error;
 pub mod event;
 pub mod interner;
 pub mod partition;
+pub mod registry;
 pub mod scanner;
 pub mod traits;
 pub mod uuid;
@@ -19,6 +20,11 @@ pub use interner::StringInterner;
 pub use partition::PartitionId;
 pub use scanner::{
     BytesFinder, contains_byte, contains_bytes, find_byte, find_bytes, json_field_value,
+};
+pub use registry::{
+    PipelineAction, PipelineDefinition, PipelineHistoryEntry, PipelineState, ProcessorRecord,
+    ProcessorRef, ProcessorType, ProcessorVersion, RegistryCommand, RegistryResponse, SinkConfig,
+    SourceConfig, UpgradeStrategy, VersionStatus,
 };
 pub use traits::{IdempotentSink, Processor, Seekable, Sink, Source, StateOps};
 pub use uuid::CoreLocalUuidGenerator;

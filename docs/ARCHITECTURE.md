@@ -891,7 +891,7 @@ aeon build ./myprocessor
 aeon validate ./myprocessor.wasm
 
 # Deploy processor to running Aeon instance
-aeon deploy ./myprocessor.wasm --target localhost:4433
+aeon deploy ./myprocessor.wasm --target localhost:4471
 ```
 
 `aeon new` generates:
@@ -1692,15 +1692,15 @@ A joining node needs to find the existing cluster. Two mechanisms:
 ```yaml
 cluster:
   peers:
-    - "10.0.0.2:4433"
-    - "10.0.0.3:4433"
+    - "10.0.0.2:4470"
+    - "10.0.0.3:4470"
 ```
 
 **Seed nodes** (dynamic scaling — only need one reachable seed):
 ```yaml
 cluster:
   seed_nodes:
-    - "10.0.0.1:4433"
+    - "10.0.0.1:4470"
 ```
 
 The seed node returns the current Raft membership. The new node joins as a learner
@@ -1715,16 +1715,16 @@ to existing pod IPs.
 # Single-node (minimum config — Raft runs with quorum of 1)
 cluster:
   node_id: 1
-  bind: "0.0.0.0:4433"
+  bind: "0.0.0.0:4470"
   num_partitions: 16          # Immutable after creation
 
 # 3-node cluster (initial bootstrap — all nodes listed)
 cluster:
   node_id: 1
-  bind: "0.0.0.0:4433"
+  bind: "0.0.0.0:4470"
   peers:
-    - "10.0.0.2:4433"
-    - "10.0.0.3:4433"
+    - "10.0.0.2:4470"
+    - "10.0.0.3:4470"
   num_partitions: 16          # Same as single-node — does NOT change
   tls:
     cert: /etc/aeon/tls/node.pem
@@ -1734,9 +1734,9 @@ cluster:
 # New node joining existing cluster (dynamic scaling)
 cluster:
   node_id: 4
-  bind: "0.0.0.0:4433"
+  bind: "0.0.0.0:4470"
   seed_nodes:                 # Only need one reachable seed
-    - "10.0.0.1:4433"
+    - "10.0.0.1:4470"
   tls:
     cert: /etc/aeon/tls/node.pem
     key: /etc/aeon/tls/node.key
@@ -1746,10 +1746,10 @@ cluster:
 **Runtime scaling** (no restart needed):
 ```bash
 # Add a node (joins as learner, auto-promotes, auto-rebalances)
-aeon cluster add 10.0.0.4:4433
+aeon cluster add 10.0.0.4:4470
 
 # Remove a node (drains partitions, removes from Raft)
-aeon cluster remove 10.0.0.4:4433
+aeon cluster remove 10.0.0.4:4470
 
 # Check cluster state
 aeon cluster status

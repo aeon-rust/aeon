@@ -1,10 +1,10 @@
 //! QUIC transport layer for inter-node Raft RPCs and partition transfer.
 
-pub mod framing;
-pub mod tls;
 pub mod endpoint;
+pub mod framing;
 pub mod network;
 pub mod server;
+pub mod tls;
 
 pub use endpoint::QuicEndpoint;
 pub use framing::{MessageType, read_frame, write_frame};

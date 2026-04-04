@@ -45,12 +45,11 @@ pub fn build_server_config(tls: &TlsConfig) -> Result<rustls::ServerConfig, Aeon
         })?;
     }
 
-    let client_verifier =
-        rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store))
-            .build()
-            .map_err(|e| AeonError::Config {
-                message: format!("failed to build client verifier: {e}"),
-            })?;
+    let client_verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store))
+        .build()
+        .map_err(|e| AeonError::Config {
+            message: format!("failed to build client verifier: {e}"),
+        })?;
 
     let config = rustls::ServerConfig::builder()
         .with_client_cert_verifier(client_verifier)
@@ -123,8 +122,7 @@ pub fn dev_self_signed_cert(
     let cert_params = rcgen::CertificateParams::new(subject_alt_names).unwrap();
     let cert = cert_params.self_signed(&key_pair).unwrap();
     let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
-    let key_der =
-        rustls::pki_types::PrivateKeyDer::try_from(key_pair.serialize_der()).unwrap();
+    let key_der = rustls::pki_types::PrivateKeyDer::try_from(key_pair.serialize_der()).unwrap();
     (cert_der, key_der)
 }
 

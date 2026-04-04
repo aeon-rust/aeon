@@ -643,6 +643,19 @@ Rolling binary upgrade: zero event loss during Aeon v1→v2 transition under loa
 | Dev environment | 2026-04-04 | `docker-compose.dev.yml`, `Dockerfile.dev`, `aeon dev up/down/status` |
 | Sample processors | 2026-04-04 | `rust-wasm-sdk` (SDK vs raw comparison), `typescript-wasm` (AssemblyScript) |
 
+### Phase 13a — Registry + Pipeline Core (Complete)
+
+| Component | Completed | Key Result |
+|-----------|-----------|------------|
+| Registry types (`aeon-types/registry`) | 2026-04-04 | ProcessorRecord, PipelineDefinition, RegistryCommand (Raft), state machine types, 8 tests |
+| Processor Registry (`aeon-engine/registry`) | 2026-04-04 | RwLock catalog, SHA-512 verification, artifact FS storage, Raft apply/snapshot/restore, 8 tests |
+| Pipeline Manager (`aeon-engine/pipeline_manager`) | 2026-04-04 | Lifecycle state machine (Created→Running→Stopped→Upgrading→Failed), history tracking, Raft apply/snapshot/restore, 10 tests |
+| Drain + Swap upgrade | 2026-04-04 | Running→Upgrading→Running with processor ref swap, history entry |
+| REST API (`aeon-engine/rest_api`) | 2026-04-04 | axum 0.8, health/ready, processor CRUD, pipeline lifecycle, 6 tests |
+| CLI management commands | 2026-04-04 | `aeon processor list/inspect/versions/register/delete`, `aeon pipeline list/inspect/create/start/stop/upgrade/history/delete`, ureq HTTP client, `--api` flag |
+
+**Test count**: 459 (up from ~298 after Phase 12a)
+
 ### Benchmark Summary (2026-04-04, Ryzen 7 250 / 24 GB RAM)
 
 **Dev infrastructure**: Rancher Desktop WSL2 (6 CPUs / 8 GB RAM), Redpanda `--smp 2`

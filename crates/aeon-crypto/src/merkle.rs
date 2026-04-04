@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::hash::{sha512, sha512_pair, Hash512};
+use crate::hash::{Hash512, sha512, sha512_pair};
 
 /// Direction of a sibling in a Merkle proof path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

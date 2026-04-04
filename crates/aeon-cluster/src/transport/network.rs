@@ -2,17 +2,17 @@
 
 use std::sync::Arc;
 
+use openraft::Vote;
 use openraft::error::{
-    InstallSnapshotError, NetworkError, RPCError, RaftError, ReplicationClosed,
-    StreamingError, Unreachable,
+    InstallSnapshotError, NetworkError, RPCError, RaftError, ReplicationClosed, StreamingError,
+    Unreachable,
 };
 use openraft::network::RPCOption;
 use openraft::raft::{
-    AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest,
-    InstallSnapshotResponse, SnapshotResponse, VoteRequest, VoteResponse,
+    AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
+    SnapshotResponse, VoteRequest, VoteResponse,
 };
 use openraft::storage::Snapshot;
-use openraft::Vote;
 
 use crate::raft_config::AeonRaftConfig;
 use crate::transport::endpoint::QuicEndpoint;
@@ -33,11 +33,7 @@ impl QuicNetworkFactory {
 impl openraft::RaftNetworkFactory<AeonRaftConfig> for QuicNetworkFactory {
     type Network = QuicNetworkConnection;
 
-    async fn new_client(
-        &mut self,
-        target: NodeId,
-        node: &NodeAddress,
-    ) -> Self::Network {
+    async fn new_client(&mut self, target: NodeId, node: &NodeAddress) -> Self::Network {
         QuicNetworkConnection {
             target,
             target_addr: node.clone(),
@@ -111,10 +107,7 @@ impl openraft::RaftNetwork<AeonRaftConfig> for QuicNetworkConnection {
         &mut self,
         rpc: AppendEntriesRequest<AeonRaftConfig>,
         _option: RPCOption,
-    ) -> Result<
-        AppendEntriesResponse<u64>,
-        RPCError<u64, NodeAddress, RaftError<u64>>,
-    > {
+    ) -> Result<AppendEntriesResponse<u64>, RPCError<u64, NodeAddress, RaftError<u64>>> {
         self.rpc(
             MessageType::AppendEntries,
             MessageType::AppendEntriesResponse,
@@ -130,17 +123,13 @@ impl openraft::RaftNetwork<AeonRaftConfig> for QuicNetworkConnection {
         snapshot: Snapshot<AeonRaftConfig>,
         _cancel: impl std::future::Future<Output = ReplicationClosed> + Send + 'static,
         _option: RPCOption,
-    ) -> Result<
-        SnapshotResponse<u64>,
-        StreamingError<AeonRaftConfig, openraft::error::Fatal<u64>>,
-    > {
+    ) -> Result<SnapshotResponse<u64>, StreamingError<AeonRaftConfig, openraft::error::Fatal<u64>>>
+    {
         // Serialize vote + snapshot meta + snapshot data together
         let snap_data = snapshot.snapshot.into_inner();
         let full = (vote, &snapshot.meta, &snap_data);
         let payload = bincode::serialize(&full).map_err(|e| {
-            StreamingError::Unreachable(Unreachable::new(&std::io::Error::other(
-                e.to_string(),
-            )))
+            StreamingError::Unreachable(Unreachable::new(&std::io::Error::other(e.to_string())))
         })?;
 
         let conn = self
@@ -148,43 +137,34 @@ impl openraft::RaftNetwork<AeonRaftConfig> for QuicNetworkConnection {
             .connect(self.target, &self.target_addr)
             .await
             .map_err(|e| {
-                StreamingError::Unreachable(Unreachable::new(&std::io::Error::other(
-                    e.to_string(),
-                )))
+                StreamingError::Unreachable(Unreachable::new(&std::io::Error::other(e.to_string())))
             })?;
 
         let (mut send, mut recv) = conn.open_bi().await.map_err(|e| {
-            StreamingError::Unreachable(Unreachable::new(&std::io::Error::other(
-                format!("failed to open QUIC stream: {e}"),
-            )))
+            StreamingError::Unreachable(Unreachable::new(&std::io::Error::other(format!(
+                "failed to open QUIC stream: {e}"
+            ))))
         })?;
 
         framing::write_frame(&mut send, MessageType::FullSnapshot, &payload)
             .await
             .map_err(|e| {
-                StreamingError::Unreachable(Unreachable::new(&std::io::Error::other(
-                    e.to_string(),
-                )))
+                StreamingError::Unreachable(Unreachable::new(&std::io::Error::other(e.to_string())))
             })?;
 
         send.finish().map_err(|e| {
-            StreamingError::Unreachable(Unreachable::new(&std::io::Error::other(
-                format!("failed to finish send: {e}"),
-            )))
+            StreamingError::Unreachable(Unreachable::new(&std::io::Error::other(format!(
+                "failed to finish send: {e}"
+            ))))
         })?;
 
         let (_, resp_payload) = framing::read_frame(&mut recv).await.map_err(|e| {
-            StreamingError::Unreachable(Unreachable::new(&std::io::Error::other(
-                e.to_string(),
-            )))
+            StreamingError::Unreachable(Unreachable::new(&std::io::Error::other(e.to_string())))
         })?;
 
-        let response: SnapshotResponse<u64> =
-            bincode::deserialize(&resp_payload).map_err(|e| {
-                StreamingError::Unreachable(Unreachable::new(&std::io::Error::other(
-                    e.to_string(),
-                )))
-            })?;
+        let response: SnapshotResponse<u64> = bincode::deserialize(&resp_payload).map_err(|e| {
+            StreamingError::Unreachable(Unreachable::new(&std::io::Error::other(e.to_string())))
+        })?;
 
         Ok(response)
     }
@@ -210,10 +190,7 @@ impl openraft::RaftNetwork<AeonRaftConfig> for QuicNetworkConnection {
         &mut self,
         rpc: VoteRequest<u64>,
         _option: RPCOption,
-    ) -> Result<
-        VoteResponse<u64>,
-        RPCError<u64, NodeAddress, RaftError<u64>>,
-    > {
+    ) -> Result<VoteResponse<u64>, RPCError<u64, NodeAddress, RaftError<u64>>> {
         self.rpc(MessageType::Vote, MessageType::VoteResponse, &rpc)
             .await
             .map_err(RPCError::Network)

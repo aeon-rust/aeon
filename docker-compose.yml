@@ -19,7 +19,7 @@ services:
       - --rpc-addr redpanda:33145
       - --advertise-rpc-addr redpanda:33145
       - --mode dev-container
-      - --smp 1
+      - --smp 2
       - --default-log-level=warn
     ports:
       - "19092:19092"   # Kafka API (external listener for host access)

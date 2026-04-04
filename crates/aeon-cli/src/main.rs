@@ -3,6 +3,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Default REST API address for CLI commands.
+const DEFAULT_API: &str = "http://localhost:4471";
+
 #[derive(Parser)]
 #[command(
     name = "aeon",
@@ -41,11 +44,95 @@ enum Commands {
         /// Path to .wasm, .so, or .dll file
         path: PathBuf,
     },
+    /// Manage processors in the registry
+    Processor {
+        /// Aeon REST API address
+        #[arg(long, default_value = DEFAULT_API, global = true)]
+        api: String,
+        #[command(subcommand)]
+        action: ProcessorAction,
+    },
+    /// Manage pipelines
+    Pipeline {
+        /// Aeon REST API address
+        #[arg(long, default_value = DEFAULT_API, global = true)]
+        api: String,
+        #[command(subcommand)]
+        action: PipelineAction,
+    },
     /// Start/stop the local development environment (Redpanda)
     Dev {
         #[command(subcommand)]
         action: DevAction,
     },
+}
+
+#[derive(Subcommand)]
+enum ProcessorAction {
+    /// List all registered processors
+    List,
+    /// Inspect a processor
+    Inspect { name: String },
+    /// List versions of a processor
+    Versions { name: String },
+    /// Register a processor artifact
+    Register {
+        /// Processor name
+        name: String,
+        /// Version string (e.g., "1.0.0")
+        #[arg(long)]
+        version: String,
+        /// Description
+        #[arg(long, default_value = "")]
+        description: String,
+        /// Path to .wasm or .so artifact
+        #[arg(long)]
+        artifact: PathBuf,
+        /// Platform (e.g., "wasm32", "x86_64-linux")
+        #[arg(long, default_value = "wasm32")]
+        platform: String,
+    },
+    /// Delete a processor version
+    Delete {
+        /// Processor name
+        name: String,
+        /// Version to delete
+        #[arg(long)]
+        version: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum PipelineAction {
+    /// List all pipelines
+    List,
+    /// Inspect a pipeline
+    Inspect { name: String },
+    /// Create a pipeline from JSON definition
+    Create {
+        /// Path to pipeline JSON file
+        #[arg(long)]
+        file: PathBuf,
+    },
+    /// Start a pipeline
+    Start { name: String },
+    /// Stop a pipeline
+    Stop { name: String },
+    /// Upgrade a pipeline's processor
+    Upgrade {
+        /// Pipeline name
+        name: String,
+        /// Processor name
+        #[arg(long)]
+        processor: String,
+        /// Processor version
+        #[arg(long)]
+        version: String,
+    },
+    /// Show pipeline lifecycle history
+    History { name: String },
+    /// Delete a pipeline
+    Delete { name: String },
 }
 
 #[derive(Subcommand)]
@@ -81,6 +168,8 @@ fn main() -> Result<()> {
         }) => cmd_new(&name, &runtime, &lang),
         Some(Commands::Build { release, dir }) => cmd_build(release, dir.as_deref()),
         Some(Commands::Validate { path }) => cmd_validate(&path),
+        Some(Commands::Processor { api, action }) => cmd_processor(&api, &action),
+        Some(Commands::Pipeline { api, action }) => cmd_pipeline(&api, &action),
         Some(Commands::Dev { action }) => cmd_dev(&action),
         None => {
             println!("Aeon v{}", env!("CARGO_PKG_VERSION"));
@@ -519,6 +608,215 @@ fn validate_native(path: &Path) -> Result<()> {
         let _ = path;
         bail!("native validation requires the 'native-validate' feature (enabled by default)")
     }
+}
+
+// ── aeon processor ─────────────────────────────────────────────────────
+
+fn cmd_processor(api: &str, action: &ProcessorAction) -> Result<()> {
+    match action {
+        ProcessorAction::List => {
+            let body: serde_json::Value = ureq::get(&format!("{api}/api/v1/processors"))
+                .call()
+                .context("failed to reach Aeon API")?
+                .into_json()
+                .context("invalid JSON response")?;
+            let arr = body.as_array().context("expected array")?;
+            if arr.is_empty() {
+                println!("No processors registered.");
+            } else {
+                println!("{:<30} {:>8}  LATEST", "NAME", "VERSIONS");
+                for item in arr {
+                    println!(
+                        "{:<30} {:>8}  {}",
+                        item["name"].as_str().unwrap_or("-"),
+                        item["version_count"].as_u64().unwrap_or(0),
+                        item["latest_version"].as_str().unwrap_or("-"),
+                    );
+                }
+            }
+            Ok(())
+        }
+        ProcessorAction::Inspect { name } => {
+            let body: serde_json::Value = ureq::get(&format!("{api}/api/v1/processors/{name}"))
+                .call()
+                .context("failed to reach Aeon API")?
+                .into_json()?;
+            println!("{}", serde_json::to_string_pretty(&body)?);
+            Ok(())
+        }
+        ProcessorAction::Versions { name } => {
+            let body: serde_json::Value =
+                ureq::get(&format!("{api}/api/v1/processors/{name}/versions"))
+                    .call()
+                    .context("failed to reach Aeon API")?
+                    .into_json()?;
+            println!("{}", serde_json::to_string_pretty(&body)?);
+            Ok(())
+        }
+        ProcessorAction::Register {
+            name,
+            version,
+            description,
+            artifact,
+            platform,
+        } => {
+            let artifact_bytes = std::fs::read(artifact)
+                .with_context(|| format!("failed to read {}", artifact.display()))?;
+
+            // Compute SHA-512 placeholder hash (matches registry.rs sha512_hex)
+            let sha512 = aeon_engine::registry::sha512_hex(&artifact_bytes);
+
+            let processor_type = if artifact.extension().is_some_and(|e| e == "wasm") {
+                "Wasm"
+            } else {
+                "NativeSo"
+            };
+
+            let payload = serde_json::json!({
+                "name": name,
+                "description": description,
+                "version": {
+                    "version": version,
+                    "sha512": sha512,
+                    "size_bytes": artifact_bytes.len(),
+                    "processor_type": processor_type,
+                    "platform": platform,
+                    "status": "Available",
+                    "registered_at": now_millis(),
+                    "registered_by": "cli",
+                },
+            });
+
+            let body: serde_json::Value =
+                ureq::post(&format!("{api}/api/v1/processors"))
+                    .send_json(&payload)
+                    .context("failed to register processor")?
+                    .into_json()?;
+            println!("{}", serde_json::to_string_pretty(&body)?);
+            Ok(())
+        }
+        ProcessorAction::Delete { name, version } => {
+            let body: serde_json::Value = ureq::delete(&format!(
+                "{api}/api/v1/processors/{name}/versions/{version}"
+            ))
+            .call()
+            .context("failed to delete processor version")?
+            .into_json()?;
+            println!("{}", serde_json::to_string_pretty(&body)?);
+            Ok(())
+        }
+    }
+}
+
+// ── aeon pipeline ──────────────────────────────────────────────────────
+
+fn cmd_pipeline(api: &str, action: &PipelineAction) -> Result<()> {
+    match action {
+        PipelineAction::List => {
+            let body: serde_json::Value = ureq::get(&format!("{api}/api/v1/pipelines"))
+                .call()
+                .context("failed to reach Aeon API")?
+                .into_json()
+                .context("invalid JSON response")?;
+            let arr = body.as_array().context("expected array")?;
+            if arr.is_empty() {
+                println!("No pipelines.");
+            } else {
+                println!("{:<30} STATE", "NAME");
+                for item in arr {
+                    println!(
+                        "{:<30} {}",
+                        item["name"].as_str().unwrap_or("-"),
+                        item["state"].as_str().unwrap_or("-"),
+                    );
+                }
+            }
+            Ok(())
+        }
+        PipelineAction::Inspect { name } => {
+            let body: serde_json::Value =
+                ureq::get(&format!("{api}/api/v1/pipelines/{name}"))
+                    .call()
+                    .context("failed to reach Aeon API")?
+                    .into_json()?;
+            println!("{}", serde_json::to_string_pretty(&body)?);
+            Ok(())
+        }
+        PipelineAction::Create { file } => {
+            let content = std::fs::read_to_string(file)
+                .with_context(|| format!("failed to read {}", file.display()))?;
+            let payload: serde_json::Value =
+                serde_json::from_str(&content).context("invalid JSON in pipeline definition")?;
+
+            let body: serde_json::Value =
+                ureq::post(&format!("{api}/api/v1/pipelines"))
+                    .send_json(&payload)
+                    .context("failed to create pipeline")?
+                    .into_json()?;
+            println!("{}", serde_json::to_string_pretty(&body)?);
+            Ok(())
+        }
+        PipelineAction::Start { name } => {
+            let body: serde_json::Value =
+                ureq::post(&format!("{api}/api/v1/pipelines/{name}/start"))
+                    .send_json(serde_json::json!({}))
+                    .context("failed to start pipeline")?
+                    .into_json()?;
+            println!("{}", serde_json::to_string_pretty(&body)?);
+            Ok(())
+        }
+        PipelineAction::Stop { name } => {
+            let body: serde_json::Value =
+                ureq::post(&format!("{api}/api/v1/pipelines/{name}/stop"))
+                    .send_json(serde_json::json!({}))
+                    .context("failed to stop pipeline")?
+                    .into_json()?;
+            println!("{}", serde_json::to_string_pretty(&body)?);
+            Ok(())
+        }
+        PipelineAction::Upgrade {
+            name,
+            processor,
+            version,
+        } => {
+            let payload = serde_json::json!({
+                "processor_name": processor,
+                "processor_version": version,
+            });
+            let body: serde_json::Value =
+                ureq::post(&format!("{api}/api/v1/pipelines/{name}/upgrade"))
+                    .send_json(&payload)
+                    .context("failed to upgrade pipeline")?
+                    .into_json()?;
+            println!("{}", serde_json::to_string_pretty(&body)?);
+            Ok(())
+        }
+        PipelineAction::History { name } => {
+            let body: serde_json::Value =
+                ureq::get(&format!("{api}/api/v1/pipelines/{name}/history"))
+                    .call()
+                    .context("failed to reach Aeon API")?
+                    .into_json()?;
+            println!("{}", serde_json::to_string_pretty(&body)?);
+            Ok(())
+        }
+        PipelineAction::Delete { name } => {
+            let body: serde_json::Value =
+                ureq::delete(&format!("{api}/api/v1/pipelines/{name}"))
+                    .call()
+                    .context("failed to delete pipeline")?
+                    .into_json()?;
+            println!("{}", serde_json::to_string_pretty(&body)?);
+            Ok(())
+        }
+    }
+}
+
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
 }
 
 // ── aeon dev ───────────────────────────────────────────────────────────

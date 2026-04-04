@@ -9,9 +9,9 @@
 use std::sync::Arc;
 
 use aeon_sample_rust_native::JsonEnrichProcessor;
+use aeon_types::Processor;
 use aeon_types::event::Event;
 use aeon_types::partition::PartitionId;
-use aeon_types::Processor;
 use aeon_wasm::{WasmConfig, WasmModule, WasmProcessor};
 use bytes::Bytes;
 use criterion::{Criterion, black_box, criterion_group, criterion_main};

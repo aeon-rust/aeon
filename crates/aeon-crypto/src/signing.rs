@@ -51,7 +51,10 @@ impl<'de> Deserialize<'de> for Signature {
                 Ok(Signature { bytes: arr })
             }
 
-            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Signature, A::Error> {
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Signature, A::Error> {
                 let mut arr = [0u8; 64];
                 for (i, byte) in arr.iter_mut().enumerate() {
                     *byte = seq

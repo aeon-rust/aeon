@@ -9,9 +9,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::hash::{sha512_pair, Hash512};
 #[cfg(test)]
 use crate::hash::sha512;
+use crate::hash::{Hash512, sha512_pair};
 
 /// A node position in the MMR (0-indexed).
 type MmrPos = usize;
@@ -337,7 +337,8 @@ mod tests {
             }
             let expected = n + n - n.count_ones() as u64;
             assert_eq!(
-                mmr.node_count() as u64, expected,
+                mmr.node_count() as u64,
+                expected,
                 "node_count wrong for {n} leaves"
             );
         }

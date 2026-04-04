@@ -75,18 +75,16 @@ impl EtmKey {
 
         // Encrypt: AES-256-CTR
         let mut ciphertext = plaintext.to_vec();
-        let mut cipher = Aes256Ctr::new(
-            self.enc_key.as_ref().into(),
-            nonce.as_ref().into(),
-        );
+        let mut cipher = Aes256Ctr::new(self.enc_key.as_ref().into(), nonce.as_ref().into());
         cipher.apply_keystream(&mut ciphertext);
 
         // Authenticate: HMAC-SHA-512 over nonce || ciphertext
-        let mut mac = <HmacSha512 as Mac>::new_from_slice(&self.mac_key)
-            .map_err(|e| aeon_types::AeonError::Crypto {
+        let mut mac = <HmacSha512 as Mac>::new_from_slice(&self.mac_key).map_err(|e| {
+            aeon_types::AeonError::Crypto {
                 message: format!("HMAC key error: {e}"),
                 source: None,
-            })?;
+            }
+        })?;
         mac.update(&nonce);
         mac.update(&ciphertext);
         let tag = mac.finalize().into_bytes();
@@ -121,24 +119,23 @@ impl EtmKey {
         let expected_tag = &data[data.len() - MAC_LEN..];
 
         // Verify MAC first (before decryption — this is EtM)
-        let mut mac = <HmacSha512 as Mac>::new_from_slice(&self.mac_key)
-            .map_err(|e| aeon_types::AeonError::Crypto {
+        let mut mac = <HmacSha512 as Mac>::new_from_slice(&self.mac_key).map_err(|e| {
+            aeon_types::AeonError::Crypto {
                 message: format!("HMAC key error: {e}"),
                 source: None,
-            })?;
+            }
+        })?;
         mac.update(nonce);
         mac.update(ciphertext);
-        mac.verify_slice(expected_tag).map_err(|_| aeon_types::AeonError::Crypto {
-            message: "HMAC verification failed: data tampered or wrong key".into(),
-            source: None,
-        })?;
+        mac.verify_slice(expected_tag)
+            .map_err(|_| aeon_types::AeonError::Crypto {
+                message: "HMAC verification failed: data tampered or wrong key".into(),
+                source: None,
+            })?;
 
         // Decrypt: AES-256-CTR
         let mut plaintext = ciphertext.to_vec();
-        let mut cipher = Aes256Ctr::new(
-            self.enc_key.as_ref().into(),
-            nonce.into(),
-        );
+        let mut cipher = Aes256Ctr::new(self.enc_key.as_ref().into(), nonce.into());
         cipher.apply_keystream(&mut plaintext);
 
         Ok(plaintext)

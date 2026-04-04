@@ -5,14 +5,12 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use aeon_cluster::raft_config::AeonRaftConfig;
+use aeon_cluster::store::{MemLogStore, StateMachineStore};
 use aeon_cluster::transport::endpoint::QuicEndpoint;
 use aeon_cluster::transport::network::QuicNetworkFactory;
 use aeon_cluster::transport::server;
-use aeon_cluster::store::{MemLogStore, StateMachineStore};
-use aeon_cluster::raft_config::AeonRaftConfig;
-use aeon_cluster::{
-    ClusterRequest, ClusterResponse, NodeAddress,
-};
+use aeon_cluster::{ClusterRequest, ClusterResponse, NodeAddress};
 use aeon_types::PartitionId;
 use openraft::{Config, Raft};
 
@@ -22,8 +20,7 @@ fn dev_quic_configs() -> (quinn::ServerConfig, quinn::ClientConfig) {
     let cert_params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
     let cert = cert_params.self_signed(&key_pair).unwrap();
     let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
-    let key_der =
-        rustls::pki_types::PrivateKeyDer::try_from(key_pair.serialize_der()).unwrap();
+    let key_der = rustls::pki_types::PrivateKeyDer::try_from(key_pair.serialize_der()).unwrap();
 
     let server_crypto = rustls::ServerConfig::builder()
         .with_no_client_auth()
@@ -46,10 +43,7 @@ fn dev_quic_configs() -> (quinn::ServerConfig, quinn::ClientConfig) {
 }
 
 /// Helper to create a Raft node with QUIC transport.
-async fn create_quic_node(
-    node_id: u64,
-    endpoint: Arc<QuicEndpoint>,
-) -> Raft<AeonRaftConfig> {
+async fn create_quic_node(node_id: u64, endpoint: Arc<QuicEndpoint>) -> Raft<AeonRaftConfig> {
     let config = Arc::new(Config {
         cluster_name: "aeon-test".to_string(),
         heartbeat_interval: 200,
@@ -89,12 +83,7 @@ async fn three_node_cluster_formation() {
         .unwrap(),
     );
     let ep3 = Arc::new(
-        QuicEndpoint::bind(
-            "127.0.0.1:0".parse().unwrap(),
-            server_cfg,
-            client_cfg,
-        )
-        .unwrap(),
+        QuicEndpoint::bind("127.0.0.1:0".parse().unwrap(), server_cfg, client_cfg).unwrap(),
     );
 
     let addr1 = ep1.local_addr().unwrap();
@@ -108,9 +97,21 @@ async fn three_node_cluster_formation() {
 
     // Start QUIC servers
     let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let _s1 = tokio::spawn(server::serve(Arc::clone(&ep1), raft1.clone(), Arc::clone(&shutdown)));
-    let _s2 = tokio::spawn(server::serve(Arc::clone(&ep2), raft2.clone(), Arc::clone(&shutdown)));
-    let _s3 = tokio::spawn(server::serve(Arc::clone(&ep3), raft3.clone(), Arc::clone(&shutdown)));
+    let _s1 = tokio::spawn(server::serve(
+        Arc::clone(&ep1),
+        raft1.clone(),
+        Arc::clone(&shutdown),
+    ));
+    let _s2 = tokio::spawn(server::serve(
+        Arc::clone(&ep2),
+        raft2.clone(),
+        Arc::clone(&shutdown),
+    ));
+    let _s3 = tokio::spawn(server::serve(
+        Arc::clone(&ep3),
+        raft3.clone(),
+        Arc::clone(&shutdown),
+    ));
 
     // Initialize cluster from node 1
     let mut members = BTreeMap::new();
@@ -159,10 +160,20 @@ async fn three_node_log_replication() {
     let (server_cfg, client_cfg) = dev_quic_configs();
 
     let ep1 = Arc::new(
-        QuicEndpoint::bind("127.0.0.1:0".parse().unwrap(), server_cfg.clone(), client_cfg.clone()).unwrap(),
+        QuicEndpoint::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            server_cfg.clone(),
+            client_cfg.clone(),
+        )
+        .unwrap(),
     );
     let ep2 = Arc::new(
-        QuicEndpoint::bind("127.0.0.1:0".parse().unwrap(), server_cfg.clone(), client_cfg.clone()).unwrap(),
+        QuicEndpoint::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            server_cfg.clone(),
+            client_cfg.clone(),
+        )
+        .unwrap(),
     );
     let ep3 = Arc::new(
         QuicEndpoint::bind("127.0.0.1:0".parse().unwrap(), server_cfg, client_cfg).unwrap(),
@@ -177,9 +188,21 @@ async fn three_node_log_replication() {
     let raft3 = create_quic_node(3, Arc::clone(&ep3)).await;
 
     let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    tokio::spawn(server::serve(Arc::clone(&ep1), raft1.clone(), Arc::clone(&shutdown)));
-    tokio::spawn(server::serve(Arc::clone(&ep2), raft2.clone(), Arc::clone(&shutdown)));
-    tokio::spawn(server::serve(Arc::clone(&ep3), raft3.clone(), Arc::clone(&shutdown)));
+    tokio::spawn(server::serve(
+        Arc::clone(&ep1),
+        raft1.clone(),
+        Arc::clone(&shutdown),
+    ));
+    tokio::spawn(server::serve(
+        Arc::clone(&ep2),
+        raft2.clone(),
+        Arc::clone(&shutdown),
+    ));
+    tokio::spawn(server::serve(
+        Arc::clone(&ep3),
+        raft3.clone(),
+        Arc::clone(&shutdown),
+    ));
 
     let mut members = BTreeMap::new();
     members.insert(1u64, NodeAddress::new("localhost", addr1.port()));

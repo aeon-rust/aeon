@@ -67,16 +67,10 @@ async fn handle_stream(
     };
 
     let result = match msg_type {
-        MessageType::AppendEntries => {
-            handle_append_entries(&raft, &payload, &mut send).await
-        }
+        MessageType::AppendEntries => handle_append_entries(&raft, &payload, &mut send).await,
         MessageType::Vote => handle_vote(&raft, &payload, &mut send).await,
-        MessageType::InstallSnapshot => {
-            handle_install_snapshot(&raft, &payload, &mut send).await
-        }
-        MessageType::FullSnapshot => {
-            handle_full_snapshot(&raft, &payload, &mut send).await
-        }
+        MessageType::InstallSnapshot => handle_install_snapshot(&raft, &payload, &mut send).await,
+        MessageType::FullSnapshot => handle_full_snapshot(&raft, &payload, &mut send).await,
         _ => {
             tracing::warn!("unexpected message type: {:?}", msg_type);
             Ok(())
@@ -99,12 +93,13 @@ async fn handle_append_entries(
             source: None,
         })?;
 
-    let resp = raft.append_entries(req).await.map_err(|e| {
-        aeon_types::AeonError::Cluster {
+    let resp = raft
+        .append_entries(req)
+        .await
+        .map_err(|e| aeon_types::AeonError::Cluster {
             message: format!("AppendEntries failed: {e}"),
             source: None,
-        }
-    })?;
+        })?;
 
     let resp_bytes =
         bincode::serialize(&resp).map_err(|e| aeon_types::AeonError::Serialization {
@@ -128,13 +123,13 @@ async fn handle_vote(
             source: None,
         })?;
 
-    let resp =
-        raft.vote(req)
-            .await
-            .map_err(|e| aeon_types::AeonError::Cluster {
-                message: format!("Vote failed: {e}"),
-                source: None,
-            })?;
+    let resp = raft
+        .vote(req)
+        .await
+        .map_err(|e| aeon_types::AeonError::Cluster {
+            message: format!("Vote failed: {e}"),
+            source: None,
+        })?;
 
     let resp_bytes =
         bincode::serialize(&resp).map_err(|e| aeon_types::AeonError::Serialization {
@@ -152,18 +147,19 @@ async fn handle_install_snapshot(
     payload: &[u8],
     send: &mut quinn::SendStream,
 ) -> Result<(), aeon_types::AeonError> {
-    let req: openraft::raft::InstallSnapshotRequest<AeonRaftConfig> =
-        bincode::deserialize(payload).map_err(|e| aeon_types::AeonError::Serialization {
+    let req: openraft::raft::InstallSnapshotRequest<AeonRaftConfig> = bincode::deserialize(payload)
+        .map_err(|e| aeon_types::AeonError::Serialization {
             message: format!("deserialize InstallSnapshot: {e}"),
             source: None,
         })?;
 
-    let resp = raft.install_snapshot(req).await.map_err(|e| {
-        aeon_types::AeonError::Cluster {
+    let resp = raft
+        .install_snapshot(req)
+        .await
+        .map_err(|e| aeon_types::AeonError::Cluster {
             message: format!("InstallSnapshot failed: {e}"),
             source: None,
-        }
-    })?;
+        })?;
 
     let resp_bytes =
         bincode::serialize(&resp).map_err(|e| aeon_types::AeonError::Serialization {

@@ -98,10 +98,7 @@ pub enum PartitionOwnership {
     /// Partition is owned by a single node.
     Owned(NodeId),
     /// Partition is being transferred from source to target.
-    Transferring {
-        source: NodeId,
-        target: NodeId,
-    },
+    Transferring { source: NodeId, target: NodeId },
 }
 
 impl PartitionOwnership {
@@ -172,11 +169,7 @@ impl PartitionTable {
 
     /// Get all unique active node IDs.
     pub fn active_nodes(&self) -> Vec<NodeId> {
-        let mut nodes: Vec<NodeId> = self
-            .assignments
-            .values()
-            .map(|o| o.active_node())
-            .collect();
+        let mut nodes: Vec<NodeId> = self.assignments.values().map(|o| o.active_node()).collect();
         nodes.sort_unstable();
         nodes.dedup();
         nodes

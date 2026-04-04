@@ -17,11 +17,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use aeon_connectors::BlackholeSink;
-use aeon_connectors::kafka::{
-    KafkaSink, KafkaSource,
-    redpanda_sink_config, redpanda_source_config,
-};
 use aeon_connectors::MemorySource;
+use aeon_connectors::kafka::{
+    KafkaSink, KafkaSource, redpanda_sink_config, redpanda_source_config,
+};
 use aeon_engine::{
     PassthroughProcessor, PipelineConfig, PipelineMetrics, ShutdownCoordinator, run_buffered,
 };
@@ -31,9 +30,9 @@ use bytes::Bytes;
 
 #[derive(Clone, Debug)]
 struct Args {
-    source_mode: String,       // "redpanda" | "memory"
-    processor_mode: String,    // "native" | "wasm"
-    sink_mode: String,         // "redpanda" | "blackhole"
+    source_mode: String,    // "redpanda" | "memory"
+    processor_mode: String, // "native" | "wasm"
+    sink_mode: String,      // "redpanda" | "blackhole"
     wasm_path: Option<String>,
     source_topic: String,
     sink_topic: String,
@@ -43,9 +42,9 @@ struct Args {
     buffer_capacity: usize,
     namespace: String,
     fuel: Option<u64>,
-    count: u64,                // for memory source
-    payload_size: usize,       // for memory source
-    duration_secs: u64,        // 0 = run until shutdown or source exhausted
+    count: u64,          // for memory source
+    payload_size: usize, // for memory source
+    duration_secs: u64,  // 0 = run until shutdown or source exhausted
 }
 
 fn parse_args() -> Args {
@@ -71,13 +70,34 @@ fn parse_args() -> Args {
     let mut i = 1;
     while i < raw.len() {
         match raw[i].as_str() {
-            "--source" => { i += 1; args.source_mode = raw[i].clone(); }
-            "--processor" => { i += 1; args.processor_mode = raw[i].clone(); }
-            "--sink" => { i += 1; args.sink_mode = raw[i].clone(); }
-            "--wasm" | "-w" => { i += 1; args.wasm_path = Some(raw[i].clone()); }
-            "--source-topic" | "-s" => { i += 1; args.source_topic = raw[i].clone(); }
-            "--sink-topic" | "-o" => { i += 1; args.sink_topic = raw[i].clone(); }
-            "--brokers" | "-b" => { i += 1; args.brokers = raw[i].clone(); }
+            "--source" => {
+                i += 1;
+                args.source_mode = raw[i].clone();
+            }
+            "--processor" => {
+                i += 1;
+                args.processor_mode = raw[i].clone();
+            }
+            "--sink" => {
+                i += 1;
+                args.sink_mode = raw[i].clone();
+            }
+            "--wasm" | "-w" => {
+                i += 1;
+                args.wasm_path = Some(raw[i].clone());
+            }
+            "--source-topic" | "-s" => {
+                i += 1;
+                args.source_topic = raw[i].clone();
+            }
+            "--sink-topic" | "-o" => {
+                i += 1;
+                args.sink_topic = raw[i].clone();
+            }
+            "--brokers" | "-b" => {
+                i += 1;
+                args.brokers = raw[i].clone();
+            }
             "--partitions" | "-p" => {
                 i += 1;
                 args.partitions = raw[i]
@@ -85,18 +105,39 @@ fn parse_args() -> Args {
                     .filter_map(|s| s.trim().parse::<i32>().ok())
                     .collect();
             }
-            "--batch-size" => { i += 1; args.batch_size = raw[i].parse().unwrap_or(1024); }
-            "--buffer-capacity" => { i += 1; args.buffer_capacity = raw[i].parse().unwrap_or(8192); }
-            "--namespace" | "-n" => { i += 1; args.namespace = raw[i].clone(); }
+            "--batch-size" => {
+                i += 1;
+                args.batch_size = raw[i].parse().unwrap_or(1024);
+            }
+            "--buffer-capacity" => {
+                i += 1;
+                args.buffer_capacity = raw[i].parse().unwrap_or(8192);
+            }
+            "--namespace" | "-n" => {
+                i += 1;
+                args.namespace = raw[i].clone();
+            }
             "--fuel" => {
                 i += 1;
                 let v: u64 = raw[i].parse().unwrap_or(1_000_000);
                 args.fuel = if v == 0 { None } else { Some(v) };
             }
-            "--count" | "-c" => { i += 1; args.count = raw[i].parse().unwrap_or(1_000_000); }
-            "--payload-size" => { i += 1; args.payload_size = raw[i].parse().unwrap_or(128); }
-            "--duration" | "-d" => { i += 1; args.duration_secs = raw[i].parse().unwrap_or(0); }
-            "--help" | "-h" => { print_usage(); std::process::exit(0); }
+            "--count" | "-c" => {
+                i += 1;
+                args.count = raw[i].parse().unwrap_or(1_000_000);
+            }
+            "--payload-size" => {
+                i += 1;
+                args.payload_size = raw[i].parse().unwrap_or(128);
+            }
+            "--duration" | "-d" => {
+                i += 1;
+                args.duration_secs = raw[i].parse().unwrap_or(0);
+            }
+            "--help" | "-h" => {
+                print_usage();
+                std::process::exit(0);
+            }
             other => {
                 eprintln!("Unknown argument: {other}");
                 print_usage();
@@ -255,7 +296,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let sent = m.outputs_sent.load(Ordering::Relaxed);
             let elapsed = start_time.elapsed().as_secs_f64();
             let delta = processed - prev_processed;
-            let rate = if elapsed > 0.0 { processed as f64 / elapsed } else { 0.0 };
+            let rate = if elapsed > 0.0 {
+                processed as f64 / elapsed
+            } else {
+                0.0
+            };
             let instant_rate = delta as f64 / 2.0; // 2-second interval
             prev_processed = processed;
             tracing::info!(
@@ -276,14 +321,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Starting pipeline — press Ctrl+C to stop"
     );
 
-    let result = match (args.source_mode.as_str(), args.processor_mode.as_str(), args.sink_mode.as_str()) {
+    let result = match (
+        args.source_mode.as_str(),
+        args.processor_mode.as_str(),
+        args.sink_mode.as_str(),
+    ) {
         // ─── Memory + Native + Blackhole (pure CPU ceiling) ─────────
         ("memory", "native", "blackhole") => {
-            tracing::info!(count = args.count, payload_size = args.payload_size, "Generating events");
-            let source = MemorySource::new(generate_events(args.count, args.payload_size), args.batch_size);
+            tracing::info!(
+                count = args.count,
+                payload_size = args.payload_size,
+                "Generating events"
+            );
+            let source = MemorySource::new(
+                generate_events(args.count, args.payload_size),
+                args.batch_size,
+            );
             let processor = PassthroughProcessor::new("bench".into());
             let sink = BlackholeSink::new();
-            run_pipeline!(source, processor, sink, pipeline_config, Arc::clone(&metrics), Arc::clone(&shutdown))
+            run_pipeline!(
+                source,
+                processor,
+                sink,
+                pipeline_config,
+                Arc::clone(&metrics),
+                Arc::clone(&shutdown)
+            )
         }
 
         // ─── Memory + Wasm + Blackhole (Wasm ceiling) ───────────────
@@ -291,12 +354,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let wasm_path = args.wasm_path.as_ref().unwrap();
             tracing::info!(path = %wasm_path, count = args.count, "Loading Wasm processor");
             let wasm_bytes = std::fs::read(wasm_path)?;
-            let wasm_config = WasmConfig { max_fuel: args.fuel, namespace: args.namespace, ..WasmConfig::default() };
+            let wasm_config = WasmConfig {
+                max_fuel: args.fuel,
+                namespace: args.namespace,
+                ..WasmConfig::default()
+            };
             let module = Arc::new(WasmModule::from_bytes(&wasm_bytes, wasm_config)?);
             let processor = WasmProcessor::new(Arc::clone(&module))?;
-            let source = MemorySource::new(generate_events(args.count, args.payload_size), args.batch_size);
+            let source = MemorySource::new(
+                generate_events(args.count, args.payload_size),
+                args.batch_size,
+            );
             let sink = BlackholeSink::new();
-            run_pipeline!(source, processor, sink, pipeline_config, Arc::clone(&metrics), Arc::clone(&shutdown))
+            run_pipeline!(
+                source,
+                processor,
+                sink,
+                pipeline_config,
+                Arc::clone(&metrics),
+                Arc::clone(&shutdown)
+            )
         }
 
         // ─── Redpanda + Native + Redpanda ───────────────────────────
@@ -310,7 +387,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let sink_config = redpanda_sink_config(&args.brokers, &args.sink_topic);
             let sink = KafkaSink::new(sink_config)?;
             tracing::info!(brokers = %args.brokers, src = %args.source_topic, dst = %args.sink_topic, "Redpanda connected");
-            run_pipeline!(source, processor, sink, pipeline_config, Arc::clone(&metrics), Arc::clone(&shutdown))
+            run_pipeline!(
+                source,
+                processor,
+                sink,
+                pipeline_config,
+                Arc::clone(&metrics),
+                Arc::clone(&shutdown)
+            )
         }
 
         // ─── Redpanda + Native + Blackhole ──────────────────────────
@@ -323,7 +407,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let processor = PassthroughProcessor::new("bench".into());
             let sink = BlackholeSink::new();
             tracing::info!(brokers = %args.brokers, src = %args.source_topic, "Redpanda → Blackhole");
-            run_pipeline!(source, processor, sink, pipeline_config, Arc::clone(&metrics), Arc::clone(&shutdown))
+            run_pipeline!(
+                source,
+                processor,
+                sink,
+                pipeline_config,
+                Arc::clone(&metrics),
+                Arc::clone(&shutdown)
+            )
         }
 
         // ─── Redpanda + Wasm + Redpanda ─────────────────────────────
@@ -331,7 +422,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let wasm_path = args.wasm_path.as_ref().unwrap();
             tracing::info!(path = %wasm_path, "Loading Wasm processor");
             let wasm_bytes = std::fs::read(wasm_path)?;
-            let wasm_config = WasmConfig { max_fuel: args.fuel, namespace: args.namespace, ..WasmConfig::default() };
+            let wasm_config = WasmConfig {
+                max_fuel: args.fuel,
+                namespace: args.namespace,
+                ..WasmConfig::default()
+            };
             let module = Arc::new(WasmModule::from_bytes(&wasm_bytes, wasm_config)?);
             let processor = WasmProcessor::new(Arc::clone(&module))?;
             let source_config = redpanda_source_config(&args.brokers, &args.source_topic)
@@ -342,7 +437,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let sink_config = redpanda_sink_config(&args.brokers, &args.sink_topic);
             let sink = KafkaSink::new(sink_config)?;
             tracing::info!(brokers = %args.brokers, src = %args.source_topic, dst = %args.sink_topic, "Redpanda + Wasm");
-            run_pipeline!(source, processor, sink, pipeline_config, Arc::clone(&metrics), Arc::clone(&shutdown))
+            run_pipeline!(
+                source,
+                processor,
+                sink,
+                pipeline_config,
+                Arc::clone(&metrics),
+                Arc::clone(&shutdown)
+            )
         }
 
         // ─── Redpanda + Wasm + Blackhole ────────────────────────────
@@ -350,7 +452,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let wasm_path = args.wasm_path.as_ref().unwrap();
             tracing::info!(path = %wasm_path, "Loading Wasm processor");
             let wasm_bytes = std::fs::read(wasm_path)?;
-            let wasm_config = WasmConfig { max_fuel: args.fuel, namespace: args.namespace, ..WasmConfig::default() };
+            let wasm_config = WasmConfig {
+                max_fuel: args.fuel,
+                namespace: args.namespace,
+                ..WasmConfig::default()
+            };
             let module = Arc::new(WasmModule::from_bytes(&wasm_bytes, wasm_config)?);
             let processor = WasmProcessor::new(Arc::clone(&module))?;
             let source_config = redpanda_source_config(&args.brokers, &args.source_topic)
@@ -360,12 +466,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let source = KafkaSource::new(source_config)?;
             let sink = BlackholeSink::new();
             tracing::info!(brokers = %args.brokers, src = %args.source_topic, "Redpanda + Wasm → Blackhole");
-            run_pipeline!(source, processor, sink, pipeline_config, Arc::clone(&metrics), Arc::clone(&shutdown))
+            run_pipeline!(
+                source,
+                processor,
+                sink,
+                pipeline_config,
+                Arc::clone(&metrics),
+                Arc::clone(&shutdown)
+            )
         }
 
         (src, proc_, snk) => {
             eprintln!("Unsupported combination: --source {src} --processor {proc_} --sink {snk}");
-            eprintln!("Supported: source=redpanda|memory, processor=native|wasm, sink=redpanda|blackhole");
+            eprintln!(
+                "Supported: source=redpanda|memory, processor=native|wasm, sink=redpanda|blackhole"
+            );
             std::process::exit(1);
         }
     };
@@ -375,7 +490,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let received = metrics.events_received.load(Ordering::Relaxed);
     let processed = metrics.events_processed.load(Ordering::Relaxed);
     let sent = metrics.outputs_sent.load(Ordering::Relaxed);
-    let rate = if elapsed.as_secs_f64() > 0.0 { processed as f64 / elapsed.as_secs_f64() } else { 0.0 };
+    let rate = if elapsed.as_secs_f64() > 0.0 {
+        processed as f64 / elapsed.as_secs_f64()
+    } else {
+        0.0
+    };
 
     tracing::info!(
         received,

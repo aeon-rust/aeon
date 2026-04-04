@@ -14,9 +14,7 @@ mod inner {
     use crate::config::ClusterConfig;
     use crate::raft_config::AeonRaftConfig;
     use crate::store::{MemLogStore, StateMachineStore};
-    use crate::types::{
-        ClusterRequest, ClusterResponse, NodeAddress, NodeId,
-    };
+    use crate::types::{ClusterRequest, ClusterResponse, NodeAddress, NodeId};
 
     /// A stub RaftNetworkFactory that does nothing (for single-node clusters).
     /// Multi-node networking is implemented in Phase 8c.
@@ -26,11 +24,7 @@ mod inner {
     impl openraft::RaftNetworkFactory<AeonRaftConfig> for StubNetworkFactory {
         type Network = StubNetwork;
 
-        async fn new_client(
-            &mut self,
-            _target: u64,
-            _node: &NodeAddress,
-        ) -> Self::Network {
+        async fn new_client(&mut self, _target: u64, _node: &NodeAddress) -> Self::Network {
             StubNetwork
         }
     }
@@ -46,14 +40,13 @@ mod inner {
             _option: openraft::network::RPCOption,
         ) -> Result<
             openraft::raft::AppendEntriesResponse<u64>,
-            openraft::error::RPCError<
-                u64,
-                NodeAddress,
-                openraft::error::RaftError<u64>,
-            >,
+            openraft::error::RPCError<u64, NodeAddress, openraft::error::RaftError<u64>>,
         > {
             Err(openraft::error::RPCError::Network(
-                openraft::error::NetworkError::new(&std::io::Error::new(std::io::ErrorKind::NotConnected, "no network in single-node mode")),
+                openraft::error::NetworkError::new(&std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "no network in single-node mode",
+                )),
             ))
         }
 
@@ -62,18 +55,18 @@ mod inner {
             _vote: openraft::Vote<u64>,
             _snapshot: openraft::storage::Snapshot<AeonRaftConfig>,
             _cancel: impl std::future::Future<Output = openraft::error::ReplicationClosed>
-                + Send
-                + 'static,
+            + Send
+            + 'static,
             _option: openraft::network::RPCOption,
         ) -> Result<
             openraft::raft::SnapshotResponse<u64>,
-            openraft::error::StreamingError<
-                AeonRaftConfig,
-                openraft::error::Fatal<u64>,
-            >,
+            openraft::error::StreamingError<AeonRaftConfig, openraft::error::Fatal<u64>>,
         > {
             Err(openraft::error::StreamingError::Unreachable(
-                openraft::error::Unreachable::new(&std::io::Error::new(std::io::ErrorKind::NotConnected, "no network in single-node mode")),
+                openraft::error::Unreachable::new(&std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "no network in single-node mode",
+                )),
             ))
         }
 
@@ -86,14 +79,14 @@ mod inner {
             openraft::error::RPCError<
                 u64,
                 NodeAddress,
-                openraft::error::RaftError<
-                    u64,
-                    openraft::error::InstallSnapshotError,
-                >,
+                openraft::error::RaftError<u64, openraft::error::InstallSnapshotError>,
             >,
         > {
             Err(openraft::error::RPCError::Network(
-                openraft::error::NetworkError::new(&std::io::Error::new(std::io::ErrorKind::NotConnected, "no network in single-node mode")),
+                openraft::error::NetworkError::new(&std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "no network in single-node mode",
+                )),
             ))
         }
 
@@ -103,14 +96,13 @@ mod inner {
             _option: openraft::network::RPCOption,
         ) -> Result<
             openraft::raft::VoteResponse<u64>,
-            openraft::error::RPCError<
-                u64,
-                NodeAddress,
-                openraft::error::RaftError<u64>,
-            >,
+            openraft::error::RPCError<u64, NodeAddress, openraft::error::RaftError<u64>>,
         > {
             Err(openraft::error::RPCError::Network(
-                openraft::error::NetworkError::new(&std::io::Error::new(std::io::ErrorKind::NotConnected, "no network in single-node mode")),
+                openraft::error::NetworkError::new(&std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "no network in single-node mode",
+                )),
             ))
         }
     }
@@ -129,15 +121,13 @@ mod inner {
         pub async fn bootstrap_single(config: ClusterConfig) -> Result<Self, AeonError> {
             config.validate()?;
 
-            let raft_config = Arc::new(
-                Config {
-                    cluster_name: "aeon".to_string(),
-                    heartbeat_interval: 500,
-                    election_timeout_min: 1500,
-                    election_timeout_max: 3000,
-                    ..Config::default()
-                },
-            );
+            let raft_config = Arc::new(Config {
+                cluster_name: "aeon".to_string(),
+                heartbeat_interval: 500,
+                election_timeout_min: 1500,
+                election_timeout_max: 3000,
+                ..Config::default()
+            });
 
             let log_store = MemLogStore::new();
             let state_machine = StateMachineStore::new();
@@ -191,18 +181,15 @@ mod inner {
         }
 
         /// Propose a ClusterRequest through Raft consensus.
-        pub async fn propose(
-            &self,
-            request: ClusterRequest,
-        ) -> Result<ClusterResponse, AeonError> {
-            let response = self
-                .raft
-                .client_write(request)
-                .await
-                .map_err(|e| AeonError::Cluster {
-                    message: format!("Raft proposal failed: {e}"),
-                    source: None,
-                })?;
+        pub async fn propose(&self, request: ClusterRequest) -> Result<ClusterResponse, AeonError> {
+            let response =
+                self.raft
+                    .client_write(request)
+                    .await
+                    .map_err(|e| AeonError::Cluster {
+                        message: format!("Raft proposal failed: {e}"),
+                        source: None,
+                    })?;
 
             Ok(response.data)
         }

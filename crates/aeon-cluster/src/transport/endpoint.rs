@@ -24,13 +24,12 @@ impl QuicEndpoint {
         server_config: ServerConfig,
         client_config: ClientConfig,
     ) -> Result<Self, AeonError> {
-        let endpoint = Endpoint::server(server_config, bind_addr).map_err(|e| {
-            AeonError::Connection {
+        let endpoint =
+            Endpoint::server(server_config, bind_addr).map_err(|e| AeonError::Connection {
                 message: format!("failed to bind QUIC endpoint on {bind_addr}: {e}"),
                 source: None,
                 retryable: false,
-            }
-        })?;
+            })?;
 
         Ok(Self {
             endpoint,
@@ -112,11 +111,13 @@ impl QuicEndpoint {
 
     /// Get the local address this endpoint is bound to.
     pub fn local_addr(&self) -> Result<SocketAddr, AeonError> {
-        self.endpoint.local_addr().map_err(|e| AeonError::Connection {
-            message: format!("failed to get local address: {e}"),
-            source: None,
-            retryable: false,
-        })
+        self.endpoint
+            .local_addr()
+            .map_err(|e| AeonError::Connection {
+                message: format!("failed to get local address: {e}"),
+                source: None,
+                retryable: false,
+            })
     }
 
     /// Close the endpoint.
@@ -164,12 +165,8 @@ mod tests {
         });
 
         // Start a "client" endpoint using same certs
-        let client = QuicEndpoint::bind(
-            "127.0.0.1:0".parse().unwrap(),
-            server_cfg,
-            client_cfg,
-        )
-        .unwrap();
+        let client =
+            QuicEndpoint::bind("127.0.0.1:0".parse().unwrap(), server_cfg, client_cfg).unwrap();
 
         // Use "localhost" as host to match cert SAN
         let target = NodeAddress::new("localhost", server_addr.port());

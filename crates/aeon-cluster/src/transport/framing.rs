@@ -64,18 +64,24 @@ pub async fn write_frame(
     header[0] = msg_type as u8;
     header[1..5].copy_from_slice(&len.to_le_bytes());
 
-    stream.write_all(&header).await.map_err(|e| AeonError::Connection {
-        message: format!("failed to write frame header: {e}"),
-        source: None,
-        retryable: matches!(e, WriteError::ConnectionLost(_)),
-    })?;
-
-    if !payload.is_empty() {
-        stream.write_all(payload).await.map_err(|e| AeonError::Connection {
-            message: format!("failed to write frame payload: {e}"),
+    stream
+        .write_all(&header)
+        .await
+        .map_err(|e| AeonError::Connection {
+            message: format!("failed to write frame header: {e}"),
             source: None,
             retryable: matches!(e, WriteError::ConnectionLost(_)),
         })?;
+
+    if !payload.is_empty() {
+        stream
+            .write_all(payload)
+            .await
+            .map_err(|e| AeonError::Connection {
+                message: format!("failed to write frame payload: {e}"),
+                source: None,
+                retryable: matches!(e, WriteError::ConnectionLost(_)),
+            })?;
     }
 
     Ok(())

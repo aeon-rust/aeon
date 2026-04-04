@@ -42,11 +42,12 @@ impl Processor for JsonEnrichProcessor {
         let enriched = match field_value {
             Some(value) => {
                 // Strip surrounding quotes if present
-                let stripped = if value.len() >= 2 && value[0] == b'"' && value[value.len() - 1] == b'"' {
-                    &value[1..value.len() - 1]
-                } else {
-                    value
-                };
+                let stripped =
+                    if value.len() >= 2 && value[0] == b'"' && value[value.len() - 1] == b'"' {
+                        &value[1..value.len() - 1]
+                    } else {
+                        value
+                    };
                 // Found the field — build enriched JSON
                 let mut buf = Vec::with_capacity(event.payload.len() + 64);
                 buf.extend_from_slice(b"{\"original\":");
@@ -66,11 +67,11 @@ impl Processor for JsonEnrichProcessor {
 
         Ok(vec![
             Output::new(Arc::clone(&self.destination), enriched)
+                .with_header(Arc::from("processed-by"), Arc::clone(&self.processor_id))
                 .with_header(
-                    Arc::from("processed-by"),
-                    Arc::clone(&self.processor_id),
+                    Arc::from("source-event-id"),
+                    Arc::from(event.id.to_string()),
                 )
-                .with_header(Arc::from("source-event-id"), Arc::from(event.id.to_string()))
                 .with_source_ts(event.source_ts),
         ])
     }

@@ -13,10 +13,13 @@ path = "src/main.rs"
 [features]
 default = ["native-validate"]
 native-validate = ["aeon-engine/native-loader"]
+rest-api = ["aeon-engine/rest-api"]
 
 [dependencies]
 aeon-types = { workspace = true }
-aeon-engine = { workspace = true, optional = true }
+aeon-engine = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
+serde_json = { workspace = true }
+ureq = { version = "2", features = ["json"] }
 wasmtime = { workspace = true }

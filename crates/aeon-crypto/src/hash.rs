@@ -55,7 +55,10 @@ impl<'de> Deserialize<'de> for Hash512 {
                 Ok(Hash512(arr))
             }
 
-            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Hash512, A::Error> {
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Hash512, A::Error> {
                 let mut arr = [0u8; 64];
                 for (i, byte) in arr.iter_mut().enumerate() {
                     *byte = seq

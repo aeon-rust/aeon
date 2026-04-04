@@ -144,10 +144,11 @@ impl ApiKeyAuthenticator {
                 message: "Authorization header must use 'Bearer <token>' format".into(),
                 source: None,
             })?;
-        self.validate_bearer(token).ok_or_else(|| AeonError::Crypto {
-            message: "invalid API key".into(),
-            source: None,
-        })
+        self.validate_bearer(token)
+            .ok_or_else(|| AeonError::Crypto {
+                message: "invalid API key".into(),
+                source: None,
+            })
     }
 }
 
