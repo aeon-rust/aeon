@@ -1,0 +1,75 @@
+name: Processor Build & Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      processor_dir:
+        description: 'Path to processor project directory'
+        required: true
+        default: 'samples/processors/rust-wasm-sdk'
+      processor_name:
+        description: 'Processor name for registry'
+        required: true
+        default: 'my-processor'
+      processor_version:
+        description: 'Processor version'
+        required: true
+        default: '0.1.0'
+      aeon_api:
+        description: 'Aeon REST API endpoint'
+        required: false
+        default: 'http://localhost:4471'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-deploy:
+    name: Build, Validate, Deploy Processor
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Detect project type
+        id: detect
+        run: |
+          if [ -f "${{ inputs.processor_dir }}/package.json" ]; then
+            echo "type=typescript" >> $GITHUB_OUTPUT
+          elif [ -f "${{ inputs.processor_dir }}/Cargo.toml" ]; then
+            echo "type=rust" >> $GITHUB_OUTPUT
+          else
+            echo "::error::No Cargo.toml or package.json found"
+            exit 1
+          fi
+
+      - name: Build Rust Wasm processor
+        if: steps.detect.outputs.type == 'rust'
+        run: |
+          cd ${{ inputs.processor_dir }}
+          cargo build --target wasm32-unknown-unknown --release
+          echo "ARTIFACT=$(find target/wasm32-unknown-unknown/release -name '*.wasm' | head -1)" >> $GITHUB_ENV
+
+      - name: Build TypeScript processor
+        if: steps.detect.outputs.type == 'typescript'
+        run: |
+          cd ${{ inputs.processor_dir }}
+          npm install
+          npm run asbuild:release
+          echo "ARTIFACT=${{ inputs.processor_dir }}/build/release.wasm" >> $GITHUB_ENV
+
+      - name: Validate artifact
+        run: |
+          # Install aeon CLI (build from source)
+          cargo build --release -p aeon-cli
+          ./target/release/aeon validate $ARTIFACT
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.processor_name }}-${{ inputs.processor_version }}.wasm
+          path: ${{ env.ARTIFACT }}

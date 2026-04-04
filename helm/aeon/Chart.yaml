@@ -1,0 +1,13 @@
+apiVersion: v2
+name: aeon
+description: Aeon — real-time data processing engine
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - streaming
+  - data-processing
+  - kafka
+  - wasm
+maintainers:
+  - name: Aeon Team

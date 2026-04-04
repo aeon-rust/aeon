@@ -669,6 +669,19 @@ Rolling binary upgrade: zero event loss during Aeon v1→v2 transition under loa
 
 **Test count**: 470 (up from 459 after Phase 13a)
 
+### Phase 14 — Production Readiness (Complete)
+
+| Component | Completed | Key Result |
+|-----------|-----------|------------|
+| Production Dockerfile | 2026-04-04 | Multi-stage (builder+runtime), debian-slim, non-root user, strip binary |
+| Docker Compose prod | 2026-04-04 | `docker-compose.prod.yml`: Aeon + Redpanda + init-topics, health checks |
+| Helm chart | 2026-04-04 | `helm/aeon/`: Deployment, Service, PVC, ConfigMap for Wasm, security contexts |
+| CI/CD GitHub Actions | 2026-04-04 | `ci.yml` (check+test+build), `processor.yml` (build+validate+deploy) |
+| Systemd service | 2026-04-04 | `aeon.service`: security hardening, journal logging, Wasm JIT memory policy |
+| K8s manifests | (pre-existing) | Deployment + ConfigMap for native/wasm/AS pipelines |
+
+**Test count**: 470 (unchanged from Phase 13b — Phase 14 is infrastructure, not code)
+
 ### Benchmark Summary (2026-04-04, Ryzen 7 250 / 24 GB RAM)
 
 **Dev infrastructure**: Rancher Desktop WSL2 (6 CPUs / 8 GB RAM), Redpanda `--smp 2`

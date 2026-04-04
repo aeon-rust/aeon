@@ -1,0 +1,71 @@
+# Aeon Helm Chart — Default Values
+
+replicaCount: 1
+
+image:
+  repository: aeon
+  tag: latest
+  pullPolicy: IfNotPresent
+
+# Aeon configuration
+config:
+  # REST API listen address
+  apiAddr: "0.0.0.0:4471"
+  # Kafka/Redpanda brokers
+  brokers: "redpanda:9092"
+  # Log level
+  logLevel: info
+  # Artifact storage directory (inside the container)
+  artifactDir: /app/artifacts
+
+# Ports
+ports:
+  quic: 4470
+  api: 4471
+  metrics: 4472
+
+# Service configuration
+service:
+  type: ClusterIP
+  annotations: {}
+
+# Resource limits
+resources:
+  requests:
+    cpu: 500m
+    memory: 256Mi
+  limits:
+    cpu: "2"
+    memory: 1Gi
+
+# Persistence for artifacts and state
+persistence:
+  enabled: true
+  storageClass: ""
+  accessModes:
+    - ReadWriteOnce
+  size: 10Gi
+
+# Processor artifacts via ConfigMap (for .wasm files)
+processors:
+  configMap: ""  # Name of ConfigMap containing .wasm files
+
+# Node selector / tolerations / affinity
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# Pod security context
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+
+# Container security context
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
