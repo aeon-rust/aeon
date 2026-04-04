@@ -32,8 +32,8 @@
 //! Compile with `cargo build --release` and the resulting `.so` can be
 //! registered with `aeon processor register`.
 
-pub use aeon_types::{AeonError, Processor};
 pub use aeon_types::event::{Event, Output};
+pub use aeon_types::{AeonError, Processor};
 
 pub mod wire;
 
@@ -238,7 +238,10 @@ mod tests {
         assert_eq!(&*deserialized[0].destination, "dest1");
         assert_eq!(deserialized[0].payload.as_ref(), b"payload1");
         assert_eq!(&*deserialized[1].destination, "dest2");
-        assert_eq!(deserialized[1].key.as_ref().map(|k| k.as_ref()), Some(b"key2".as_ref()));
+        assert_eq!(
+            deserialized[1].key.as_ref().map(|k| k.as_ref()),
+            Some(b"key2".as_ref())
+        );
         assert_eq!(deserialized[1].headers.len(), 1);
         assert_eq!(&*deserialized[1].headers[0].0, "h1");
     }

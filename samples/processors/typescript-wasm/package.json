@@ -1,0 +1,17 @@
+{
+  "name": "aeon-ts-enrichment",
+  "version": "0.1.0",
+  "description": "Sample Aeon Wasm processor in TypeScript (AssemblyScript)",
+  "scripts": {
+    "asbuild:debug": "asc assembly/index.ts --target debug",
+    "asbuild:release": "asc assembly/index.ts --target release",
+    "asbuild": "npm run asbuild:release"
+  },
+  "devDependencies": {
+    "assemblyscript": "^0.27.0"
+  },
+  "dependencies": {
+    "@aeon/wasm-sdk": "file:../../../sdks/typescript"
+  },
+  "license": "Apache-2.0"
+}

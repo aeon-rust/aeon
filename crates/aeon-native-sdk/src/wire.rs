@@ -51,9 +51,9 @@
 //!   [N bytes]  event (above format)
 //! ```
 
+use aeon_types::AeonError;
 use aeon_types::event::{Event, Output};
 use aeon_types::partition::PartitionId;
-use aeon_types::AeonError;
 use bytes::Bytes;
 use smallvec::SmallVec;
 use std::sync::Arc;
@@ -113,8 +113,7 @@ fn read_bytes<'a>(data: &'a [u8], offset: &mut usize, len: usize) -> Result<&'a 
 fn read_string(data: &[u8], offset: &mut usize) -> Result<Arc<str>, AeonError> {
     let len = read_u32(data, offset)? as usize;
     let bytes = read_bytes(data, offset, len)?;
-    let s = std::str::from_utf8(bytes)
-        .map_err(|e| wire_error(&format!("invalid UTF-8: {e}")))?;
+    let s = std::str::from_utf8(bytes).map_err(|e| wire_error(&format!("invalid UTF-8: {e}")))?;
     Ok(Arc::from(s))
 }
 
@@ -164,9 +163,11 @@ pub fn deserialize_event(data: &[u8]) -> Result<Event, AeonError> {
 
     // UUID
     let uuid_bytes = read_bytes(data, &mut offset, 16)?;
-    let id = uuid::Uuid::from_bytes(uuid_bytes.try_into().map_err(|_| {
-        wire_error("invalid UUID bytes")
-    })?);
+    let id = uuid::Uuid::from_bytes(
+        uuid_bytes
+            .try_into()
+            .map_err(|_| wire_error("invalid UUID bytes"))?,
+    );
 
     // Timestamp
     let timestamp = read_i64(data, &mut offset)?;

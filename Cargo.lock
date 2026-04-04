@@ -15,8 +15,11 @@ dependencies = [
 name = "aeon-cli"
 version = "0.1.0"
 dependencies = [
+ "aeon-engine",
  "aeon-types",
  "anyhow",
+ "clap",
+ "wasmtime",
 ]
 
 [[package]]
@@ -187,6 +190,10 @@ dependencies = [
  "uuid",
  "wasmtime",
 ]
+
+[[package]]
+name = "aeon-wasm-sdk"
+version = "0.1.0"
 
 [[package]]
 name = "aes"

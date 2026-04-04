@@ -20,10 +20,22 @@ use aeon_native_sdk::wire;
 /// Type aliases for C-ABI function pointers.
 type CreateFn = unsafe extern "C" fn(*const u8, usize) -> *mut std::ffi::c_void;
 type DestroyFn = unsafe extern "C" fn(*mut std::ffi::c_void);
-type ProcessFn =
-    unsafe extern "C" fn(*mut std::ffi::c_void, *const u8, usize, *mut u8, usize, *mut usize) -> i32;
-type ProcessBatchFn =
-    unsafe extern "C" fn(*mut std::ffi::c_void, *const u8, usize, *mut u8, usize, *mut usize) -> i32;
+type ProcessFn = unsafe extern "C" fn(
+    *mut std::ffi::c_void,
+    *const u8,
+    usize,
+    *mut u8,
+    usize,
+    *mut usize,
+) -> i32;
+type ProcessBatchFn = unsafe extern "C" fn(
+    *mut std::ffi::c_void,
+    *const u8,
+    usize,
+    *mut u8,
+    usize,
+    *mut usize,
+) -> i32;
 
 /// Default output buffer size (1 MB). Grown if needed.
 const DEFAULT_OUT_BUF_SIZE: usize = 1024 * 1024;

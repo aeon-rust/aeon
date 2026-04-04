@@ -621,7 +621,7 @@ Rolling binary upgrade: zero event loss during Aeon v1→v2 transition under loa
 | Phase 6 — Observability | 2026-03-28 | Histograms, logging, per-partition metrics, Grafana dashboard, 34 tests |
 | Phase 7 — Wasm Runtime | 2026-03-28 | Wasmtime, host functions, WIT contract, ~794K wasm events/sec, 21 tests |
 
-**Total workspace tests**: 288 unit tests passing (44 types + 9 io + 147 crypto + 83 cluster + 5 engine) + 3 Redpanda integration (require running container) | **Clippy**: clean | **Rustfmt**: clean
+**Total workspace tests**: 298 unit tests passing (44 types + 9 connectors + 147 crypto + 83 engine + 5 backpressure + 10 wasm-sdk) + 3 Redpanda integration (require running container) | **Clippy**: clean | **Rustfmt**: clean
 
 ### Gate 2 — In Progress (Phases 8–10)
 
@@ -629,7 +629,19 @@ Rolling binary upgrade: zero event loss during Aeon v1→v2 transition under loa
 |-------|-----------|------------|
 | Phase 8 — Cluster + QUIC | 2026-03-29 | openraft, quinn QUIC, mTLS, partition manager, 3-node replication, 72 tests |
 | Phase 9 — PoH + Merkle | 2026-03-30 | SHA-512 Merkle trees, Ed25519 signing, MMR, per-partition PoH chains, 71 tests |
-| Phase 10 — Security & Crypto | In progress | EtM encryption, KeyProvider, FIPS guard, CertificateStore, TLS 3-mode (none/auto/pem), auto-cert gen, per-connector TLS, REST API auth, 147 tests |
+| Phase 10 — Security & Crypto | 2026-04-04 | EtM encryption, KeyProvider, FIPS guard, CertificateStore, TLS 3-mode (none/auto/pem), auto-cert gen, per-connector TLS, REST API auth, 147 tests |
+
+### Phase 12a — Processor SDKs + Dev Tooling (Complete)
+
+| Component | Completed | Key Result |
+|-----------|-----------|------------|
+| Rust native SDK (`aeon-native-sdk`) | 2026-04-04 | `export_processor!` macro, C-ABI wire format, 6 tests |
+| Native loader (`aeon-engine/native_loader`) | 2026-04-04 | `libloading` dlopen, Processor trait impl, buffer growth, symbol validation |
+| Rust Wasm SDK (`aeon-wasm-sdk`) | 2026-04-04 | `aeon_processor!` macro, no_std, bump allocator, host import wrappers, 10 tests |
+| TypeScript Wasm SDK (`sdks/typescript`) | 2026-04-04 | AssemblyScript, Event/Output types, wire format, state/log/metrics/clock wrappers |
+| CLI (`aeon-cli`) | 2026-04-04 | `aeon new/build/validate/dev` subcommands, Wasm+native+TS scaffolding |
+| Dev environment | 2026-04-04 | `docker-compose.dev.yml`, `Dockerfile.dev`, `aeon dev up/down/status` |
+| Sample processors | 2026-04-04 | `rust-wasm-sdk` (SDK vs raw comparison), `typescript-wasm` (AssemblyScript) |
 
 ### Benchmark Summary (2026-04-04, Ryzen 7 250 / 24 GB RAM)
 

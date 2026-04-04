@@ -10,6 +10,13 @@ rust-version.workspace = true
 name = "aeon"
 path = "src/main.rs"
 
+[features]
+default = ["native-validate"]
+native-validate = ["aeon-engine/native-loader"]
+
 [dependencies]
 aeon-types = { workspace = true }
+aeon-engine = { workspace = true, optional = true }
 anyhow = { workspace = true }
+clap = { workspace = true }
+wasmtime = { workspace = true }
