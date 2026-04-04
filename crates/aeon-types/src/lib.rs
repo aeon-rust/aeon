@@ -22,9 +22,10 @@ pub use scanner::{
     BytesFinder, contains_byte, contains_bytes, find_byte, find_bytes, json_field_value,
 };
 pub use registry::{
-    PipelineAction, PipelineDefinition, PipelineHistoryEntry, PipelineState, ProcessorRecord,
-    ProcessorRef, ProcessorType, ProcessorVersion, RegistryCommand, RegistryResponse, SinkConfig,
-    SourceConfig, UpgradeStrategy, VersionStatus,
+    BlueGreenActive, BlueGreenState, CanaryState, CanaryThresholds, PipelineAction,
+    PipelineDefinition, PipelineHistoryEntry, PipelineState, ProcessorRecord, ProcessorRef,
+    ProcessorType, ProcessorVersion, RegistryCommand, RegistryResponse, SinkConfig, SourceConfig,
+    UpgradeInfo, UpgradeStrategy, VersionStatus,
 };
 pub use traits::{IdempotentSink, Processor, Seekable, Sink, Source, StateOps};
 pub use uuid::CoreLocalUuidGenerator;

@@ -218,6 +218,9 @@ pub struct PipelineDefinition {
     pub updated_at: i64,
     /// Node ID this pipeline is assigned to (for cluster mode).
     pub assigned_node: Option<u64>,
+    /// In-progress upgrade state (blue-green or canary). None when stable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upgrade_state: Option<UpgradeInfo>,
 }
 
 impl PipelineDefinition {
@@ -239,6 +242,7 @@ impl PipelineDefinition {
             created_at: now,
             updated_at: now,
             assigned_node: None,
+            upgrade_state: None,
         }
     }
 }
@@ -271,6 +275,104 @@ pub enum PipelineAction {
     UpgradeCompleted,
     UpgradeRolledBack,
     Failed,
+    /// Blue-green: shadow processor deployed and warming up.
+    BlueGreenStarted,
+    /// Blue-green: traffic cut over to green processor.
+    BlueGreenCutover,
+    /// Canary: deployment started at initial traffic percentage.
+    CanaryStarted,
+    /// Canary: traffic percentage promoted to next step.
+    CanaryPromoted,
+    /// Canary: fully promoted to 100%, canary completed.
+    CanaryCompleted,
+}
+
+// ── Upgrade State Tracking ─────────────────────────────────────────────
+
+/// In-progress upgrade information attached to a pipeline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "strategy", rename_all = "kebab-case")]
+pub enum UpgradeInfo {
+    /// Blue-green: old + new running simultaneously, instant cutover.
+    BlueGreen(BlueGreenState),
+    /// Canary: gradual traffic shift with metrics-based auto-promote/rollback.
+    Canary(CanaryState),
+}
+
+/// Blue-green upgrade state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlueGreenState {
+    /// The "blue" (old, currently active) processor.
+    pub blue_processor: ProcessorRef,
+    /// The "green" (new, warming up or ready) processor.
+    pub green_processor: ProcessorRef,
+    /// Which version is currently receiving live traffic.
+    pub active: BlueGreenActive,
+    /// When the upgrade started (Unix epoch millis).
+    pub started_at: i64,
+}
+
+/// Which processor version is active in a blue-green deployment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BlueGreenActive {
+    /// Old (original) processor is handling traffic.
+    Blue,
+    /// New processor has been cut over to handle traffic.
+    Green,
+}
+
+/// Canary upgrade state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CanaryState {
+    /// The baseline (old) processor.
+    pub baseline_processor: ProcessorRef,
+    /// The canary (new) processor.
+    pub canary_processor: ProcessorRef,
+    /// Current traffic percentage routed to canary (0–100).
+    pub traffic_pct: u8,
+    /// Traffic shift steps (e.g., [10, 50, 100]).
+    pub steps: Vec<u8>,
+    /// Current step index into `steps`.
+    pub current_step: usize,
+    /// Thresholds for auto-promote/rollback decisions.
+    pub thresholds: CanaryThresholds,
+    /// When the canary started (Unix epoch millis).
+    pub started_at: i64,
+}
+
+/// Thresholds that control canary auto-promote and auto-rollback.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CanaryThresholds {
+    /// Max error rate (fraction, 0.0–1.0) before auto-rollback.
+    #[serde(default = "default_max_error_rate")]
+    pub max_error_rate: f64,
+    /// Max P99 latency (ms) before auto-rollback.
+    #[serde(default = "default_max_p99_latency_ms")]
+    pub max_p99_latency_ms: u64,
+    /// Min throughput ratio (canary / baseline) before auto-rollback.
+    #[serde(default = "default_min_throughput_ratio")]
+    pub min_throughput_ratio: f64,
+}
+
+fn default_max_error_rate() -> f64 {
+    0.01
+}
+fn default_max_p99_latency_ms() -> u64 {
+    100
+}
+fn default_min_throughput_ratio() -> f64 {
+    0.8
+}
+
+impl Default for CanaryThresholds {
+    fn default() -> Self {
+        Self {
+            max_error_rate: default_max_error_rate(),
+            max_p99_latency_ms: default_max_p99_latency_ms(),
+            min_throughput_ratio: default_min_throughput_ratio(),
+        }
+    }
 }
 
 // ── Raft State Machine Commands ────────────────────────────────────────
@@ -294,7 +396,9 @@ pub enum RegistryCommand {
         status: VersionStatus,
     },
     /// Create a new pipeline.
-    CreatePipeline { definition: PipelineDefinition },
+    CreatePipeline {
+        definition: Box<PipelineDefinition>,
+    },
     /// Update pipeline state.
     SetPipelineState { name: String, state: PipelineState },
     /// Upgrade pipeline processor.

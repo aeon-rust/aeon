@@ -60,6 +60,68 @@ enum Commands {
         #[command(subcommand)]
         action: PipelineAction,
     },
+    /// Deploy an artifact to a running pipeline (register + upgrade)
+    Deploy {
+        /// Path to .wasm or .so artifact
+        artifact: PathBuf,
+        /// Pipeline to upgrade
+        #[arg(long)]
+        pipeline: String,
+        /// Processor name
+        #[arg(long)]
+        processor: String,
+        /// Version string
+        #[arg(long)]
+        version: String,
+        /// Aeon REST API address
+        #[arg(long, default_value = DEFAULT_API)]
+        api: String,
+    },
+    /// Show real-time pipeline status (simple text dashboard)
+    Top {
+        /// Aeon REST API address
+        #[arg(long, default_value = DEFAULT_API)]
+        api: String,
+    },
+    /// Verify PoH/Merkle chain integrity (placeholder)
+    Verify {
+        /// Pipeline to verify (or "all")
+        #[arg(default_value = "all")]
+        target: String,
+        /// Aeon REST API address
+        #[arg(long, default_value = DEFAULT_API)]
+        api: String,
+    },
+    /// Apply a YAML manifest (declarative processors + pipelines)
+    Apply {
+        /// Path to manifest YAML file
+        #[arg(short, long)]
+        file: PathBuf,
+        /// Aeon REST API address
+        #[arg(long, default_value = DEFAULT_API)]
+        api: String,
+        /// Dry run (show what would change without applying)
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Export current state as a YAML manifest
+    Export {
+        /// Output file path (stdout if omitted)
+        #[arg(short, long)]
+        file: Option<PathBuf>,
+        /// Aeon REST API address
+        #[arg(long, default_value = DEFAULT_API)]
+        api: String,
+    },
+    /// Diff a manifest against the current state
+    Diff {
+        /// Path to manifest YAML file
+        #[arg(short, long)]
+        file: PathBuf,
+        /// Aeon REST API address
+        #[arg(long, default_value = DEFAULT_API)]
+        api: String,
+    },
     /// Start/stop the local development environment (Redpanda)
     Dev {
         #[command(subcommand)]
@@ -118,7 +180,7 @@ enum PipelineAction {
     Start { name: String },
     /// Stop a pipeline
     Stop { name: String },
-    /// Upgrade a pipeline's processor
+    /// Upgrade a pipeline's processor (drain-swap, default)
     Upgrade {
         /// Pipeline name
         name: String,
@@ -128,11 +190,32 @@ enum PipelineAction {
         /// Processor version
         #[arg(long)]
         version: String,
+        /// Upgrade strategy
+        #[arg(long, default_value = "drain-swap")]
+        strategy: UpgradeStrategyArg,
+        /// Canary traffic steps (comma-separated, e.g., "10,50,100")
+        #[arg(long)]
+        steps: Option<String>,
     },
+    /// Cut over blue-green deployment to the new processor
+    Cutover { name: String },
+    /// Roll back an in-progress upgrade (blue-green or canary)
+    Rollback { name: String },
+    /// Promote canary to the next traffic step
+    Promote { name: String },
+    /// Show canary upgrade status
+    CanaryStatus { name: String },
     /// Show pipeline lifecycle history
     History { name: String },
     /// Delete a pipeline
     Delete { name: String },
+}
+
+#[derive(Clone, ValueEnum)]
+enum UpgradeStrategyArg {
+    DrainSwap,
+    BlueGreen,
+    Canary,
 }
 
 #[derive(Subcommand)]
@@ -170,6 +253,18 @@ fn main() -> Result<()> {
         Some(Commands::Validate { path }) => cmd_validate(&path),
         Some(Commands::Processor { api, action }) => cmd_processor(&api, &action),
         Some(Commands::Pipeline { api, action }) => cmd_pipeline(&api, &action),
+        Some(Commands::Deploy {
+            artifact,
+            pipeline,
+            processor,
+            version,
+            api,
+        }) => cmd_deploy(&artifact, &pipeline, &processor, &version, &api),
+        Some(Commands::Top { api }) => cmd_top(&api),
+        Some(Commands::Verify { target, api }) => cmd_verify(&target, &api),
+        Some(Commands::Apply { file, api, dry_run }) => cmd_apply(&file, &api, dry_run),
+        Some(Commands::Export { file, api }) => cmd_export(file.as_deref(), &api),
+        Some(Commands::Diff { file, api }) => cmd_diff(&file, &api),
         Some(Commands::Dev { action }) => cmd_dev(&action),
         None => {
             println!("Aeon v{}", env!("CARGO_PKG_VERSION"));
@@ -778,15 +873,70 @@ fn cmd_pipeline(api: &str, action: &PipelineAction) -> Result<()> {
             name,
             processor,
             version,
+            strategy,
+            steps,
         } => {
-            let payload = serde_json::json!({
+            let endpoint = match strategy {
+                UpgradeStrategyArg::DrainSwap => format!("{api}/api/v1/pipelines/{name}/upgrade"),
+                UpgradeStrategyArg::BlueGreen => {
+                    format!("{api}/api/v1/pipelines/{name}/upgrade/blue-green")
+                }
+                UpgradeStrategyArg::Canary => {
+                    format!("{api}/api/v1/pipelines/{name}/upgrade/canary")
+                }
+            };
+            let mut payload = serde_json::json!({
                 "processor_name": processor,
                 "processor_version": version,
             });
+            if let (UpgradeStrategyArg::Canary, Some(steps_str)) = (strategy, steps) {
+                let parsed: Vec<u8> = steps_str
+                    .split(',')
+                    .filter_map(|s| s.trim().parse().ok())
+                    .collect();
+                if !parsed.is_empty() {
+                    payload["steps"] = serde_json::json!(parsed);
+                }
+            }
+            let body: serde_json::Value = ureq::post(&endpoint)
+                .send_json(&payload)
+                .context("failed to upgrade pipeline")?
+                .into_json()?;
+            println!("{}", serde_json::to_string_pretty(&body)?);
+            Ok(())
+        }
+        PipelineAction::Cutover { name } => {
             let body: serde_json::Value =
-                ureq::post(&format!("{api}/api/v1/pipelines/{name}/upgrade"))
-                    .send_json(&payload)
-                    .context("failed to upgrade pipeline")?
+                ureq::post(&format!("{api}/api/v1/pipelines/{name}/cutover"))
+                    .send_json(serde_json::json!({}))
+                    .context("failed to cutover pipeline")?
+                    .into_json()?;
+            println!("{}", serde_json::to_string_pretty(&body)?);
+            Ok(())
+        }
+        PipelineAction::Rollback { name } => {
+            let body: serde_json::Value =
+                ureq::post(&format!("{api}/api/v1/pipelines/{name}/rollback"))
+                    .send_json(serde_json::json!({}))
+                    .context("failed to rollback pipeline")?
+                    .into_json()?;
+            println!("{}", serde_json::to_string_pretty(&body)?);
+            Ok(())
+        }
+        PipelineAction::Promote { name } => {
+            let body: serde_json::Value =
+                ureq::post(&format!("{api}/api/v1/pipelines/{name}/promote"))
+                    .send_json(serde_json::json!({}))
+                    .context("failed to promote canary")?
+                    .into_json()?;
+            println!("{}", serde_json::to_string_pretty(&body)?);
+            Ok(())
+        }
+        PipelineAction::CanaryStatus { name } => {
+            let body: serde_json::Value =
+                ureq::get(&format!("{api}/api/v1/pipelines/{name}/canary-status"))
+                    .call()
+                    .context("failed to reach Aeon API")?
                     .into_json()?;
             println!("{}", serde_json::to_string_pretty(&body)?);
             Ok(())
@@ -810,6 +960,302 @@ fn cmd_pipeline(api: &str, action: &PipelineAction) -> Result<()> {
             Ok(())
         }
     }
+}
+
+// ── aeon deploy ───────────────────────────────────────────────────────
+
+fn cmd_deploy(
+    artifact: &Path,
+    pipeline: &str,
+    processor: &str,
+    version: &str,
+    api: &str,
+) -> Result<()> {
+    if !artifact.exists() {
+        bail!("artifact not found: {}", artifact.display());
+    }
+
+    let artifact_bytes = std::fs::read(artifact)
+        .with_context(|| format!("failed to read {}", artifact.display()))?;
+
+    let sha512 = aeon_engine::registry::sha512_hex(&artifact_bytes);
+    let processor_type = if artifact.extension().is_some_and(|e| e == "wasm") {
+        "Wasm"
+    } else {
+        "NativeSo"
+    };
+
+    // Step 1: Register processor
+    println!("Registering {processor}:{version}...");
+    let payload = serde_json::json!({
+        "name": processor,
+        "description": "",
+        "version": {
+            "version": version,
+            "sha512": sha512,
+            "size_bytes": artifact_bytes.len(),
+            "processor_type": processor_type,
+            "platform": "wasm32",
+            "status": "Available",
+            "registered_at": now_millis(),
+            "registered_by": "cli",
+        },
+    });
+    let _: serde_json::Value = ureq::post(&format!("{api}/api/v1/processors"))
+        .send_json(&payload)
+        .context("failed to register processor")?
+        .into_json()?;
+
+    // Step 2: Upgrade pipeline
+    println!("Upgrading pipeline '{pipeline}' to {processor}:{version}...");
+    let upgrade_payload = serde_json::json!({
+        "processor_name": processor,
+        "processor_version": version,
+    });
+    let _: serde_json::Value = ureq::post(&format!("{api}/api/v1/pipelines/{pipeline}/upgrade"))
+        .send_json(&upgrade_payload)
+        .context("failed to upgrade pipeline")?
+        .into_json()?;
+
+    println!("Deployed {processor}:{version} to pipeline '{pipeline}'.");
+    Ok(())
+}
+
+// ── aeon top ──────────────────────────────────────────────────────────
+
+fn cmd_top(api: &str) -> Result<()> {
+    println!("Aeon Pipeline Dashboard ({})", api);
+    println!("{}", "=".repeat(70));
+
+    let pipelines: serde_json::Value = ureq::get(&format!("{api}/api/v1/pipelines"))
+        .call()
+        .context("failed to reach Aeon API")?
+        .into_json()?;
+
+    let arr = pipelines.as_array().context("expected array")?;
+    if arr.is_empty() {
+        println!("No pipelines.");
+        return Ok(());
+    }
+
+    println!(
+        "{:<25} {:<12} {:<20} {:<12}",
+        "PIPELINE", "STATE", "PROCESSOR", "UPGRADE"
+    );
+    println!("{}", "-".repeat(70));
+
+    for item in arr {
+        let name = item["name"].as_str().unwrap_or("-");
+
+        // Fetch full details
+        let detail: serde_json::Value = match ureq::get(&format!("{api}/api/v1/pipelines/{name}"))
+            .call()
+        {
+            Ok(resp) => resp.into_json().unwrap_or_default(),
+            Err(_) => serde_json::json!({}),
+        };
+
+        let state = detail["state"].as_str().unwrap_or(
+            item["state"].as_str().unwrap_or("-"),
+        );
+        let proc_name = detail["processor"]["name"].as_str().unwrap_or("-");
+        let proc_ver = detail["processor"]["version"].as_str().unwrap_or("-");
+        let proc_str = format!("{proc_name}:{proc_ver}");
+
+        let upgrade = if detail["upgrade_state"].is_object() {
+            let strategy = detail["upgrade_state"]["strategy"]
+                .as_str()
+                .unwrap_or("unknown");
+            match strategy {
+                "canary" => {
+                    let pct = detail["upgrade_state"]["traffic_pct"]
+                        .as_u64()
+                        .unwrap_or(0);
+                    format!("canary {pct}%")
+                }
+                "blue-green" => {
+                    let active = detail["upgrade_state"]["active"]
+                        .as_str()
+                        .unwrap_or("blue");
+                    format!("bg:{active}")
+                }
+                _ => strategy.to_string(),
+            }
+        } else {
+            "-".to_string()
+        };
+
+        println!("{:<25} {:<12} {:<20} {:<12}", name, state, proc_str, upgrade);
+    }
+    Ok(())
+}
+
+// ── aeon verify ───────────────────────────────────────────────────────
+
+fn cmd_verify(target: &str, _api: &str) -> Result<()> {
+    // Placeholder for PoH/Merkle verification.
+    // In production, this would:
+    // 1. Fetch the PoH chain for the target pipeline(s)
+    // 2. Verify each entry's hash links to the previous
+    // 3. Verify Merkle proofs for event batches
+    // 4. Report any integrity violations
+    println!("Aeon Integrity Verification");
+    println!("{}", "=".repeat(50));
+    println!("Target: {target}");
+    println!();
+    println!("PoH chain verification is not yet connected to the runtime.");
+    println!("This command will verify Proof-of-History and Merkle tree");
+    println!("integrity once pipeline event tracing is wired in Phase 14.");
+    println!();
+    println!("Available verification modules:");
+    println!("  - PoH chain continuity (aeon-crypto::poh)");
+    println!("  - Merkle batch proofs (aeon-crypto::merkle)");
+    println!("  - MMR append-only log (aeon-crypto::mmr)");
+    println!("  - Ed25519 signature validation (aeon-crypto::signing)");
+    Ok(())
+}
+
+// ── aeon apply / export / diff ─────────────────────────────────────────
+
+/// A declarative manifest for processors and pipelines.
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct Manifest {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pipelines: Vec<serde_json::Value>,
+}
+
+fn cmd_apply(file: &Path, api: &str, dry_run: bool) -> Result<()> {
+    let content =
+        std::fs::read_to_string(file).with_context(|| format!("failed to read {}", file.display()))?;
+    let manifest: Manifest = serde_yaml::from_str(&content).context("invalid YAML manifest")?;
+
+    if manifest.pipelines.is_empty() {
+        println!("Manifest is empty — nothing to apply.");
+        return Ok(());
+    }
+
+    // Fetch existing pipelines
+    let existing: serde_json::Value = ureq::get(&format!("{api}/api/v1/pipelines"))
+        .call()
+        .context("failed to reach Aeon API")?
+        .into_json()?;
+    let existing_names: Vec<String> = existing
+        .as_array()
+        .unwrap_or(&vec![])
+        .iter()
+        .filter_map(|p| p["name"].as_str().map(String::from))
+        .collect();
+
+    for pipeline_def in &manifest.pipelines {
+        let name = pipeline_def["name"].as_str().unwrap_or("<unnamed>");
+        let exists = existing_names.contains(&name.to_string());
+
+        if dry_run {
+            if exists {
+                println!("[dry-run] pipeline '{name}' — already exists (skip)");
+            } else {
+                println!("[dry-run] pipeline '{name}' — would create");
+            }
+        } else if exists {
+            println!("pipeline '{name}' — already exists (skip)");
+        } else {
+            ureq::post(&format!("{api}/api/v1/pipelines"))
+                .send_json(pipeline_def)
+                .with_context(|| format!("failed to create pipeline '{name}'"))?;
+            println!("pipeline '{name}' — created");
+        }
+    }
+
+    if dry_run {
+        println!("\nDry run complete. No changes applied.");
+    } else {
+        println!("\nManifest applied.");
+    }
+    Ok(())
+}
+
+fn cmd_export(file: Option<&Path>, api: &str) -> Result<()> {
+    let pipelines: serde_json::Value = ureq::get(&format!("{api}/api/v1/pipelines"))
+        .call()
+        .context("failed to reach Aeon API")?
+        .into_json()?;
+
+    // Fetch full details for each pipeline
+    let mut full_pipelines = Vec::new();
+    if let Some(arr) = pipelines.as_array() {
+        for p in arr {
+            if let Some(name) = p["name"].as_str() {
+                let detail: serde_json::Value =
+                    ureq::get(&format!("{api}/api/v1/pipelines/{name}"))
+                        .call()
+                        .with_context(|| format!("failed to fetch pipeline '{name}'"))?
+                        .into_json()?;
+                full_pipelines.push(detail);
+            }
+        }
+    }
+
+    let manifest = Manifest {
+        pipelines: full_pipelines,
+    };
+    let yaml = serde_yaml::to_string(&manifest).context("failed to serialize manifest")?;
+
+    match file {
+        Some(path) => {
+            std::fs::write(path, &yaml)
+                .with_context(|| format!("failed to write {}", path.display()))?;
+            println!("Exported to {}", path.display());
+        }
+        None => print!("{yaml}"),
+    }
+    Ok(())
+}
+
+fn cmd_diff(file: &Path, api: &str) -> Result<()> {
+    let content =
+        std::fs::read_to_string(file).with_context(|| format!("failed to read {}", file.display()))?;
+    let manifest: Manifest = serde_yaml::from_str(&content).context("invalid YAML manifest")?;
+
+    let existing: serde_json::Value = ureq::get(&format!("{api}/api/v1/pipelines"))
+        .call()
+        .context("failed to reach Aeon API")?
+        .into_json()?;
+    let existing_names: Vec<String> = existing
+        .as_array()
+        .unwrap_or(&vec![])
+        .iter()
+        .filter_map(|p| p["name"].as_str().map(String::from))
+        .collect();
+
+    let manifest_names: Vec<String> = manifest
+        .pipelines
+        .iter()
+        .filter_map(|p| p["name"].as_str().map(String::from))
+        .collect();
+
+    let mut changes = false;
+    for name in &manifest_names {
+        if !existing_names.contains(name) {
+            println!("+ pipeline '{name}' (would be created)");
+            changes = true;
+        }
+    }
+    for name in &existing_names {
+        if !manifest_names.contains(name) {
+            println!("- pipeline '{name}' (exists but not in manifest)");
+            changes = true;
+        }
+    }
+    for name in &manifest_names {
+        if existing_names.contains(name) {
+            println!("  pipeline '{name}' (unchanged)");
+        }
+    }
+
+    if !changes {
+        println!("\nNo differences.");
+    }
+    Ok(())
 }
 
 fn now_millis() -> i64 {

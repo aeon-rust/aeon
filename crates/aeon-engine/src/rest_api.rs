@@ -71,6 +71,21 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/pipelines/{name}/start", post(start_pipeline))
         .route("/api/v1/pipelines/{name}/stop", post(stop_pipeline))
         .route("/api/v1/pipelines/{name}/upgrade", post(upgrade_pipeline))
+        .route(
+            "/api/v1/pipelines/{name}/upgrade/blue-green",
+            post(upgrade_blue_green),
+        )
+        .route(
+            "/api/v1/pipelines/{name}/upgrade/canary",
+            post(upgrade_canary),
+        )
+        .route("/api/v1/pipelines/{name}/cutover", post(cutover_pipeline))
+        .route("/api/v1/pipelines/{name}/rollback", post(rollback_pipeline))
+        .route("/api/v1/pipelines/{name}/promote", post(promote_canary))
+        .route(
+            "/api/v1/pipelines/{name}/canary-status",
+            get(canary_status),
+        )
         .route("/api/v1/pipelines/{name}/history", get(pipeline_history))
         .with_state(state)
 }
@@ -270,6 +285,107 @@ async fn upgrade_pipeline(
     match state.pipelines.upgrade(&name, proc_ref, "api").await {
         Ok(()) => Json(serde_json::json!({"status": "upgraded"})).into_response(),
         Err(e) => api_error(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    }
+}
+
+// ── Blue-Green + Canary endpoints ──────────────────────────────────────
+
+async fn upgrade_blue_green(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(req): Json<UpgradeRequest>,
+) -> impl IntoResponse {
+    let proc_ref = aeon_types::registry::ProcessorRef {
+        name: req.processor_name,
+        version: req.processor_version,
+    };
+    match state
+        .pipelines
+        .upgrade_blue_green(&name, proc_ref, "api")
+        .await
+    {
+        Ok(()) => Json(serde_json::json!({"status": "blue-green-started"})).into_response(),
+        Err(e) => api_error(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct CanaryUpgradeRequest {
+    processor_name: String,
+    processor_version: String,
+    #[serde(default = "default_canary_steps")]
+    steps: Vec<u8>,
+    #[serde(default)]
+    thresholds: aeon_types::registry::CanaryThresholds,
+}
+
+fn default_canary_steps() -> Vec<u8> {
+    vec![10, 50, 100]
+}
+
+async fn upgrade_canary(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(req): Json<CanaryUpgradeRequest>,
+) -> impl IntoResponse {
+    let proc_ref = aeon_types::registry::ProcessorRef {
+        name: req.processor_name,
+        version: req.processor_version,
+    };
+    match state
+        .pipelines
+        .upgrade_canary(&name, proc_ref, req.steps, req.thresholds, "api")
+        .await
+    {
+        Ok(()) => Json(serde_json::json!({"status": "canary-started"})).into_response(),
+        Err(e) => api_error(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    }
+}
+
+async fn cutover_pipeline(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    match state.pipelines.cutover(&name, "api").await {
+        Ok(()) => Json(serde_json::json!({"status": "cutover-complete"})).into_response(),
+        Err(e) => api_error(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    }
+}
+
+async fn rollback_pipeline(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    match state.pipelines.rollback_upgrade(&name, "api").await {
+        Ok(()) => Json(serde_json::json!({"status": "rolled-back"})).into_response(),
+        Err(e) => api_error(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    }
+}
+
+async fn promote_canary(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    match state.pipelines.promote_canary(&name, "api").await {
+        Ok(()) => Json(serde_json::json!({"status": "promoted"})).into_response(),
+        Err(e) => api_error(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    }
+}
+
+async fn canary_status(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    match state.pipelines.canary_status(&name).await {
+        Some(cs) => {
+            let json = serde_json::to_value(&cs).unwrap_or_default();
+            (StatusCode::OK, Json(json)).into_response()
+        }
+        None => api_error(
+            StatusCode::NOT_FOUND,
+            format!("no canary upgrade in progress for '{name}'"),
+        )
+        .into_response(),
     }
 }
 
@@ -492,5 +608,166 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         // Should have at least 2 entries: created + started
         assert!(json.as_array().unwrap().len() >= 2);
+    }
+
+    /// Helper: create a running pipeline for upgrade tests.
+    async fn create_running_pipeline(state: &Arc<AppState>, name: &str) {
+        let def = PipelineDefinition::new(
+            name,
+            SourceConfig {
+                source_type: "kafka".into(),
+                topic: Some("in".into()),
+                partitions: vec![0],
+                config: BTreeMap::new(),
+            },
+            ProcessorRef {
+                name: "proc".into(),
+                version: "1.0.0".into(),
+            },
+            SinkConfig {
+                sink_type: "kafka".into(),
+                topic: Some("out".into()),
+                config: BTreeMap::new(),
+            },
+            1000,
+        );
+        state.pipelines.create(def).await.unwrap();
+        state.pipelines.start(name, "test").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn blue_green_via_api() {
+        let state = test_state();
+        create_running_pipeline(&state, "bg-api").await;
+
+        // Start blue-green upgrade
+        let app = api_router(state.clone());
+        let resp = app
+            .oneshot(
+                Request::post("/api/v1/pipelines/bg-api/upgrade/blue-green")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"processor_name":"proc","processor_version":"2.0.0"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Cutover
+        let app = api_router(state.clone());
+        let resp = app
+            .oneshot(
+                Request::post("/api/v1/pipelines/bg-api/cutover")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let p = state.pipelines.get("bg-api").await.unwrap();
+        assert_eq!(p.processor.version, "2.0.0");
+    }
+
+    #[tokio::test]
+    async fn rollback_via_api() {
+        let state = test_state();
+        create_running_pipeline(&state, "rb-api").await;
+
+        // Start blue-green
+        state
+            .pipelines
+            .upgrade_blue_green(
+                "rb-api",
+                ProcessorRef {
+                    name: "proc".into(),
+                    version: "2.0.0".into(),
+                },
+                "test",
+            )
+            .await
+            .unwrap();
+
+        // Rollback via API
+        let app = api_router(state.clone());
+        let resp = app
+            .oneshot(
+                Request::post("/api/v1/pipelines/rb-api/rollback")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let p = state.pipelines.get("rb-api").await.unwrap();
+        assert_eq!(p.processor.version, "1.0.0");
+    }
+
+    #[tokio::test]
+    async fn canary_via_api() {
+        let state = test_state();
+        create_running_pipeline(&state, "can-api").await;
+
+        // Start canary
+        let app = api_router(state.clone());
+        let resp = app
+            .oneshot(
+                Request::post("/api/v1/pipelines/can-api/upgrade/canary")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"processor_name":"proc","processor_version":"2.0.0","steps":[10,100]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Check canary status
+        let app = api_router(state.clone());
+        let resp = app
+            .oneshot(
+                Request::get("/api/v1/pipelines/can-api/canary-status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["traffic_pct"], 10);
+
+        // Promote to 100%
+        let app = api_router(state.clone());
+        let resp = app
+            .oneshot(
+                Request::post("/api/v1/pipelines/can-api/promote")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Promote again → complete
+        let app = api_router(state.clone());
+        let resp = app
+            .oneshot(
+                Request::post("/api/v1/pipelines/can-api/promote")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let p = state.pipelines.get("can-api").await.unwrap();
+        assert_eq!(p.processor.version, "2.0.0");
     }
 }

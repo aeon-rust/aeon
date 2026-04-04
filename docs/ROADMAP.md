@@ -656,6 +656,19 @@ Rolling binary upgrade: zero event loss during Aeon v1→v2 transition under loa
 
 **Test count**: 459 (up from ~298 after Phase 12a)
 
+### Phase 13b — Advanced Upgrades + DevEx (Complete)
+
+| Component | Completed | Key Result |
+|-----------|-----------|------------|
+| Blue-Green upgrade | 2026-04-04 | Shadow deploy + cutover + rollback, BlueGreenState tracking, 5 tests |
+| Canary upgrade | 2026-04-04 | Gradual traffic shift (steps), promote/rollback, CanaryThresholds, 4 tests |
+| REST API upgrade endpoints | 2026-04-04 | `/upgrade/blue-green`, `/upgrade/canary`, `/cutover`, `/rollback`, `/promote`, `/canary-status`, 3 tests |
+| CLI upgrade commands | 2026-04-04 | `--strategy drain-swap/blue-green/canary`, `cutover`, `rollback`, `promote`, `canary-status` |
+| YAML manifest | 2026-04-04 | `aeon apply -f`, `aeon export -f`, `aeon diff -f`, serde_yaml, dry-run support |
+| CLI devex | 2026-04-04 | `aeon deploy` (register+upgrade), `aeon top` (text dashboard), `aeon verify` (placeholder) |
+
+**Test count**: 470 (up from 459 after Phase 13a)
+
 ### Benchmark Summary (2026-04-04, Ryzen 7 250 / 24 GB RAM)
 
 **Dev infrastructure**: Rancher Desktop WSL2 (6 CPUs / 8 GB RAM), Redpanda `--smp 2`
