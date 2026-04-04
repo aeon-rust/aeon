@@ -93,10 +93,12 @@ name = "aeon-engine"
 version = "0.1.0"
 dependencies = [
  "aeon-connectors",
+ "aeon-native-sdk",
  "aeon-types",
  "bytes",
  "core_affinity",
  "criterion",
+ "libloading",
  "rdkafka",
  "rtrb",
  "smallvec",
@@ -112,6 +114,16 @@ dependencies = [
  "aeon-types",
  "bytes",
  "tokio",
+]
+
+[[package]]
+name = "aeon-native-sdk"
+version = "0.1.0"
+dependencies = [
+ "aeon-types",
+ "bytes",
+ "smallvec",
+ "uuid",
 ]
 
 [[package]]
@@ -1644,6 +1656,16 @@ name = "libc"
 version = "0.2.183"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b5b646652bf6661599e1da8901b3b9522896f01e736bad5f723fe7a3a27f899d"
+
+[[package]]
+name = "libloading"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
 
 [[package]]
 name = "libm"

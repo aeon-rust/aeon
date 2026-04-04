@@ -6,6 +6,10 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+default = ["native-loader"]
+native-loader = ["libloading", "aeon-native-sdk"]
+
 [dependencies]
 aeon-types = { workspace = true }
 bytes = { workspace = true }
@@ -14,6 +18,10 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 core_affinity = { workspace = true }
+
+# Native .so processor loading (feature-gated)
+libloading = { version = "0.8", optional = true }
+aeon-native-sdk = { path = "../aeon-native-sdk", optional = true }
 
 [dev-dependencies]
 aeon-connectors = { workspace = true, features = ["kafka"] }

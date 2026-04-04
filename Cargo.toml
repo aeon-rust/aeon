@@ -13,6 +13,7 @@ members = [
     "crates/aeon-cluster",
     "crates/aeon-crypto",
     "crates/aeon-observability",
+    "crates/aeon-native-sdk",
     "crates/aeon-cli",
     "samples/processors/rust-native",
     "samples/e2e-pipeline",

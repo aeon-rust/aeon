@@ -12,6 +12,9 @@ pub mod processor;
 pub mod retry;
 pub mod shutdown;
 
+#[cfg(feature = "native-loader")]
+pub mod native_loader;
+
 pub use affinity::{PipelineCores, available_cores, pin_to_core, pipeline_core_assignment};
 pub use batch_tuner::BatchTuner;
 pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitState};
@@ -23,3 +26,6 @@ pub use pipeline::{PipelineConfig, PipelineMetrics, run, run_buffered};
 pub use processor::PassthroughProcessor;
 pub use retry::{RetryConfig, RetryOutcome, backoff_delay, retry_async, retry_sync};
 pub use shutdown::{ShutdownConfig, ShutdownCoordinator};
+
+#[cfg(feature = "native-loader")]
+pub use native_loader::NativeProcessor;
