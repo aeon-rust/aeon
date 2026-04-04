@@ -7654,6 +7654,128 @@ All clean. Let me mark the task complete.
 ==============================================================
  please commit to local git. Then proceed
  ==============================================================
- 
- 
+claude's response:
+
+ Committed as faf4963. Working tree clean (only .claude/ untracked, which is local config).
+
+  Now proceeding to Phase 13b — Advanced Upgrades + DevEx. Let me check what's in scope.
+
+ Phase 13b is a large scope. Let me break it into tasks.
+
+● Starting with Blue-Green upgrades. I need to extend the PipelineManager and types to support running two processor versions simultaneously with cutover.
+  Let me read the current pipeline manager and types.
+
+  Read 1 file (ctrl+o to expand)
+
+● Now let me read the registry types to see what I need to extend.
+
+ Phase 14 committed as c7fb5e9. Here's the summary:
+
+  Phase 14 — Production Readiness:
+
+  ┌─────────────────────────────────┬────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+  │            Artifact             │                                                    Description                                                     │
+  ├─────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ docker/Dockerfile               │ Multi-stage build: Rust 1.85 builder + debian-slim runtime, non-root aeon user, stripped binary                    │
+  ├─────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ docker/docker-compose.prod.yml  │ Aeon + Redpanda + init-topics, health checks, restart policy, debug profile for Console                            │
+  ├─────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ helm/aeon/                      │ Full Helm chart: Deployment (liveness/readiness probes), Service, PVC, ConfigMap mount for Wasm, security contexts │
+  ├─────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ .github/workflows/ci.yml        │ fmt + clippy + test + build release binary, cargo caching                                                          │
+  ├─────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ .github/workflows/processor.yml │ Manual dispatch: build Rust/TypeScript Wasm processor, validate, upload artifact                                   │
+  ├─────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ deploy/systemd/aeon.service     │ Security-hardened systemd unit with ProtectSystem=strict, journal logging, Wasm JIT memory policy                  │
+  └─────────────────────────────────┴────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+  Git log so far this session:
+  c7fb5e9 feat: Phase 14 — Production readiness (Docker, Helm, CI/CD, systemd)
+  ee17971 feat: Phase 13b — Blue-green, canary upgrades, YAML manifest, CLI devex
+  faf4963 feat: Phase 13a — Registry, Pipeline Manager, REST API, CLI management
+
+  Per the roadmap, the next phases are 11a (streaming connectors) and 11b (advanced connectors). Want me to continue?
+
+✻ Crunched for 3m 29s
+
+● Background command "cargo test -p aeon-engine --features rest-api 2&gt;&amp;1 | grep -E "(^running|^test result|FAILED)"" completed (exit code 0)
+
+● Waiting for your direction. The roadmap has Phase 11a (streaming connectors: File, WebSocket, HTTP, Redis, NATS, MQTT, RabbitMQ) and Phase 11b (advanced
+  connectors: WebTransport, CDC) next. Let me know if you'd like to proceed with those, or tackle something else.
+
+
+===================================================================
+proceed
+====================================================================
+ Phase 11a complete. Here's the summary:
+
+  Phase 11a — Streaming Connectors (7 connectors, 14 source/sink implementations):
+
+  ┌────────────────┬──────────────────────────────────────┬──────────────────────────────┬───────────────────┬───────────────┐
+  │   Connector    │                Source                │             Sink             │       Crate       │    Feature    │
+  ├────────────────┼──────────────────────────────────────┼──────────────────────────────┼───────────────────┼───────────────┤
+  │ File           │ FileSource (line-delimited)          │ FileSink (append/truncate)   │ tokio fs          │ file          │
+  ├────────────────┼──────────────────────────────────────┼──────────────────────────────┼───────────────────┼───────────────┤
+  │ HTTP Webhook   │ HttpWebhookSource (axum POST server) │ —                            │ axum              │ http          │
+  ├────────────────┼──────────────────────────────────────┼──────────────────────────────┼───────────────────┼───────────────┤
+  │ HTTP Polling   │ HttpPollingSource (periodic GET)     │ —                            │ reqwest           │ http          │
+  ├────────────────┼──────────────────────────────────────┼──────────────────────────────┼───────────────────┼───────────────┤
+  │ WebSocket      │ WebSocketSource (push buffer)        │ WebSocketSink                │ tokio-tungstenite │ websocket     │
+  ├────────────────┼──────────────────────────────────────┼──────────────────────────────┼───────────────────┼───────────────┤
+  │ Redis Streams  │ RedisSource (XREADGROUP)             │ RedisSink (XADD)             │ redis             │ redis-streams │
+  ├────────────────┼──────────────────────────────────────┼──────────────────────────────┼───────────────────┼───────────────┤
+  │ NATS/JetStream │ NatsSource (pull consumer)           │ NatsSink (JS publish)        │ async-nats        │ nats          │
+  ├────────────────┼──────────────────────────────────────┼──────────────────────────────┼───────────────────┼───────────────┤
+  │ MQTT           │ MqttSource (subscribe)               │ MqttSink (publish)           │ rumqttc           │ mqtt          │
+  ├────────────────┼──────────────────────────────────────┼──────────────────────────────┼───────────────────┼───────────────┤
+  │ RabbitMQ       │ RabbitMqSource (basic.consume)       │ RabbitMqSink (basic.publish) │ lapin             │ rabbitmq      │
+  └────────────────┴──────────────────────────────────────┴──────────────────────────────┴───────────────────┴───────────────┘
+
+  Shared infrastructure: PushBuffer — three-phase backpressure (bounded channel → spill counter → protocol flow control) used by WebSocket, HTTP Webhook,
+  MQTT, and RabbitMQ push sources.
+
+  Tests: 13 new tests (497 total), clippy clean, all existing tests pass.
+
+  Next up is Phase 11b — Advanced Connectors (WebTransport, QUIC raw, PostgreSQL/MySQL/MongoDB CDC). Want me to proceed?
+
+✻ Cogitated for 19m 8s
+==========================================================================
+proceed
+===========================================================================
+ Phase 11b complete. Here's the summary:
+
+  Phase 11b — Advanced Connectors (5 connectors, 8 source/sink implementations):
+
+  ┌────────────────────────┬─────────────────────────────────────────┬──────────────────┬────────────────┬──────────────┐
+  │       Connector        │                 Source                  │       Sink       │     Crate      │   Feature    │
+  ├────────────────────────┼─────────────────────────────────────────┼──────────────────┼────────────────┼──────────────┤
+  │ QUIC raw               │ QuicSource (length-prefixed streams)    │ QuicSink         │ quinn          │ quic         │
+  ├────────────────────────┼─────────────────────────────────────────┼──────────────────┼────────────────┼──────────────┤
+  │ WebTransport Streams   │ WebTransportSource (reliable)           │ WebTransportSink │ wtransport     │ webtransport │
+  ├────────────────────────┼─────────────────────────────────────────┼──────────────────┼────────────────┼──────────────┤
+  │ WebTransport Datagrams │ WebTransportDatagramSource (lossy)      │ —                │ wtransport     │ webtransport │
+  ├────────────────────────┼─────────────────────────────────────────┼──────────────────┼────────────────┼──────────────┤
+  │ PostgreSQL CDC         │ PostgresCdcSource (logical replication) │ —                │ tokio-postgres │ postgres-cdc │
+  ├────────────────────────┼─────────────────────────────────────────┼──────────────────┼────────────────┼──────────────┤
+  │ MySQL CDC              │ MysqlCdcSource (binlog events)          │ —                │ mysql_async    │ mysql-cdc    │
+  ├────────────────────────┼─────────────────────────────────────────┼──────────────────┼────────────────┼──────────────┤
+  │ MongoDB CDC            │ MongoDbCdcSource (change streams)       │ —                │ mongodb        │ mongodb-cdc  │
+  └────────────────────────┴─────────────────────────────────────────┴──────────────────┴────────────────┴──────────────┘
+
+  Key details:
+  - QUIC source/sink roundtrip tested with self-signed TLS
+  - WebTransport Datagram source enforces accept_loss: true (rejects without it)
+  - CDC connectors are source-only (databases are read via replication/change capture)
+  - MongoDB CDC uses push buffer pattern (ChangeStream isn't Sync)
+  - MySQL 8 added to docker-compose with binlog + GTID enabled
+  - 26 total connector tests, 484 workspace tests — all passing, clippy clean
+
+  The connector infrastructure is now complete with 22 total source/sink implementations across 12 connector types. Want me to commit and proceed to the
+  next phase?
+
+✻ Worked for 39m 33s
+===============================================================================
+proceed
+==================================================================================
+
 

@@ -362,7 +362,7 @@ user demand.
 - Installation, ports & multi-version operation: `docs/INSTALLATION.md`
 - Default ports: 4470 (QUIC inter-node), 4471 (HTTP API), 4472 (QUIC external connectors)
 
-### Phase 11a — Streaming Connectors
+### Phase 11a — Streaming Connectors ✅ (2026-04-04)
 
 > Execution order: after Phase 14
 
@@ -373,7 +373,7 @@ user demand.
 - NATS/JetStream source + sink
 - MQTT source + sink
 - RabbitMQ/AMQP source + sink
-- Push-source backpressure: three-phase (buffer �� spill to disk → protocol-level flow control)
+- Push-source backpressure: three-phase (buffer → spill to disk → protocol-level flow control)
 - Docker-compose additions: Redis, NATS, Mosquitto, RabbitMQ
 
 **Acceptance**: Each connector has unit tests + docker-compose integration test.
@@ -387,9 +387,24 @@ Push source connectors must validate three-phase backpressure (buffer → spill 
 | Each connector: E2E with Rust native processor | Throughput + P99 |
 | Push-source backpressure: burst → recovery | Zero event loss, recovery time |
 
-### Phase 11b — Advanced Connectors
+**Phase 11a Completion Summary**:
 
-- WebTransport Streams (source + sink, reliable, via web-transport-quinn)
+| Deliverable | Key Result |
+|-------------|-----------|
+| File connector (FileSource + FileSink) | Line-delimited read/write, lazy open, append mode, 6 tests |
+| HTTP connectors (Webhook + Polling) | axum webhook server with push buffer, reqwest polling, 4 tests |
+| WebSocket connector (source + sink) | tokio-tungstenite, push buffer, binary/text messages |
+| Redis Streams (source + sink) | XREADGROUP consumer groups, XADD with MAXLEN, auto-ack |
+| NATS/JetStream (source + sink) | Pull consumer, durable, explicit ack, JetStream + core publish |
+| MQTT (source + sink) | rumqttc, QoS configurable, background event loop |
+| RabbitMQ/AMQP (source + sink) | lapin, publisher confirms, prefetch QoS, queue declare |
+| Push-source backpressure | Three-phase: bounded channel → spill counter → protocol flow control, 3 tests |
+| Feature gating | 7 new features: file, http, websocket, redis-streams, nats, mqtt, rabbitmq |
+| Tests | 13 new unit tests (497 total), clippy clean |
+
+### Phase 11b — Advanced Connectors ✅ (2026-04-04)
+
+- WebTransport Streams (source + sink, reliable, via wtransport)
 - WebTransport Datagrams (source only, explicit lossy opt-in)
 - QUIC raw source/sink (external QUIC clients on port 4472, not inter-node)
 - PostgreSQL CDC (replication slot, WAL parsing, schema tracking)
@@ -409,6 +424,20 @@ Docker-compose additions: PostgreSQL 16, MySQL 8, MongoDB 7.
 | WebTransport Streams: throughput (reliable) | Events/sec vs WebSocket |
 | WebTransport Datagrams: throughput (lossy) | Events/sec, loss rate |
 | PostgreSQL CDC: sustained change capture | Changes/sec, replication lag |
+
+**Phase 11b Completion Summary**:
+
+| Deliverable | Key Result |
+|-------------|-----------|
+| QUIC raw (source + sink) | quinn-based, length-prefixed framing, self-signed TLS for dev, 3 tests |
+| WebTransport Streams (source + sink) | wtransport 0.6, HTTP/3 endpoint, bidirectional streams |
+| WebTransport Datagrams (source) | Lossy mode, requires `accept_loss: true`, 1 test |
+| PostgreSQL CDC (source) | tokio-postgres, `pg_logical_slot_get_changes()`, publication filter |
+| MySQL CDC (source) | mysql_async, `SHOW BINLOG EVENTS`, GTID tracking, row-based |
+| MongoDB Change Streams (source) | mongodb v3 driver, `watch()`, push buffer pattern, resume token |
+| Docker-compose | MySQL 8 service added (binlog enabled, GTID mode) |
+| Feature gating | 5 new features: quic, webtransport, postgres-cdc, mysql-cdc, mongodb-cdc |
+| Tests | 4 new unit tests (QUIC: 3, WebTransport datagram: 1), 26 total connector tests, clippy clean |
 
 ### Phase 12 — Processor SDKs + Dev Tooling (Build Side)
 

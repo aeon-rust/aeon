@@ -129,6 +129,34 @@ services:
     networks:
       - aeon-net
 
+  # ─── MySQL 8 ──────────────────────────────────────────────────────────
+  mysql:
+    image: mysql:8.0
+    container_name: aeon-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: aeon_root
+      MYSQL_DATABASE: aeon
+      MYSQL_USER: aeon
+      MYSQL_PASSWORD: aeon_dev
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    command: >
+      --server-id=1
+      --log-bin=mysql-bin
+      --binlog-format=ROW
+      --binlog-row-image=FULL
+      --gtid-mode=ON
+      --enforce-gtid-consistency=ON
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - aeon-net
+
   # ─── Redis 7 (Streams + Valkey compatible) ────────────────────────────
   redis:
     image: redis:7-alpine
@@ -272,6 +300,7 @@ networks:
 volumes:
   redpanda-data:
   postgres-data:
+  mysql-data:
   mongodb-data:
   redis-data:
   rabbitmq-data:
