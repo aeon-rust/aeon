@@ -44,7 +44,7 @@ impl ClusterConfig {
     pub fn single_node(node_id: u64, num_partitions: u16) -> Self {
         Self {
             node_id,
-            bind: "0.0.0.0:4433".parse().unwrap(),
+            bind: "0.0.0.0:4470".parse().unwrap(),
             num_partitions,
             peers: Vec::new(),
             seed_nodes: Vec::new(),
@@ -132,7 +132,7 @@ mod tests {
     fn rejects_even_cluster_size() {
         let cfg = ClusterConfig {
             node_id: 1,
-            bind: "0.0.0.0:4433".parse().unwrap(),
+            bind: "0.0.0.0:4470".parse().unwrap(),
             num_partitions: 16,
             peers: vec![NodeAddress::new("10.0.0.2", 4433)],
             seed_nodes: Vec::new(),
@@ -151,7 +151,7 @@ mod tests {
                 .collect();
             let cfg = ClusterConfig {
                 node_id: 1,
-                bind: "0.0.0.0:4433".parse().unwrap(),
+                bind: "0.0.0.0:4470".parse().unwrap(),
                 num_partitions: 16,
                 peers,
                 seed_nodes: Vec::new(),
@@ -166,7 +166,7 @@ mod tests {
     fn rejects_duplicate_peers() {
         let cfg = ClusterConfig {
             node_id: 1,
-            bind: "0.0.0.0:4433".parse().unwrap(),
+            bind: "0.0.0.0:4470".parse().unwrap(),
             num_partitions: 16,
             peers: vec![
                 NodeAddress::new("10.0.0.2", 4433),
@@ -184,7 +184,7 @@ mod tests {
         // seed_nodes doesn't count toward initial cluster size
         let cfg = ClusterConfig {
             node_id: 1,
-            bind: "0.0.0.0:4433".parse().unwrap(),
+            bind: "0.0.0.0:4470".parse().unwrap(),
             num_partitions: 16,
             peers: Vec::new(),
             seed_nodes: vec![NodeAddress::new("10.0.0.1", 4433)],
@@ -200,7 +200,7 @@ mod tests {
     fn config_serde_roundtrip() {
         let cfg = ClusterConfig {
             node_id: 1,
-            bind: "0.0.0.0:4433".parse().unwrap(),
+            bind: "0.0.0.0:4470".parse().unwrap(),
             num_partitions: 16,
             peers: vec![
                 NodeAddress::new("10.0.0.2", 4433),

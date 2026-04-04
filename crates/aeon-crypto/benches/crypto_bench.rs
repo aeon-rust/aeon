@@ -1,7 +1,8 @@
-//! Benchmarks for aeon-crypto: hashing, Merkle tree, PoH chain, signing.
+//! Benchmarks for aeon-crypto: hashing, Merkle tree, PoH chain, signing, encryption.
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 
+use aeon_crypto::encryption::EtmKey;
 use aeon_crypto::hash::{sha512, Hash512};
 use aeon_crypto::merkle::MerkleTree;
 use aeon_crypto::mmr::MerkleMountainRange;
@@ -155,6 +156,40 @@ fn bench_signing(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_etm_encryption(c: &mut Criterion) {
+    let mut group = c.benchmark_group("etm_encryption");
+
+    let key = EtmKey::generate();
+
+    for &size in &[64, 256, 1024, 4096, 65536] {
+        let plaintext = vec![0xABu8; size];
+
+        group.bench_with_input(BenchmarkId::new("encrypt", size), &plaintext, |b, pt| {
+            b.iter(|| key.encrypt(black_box(pt)))
+        });
+
+        let ciphertext = key.encrypt(&plaintext).unwrap();
+        group.bench_with_input(
+            BenchmarkId::new("decrypt", size),
+            &ciphertext,
+            |b, ct| b.iter(|| key.decrypt(black_box(ct))),
+        );
+    }
+
+    // Roundtrip (encrypt + decrypt)
+    let payload_1k = vec![0xCDu8; 1024];
+    group.bench_function("roundtrip_1KB", |b| {
+        b.iter(|| {
+            let ct = key.encrypt(black_box(&payload_1k)).unwrap();
+            key.decrypt(black_box(&ct)).unwrap()
+        })
+    });
+
+    group.bench_function("keygen", |b| b.iter(EtmKey::generate));
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_sha512,
@@ -162,5 +197,6 @@ criterion_group!(
     bench_mmr,
     bench_poh_chain,
     bench_signing,
+    bench_etm_encryption,
 );
 criterion_main!(benches);
