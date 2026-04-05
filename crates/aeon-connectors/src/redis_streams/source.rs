@@ -80,13 +80,13 @@ pub struct RedisSource {
 impl RedisSource {
     /// Connect to Redis and ensure the consumer group exists.
     pub async fn new(config: RedisSourceConfig) -> Result<Self, AeonError> {
-        let client = redis::Client::open(config.url.as_str()).map_err(|e| {
-            AeonError::connection(format!("redis client create failed: {e}"))
-        })?;
+        let client = redis::Client::open(config.url.as_str())
+            .map_err(|e| AeonError::connection(format!("redis client create failed: {e}")))?;
 
-        let mut conn = client.get_multiplexed_async_connection().await.map_err(|e| {
-            AeonError::connection(format!("redis connect failed: {e}"))
-        })?;
+        let mut conn = client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| AeonError::connection(format!("redis connect failed: {e}")))?;
 
         // Create consumer group (ignore error if it already exists)
         let result: redis::RedisResult<String> = redis::cmd("XGROUP")
@@ -179,11 +179,7 @@ impl Source for RedisSource {
                         let mut parts = Vec::new();
                         for (k, v) in &entry.map {
                             if let redis::Value::BulkString(bytes) = v {
-                                parts.push(format!(
-                                    "{}={}",
-                                    k,
-                                    String::from_utf8_lossy(bytes)
-                                ));
+                                parts.push(format!("{}={}", k, String::from_utf8_lossy(bytes)));
                             }
                         }
                         Bytes::from(parts.join(","))

@@ -13,7 +13,7 @@ extern crate alloc;
 
 use aeon_wasm_sdk::prelude::*;
 
-fn enrich(event: Event) -> Vec<WasmOutput> {
+fn enrich(event: Event) -> Vec<Output> {
     // Try to extract user_id from JSON payload
     let payload = &event.payload;
     let user_id = extract_json_field(payload, b"user_id");
@@ -31,7 +31,7 @@ fn enrich(event: Event) -> Vec<WasmOutput> {
         None => payload.clone(),
     };
 
-    vec![WasmOutput::new("enriched", output_payload)]
+    vec![Output::new("enriched", output_payload)]
 }
 
 aeon_processor!(enrich);

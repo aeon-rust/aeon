@@ -55,6 +55,33 @@ pub fn pipeline_core_assignment() -> Option<PipelineCores> {
     }
 }
 
+/// Assigns core IDs for multiple partition pipelines.
+///
+/// Each partition gets 3 dedicated cores (source, processor, sink).
+/// Core 0 is reserved for OS/runtime. Returns `None` if insufficient cores.
+///
+/// Layout: `[OS | P0-src P0-proc P0-sink | P1-src P1-proc P1-sink | ...]`
+pub fn multi_pipeline_core_assignment(partition_count: usize) -> Option<Vec<PipelineCores>> {
+    if partition_count == 0 {
+        return Some(vec![]);
+    }
+    let cores = core_ids();
+    let needed = 1 + (partition_count * 3); // core 0 + 3 per partition
+    if cores.len() < needed {
+        return None;
+    }
+    let mut assignments = Vec::with_capacity(partition_count);
+    for i in 0..partition_count {
+        let base = 1 + (i * 3); // skip core 0
+        assignments.push(PipelineCores {
+            source: cores[base],
+            processor: cores[base + 1],
+            sink: cores[base + 2],
+        });
+    }
+    Some(assignments)
+}
+
 /// Core assignments for the three pipeline stages.
 #[derive(Debug, Clone, Copy)]
 pub struct PipelineCores {
@@ -101,5 +128,55 @@ mod tests {
             assert_ne!(a.source, a.sink);
         }
         // If < 3 cores, assignment is None — which is fine
+    }
+
+    #[test]
+    fn multi_pipeline_zero_partitions() {
+        let result = multi_pipeline_core_assignment(0);
+        assert!(result.is_some());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn multi_pipeline_assignment_logic() {
+        let cores = available_cores();
+        // Try to assign for 1 partition (needs 4 cores: OS + 3)
+        let result = multi_pipeline_core_assignment(1);
+        if cores >= 4 {
+            assert!(result.is_some());
+            let assignments = result.unwrap();
+            assert_eq!(assignments.len(), 1);
+            // Core 0 reserved, so all assigned cores > 0
+            let a = &assignments[0];
+            assert_ne!(a.source, 0);
+            assert_ne!(a.source, a.processor);
+            assert_ne!(a.processor, a.sink);
+        }
+
+        // Try 2 partitions (needs 7 cores)
+        let result = multi_pipeline_core_assignment(2);
+        if cores >= 7 {
+            assert!(result.is_some());
+            let assignments = result.unwrap();
+            assert_eq!(assignments.len(), 2);
+            // Partition 0 and 1 should use different cores
+            let p0 = &assignments[0];
+            let p1 = &assignments[1];
+            assert_ne!(p0.source, p1.source);
+            assert_ne!(p0.processor, p1.processor);
+            assert_ne!(p0.sink, p1.sink);
+        }
+    }
+
+    #[test]
+    fn multi_pipeline_insufficient_cores() {
+        // Request more partitions than cores can support
+        let cores = available_cores();
+        let too_many = (cores / 3) + 2;
+        let result = multi_pipeline_core_assignment(too_many);
+        // Should return None if insufficient
+        if cores < 1 + (too_many * 3) {
+            assert!(result.is_none());
+        }
     }
 }

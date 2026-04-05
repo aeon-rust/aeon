@@ -31,11 +31,13 @@ fn make_json_event(i: usize) -> Event {
 }
 
 fn load_rust_wasm() -> WasmProcessor {
-    let wasm_bytes = std::fs::read(concat!(
+    let default_path = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../rust-wasm/target/wasm32-unknown-unknown/release/aeon_sample_rust_wasm.wasm"
-    ))
-    .expect("Build rust-wasm first: cd samples/processors/rust-wasm && cargo build --target wasm32-unknown-unknown --release");
+    );
+    let path = std::env::var("AEON_BENCH_RUST_WASM").unwrap_or_else(|_| default_path.to_string());
+    let wasm_bytes = std::fs::read(&path)
+        .unwrap_or_else(|_| panic!("Cannot read Rust Wasm at {path}. Build first: cd samples/processors/rust-wasm && cargo build --target wasm32-unknown-unknown --release"));
 
     let config = WasmConfig {
         max_fuel: Some(10_000_000),
@@ -46,11 +48,13 @@ fn load_rust_wasm() -> WasmProcessor {
 }
 
 fn load_assemblyscript_wasm() -> WasmProcessor {
-    let wasm_bytes = std::fs::read(concat!(
+    let default_path = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../assemblyscript-wasm/build/processor.wasm"
-    ))
-    .expect("Build assemblyscript first: cd samples/processors/assemblyscript-wasm && npm run asbuild:release");
+    );
+    let path = std::env::var("AEON_BENCH_AS_WASM").unwrap_or_else(|_| default_path.to_string());
+    let wasm_bytes = std::fs::read(&path)
+        .unwrap_or_else(|_| panic!("Cannot read AS Wasm at {path}. Build first: cd samples/processors/assemblyscript-wasm && npm run asbuild:release"));
 
     let config = WasmConfig {
         max_fuel: Some(10_000_000),

@@ -5,10 +5,11 @@ This guide covers how to build event processors for Aeon in three runtime modes:
 | Runtime | Latency | Throughput | Best For |
 |---------|---------|------------|----------|
 | **Rust-native** | ~240ns | ~4.2M/sec | Maximum performance, trusted code |
-| **Rust-Wasm** | ~1.2us | ~820K/sec | Sandboxed Rust, fuel-metered |
+| **Rust-Wasm (SDK)** | ~1.2us | ~820K/sec | Sandboxed Rust, minimal boilerplate |
+| **Rust-Wasm (raw)** | ~1.2us | ~820K/sec | Sandboxed Rust, full ABI control |
 | **AssemblyScript-Wasm** | ~1.1us | ~940K/sec | TypeScript developers, rapid prototyping |
 
-All three produce the same result. Choose based on your team's language preference and whether you need Wasm sandboxing (fuel limits, memory isolation, namespace separation).
+All four produce the same result. Choose based on your team's language preference and whether you need Wasm sandboxing (fuel limits, memory isolation, namespace separation). For Rust-Wasm, the SDK (Option 2) is recommended over raw ABI (Option 3) unless you need low-level control.
 
 ---
 
@@ -153,9 +154,146 @@ See `samples/processors/rust-native/src/lib.rs` for a complete JSON enrichment e
 
 ---
 
-## Option 2: Rust-Wasm Processor
+## Option 2: Rust-Wasm Processor (SDK — Recommended)
 
-Compile Rust to WebAssembly for sandboxed execution with fuel metering.
+The `aeon-wasm-sdk` crate eliminates all manual boilerplate (bump allocator, wire format parsing, ABI exports). You write a plain function; the `aeon_processor!` macro generates everything else.
+
+### Step 1: Install the Target
+
+```bash
+rustup target add wasm32-unknown-unknown
+```
+
+### Step 2: Create a Crate
+
+```bash
+mkdir -p my-wasm-processor/src
+cd my-wasm-processor
+```
+
+`Cargo.toml`:
+```toml
+[package]
+name = "my-wasm-processor"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+aeon-wasm-sdk = { path = "../crates/aeon-wasm-sdk" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+```
+
+### Step 3: Implement Your Processor
+
+`src/lib.rs`:
+```rust
+#![no_std]
+extern crate alloc;
+
+use aeon_wasm_sdk::prelude::*;
+
+fn my_processor(event: Event) -> Vec<Output> {
+    // Access event fields
+    let payload = &event.payload;
+
+    // Your logic here — this example uppercases the payload
+    let upper: Vec<u8> = payload.iter().map(|b| b.to_ascii_uppercase()).collect();
+
+    // Return one or more outputs (or empty vec to filter/drop)
+    vec![Output::new("output-topic", upper)]
+}
+
+// This macro generates: allocator, ABI exports, panic handler, global allocator
+aeon_processor!(my_processor);
+```
+
+That's it. Compare this with Option 3 (raw Wasm) which requires ~100 lines of manual wire format code.
+
+### SDK Event and Output API
+
+```rust
+// Event fields:
+event.id          // [u8; 16] — UUIDv7 bytes
+event.timestamp   // i64 — Unix epoch nanoseconds
+event.source      // String — Source identifier
+event.partition   // u16 — Partition number
+event.metadata    // Vec<(String, String)> — Key-value headers
+event.payload     // Vec<u8> — Payload bytes
+event.payload_str() // Option<&str> — Payload as UTF-8 (if valid)
+
+// Output construction:
+Output::new("destination", payload_bytes)      // Basic output
+Output::from_str("destination", "text payload") // From string
+    .with_key(key_bytes)                        // Optional partition key
+    .with_key_str("key")                        // Key from string
+    .with_header("key", "value")                // Add a header
+
+// Filtering (drop an event):
+vec![]
+
+// Fan-out (emit multiple outputs):
+vec![output1, output2, output3]
+```
+
+### SDK Host Imports
+
+The SDK provides ergonomic wrappers for all host functions:
+
+```rust
+use aeon_wasm_sdk::{state, log, metrics, clock};
+
+// State operations (namespaced per processor)
+state::put(b"my-key", b"my-value");
+let value: Option<Vec<u8>> = state::get(b"my-key");
+state::delete(b"my-key");
+
+// Logging
+log::info("processing event");
+log::warn("unusual payload detected");
+log::error("failed to parse JSON");
+
+// Metrics
+metrics::counter_inc("events_processed", 1);
+metrics::gauge_set("queue_depth", 42.0);
+
+// Clock
+let now_ms: i64 = clock::now_ms();
+```
+
+### Step 4: Build
+
+```bash
+cargo build --target wasm32-unknown-unknown --release
+# Output: target/wasm32-unknown-unknown/release/my_wasm_processor.wasm
+ls -lh target/wasm32-unknown-unknown/release/*.wasm  # Typically 2-5KB
+```
+
+### Step 5: Load and Run
+
+Same as any Wasm processor — load with `WasmModule::from_bytes()` or deploy via CLI:
+
+```bash
+aeon processor register my-processor --version 1.0.0 \
+  --artifact target/wasm32-unknown-unknown/release/my_wasm_processor.wasm \
+  --runtime wasm
+```
+
+### Reference
+
+See `samples/processors/rust-wasm-sdk/src/lib.rs` for a complete JSON enrichment example.
+
+---
+
+## Option 3: Rust-Wasm Processor (Raw ABI)
+
+Compile Rust to WebAssembly with full control over the ABI. Use this only if you need to optimize beyond what the SDK provides or need custom memory management.
 
 ### Step 1: Install the Target
 
@@ -339,7 +477,7 @@ See `samples/processors/rust-wasm/src/lib.rs` for a complete JSON enrichment exa
 
 ---
 
-## Option 3: AssemblyScript-Wasm Processor
+## Option 4: AssemblyScript-Wasm Processor
 
 AssemblyScript is a TypeScript-like language that compiles to WebAssembly. Great for teams familiar with TypeScript.
 
@@ -599,9 +737,11 @@ c.bench_function("my_wasm_processor", |b| {
 ## Tips
 
 1. **Start with Rust-native** for development, switch to Wasm when you need sandboxing
-2. **Use `json_field_value()`** for JSON routing — it's SIMD-accelerated and avoids full JSON parsing
-3. **Keep payloads as bytes** — don't deserialize to String unless necessary
-4. **Propagate `source_ts`** via `.with_source_ts(event.source_ts)` for latency tracking
-5. **Reset your bump allocator** at the start of each `process()` call to avoid OOM
-6. **Wasm binaries are tiny** (1-5KB) — deployment is essentially zero-overhead
-7. **Fuel metering** protects against infinite loops — set `max_fuel` appropriately
+2. **Use the Wasm SDK** (Option 2) over raw ABI (Option 3) unless you need low-level control
+3. **Use `json_field_value()`** for JSON routing — it's SIMD-accelerated and avoids full JSON parsing
+4. **Keep payloads as bytes** — don't deserialize to String unless necessary
+5. **Propagate `source_ts`** via `.with_source_ts(event.source_ts)` for latency tracking
+6. **Reset your bump allocator** at the start of each `process()` call to avoid OOM (raw ABI only; the SDK handles this automatically)
+7. **Wasm binaries are tiny** (1-5KB) — deployment is essentially zero-overhead
+8. **Fuel metering** protects against infinite loops — set `max_fuel` appropriately
+9. **Use `aeon validate`** CLI command to verify your `.wasm` or `.so`/`.dll` artifact before deploying

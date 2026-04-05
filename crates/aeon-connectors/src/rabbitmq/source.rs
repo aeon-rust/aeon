@@ -95,21 +95,18 @@ impl RabbitMqSource {
     pub async fn new(config: RabbitMqSourceConfig) -> Result<Self, AeonError> {
         let conn = Connection::connect(&config.uri, ConnectionProperties::default())
             .await
-            .map_err(|e| {
-                AeonError::connection(format!("rabbitmq connect failed: {e}"))
-            })?;
+            .map_err(|e| AeonError::connection(format!("rabbitmq connect failed: {e}")))?;
 
-        let channel = conn.create_channel().await.map_err(|e| {
-            AeonError::connection(format!("rabbitmq channel create failed: {e}"))
-        })?;
+        let channel = conn
+            .create_channel()
+            .await
+            .map_err(|e| AeonError::connection(format!("rabbitmq channel create failed: {e}")))?;
 
         // Set QoS
         channel
             .basic_qos(config.prefetch_count, BasicQosOptions::default())
             .await
-            .map_err(|e| {
-                AeonError::connection(format!("rabbitmq basic_qos failed: {e}"))
-            })?;
+            .map_err(|e| AeonError::connection(format!("rabbitmq basic_qos failed: {e}")))?;
 
         // Declare queue if configured
         if config.declare_queue {
@@ -137,9 +134,7 @@ impl RabbitMqSource {
                 FieldTable::default(),
             )
             .await
-            .map_err(|e| {
-                AeonError::connection(format!("rabbitmq basic_consume failed: {e}"))
-            })?;
+            .map_err(|e| AeonError::connection(format!("rabbitmq basic_consume failed: {e}")))?;
 
         tracing::info!(
             queue = %config.queue,

@@ -182,6 +182,11 @@ impl SignedRoot {
 }
 
 impl Signature {
+    /// Construct a Signature from raw 64 bytes.
+    pub fn from_bytes(bytes: [u8; 64]) -> Self {
+        Self { bytes }
+    }
+
     /// Raw 64-byte signature.
     pub fn as_bytes(&self) -> &[u8; 64] {
         &self.bytes

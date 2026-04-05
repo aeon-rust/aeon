@@ -68,11 +68,7 @@ impl Processor for JsonEnrichProcessor {
         Ok(vec![
             Output::new(Arc::clone(&self.destination), enriched)
                 .with_header(Arc::from("processed-by"), Arc::clone(&self.processor_id))
-                .with_header(
-                    Arc::from("source-event-id"),
-                    Arc::from(event.id.to_string()),
-                )
-                .with_source_ts(event.source_ts),
+                .with_event_identity(&event),
         ])
     }
 }
@@ -105,10 +101,14 @@ mod tests {
         assert!(payload.contains("\"extracted_user_id\":\"u-42\""));
         assert!(payload.contains("\"original\":"));
 
-        // Check headers
-        assert_eq!(outputs[0].headers.len(), 2);
+        // Check headers — source-event-id is now a structural field, not a header
+        assert_eq!(outputs[0].headers.len(), 1);
         assert_eq!(&*outputs[0].headers[0].0, "processed-by");
         assert_eq!(&*outputs[0].headers[0].1, "rust-native-v1");
+
+        // Event identity propagated structurally
+        assert_eq!(outputs[0].source_event_id, Some(uuid::Uuid::nil()));
+        assert_eq!(outputs[0].source_partition, Some(PartitionId::new(0)));
     }
 
     #[test]

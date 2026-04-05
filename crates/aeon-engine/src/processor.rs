@@ -20,9 +20,10 @@ impl PassthroughProcessor {
 
 impl Processor for PassthroughProcessor {
     fn process(&self, event: Event) -> Result<Vec<Output>, AeonError> {
+        // Bytes::clone = Arc increment, zero-copy (required to borrow event for identity)
         Ok(vec![
-            Output::new(Arc::clone(&self.destination), event.payload)
-                .with_source_ts(event.source_ts),
+            Output::new(Arc::clone(&self.destination), event.payload.clone())
+                .with_event_identity(&event),
         ])
     }
 
@@ -30,8 +31,8 @@ impl Processor for PassthroughProcessor {
         let mut outputs = Vec::with_capacity(events.len());
         for event in events {
             outputs.push(
-                Output::new(Arc::clone(&self.destination), event.payload)
-                    .with_source_ts(event.source_ts),
+                Output::new(Arc::clone(&self.destination), event.payload.clone())
+                    .with_event_identity(&event),
             );
         }
         Ok(outputs)

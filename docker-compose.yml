@@ -6,7 +6,7 @@
 services:
   # ─── Redpanda (Kafka-compatible streaming) ────────────────────────────
   redpanda:
-    image: docker.redpanda.com/redpandadata/redpanda:v24.2.12
+    image: docker.redpanda.com/redpandadata/redpanda:${REDPANDA_VERSION:-v24.2.12}
     container_name: aeon-redpanda
     command:
       - redpanda
@@ -19,8 +19,9 @@ services:
       - --rpc-addr redpanda:33145
       - --advertise-rpc-addr redpanda:33145
       - --mode dev-container
-      - --smp 2
-      - --default-log-level=warn
+      - --smp ${REDPANDA_SMP:-4}
+      - --memory ${REDPANDA_MEMORY:-4G}
+      - --default-log-level=${REDPANDA_LOG_LEVEL:-warn}
     ports:
       - "19092:19092"   # Kafka API (external listener for host access)
       - "18082:18082"   # Pandaproxy (HTTP)
@@ -60,11 +61,14 @@ services:
     entrypoint: /bin/bash
     command: >
       -c "
-      rpk topic create aeon-source -p 16 --brokers redpanda:9092 &&
-      rpk topic create aeon-sink -p 16 --brokers redpanda:9092 &&
-      rpk topic create aeon-dlq -p 4 --brokers redpanda:9092 &&
-      rpk topic create aeon-bench-source -p 16 --brokers redpanda:9092 &&
-      rpk topic create aeon-bench-sink -p 16 --brokers redpanda:9092 &&
+      rpk topic create aeon-source -p 16 --brokers redpanda:9092 || true;
+      rpk topic create aeon-sink -p 16 --brokers redpanda:9092 || true;
+      rpk topic create aeon-dlq -p 4 --brokers redpanda:9092 || true;
+      rpk topic create aeon-bench-source -p 16 --brokers redpanda:9092 || true;
+      rpk topic create aeon-bench-sink -p 16 --brokers redpanda:9092 || true;
+      rpk topic create aeon-scale-p4 -p 4 --brokers redpanda:9092 || true;
+      rpk topic create aeon-scale-p8 -p 8 --brokers redpanda:9092 || true;
+      rpk topic create aeon-scale-p16 -p 16 --brokers redpanda:9092 || true;
       echo 'Topics created successfully'
       "
     networks:
@@ -75,9 +79,9 @@ services:
     image: postgres:16-alpine
     container_name: aeon-postgres
     environment:
-      POSTGRES_USER: aeon
-      POSTGRES_PASSWORD: aeon_dev
-      POSTGRES_DB: aeon
+      POSTGRES_USER: ${POSTGRES_USER:-aeon}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-aeon}
     ports:
       - "5432:5432"
     volumes:
@@ -134,10 +138,10 @@ services:
     image: mysql:8.0
     container_name: aeon-mysql
     environment:
-      MYSQL_ROOT_PASSWORD: aeon_root
-      MYSQL_DATABASE: aeon
-      MYSQL_USER: aeon
-      MYSQL_PASSWORD: aeon_dev
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?Set MYSQL_ROOT_PASSWORD in .env}
+      MYSQL_DATABASE: ${MYSQL_DB:-aeon}
+      MYSQL_USER: ${MYSQL_USER:-aeon}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?Set MYSQL_PASSWORD in .env}
     ports:
       - "3306:3306"
     volumes:
@@ -182,8 +186,8 @@ services:
       - "5672:5672"     # AMQP
       - "15672:15672"   # Management UI
     environment:
-      RABBITMQ_DEFAULT_USER: aeon
-      RABBITMQ_DEFAULT_PASS: aeon_dev
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-aeon}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?Set RABBITMQ_PASSWORD in .env}
     volumes:
       - rabbitmq-data:/var/lib/rabbitmq
     healthcheck:
@@ -230,6 +234,25 @@ services:
     networks:
       - aeon-net
 
+  # ─── OpenTelemetry Collector (vendor-neutral routing) ──────────────────
+  # Routes OTLP traces/logs/metrics to any combination of backends:
+  # SigNoz, Grafana (Tempo/Loki/Mimir), Jaeger, Elastic APM, OpenObserve, etc.
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.115.0
+    container_name: aeon-otel-collector
+    ports:
+      - "4317:4317"     # OTLP gRPC receiver
+      - "4318:4318"     # OTLP HTTP receiver
+      - "8889:8889"     # Prometheus metrics exporter
+    volumes:
+      - ./docker/otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml:ro
+    depends_on:
+      - jaeger
+      - loki
+      - prometheus
+    networks:
+      - aeon-net
+
   # ─── Observability: Prometheus ────────────────────────────────────────
   prometheus:
     image: prom/prometheus:v2.55.0
@@ -253,9 +276,9 @@ services:
     ports:
       - "3000:3000"
     environment:
-      GF_SECURITY_ADMIN_USER: admin
-      GF_SECURITY_ADMIN_PASSWORD: aeon_dev
-      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?Set GRAFANA_ADMIN_PASSWORD in .env}
+      GF_AUTH_ANONYMOUS_ENABLED: ${GRAFANA_ANONYMOUS_ENABLED:-false}
       GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
     volumes:
       - grafana-data:/var/lib/grafana

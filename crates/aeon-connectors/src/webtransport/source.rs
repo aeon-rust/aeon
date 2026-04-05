@@ -65,13 +65,12 @@ pub struct WebTransportSource {
 impl WebTransportSource {
     /// Bind and start the WebTransport listener.
     pub async fn new(config: WebTransportSourceConfig) -> Result<Self, AeonError> {
-        let endpoint = wtransport::Endpoint::server(config.server_config)
-            .map_err(|e| {
-                AeonError::connection(format!(
-                    "webtransport bind failed on {}: {e}",
-                    config.bind_addr
-                ))
-            })?;
+        let endpoint = wtransport::Endpoint::server(config.server_config).map_err(|e| {
+            AeonError::connection(format!(
+                "webtransport bind failed on {}: {e}",
+                config.bind_addr
+            ))
+        })?;
 
         tracing::info!(addr = %config.bind_addr, "WebTransportSource listening");
 
@@ -129,9 +128,7 @@ async fn wt_accept_loop(
                 let source_name = Arc::clone(&source_name);
 
                 tokio::spawn(async move {
-                    if let Err(e) =
-                        handle_wt_stream(stream, tx, source_name).await
-                    {
+                    if let Err(e) = handle_wt_stream(stream, tx, source_name).await {
                         tracing::debug!(error = %e, "webtransport stream error");
                     }
                 });
@@ -166,9 +163,9 @@ async fn handle_wt_stream(
         }
 
         let mut payload_buf = vec![0u8; len];
-        recv.read_exact(&mut payload_buf).await.map_err(|e| {
-            AeonError::connection(format!("webtransport read payload failed: {e}"))
-        })?;
+        recv.read_exact(&mut payload_buf)
+            .await
+            .map_err(|e| AeonError::connection(format!("webtransport read payload failed: {e}")))?;
 
         let event = Event::new(
             uuid::Uuid::nil(),

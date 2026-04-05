@@ -98,9 +98,10 @@ impl MysqlCdcSource {
     pub async fn new(config: MysqlCdcSourceConfig) -> Result<Self, AeonError> {
         let pool = mysql_async::Pool::new(config.url.as_str());
 
-        let mut conn = pool.get_conn().await.map_err(|e| {
-            AeonError::connection(format!("mysql connect failed: {e}"))
-        })?;
+        let mut conn = pool
+            .get_conn()
+            .await
+            .map_err(|e| AeonError::connection(format!("mysql connect failed: {e}")))?;
 
         // Verify binlog is enabled
         let rows: Vec<(String, u64, String, String)> = conn
@@ -109,10 +110,7 @@ impl MysqlCdcSource {
             .map_err(|e| AeonError::connection(format!("SHOW MASTER STATUS failed: {e}")))?;
 
         let (file, position) = if let Some(config_file) = &config.binlog_file {
-            (
-                config_file.clone(),
-                config.binlog_position.unwrap_or(4),
-            )
+            (config_file.clone(), config.binlog_position.unwrap_or(4))
         } else if let Some(row) = rows.first() {
             (row.0.clone(), row.1)
         } else {
@@ -141,9 +139,11 @@ impl MysqlCdcSource {
 
 impl Source for MysqlCdcSource {
     async fn next_batch(&mut self) -> Result<Vec<Event>, AeonError> {
-        let mut conn = self.pool.get_conn().await.map_err(|e| {
-            AeonError::connection(format!("mysql connect failed: {e}"))
-        })?;
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| AeonError::connection(format!("mysql connect failed: {e}")))?;
 
         // Query binlog events from current position
         let query = format!(
@@ -154,9 +154,7 @@ impl Source for MysqlCdcSource {
         let rows: Vec<(String, u64, String, u32, u64, String)> = conn
             .query(&query)
             .await
-            .map_err(|e| {
-                AeonError::connection(format!("SHOW BINLOG EVENTS failed: {e}"))
-            })?;
+            .map_err(|e| AeonError::connection(format!("SHOW BINLOG EVENTS failed: {e}")))?;
 
         let mut events = Vec::new();
         let now = std::time::Instant::now();
@@ -170,11 +168,7 @@ impl Source for MysqlCdcSource {
 
             // Filter by table if configured
             if !self.config.tables.is_empty() {
-                let matches = self
-                    .config
-                    .tables
-                    .iter()
-                    .any(|t| info.contains(t.as_str()));
+                let matches = self.config.tables.iter().any(|t| info.contains(t.as_str()));
                 if !matches {
                     self.current_position = *end_pos;
                     continue;
@@ -190,8 +184,7 @@ impl Source for MysqlCdcSource {
                 "source": "mysql-cdc",
             });
 
-            let payload_bytes =
-                Bytes::from(serde_json::to_vec(&payload).unwrap_or_default());
+            let payload_bytes = Bytes::from(serde_json::to_vec(&payload).unwrap_or_default());
 
             let mut event = Event::new(
                 uuid::Uuid::nil(),
@@ -201,10 +194,9 @@ impl Source for MysqlCdcSource {
                 payload_bytes,
             );
             event = event.with_source_ts(now);
-            event.metadata.push((
-                Arc::from("mysql.binlog_file"),
-                Arc::from(log_name.as_str()),
-            ));
+            event
+                .metadata
+                .push((Arc::from("mysql.binlog_file"), Arc::from(log_name.as_str())));
             event.metadata.push((
                 Arc::from("mysql.position"),
                 Arc::from(end_pos.to_string().as_str()),

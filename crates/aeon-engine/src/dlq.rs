@@ -30,7 +30,9 @@ impl DlqRecord {
     pub fn to_output(&self, destination: &Arc<str>) -> Output {
         // Encode error context as a simple header-enriched output.
         // The payload carries the original event payload; error info goes in headers.
-        let mut output = Output::new(Arc::clone(destination), self.event.payload.clone());
+        // Event identity is carried structurally via source_event_id/source_partition.
+        let mut output = Output::new(Arc::clone(destination), self.event.payload.clone())
+            .with_event_identity(&self.event);
 
         // Add the original event key as the output key for partition affinity
         output.key = Some(Bytes::copy_from_slice(self.event.id.as_bytes()));
@@ -117,7 +119,7 @@ impl<K: Sink> DeadLetterQueue<K> {
 
         let batch: Vec<Output> = self.buffer.drain(..).collect();
         let count = batch.len() as u64;
-        self.sink.write_batch(batch).await?;
+        let _batch_result = self.sink.write_batch(batch).await?;
         self.sink.flush().await?;
         self.records_sent.fetch_add(count, Ordering::Relaxed);
         Ok(())

@@ -37,11 +37,7 @@ pub struct MqttSourceConfig {
 
 impl MqttSourceConfig {
     /// Create a config for subscribing to an MQTT topic.
-    pub fn new(
-        host: impl Into<String>,
-        port: u16,
-        topic: impl Into<String>,
-    ) -> Self {
+    pub fn new(host: impl Into<String>, port: u16, topic: impl Into<String>) -> Self {
         Self {
             host: host.into(),
             port,
@@ -95,8 +91,7 @@ pub struct MqttSource {
 impl MqttSource {
     /// Connect to the MQTT broker and subscribe to the topic.
     pub async fn new(config: MqttSourceConfig) -> Result<Self, AeonError> {
-        let mut mqttoptions =
-            MqttOptions::new(&config.client_id, &config.host, config.port);
+        let mut mqttoptions = MqttOptions::new(&config.client_id, &config.host, config.port);
         mqttoptions.set_keep_alive(config.keep_alive);
 
         let (client, eventloop) = AsyncClient::new(mqttoptions, config.cap);
@@ -105,9 +100,7 @@ impl MqttSource {
         client
             .subscribe(&config.topic, config.qos)
             .await
-            .map_err(|e| {
-                AeonError::connection(format!("mqtt subscribe failed: {e}"))
-            })?;
+            .map_err(|e| AeonError::connection(format!("mqtt subscribe failed: {e}")))?;
 
         tracing::info!(
             host = %config.host,

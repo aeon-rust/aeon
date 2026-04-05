@@ -1,6 +1,6 @@
 //! In-memory sink that collects outputs for testing.
 
-use aeon_types::{AeonError, Output, Sink};
+use aeon_types::{AeonError, BatchResult, Output, Sink};
 
 /// A sink that collects all outputs into a `Vec<Output>` for assertion.
 ///
@@ -44,9 +44,13 @@ impl Default for MemorySink {
 }
 
 impl Sink for MemorySink {
-    async fn write_batch(&mut self, outputs: Vec<Output>) -> Result<(), AeonError> {
+    async fn write_batch(&mut self, outputs: Vec<Output>) -> Result<BatchResult, AeonError> {
+        let ids = outputs
+            .iter()
+            .filter_map(|o| o.source_event_id)
+            .collect();
         self.outputs.extend(outputs);
-        Ok(())
+        Ok(BatchResult::all_delivered(ids))
     }
 
     async fn flush(&mut self) -> Result<(), AeonError> {

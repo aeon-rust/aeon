@@ -3,6 +3,8 @@
 //! These types are Raft-replicated — every node in the cluster holds the
 //! same registry and pipeline state. Serialized via serde for Raft log entries.
 
+use crate::processor_identity::ProcessorIdentity;
+use crate::processor_transport::{ProcessorBinding, ProcessorConnectionConfig};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -16,6 +18,10 @@ pub enum ProcessorType {
     Wasm,
     /// Native shared library (`.so` / `.dll` / `.dylib`).
     NativeSo,
+    /// WebTransport (HTTP/3 + QUIC) out-of-process processor.
+    WebTransport,
+    /// WebSocket (HTTP/2 + HTTP/1.1) out-of-process processor.
+    WebSocket,
 }
 
 impl std::fmt::Display for ProcessorType {
@@ -23,6 +29,8 @@ impl std::fmt::Display for ProcessorType {
         match self {
             Self::Wasm => write!(f, "wasm"),
             Self::NativeSo => write!(f, "native-so"),
+            Self::WebTransport => write!(f, "web-transport"),
+            Self::WebSocket => write!(f, "web-socket"),
         }
     }
 }
@@ -58,6 +66,12 @@ pub struct ProcessorVersion {
     pub registered_at: i64,
     /// Who registered this version (operator ID or "cli").
     pub registered_by: String,
+    /// Endpoint URL for T3/T4 processors (e.g., "https://host:4462").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    /// Maximum batch size this processor version supports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_batch_size: Option<u32>,
 }
 
 /// A processor record in the registry — contains all versions.
@@ -188,6 +202,24 @@ pub struct ProcessorRef {
     pub name: String,
     /// Version string (e.g., "1.2.3" or "latest").
     pub version: String,
+    /// Binding mode — dedicated (default) or shared across pipelines.
+    #[serde(default)]
+    pub binding: ProcessorBinding,
+    /// Per-pipeline connection overrides (T3/T4 only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection: Option<ProcessorConnectionConfig>,
+}
+
+impl ProcessorRef {
+    /// Create a new ProcessorRef with default binding and no connection overrides.
+    pub fn new(name: impl Into<String>, version: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            version: version.into(),
+            binding: ProcessorBinding::default(),
+            connection: None,
+        }
+    }
 }
 
 impl std::fmt::Display for ProcessorRef {
@@ -396,9 +428,7 @@ pub enum RegistryCommand {
         status: VersionStatus,
     },
     /// Create a new pipeline.
-    CreatePipeline {
-        definition: Box<PipelineDefinition>,
-    },
+    CreatePipeline { definition: Box<PipelineDefinition> },
     /// Update pipeline state.
     SetPipelineState { name: String, state: PipelineState },
     /// Upgrade pipeline processor.
@@ -408,6 +438,17 @@ pub enum RegistryCommand {
     },
     /// Delete a pipeline.
     DeletePipeline { name: String },
+    /// Register a processor identity (ED25519 public key).
+    RegisterIdentity {
+        processor_name: String,
+        identity: ProcessorIdentity,
+    },
+    /// Revoke a processor identity by fingerprint.
+    RevokeIdentity {
+        processor_name: String,
+        fingerprint: String,
+        revoked_at: i64,
+    },
 }
 
 /// Response from applying a RegistryCommand.
@@ -416,6 +457,8 @@ pub enum RegistryResponse {
     Ok,
     ProcessorRegistered { name: String, version: String },
     PipelineCreated { name: String },
+    IdentityRegistered { fingerprint: String },
+    IdentityRevoked { fingerprint: String },
     Error { message: String },
 }
 
@@ -446,6 +489,8 @@ mod tests {
                 status: VersionStatus::Archived,
                 registered_at: 1000,
                 registered_by: "cli".into(),
+                endpoint: None,
+                max_batch_size: None,
             },
         );
         rec.versions.insert(
@@ -459,6 +504,8 @@ mod tests {
                 status: VersionStatus::Available,
                 registered_at: 2000,
                 registered_by: "cli".into(),
+                endpoint: None,
+                max_batch_size: None,
             },
         );
 
@@ -482,10 +529,7 @@ mod tests {
             topic: Some("output".into()),
             config: BTreeMap::new(),
         };
-        let proc_ref = ProcessorRef {
-            name: "enricher".into(),
-            version: "1.0.0".into(),
-        };
+        let proc_ref = ProcessorRef::new("enricher", "1.0.0");
 
         let pipeline = PipelineDefinition::new("my-pipeline", src, proc_ref, sink, 5000);
         assert_eq!(pipeline.name, "my-pipeline");
@@ -504,6 +548,73 @@ mod tests {
     fn processor_type_display() {
         assert_eq!(ProcessorType::Wasm.to_string(), "wasm");
         assert_eq!(ProcessorType::NativeSo.to_string(), "native-so");
+        assert_eq!(ProcessorType::WebTransport.to_string(), "web-transport");
+        assert_eq!(ProcessorType::WebSocket.to_string(), "web-socket");
+    }
+
+    #[test]
+    fn processor_type_serde_roundtrip() {
+        let json = serde_json::to_string(&ProcessorType::WebTransport).unwrap();
+        assert_eq!(json, "\"web-transport\"");
+        let back: ProcessorType = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ProcessorType::WebTransport);
+
+        let json = serde_json::to_string(&ProcessorType::WebSocket).unwrap();
+        assert_eq!(json, "\"web-socket\"");
+        let back: ProcessorType = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ProcessorType::WebSocket);
+    }
+
+    #[test]
+    fn processor_ref_new_defaults() {
+        let r = ProcessorRef::new("my-proc", "1.0.0");
+        assert_eq!(r.name, "my-proc");
+        assert_eq!(r.version, "1.0.0");
+        assert!(matches!(r.binding, ProcessorBinding::Dedicated));
+        assert!(r.connection.is_none());
+    }
+
+    #[test]
+    fn processor_ref_serde_with_binding() {
+        let mut r = ProcessorRef::new("proc", "2.0.0");
+        r.binding = ProcessorBinding::Shared {
+            group: "analytics".into(),
+        };
+        r.connection = Some(ProcessorConnectionConfig {
+            endpoint: Some("https://host:4462".into()),
+            batch_size: Some(512),
+            timeout_ms: None,
+            min_instances: None,
+        });
+
+        let json = serde_json::to_string(&r).unwrap();
+        let back: ProcessorRef = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.name, "proc");
+        match back.binding {
+            ProcessorBinding::Shared { group } => assert_eq!(group, "analytics"),
+            _ => panic!("expected Shared"),
+        }
+        assert_eq!(back.connection.unwrap().batch_size, Some(512));
+    }
+
+    #[test]
+    fn processor_version_with_endpoint() {
+        let pv = ProcessorVersion {
+            version: "1.0.0".into(),
+            sha512: "hash".into(),
+            size_bytes: 1024,
+            processor_type: ProcessorType::WebTransport,
+            platform: "linux-x86_64".into(),
+            status: VersionStatus::Available,
+            registered_at: 1000,
+            registered_by: "cli".into(),
+            endpoint: Some("https://proc.example.com:4462".into()),
+            max_batch_size: Some(2048),
+        };
+        let json = serde_json::to_string(&pv).unwrap();
+        let back: ProcessorVersion = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.endpoint.as_deref(), Some("https://proc.example.com:4462"));
+        assert_eq!(back.max_batch_size, Some(2048));
     }
 
     #[test]
@@ -520,6 +631,8 @@ mod tests {
                 status: VersionStatus::Available,
                 registered_at: 9999,
                 registered_by: "test".into(),
+                endpoint: None,
+                max_batch_size: None,
             },
         };
 
@@ -545,10 +658,7 @@ mod tests {
                 partitions: vec![0],
                 config: BTreeMap::new(),
             },
-            ProcessorRef {
-                name: "proc".into(),
-                version: "1.0.0".into(),
-            },
+            ProcessorRef::new("proc", "1.0.0"),
             SinkConfig {
                 sink_type: "kafka".into(),
                 topic: Some("out".into()),

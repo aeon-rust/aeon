@@ -10,10 +10,10 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use aeon_types::AeonError;
 use aeon_types::registry::{
     ProcessorRecord, ProcessorVersion, RegistryCommand, RegistryResponse, VersionStatus,
 };
-use aeon_types::AeonError;
 use tokio::sync::RwLock;
 
 /// Processor Registry — manages processor artifacts and metadata.
@@ -32,7 +32,10 @@ impl ProcessorRegistry {
     pub fn new(artifact_dir: impl Into<PathBuf>) -> Result<Self, AeonError> {
         let dir = artifact_dir.into();
         std::fs::create_dir_all(&dir).map_err(|e| AeonError::Config {
-            message: format!("failed to create artifact directory '{}': {e}", dir.display()),
+            message: format!(
+                "failed to create artifact directory '{}': {e}",
+                dir.display()
+            ),
         })?;
 
         Ok(Self {
@@ -144,11 +147,7 @@ impl ProcessorRegistry {
     }
 
     /// Load artifact bytes for a specific processor version.
-    pub async fn load_artifact(
-        &self,
-        name: &str,
-        version: &str,
-    ) -> Result<Vec<u8>, AeonError> {
+    pub async fn load_artifact(&self, name: &str, version: &str) -> Result<Vec<u8>, AeonError> {
         let path = self.artifact_path(name, version);
         std::fs::read(&path).map_err(|e| {
             AeonError::not_found(format!(
@@ -217,9 +216,9 @@ impl ProcessorRegistry {
         let ver_string = version.version.clone();
         let now = now_millis();
 
-        let record = procs.entry(name.to_string()).or_insert_with(|| {
-            ProcessorRecord::new(name, description, now)
-        });
+        let record = procs
+            .entry(name.to_string())
+            .or_insert_with(|| ProcessorRecord::new(name, description, now));
 
         record.versions.insert(ver_string.clone(), version);
         record.updated_at = now;
@@ -344,6 +343,8 @@ mod tests {
             status: VersionStatus::Available,
             registered_at: 1000,
             registered_by: "test".into(),
+            endpoint: None,
+            max_batch_size: None,
         }
     }
 
@@ -354,7 +355,10 @@ mod tests {
 
         let data = b"fake wasm bytes";
         let ver = make_version("1.0.0", data);
-        let resp = reg.register("my-proc", "A processor", ver, data).await.unwrap();
+        let resp = reg
+            .register("my-proc", "A processor", ver, data)
+            .await
+            .unwrap();
 
         match resp {
             RegistryResponse::ProcessorRegistered { name, version } => {

@@ -1,0 +1,76 @@
+# OpenTelemetry Collector Configuration for Aeon
+#
+# Receives OTLP from Aeon and routes to:
+#   - Traces → Jaeger (or Tempo, SigNoz, Elastic APM)
+#   - Metrics → Prometheus (or Mimir, VictoriaMetrics)
+#   - Logs → Loki (or OpenObserve, Elasticsearch)
+#
+# To switch backends, change the exporters section below.
+# Aeon itself never needs to change — it always emits OTLP.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    timeout: 5s
+    send_batch_size: 1024
+    send_batch_max_size: 2048
+
+  # Add Aeon resource attributes
+  resource:
+    attributes:
+      - key: deployment.environment
+        value: development
+        action: upsert
+
+exporters:
+  # ── Traces → Jaeger ──────────────────────────────────────────────────
+  # To use Grafana Tempo instead: replace with otlp/tempo exporter
+  # To use SigNoz: replace with otlp/signoz pointing to signoz-otel:4317
+  otlp/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
+
+  # ── Metrics → Prometheus ─────────────────────────────────────────────
+  # Exposes metrics on :8889 for Prometheus to scrape.
+  # To use VictoriaMetrics: scrape this same endpoint from VM instead.
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    namespace: aeon
+    resource_to_telemetry_conversion:
+      enabled: true
+
+  # ── Logs → Loki ──────────────────────────────────────────────────────
+  # To use OpenObserve: replace with otlphttp pointing to OpenObserve endpoint
+  # To use Elasticsearch: replace with elasticsearch exporter
+  loki:
+    endpoint: http://loki:3100/loki/api/v1/push
+
+  # Debug exporter (stdout) — useful for troubleshooting
+  # Uncomment to see all telemetry in collector logs:
+  # debug:
+  #   verbosity: detailed
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch, resource]
+      exporters: [otlp/jaeger]
+
+    metrics:
+      receivers: [otlp]
+      processors: [batch, resource]
+      exporters: [prometheus]
+
+    logs:
+      receivers: [otlp]
+      processors: [batch, resource]
+      exporters: [loki]

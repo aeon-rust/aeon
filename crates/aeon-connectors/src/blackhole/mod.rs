@@ -1,6 +1,6 @@
 //! Blackhole sink — discards all outputs. Used for benchmarking Aeon's internal ceiling.
 
-use aeon_types::{AeonError, Output, Sink};
+use aeon_types::{AeonError, BatchResult, Output, Sink};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A sink that discards all outputs and counts them.
@@ -36,10 +36,14 @@ impl Default for BlackholeSink {
 }
 
 impl Sink for BlackholeSink {
-    async fn write_batch(&mut self, outputs: Vec<Output>) -> Result<(), AeonError> {
+    async fn write_batch(&mut self, outputs: Vec<Output>) -> Result<BatchResult, AeonError> {
         self.count
             .fetch_add(outputs.len() as u64, Ordering::Relaxed);
-        Ok(())
+        let ids = outputs
+            .iter()
+            .filter_map(|o| o.source_event_id)
+            .collect();
+        Ok(BatchResult::all_delivered(ids))
     }
 
     async fn flush(&mut self) -> Result<(), AeonError> {

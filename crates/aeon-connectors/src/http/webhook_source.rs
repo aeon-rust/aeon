@@ -3,7 +3,7 @@
 //! Runs an HTTP server on a configurable address. Each POST request body
 //! becomes an Event. Uses the shared push buffer for three-phase backpressure.
 
-use crate::push_buffer::{PushBufferRx, PushBufferTx, push_buffer, PushBufferConfig};
+use crate::push_buffer::{PushBufferConfig, PushBufferRx, PushBufferTx, push_buffer};
 use aeon_types::{AeonError, Event, PartitionId, Source};
 use bytes::Bytes;
 use std::net::SocketAddr;
@@ -91,10 +91,7 @@ impl HttpWebhookSource {
         });
 
         let app = axum::Router::new()
-            .route(
-                &config.path,
-                axum::routing::post(webhook_handler),
-            )
+            .route(&config.path, axum::routing::post(webhook_handler))
             .route("/health", axum::routing::get(|| async { "ok" }))
             .with_state(state);
 
@@ -104,9 +101,9 @@ impl HttpWebhookSource {
                 AeonError::connection(format!("webhook bind failed on {}: {e}", config.bind_addr))
             })?;
 
-        let addr = listener.local_addr().map_err(|e| {
-            AeonError::connection(format!("failed to get local addr: {e}"))
-        })?;
+        let addr = listener
+            .local_addr()
+            .map_err(|e| AeonError::connection(format!("failed to get local addr: {e}")))?;
 
         tracing::info!(%addr, "HttpWebhookSource listening");
 
@@ -122,7 +119,6 @@ impl HttpWebhookSource {
             _server_handle: handle,
         })
     }
-
 }
 
 async fn webhook_handler(

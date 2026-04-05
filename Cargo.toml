@@ -26,6 +26,8 @@ version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 rust-version = "1.85"
+repository = "https://github.com/aeon-rust/aeon"
+homepage = "https://github.com/aeon-rust/aeon"
 
 [workspace.dependencies]
 # Core
@@ -49,6 +51,7 @@ dashmap = "6"
 # Serialization
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
+crc32fast = "1"
 
 # Kafka / Redpanda
 rdkafka = { version = "0.36", features = ["cmake-build"] }
@@ -68,8 +71,14 @@ clap = { version = "4", features = ["derive"] }
 
 # HTTP / REST
 axum = "0.8"
+tower-http = { version = "0.6", features = ["trace", "cors", "limit", "set-header"] }
 serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+
+# Crypto (integrity verification)
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
 
 # Streaming connectors
 futures-util = "0.3"
@@ -88,16 +97,23 @@ mongodb = "3"
 # Observability
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-opentelemetry = "0.28"
+opentelemetry = "0.27"
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.27", features = ["tonic", "logs"] }
 
 # Testing
 criterion = { version = "0.5", features = ["html_reports"] }
 
-# Workspace internal
-aeon-types = { path = "crates/aeon-types" }
-aeon-io = { path = "crates/aeon-io" }
-aeon-state = { path = "crates/aeon-state" }
-aeon-engine = { path = "crates/aeon-engine" }
-aeon-connectors = { path = "crates/aeon-connectors" }
+# Workspace internal (version required for crates.io publishing)
+aeon-types = { path = "crates/aeon-types", version = "0.1.0" }
+aeon-io = { path = "crates/aeon-io", version = "0.1.0" }
+aeon-state = { path = "crates/aeon-state", version = "0.1.0" }
+aeon-engine = { path = "crates/aeon-engine", version = "0.1.0" }
+aeon-connectors = { path = "crates/aeon-connectors", version = "0.1.0" }
+aeon-native-sdk = { path = "crates/aeon-native-sdk", version = "0.1.0" }
+aeon-crypto = { path = "crates/aeon-crypto", version = "0.1.0" }
+rand = "0.8"
 
 [profile.release]
 lto = "thin"

@@ -95,8 +95,8 @@ impl WasmProcessor {
         let _ = instance.call_2i32_i32("dealloc", guest_ptr, event_len);
         let _ = instance.call_2i32_i32("dealloc", result_ptr, (result_len + 4) as i32);
 
-        // Deserialize outputs, propagating source_ts
-        deserialize_outputs(&result_bytes, event.source_ts)
+        // Deserialize outputs, propagating event identity
+        deserialize_outputs(&result_bytes, &event)
     }
 
     /// Process a batch of events.
@@ -146,10 +146,11 @@ fn serialize_event(event: &Event) -> Vec<u8> {
 }
 
 /// Deserialize output list from wire format bytes.
-fn deserialize_outputs(
-    data: &[u8],
-    source_ts: Option<std::time::Instant>,
-) -> Result<Vec<Output>, AeonError> {
+///
+/// Propagates event identity (source_event_id, source_partition, source_ts)
+/// from the originating event to every output.
+fn deserialize_outputs(data: &[u8], source_event: &Event) -> Result<Vec<Output>, AeonError> {
+    let source_ts = source_event.source_ts;
     let mut pos = 0;
 
     let read_u32 = |pos: &mut usize| -> Result<u32, AeonError> {
@@ -218,6 +219,9 @@ fn deserialize_outputs(
             payload,
             headers,
             source_ts,
+            source_event_id: Some(source_event.id),
+            source_partition: Some(source_event.partition),
+            source_offset: None,
         });
     }
 
@@ -238,6 +242,16 @@ impl aeon_types::Processor for WasmProcessor {
 mod tests {
     use super::*;
     use aeon_types::partition::PartitionId;
+
+    fn test_event() -> Event {
+        Event::new(
+            uuid::Uuid::from_bytes([7u8; 16]),
+            42,
+            Arc::from("test"),
+            PartitionId::new(0),
+            Bytes::from_static(b"test"),
+        )
+    }
 
     #[test]
     fn serialize_deserialize_roundtrip() {
@@ -263,7 +277,7 @@ mod tests {
     fn deserialize_empty_output_list() {
         // 4 bytes: count = 0
         let data = 0u32.to_le_bytes();
-        let outputs = deserialize_outputs(&data, None).unwrap();
+        let outputs = deserialize_outputs(&data, &test_event()).unwrap();
         assert!(outputs.is_empty());
     }
 
@@ -288,7 +302,7 @@ mod tests {
         // Headers: 0
         data.extend_from_slice(&0u32.to_le_bytes());
 
-        let outputs = deserialize_outputs(&data, None).unwrap();
+        let outputs = deserialize_outputs(&data, &test_event()).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(&*outputs[0].destination, "output");
         assert_eq!(outputs[0].payload.as_ref(), b"result");
@@ -322,7 +336,7 @@ mod tests {
         data.extend_from_slice(&2u32.to_le_bytes());
         data.extend_from_slice(b"v1");
 
-        let outputs = deserialize_outputs(&data, None).unwrap();
+        let outputs = deserialize_outputs(&data, &test_event()).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(&*outputs[0].destination, "dest");
         assert_eq!(outputs[0].key.as_ref().unwrap().as_ref(), b"mykey");
@@ -335,7 +349,7 @@ mod tests {
     #[test]
     fn deserialize_truncated_data_returns_error() {
         let data = [0u8; 2]; // Too short for even count
-        let result = deserialize_outputs(&data, None);
+        let result = deserialize_outputs(&data, &test_event());
         assert!(result.is_err());
     }
 

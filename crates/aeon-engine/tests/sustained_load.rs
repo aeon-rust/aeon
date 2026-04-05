@@ -130,6 +130,7 @@ async fn sustained_30s_buffered_zero_event_loss() {
         source_buffer_capacity: 256,
         sink_buffer_capacity: 256,
         max_batch_size: 1024,
+        ..Default::default()
     };
     let metrics = Arc::new(PipelineMetrics::new());
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -142,6 +143,7 @@ async fn sustained_30s_buffered_zero_event_loss() {
         config,
         Arc::clone(&metrics),
         shutdown,
+        None,
     )
     .await
     .unwrap();

@@ -1,0 +1,77 @@
+# Aeon — Benchmark Docker Image
+#
+# Builds benchmark binaries for running on the same Docker network as Redpanda.
+#
+# Usage:
+#   docker build -t aeon-bench -f docker/Dockerfile.bench .
+#   docker run --rm --network aeon-net -e AEON_BENCH_BROKERS=redpanda:9092 aeon-bench
+
+FROM rust:1.85-bookworm AS builder
+
+WORKDIR /build
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    cmake libssl-dev pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN rustup target add wasm32-unknown-unknown
+
+# Install Node.js for AssemblyScript
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y nodejs
+
+COPY . .
+
+# Build Rust Wasm sample
+RUN cd samples/processors/rust-wasm \
+    && cargo build --target wasm32-unknown-unknown --release
+
+# Build AssemblyScript Wasm sample
+RUN cd samples/processors/assemblyscript-wasm \
+    && npm install && mkdir -p build && npm run build
+
+# Build benchmark binaries
+RUN cargo build --release --bench blackhole_bench -p aeon-engine \
+    && cargo build --release --bench redpanda_bench -p aeon-engine \
+    && cargo build --release --bench pipeline_components_bench -p aeon-engine \
+    && cargo build --release --bench partition_scaling_bench -p aeon-engine \
+    && cargo build --release --bench multi_partition_blackhole_bench -p aeon-engine \
+    && cargo build --release --bench e2e_delivery_bench -p aeon-engine \
+    && cargo build --release --bench multi_runtime -p aeon-sample-rust-native
+
+# ── Runtime ───────────────────────────────────────────────────────────
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates libssl3 \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 1000 aeon \
+    && useradd --uid 1000 --gid aeon --shell /bin/bash --create-home aeon
+
+WORKDIR /bench
+
+# Copy bench binaries (strip the hash suffix by finding the executable)
+COPY --from=builder /build/target/release/deps/blackhole_bench-* /bench/bins/
+COPY --from=builder /build/target/release/deps/redpanda_bench-* /bench/bins/
+COPY --from=builder /build/target/release/deps/pipeline_components_bench-* /bench/bins/
+COPY --from=builder /build/target/release/deps/partition_scaling_bench-* /bench/bins/
+COPY --from=builder /build/target/release/deps/multi_partition_blackhole_bench-* /bench/bins/
+COPY --from=builder /build/target/release/deps/e2e_delivery_bench-* /bench/bins/
+COPY --from=builder /build/target/release/deps/multi_runtime-* /bench/bins/
+
+# Copy Wasm artifacts
+COPY --from=builder /build/samples/processors/rust-wasm/target/wasm32-unknown-unknown/release/aeon_sample_rust_wasm.wasm /bench/wasm/
+COPY --from=builder /build/samples/processors/assemblyscript-wasm/build/processor.wasm /bench/wasm/as_processor.wasm
+
+COPY docker/bench-entrypoint.sh /bench/run.sh
+RUN chmod +x /bench/run.sh
+
+RUN chown -R aeon:aeon /bench
+
+ENV AEON_BENCH_BROKERS=redpanda:9092
+ENV AEON_BENCH_RUST_WASM=/bench/wasm/aeon_sample_rust_wasm.wasm
+ENV AEON_BENCH_AS_WASM=/bench/wasm/as_processor.wasm
+
+USER aeon
+
+ENTRYPOINT ["/bench/run.sh"]

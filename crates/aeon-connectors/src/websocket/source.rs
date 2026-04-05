@@ -66,12 +66,11 @@ pub struct WebSocketSource {
 impl WebSocketSource {
     /// Connect to the WebSocket server and start receiving.
     pub async fn new(config: WebSocketSourceConfig) -> Result<Self, AeonError> {
-        let (ws_stream, _) =
-            tokio_tungstenite::connect_async(&config.url)
-                .await
-                .map_err(|e| {
-                    AeonError::connection(format!("websocket connect failed: {}: {e}", config.url))
-                })?;
+        let (ws_stream, _) = tokio_tungstenite::connect_async(&config.url)
+            .await
+            .map_err(|e| {
+                AeonError::connection(format!("websocket connect failed: {}: {e}", config.url))
+            })?;
 
         tracing::info!(url = %config.url, "WebSocketSource connected");
 

@@ -234,7 +234,10 @@ fn generate_events(count: u64, payload_size: usize) -> Vec<Event> {
 /// This avoids trait objects on the hot path (static dispatch per CLAUDE.md rule 9).
 macro_rules! run_pipeline {
     ($source:expr, $processor:expr, $sink:expr, $config:expr, $metrics:expr, $shutdown:expr) => {
-        run_buffered($source, $processor, $sink, $config, $metrics, $shutdown).await
+        run_buffered(
+            $source, $processor, $sink, $config, $metrics, $shutdown, None,
+        )
+        .await
     };
 }
 
@@ -262,6 +265,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         source_buffer_capacity: args.buffer_capacity,
         sink_buffer_capacity: args.buffer_capacity,
         max_batch_size: args.batch_size,
+        ..Default::default()
     };
 
     // Signal handler

@@ -2,7 +2,7 @@
 //!
 //! Each output payload is published as an MQTT message to the configured topic.
 
-use aeon_types::{AeonError, Output, Sink};
+use aeon_types::{AeonError, BatchResult, Output, Sink};
 use rumqttc::{AsyncClient, MqttOptions, QoS};
 use std::time::Duration;
 
@@ -26,11 +26,7 @@ pub struct MqttSinkConfig {
 
 impl MqttSinkConfig {
     /// Create a config for publishing to an MQTT topic.
-    pub fn new(
-        host: impl Into<String>,
-        port: u16,
-        topic: impl Into<String>,
-    ) -> Self {
+    pub fn new(host: impl Into<String>, port: u16, topic: impl Into<String>) -> Self {
         Self {
             host: host.into(),
             port,
@@ -69,8 +65,7 @@ pub struct MqttSink {
 impl MqttSink {
     /// Connect to the MQTT broker.
     pub async fn new(config: MqttSinkConfig) -> Result<Self, AeonError> {
-        let mut mqttoptions =
-            MqttOptions::new(&config.client_id, &config.host, config.port);
+        let mut mqttoptions = MqttOptions::new(&config.client_id, &config.host, config.port);
         mqttoptions.set_keep_alive(config.keep_alive);
 
         let (client, mut eventloop) = AsyncClient::new(mqttoptions, config.cap);
@@ -110,7 +105,11 @@ impl MqttSink {
 }
 
 impl Sink for MqttSink {
-    async fn write_batch(&mut self, outputs: Vec<Output>) -> Result<(), AeonError> {
+    async fn write_batch(&mut self, outputs: Vec<Output>) -> Result<BatchResult, AeonError> {
+        let ids = outputs
+            .iter()
+            .filter_map(|o| o.source_event_id)
+            .collect();
         for output in &outputs {
             self.client
                 .publish(
@@ -120,13 +119,11 @@ impl Sink for MqttSink {
                     output.payload.to_vec(),
                 )
                 .await
-                .map_err(|e| {
-                    AeonError::connection(format!("mqtt publish failed: {e}"))
-                })?;
+                .map_err(|e| AeonError::connection(format!("mqtt publish failed: {e}")))?;
             self.delivered += 1;
         }
 
-        Ok(())
+        Ok(BatchResult::all_delivered(ids))
     }
 
     async fn flush(&mut self) -> Result<(), AeonError> {

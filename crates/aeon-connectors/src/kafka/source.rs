@@ -3,14 +3,14 @@
 //! Uses `StreamConsumer` for async integration with tokio.
 //! Manual `assign()` instead of `subscribe()` — Aeon manages partition ownership.
 
-use aeon_types::{AeonError, Event, PartitionId, Source};
+use aeon_types::{AeonError, CoreLocalUuidGenerator, Event, PartitionId, Source};
 use bytes::Bytes;
 use rdkafka::TopicPartitionList;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::message::{Headers, Message};
 use smallvec::SmallVec;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Configuration for `KafkaSource`.
@@ -29,6 +29,12 @@ pub struct KafkaSourceConfig {
     pub drain_timeout: Duration,
     /// Source identifier for events (interned).
     pub source_name: Arc<str>,
+    /// Consumer group ID. Required by rdkafka even for manual assign.
+    /// Default: "aeon-manual".
+    pub group_id: String,
+    /// Max consecutive empty polls before the source signals exhaustion.
+    /// Default: 10. Set higher for continuous streaming, lower for finite tests.
+    pub max_empty_polls: u32,
     /// Optional: additional rdkafka config overrides.
     pub config_overrides: Vec<(String, String)>,
 }
@@ -44,6 +50,8 @@ impl KafkaSourceConfig {
             poll_timeout: Duration::from_secs(1),
             drain_timeout: Duration::from_millis(10),
             source_name: Arc::from("kafka"),
+            group_id: "aeon-manual".to_string(),
+            max_empty_polls: 10,
             config_overrides: Vec::new(),
         }
     }
@@ -78,6 +86,18 @@ impl KafkaSourceConfig {
         self
     }
 
+    /// Set the consumer group ID (required by rdkafka even for manual assign).
+    pub fn with_group_id(mut self, group_id: impl Into<String>) -> Self {
+        self.group_id = group_id.into();
+        self
+    }
+
+    /// Set max consecutive empty polls before signaling exhaustion.
+    pub fn with_max_empty_polls(mut self, max: u32) -> Self {
+        self.max_empty_polls = max;
+        self
+    }
+
     /// Add an rdkafka config override (e.g., "fetch.min.bytes", "1024").
     pub fn with_config(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.config_overrides.push((key.into(), value.into()));
@@ -100,6 +120,9 @@ pub struct KafkaSource {
     consecutive_empty_polls: u32,
     /// Max consecutive empty polls before returning empty batch (source "done").
     max_empty_polls: u32,
+    /// Per-source UUIDv7 generator (SPSC pool, ~1-2ns per UUID).
+    /// Mutex for Sync (Source: Send + Sync), only accessed in next_batch.
+    uuid_gen: Mutex<CoreLocalUuidGenerator>,
 }
 
 impl KafkaSource {
@@ -108,7 +131,7 @@ impl KafkaSource {
         let mut client_config = ClientConfig::new();
         client_config
             .set("bootstrap.servers", &config.brokers)
-            .set("group.id", "aeon-manual") // Required by rdkafka even for manual assign
+            .set("group.id", &config.group_id)
             .set("enable.auto.commit", "false") // Aeon manages offsets
             .set("auto.offset.reset", "earliest")
             .set("fetch.min.bytes", "1")
@@ -143,19 +166,20 @@ impl KafkaSource {
             "KafkaSource assigned partitions"
         );
 
+        // Use core_id 0 for UUID generation. In multi-partition pipelines,
+        // each partition's KafkaSource will run on its own core — but the core_id
+        // for UUID generation is about uniqueness, not affinity. Core 0 is safe
+        // for single-source; multi-partition uses distinct generators per partition.
+        let uuid_gen = CoreLocalUuidGenerator::new(0);
+
+        let max_empty_polls = config.max_empty_polls;
         Ok(Self {
             consumer,
             config,
             consecutive_empty_polls: 0,
-            max_empty_polls: 10,
+            max_empty_polls,
+            uuid_gen: Mutex::new(uuid_gen),
         })
-    }
-
-    /// Set maximum consecutive empty polls before the source reports exhaustion.
-    /// Useful for finite test scenarios. For continuous streaming, set high or use default.
-    pub fn with_max_empty_polls(mut self, max: u32) -> Self {
-        self.max_empty_polls = max;
-        self
     }
 
     /// Convert a borrowed rdkafka message into an owned Event.
@@ -173,13 +197,22 @@ impl KafkaSource {
         let partition = PartitionId::new(msg.partition() as u16);
         let timestamp = msg.timestamp().to_millis().unwrap_or(0) * 1_000_000; // ms → ns
 
+        let event_id = self
+            .uuid_gen
+            .lock()
+            .map_err(|_| AeonError::connection("UUID generator mutex poisoned"))?
+            .next_uuid();
+
         let mut event = Event::new(
-            uuid::Uuid::nil(), // TODO: UUIDv7 from pool
+            event_id,
             timestamp,
             Arc::clone(&self.config.source_name),
             partition,
             payload,
         );
+
+        // Store Kafka offset for checkpoint resume position
+        event.source_offset = Some(msg.offset());
 
         // Propagate Kafka headers as event metadata
         if let Some(headers) = msg.headers() {

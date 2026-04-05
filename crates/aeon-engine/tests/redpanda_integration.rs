@@ -102,10 +102,10 @@ async fn redpanda_source_receives_messages() {
         .with_partitions((0..16).collect())
         .with_batch_max(256)
         .with_poll_timeout(Duration::from_secs(2))
-        .with_source_name("test-source");
+        .with_source_name("test-source")
+        .with_max_empty_polls(5);
 
     let mut source = KafkaSource::new(config).expect("source creation");
-    source = source.with_max_empty_polls(5);
 
     let mut total_events = 0;
     loop {
@@ -171,10 +171,10 @@ async fn redpanda_end_to_end_passthrough() {
         .with_partitions((0..16).collect())
         .with_batch_max(128)
         .with_poll_timeout(Duration::from_secs(2))
-        .with_source_name("e2e-source");
+        .with_source_name("e2e-source")
+        .with_max_empty_polls(5);
 
     let mut source = KafkaSource::new(source_config).expect("source creation");
-    source = source.with_max_empty_polls(5);
 
     let processor = PassthroughProcessor::new(Arc::from(sink_topic));
 

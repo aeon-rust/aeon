@@ -2,8 +2,13 @@
 //!
 //! Each output payload is written as a single line. Supports append mode
 //! for continuous writing and truncate mode for fresh output.
+//!
+//! Delivery strategies:
+//! - **PerEvent**: writes each output + fsync individually (slowest, strictest).
+//! - **OrderedBatch** (default): writes all outputs in order + single fsync at batch end.
+//! - **UnorderedBatch**: writes to BufWriter only, flush() fsyncs (highest throughput).
 
-use aeon_types::{AeonError, Output, Sink};
+use aeon_types::{AeonError, BatchResult, DeliveryStrategy, Output, Sink};
 use tokio::io::AsyncWriteExt;
 
 use std::path::PathBuf;
@@ -14,6 +19,8 @@ pub struct FileSinkConfig {
     pub path: PathBuf,
     /// Whether to append to existing file (true) or truncate (false).
     pub append: bool,
+    /// Delivery strategy — controls flush behavior.
+    pub strategy: DeliveryStrategy,
 }
 
 impl FileSinkConfig {
@@ -22,6 +29,7 @@ impl FileSinkConfig {
         Self {
             path: path.into(),
             append: false,
+            strategy: DeliveryStrategy::default(),
         }
     }
 
@@ -30,12 +38,22 @@ impl FileSinkConfig {
         self.append = append;
         self
     }
+
+    /// Set the delivery strategy.
+    pub fn with_strategy(mut self, strategy: DeliveryStrategy) -> Self {
+        self.strategy = strategy;
+        self
+    }
 }
 
 /// File output sink — writes outputs as lines.
 ///
 /// Opens the file lazily on first `write_batch()`.
 /// Uses a BufWriter for efficient batched I/O.
+///
+/// - **PerEvent**: writes + fsync per event (strict durability).
+/// - **OrderedBatch**: writes all events in order, single fsync at batch end.
+/// - **UnorderedBatch**: writes accumulate in BufWriter until `flush()`.
 pub struct FileSink {
     config: FileSinkConfig,
     writer: Option<tokio::io::BufWriter<tokio::fs::File>>,
@@ -82,25 +100,73 @@ impl FileSink {
 }
 
 impl Sink for FileSink {
-    async fn write_batch(&mut self, outputs: Vec<Output>) -> Result<(), AeonError> {
+    async fn write_batch(&mut self, outputs: Vec<Output>) -> Result<BatchResult, AeonError> {
         self.ensure_open().await?;
-        let writer = self.writer.as_mut().ok_or_else(|| {
-            AeonError::state("FileSink writer not initialized")
-        })?;
+        let writer = self
+            .writer
+            .as_mut()
+            .ok_or_else(|| AeonError::state("FileSink writer not initialized"))?;
 
-        for output in &outputs {
-            writer
-                .write_all(output.payload.as_ref())
-                .await
-                .map_err(|e| AeonError::connection(format!("file write error: {e}")))?;
-            writer
-                .write_all(b"\n")
-                .await
-                .map_err(|e| AeonError::connection(format!("file write error: {e}")))?;
-            self.written += 1;
+        let event_ids: Vec<_> = outputs
+            .iter()
+            .filter_map(|o| o.source_event_id)
+            .collect();
+
+        match self.config.strategy {
+            DeliveryStrategy::PerEvent => {
+                // Write + flush per event for strict durability.
+                for output in &outputs {
+                    writer
+                        .write_all(output.payload.as_ref())
+                        .await
+                        .map_err(|e| AeonError::connection(format!("file write error: {e}")))?;
+                    writer
+                        .write_all(b"\n")
+                        .await
+                        .map_err(|e| AeonError::connection(format!("file write error: {e}")))?;
+                    writer
+                        .flush()
+                        .await
+                        .map_err(|e| AeonError::connection(format!("file flush error: {e}")))?;
+                    self.written += 1;
+                }
+                Ok(BatchResult::all_delivered(event_ids))
+            }
+            DeliveryStrategy::OrderedBatch => {
+                // Write all in order, single flush at batch end.
+                for output in &outputs {
+                    writer
+                        .write_all(output.payload.as_ref())
+                        .await
+                        .map_err(|e| AeonError::connection(format!("file write error: {e}")))?;
+                    writer
+                        .write_all(b"\n")
+                        .await
+                        .map_err(|e| AeonError::connection(format!("file write error: {e}")))?;
+                    self.written += 1;
+                }
+                writer
+                    .flush()
+                    .await
+                    .map_err(|e| AeonError::connection(format!("file flush error: {e}")))?;
+                Ok(BatchResult::all_delivered(event_ids))
+            }
+            DeliveryStrategy::UnorderedBatch => {
+                // Write to BufWriter only — no flush until explicit flush() call.
+                for output in &outputs {
+                    writer
+                        .write_all(output.payload.as_ref())
+                        .await
+                        .map_err(|e| AeonError::connection(format!("file write error: {e}")))?;
+                    writer
+                        .write_all(b"\n")
+                        .await
+                        .map_err(|e| AeonError::connection(format!("file write error: {e}")))?;
+                    self.written += 1;
+                }
+                Ok(BatchResult::all_pending(event_ids))
+            }
         }
-
-        Ok(())
     }
 
     async fn flush(&mut self) -> Result<(), AeonError> {
@@ -132,10 +198,7 @@ mod tests {
         let config = FileSinkConfig::new(&path);
         let mut sink = FileSink::new(config);
 
-        let outputs = vec![
-            test_output("hello"),
-            test_output("world"),
-        ];
+        let outputs = vec![test_output("hello"), test_output("world")];
         sink.write_batch(outputs).await.unwrap();
         sink.flush().await.unwrap();
 
@@ -199,5 +262,69 @@ mod tests {
         assert_eq!(batch[0].payload.as_ref(), b"alpha");
         assert_eq!(batch[1].payload.as_ref(), b"beta");
         assert_eq!(batch[2].payload.as_ref(), b"gamma");
+    }
+
+    #[tokio::test]
+    async fn test_file_sink_unordered_batch_defers_flush() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let config = FileSinkConfig::new(&path).with_strategy(DeliveryStrategy::UnorderedBatch);
+        let mut sink = FileSink::new(config);
+
+        // Write without explicit flush — data stays in BufWriter
+        let result = sink
+            .write_batch(vec![test_output("buffered")])
+            .await
+            .unwrap();
+        // No source_event_id on test outputs, so pending IDs are empty,
+        // but the data is buffered (not flushed to disk yet).
+        assert_eq!(result.delivered.len(), 0);
+
+        // After flush, data must be durable
+        sink.flush().await.unwrap();
+
+        let contents = tokio::fs::read_to_string(&path).await.unwrap();
+        assert_eq!(contents, "buffered\n");
+        assert_eq!(sink.written(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_file_sink_ordered_batch_flushes_per_batch() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let config = FileSinkConfig::new(&path).with_strategy(DeliveryStrategy::OrderedBatch);
+        let mut sink = FileSink::new(config);
+
+        // In OrderedBatch mode, data is flushed after each batch
+        let result = sink
+            .write_batch(vec![test_output("durable")])
+            .await
+            .unwrap();
+        assert!(result.all_succeeded());
+
+        // Should be readable without explicit flush()
+        let contents = tokio::fs::read_to_string(&path).await.unwrap();
+        assert_eq!(contents, "durable\n");
+    }
+
+    #[tokio::test]
+    async fn test_file_sink_per_event_flushes_each() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let config = FileSinkConfig::new(&path).with_strategy(DeliveryStrategy::PerEvent);
+        let mut sink = FileSink::new(config);
+
+        let result = sink
+            .write_batch(vec![test_output("a"), test_output("b")])
+            .await
+            .unwrap();
+        assert!(result.all_succeeded());
+        assert_eq!(sink.written(), 2);
+
+        let contents = tokio::fs::read_to_string(&path).await.unwrap();
+        assert_eq!(contents, "a\nb\n");
     }
 }

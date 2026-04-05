@@ -106,17 +106,13 @@ impl MongoDbCdcSource {
                 .pipeline(config.pipeline.clone())
                 .with_options(options)
                 .await
-                .map_err(|e| {
-                    AeonError::connection(format!("mongodb change stream failed: {e}"))
-                })?
+                .map_err(|e| AeonError::connection(format!("mongodb change stream failed: {e}")))?
         } else {
             db.watch()
                 .pipeline(config.pipeline.clone())
                 .with_options(options)
                 .await
-                .map_err(|e| {
-                    AeonError::connection(format!("mongodb change stream failed: {e}"))
-                })?
+                .map_err(|e| AeonError::connection(format!("mongodb change stream failed: {e}")))?
         };
 
         tracing::info!(
@@ -150,7 +146,10 @@ async fn mongodb_reader(
             Ok(change_event) => {
                 // Serialize the full change event as BSON → bytes
                 let mut doc = Document::new();
-                doc.insert("operationType", format!("{:?}", change_event.operation_type));
+                doc.insert(
+                    "operationType",
+                    format!("{:?}", change_event.operation_type),
+                );
 
                 if let Some(ns) = &change_event.ns {
                     let mut ns_doc = Document::new();

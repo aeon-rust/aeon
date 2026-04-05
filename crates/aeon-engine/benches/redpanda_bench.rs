@@ -15,14 +15,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-const BROKERS: &str = "localhost:19092";
+fn brokers() -> String {
+    std::env::var("AEON_BENCH_BROKERS").unwrap_or_else(|_| "localhost:19092".to_string())
+}
 const SOURCE_TOPIC: &str = "aeon-bench-source";
 const SINK_TOPIC: &str = "aeon-bench-sink";
 
 /// Produce N messages using BaseProducer (fire-and-forget, high throughput).
 fn produce_messages(count: usize, payload_size: usize) {
     let producer: BaseProducer = ClientConfig::new()
-        .set("bootstrap.servers", BROKERS)
+        .set("bootstrap.servers", &brokers())
         .set("message.timeout.ms", "30000")
         .set("queue.buffering.max.messages", "1000000")
         .set("queue.buffering.max.kbytes", "1048576")
@@ -32,14 +34,18 @@ fn produce_messages(count: usize, payload_size: usize) {
         .expect("producer creation");
 
     let payload = vec![b'x'; payload_size];
-    let keys: Vec<String> = (0..16).map(|i| format!("{i}")).collect();
+    let num_keys: usize = std::env::var("AEON_BENCH_NUM_PARTITIONS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(16);
+    let keys: Vec<String> = (0..num_keys).map(|i| format!("{i}")).collect();
 
     for i in 0..count {
         loop {
             match producer.send(
                 BaseRecord::to(SOURCE_TOPIC)
                     .payload(&payload)
-                    .key(keys[i % 16].as_bytes()),
+                    .key(keys[i % num_keys].as_bytes()),
             ) {
                 Ok(()) => break,
                 Err((
@@ -65,15 +71,19 @@ fn produce_messages(count: usize, payload_size: usize) {
 }
 
 fn make_source(batch_size: usize) -> KafkaSource {
-    let config = KafkaSourceConfig::new(BROKERS, SOURCE_TOPIC)
-        .with_partitions((0..16).collect())
+    let num_partitions: usize = std::env::var("AEON_BENCH_NUM_PARTITIONS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(16);
+    let config = KafkaSourceConfig::new(&brokers(), SOURCE_TOPIC)
+        .with_partitions((0..num_partitions as i32).collect())
         .with_batch_max(batch_size)
         .with_poll_timeout(Duration::from_secs(2))
         .with_drain_timeout(Duration::from_millis(10))
-        .with_source_name("bench");
+        .with_source_name("bench")
+        .with_max_empty_polls(5);
 
-    let source = KafkaSource::new(config).expect("source");
-    source.with_max_empty_polls(5)
+    KafkaSource::new(config).expect("source")
 }
 
 fn main() {
@@ -82,22 +92,32 @@ fn main() {
         .build()
         .unwrap();
 
+    let broker_addr = brokers();
+
     // Check if Redpanda is available
     let available: Result<BaseProducer, _> = ClientConfig::new()
-        .set("bootstrap.servers", BROKERS)
+        .set("bootstrap.servers", &broker_addr)
         .set("message.timeout.ms", "5000")
         .create();
 
     if available.is_err() {
-        eprintln!("SKIP: Redpanda not available at {BROKERS}");
+        eprintln!("SKIP: Redpanda not available at {broker_addr}");
         return;
     }
     drop(available);
 
+    println!("Broker: {broker_addr}");
+
     println!("=== Redpanda Throughput Benchmark ===\n");
 
-    let event_count = 100_000;
-    let payload_size = 256;
+    let event_count: usize = std::env::var("AEON_BENCH_EVENT_COUNT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100_000);
+    let payload_size: usize = std::env::var("AEON_BENCH_PAYLOAD_SIZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(256);
 
     // ── Step 1: Produce messages ──
     print!("Producing {event_count} messages ({payload_size}B payload)... ");
@@ -149,7 +169,8 @@ fn main() {
     let metrics = rt.block_on(async {
         let mut source = make_source(1024);
         let processor = PassthroughProcessor::new(Arc::from(SINK_TOPIC));
-        let sink_config = KafkaSinkConfig::new(BROKERS, SINK_TOPIC).with_config("linger.ms", "0"); // minimize delivery latency
+        let sink_config =
+            KafkaSinkConfig::new(&brokers(), SINK_TOPIC).with_config("linger.ms", "0"); // minimize delivery latency
         let mut sink = aeon_connectors::kafka::KafkaSink::new(sink_config).expect("sink");
         let metrics = PipelineMetrics::new();
         let shutdown = AtomicBool::new(false);
@@ -182,13 +203,15 @@ fn main() {
     let metrics = rt.block_on(async {
         let source = make_source(1024);
         let processor = PassthroughProcessor::new(Arc::from(SINK_TOPIC));
-        let sink_config = KafkaSinkConfig::new(BROKERS, SINK_TOPIC).with_config("linger.ms", "0");
+        let sink_config =
+            KafkaSinkConfig::new(&brokers(), SINK_TOPIC).with_config("linger.ms", "0");
         let sink = aeon_connectors::kafka::KafkaSink::new(sink_config).expect("sink");
 
         let config = PipelineConfig {
             source_buffer_capacity: 256,
             sink_buffer_capacity: 256,
             max_batch_size: 1024,
+            ..Default::default()
         };
         let metrics = Arc::new(PipelineMetrics::new());
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -200,6 +223,7 @@ fn main() {
             config,
             Arc::clone(&metrics),
             shutdown,
+            None,
         )
         .await
         .expect("pipeline run");
@@ -222,16 +246,26 @@ fn main() {
 
     // ── Headroom ratio ──
     println!("\n=== Headroom Ratio ===");
-    let blackhole_ceiling = 7_500_000.0_f64;
+    let blackhole_ceiling: f64 = std::env::var("AEON_BENCH_BLACKHOLE_CEILING")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(7_500_000.0);
+    let headroom_target: f64 = std::env::var("AEON_BENCH_HEADROOM_TARGET")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5.0);
     let rp_throughput = received as f64 / elapsed.as_secs_f64();
     let headroom = blackhole_ceiling / rp_throughput;
-    println!("Blackhole ceiling: ~7.5M events/sec (from blackhole_bench)");
+    println!(
+        "Blackhole ceiling: ~{:.1}M events/sec (from blackhole_bench)",
+        blackhole_ceiling / 1_000_000.0
+    );
     println!("Redpanda E2E:      {rp_throughput:.0} events/sec");
     println!("Headroom ratio:    {headroom:.1}x");
-    if headroom >= 5.0 {
-        println!("✓ PASS: headroom >= 5x — Aeon is not the bottleneck");
+    if headroom >= headroom_target {
+        println!("✓ PASS: headroom >= {headroom_target}x — Aeon is not the bottleneck");
     } else {
-        println!("✗ FAIL: headroom < 5x — investigate pipeline overhead");
+        println!("✗ FAIL: headroom < {headroom_target}x — investigate pipeline overhead");
     }
     println!();
 }

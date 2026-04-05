@@ -35,11 +35,20 @@ pub struct Event {
     pub payload: Bytes,
     /// Source-side timestamp for end-to-end latency tracking.
     pub source_ts: Option<Instant>,
+    /// Source-system offset (e.g., Kafka message offset) for checkpoint resume.
+    /// Set by source connectors; propagated to Output via `with_event_identity()`.
+    pub source_offset: Option<i64>,
 }
 
 /// The output envelope emitted by processors and consumed by sinks.
 ///
 /// Cache-line aligned to prevent false sharing between CPU cores.
+///
+/// **Event identity propagation**: `source_event_id`, `source_partition`, and
+/// `source_offset` trace every output back to the originating source event.
+/// This enables per-event delivery tracking in the `DeliveryLedger`, checkpoint
+/// offset persistence, DLQ correlation, and end-to-end traceability without
+/// header-based workarounds.
 #[repr(align(64))]
 #[derive(Debug, Clone)]
 pub struct Output {
@@ -53,6 +62,18 @@ pub struct Output {
     pub headers: SmallVec<[(Arc<str>, Arc<str>); 4]>,
     /// Propagated from source Event for latency tracking.
     pub source_ts: Option<Instant>,
+
+    // ── Event identity (propagated from source Event) ────────────────
+    /// UUIDv7 of the source event that produced this output.
+    /// Set by processors; used by DeliveryLedger for per-event ack tracking.
+    /// `None` only for synthetic outputs (e.g., DLQ records, test fixtures).
+    pub source_event_id: Option<uuid::Uuid>,
+    /// Source partition of the originating event.
+    /// Used by checkpoint to persist per-partition offsets.
+    pub source_partition: Option<PartitionId>,
+    /// Source offset (e.g., Kafka offset) of the originating event.
+    /// Used by checkpoint to persist resume position per partition.
+    pub source_offset: Option<i64>,
 }
 
 impl Event {
@@ -72,6 +93,7 @@ impl Event {
             metadata: SmallVec::new(),
             payload,
             source_ts: None,
+            source_offset: None,
         }
     }
 
@@ -88,6 +110,13 @@ impl Event {
         self.source_ts = Some(ts);
         self
     }
+
+    /// Set the source-system offset (e.g., Kafka message offset) for checkpoint.
+    #[inline]
+    pub fn with_source_offset(mut self, offset: i64) -> Self {
+        self.source_offset = Some(offset);
+        self
+    }
 }
 
 impl Output {
@@ -99,6 +128,9 @@ impl Output {
             payload,
             headers: SmallVec::new(),
             source_ts: None,
+            source_event_id: None,
+            source_partition: None,
+            source_offset: None,
         }
     }
 
@@ -123,6 +155,39 @@ impl Output {
         self
     }
 
+    /// Set the source event identity fields from the originating Event.
+    /// This is the primary method processors should use to propagate traceability.
+    /// Copies: event.id, event.partition, event.source_ts, event.source_offset.
+    #[inline]
+    pub fn with_event_identity(mut self, event: &Event) -> Self {
+        self.source_event_id = Some(event.id);
+        self.source_partition = Some(event.partition);
+        self.source_ts = event.source_ts;
+        self.source_offset = event.source_offset;
+        self
+    }
+
+    /// Set the source event ID (UUIDv7) for delivery tracking.
+    #[inline]
+    pub fn with_source_event_id(mut self, id: uuid::Uuid) -> Self {
+        self.source_event_id = Some(id);
+        self
+    }
+
+    /// Set the source partition for checkpoint offset tracking.
+    #[inline]
+    pub fn with_source_partition(mut self, partition: PartitionId) -> Self {
+        self.source_partition = Some(partition);
+        self
+    }
+
+    /// Set the source offset for checkpoint resume position.
+    #[inline]
+    pub fn with_source_offset(mut self, offset: i64) -> Self {
+        self.source_offset = Some(offset);
+        self
+    }
+
     /// Convert this output back into an event for processor chaining.
     ///
     /// Used in DAG topologies where one processor's output feeds another processor's input.
@@ -143,6 +208,7 @@ impl Output {
             metadata: self.headers,
             payload: self.payload,
             source_ts: self.source_ts,
+            source_offset: self.source_offset,
         }
     }
 }
@@ -254,5 +320,44 @@ mod tests {
         let event2 = event1.clone();
         // Both events share the same Arc<str> allocation
         assert!(Arc::ptr_eq(&event1.source, &event2.source));
+    }
+
+    #[test]
+    fn output_new_has_no_event_identity() {
+        let output = Output::new(Arc::from("dest"), Bytes::from_static(b"data"));
+        assert!(output.source_event_id.is_none());
+        assert!(output.source_partition.is_none());
+        assert!(output.source_offset.is_none());
+    }
+
+    #[test]
+    fn output_with_event_identity() {
+        let event_id = uuid::Uuid::from_bytes([1u8; 16]);
+        let event = Event::new(
+            event_id,
+            999,
+            Arc::from("src"),
+            PartitionId::new(7),
+            Bytes::from_static(b"payload"),
+        );
+        let output = Output::new(Arc::from("dest"), Bytes::from_static(b"result"))
+            .with_event_identity(&event);
+
+        assert_eq!(output.source_event_id, Some(event_id));
+        assert_eq!(output.source_partition, Some(PartitionId::new(7)));
+        assert!(output.source_ts.is_none()); // event had no source_ts
+    }
+
+    #[test]
+    fn output_with_source_event_id_builder() {
+        let id = uuid::Uuid::from_bytes([42u8; 16]);
+        let output = Output::new(Arc::from("dest"), Bytes::from_static(b"data"))
+            .with_source_event_id(id)
+            .with_source_partition(PartitionId::new(3))
+            .with_source_offset(12345);
+
+        assert_eq!(output.source_event_id, Some(id));
+        assert_eq!(output.source_partition, Some(PartitionId::new(3)));
+        assert_eq!(output.source_offset, Some(12345));
     }
 }

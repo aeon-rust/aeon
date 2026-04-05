@@ -99,18 +99,20 @@ impl Source for FileSource {
         }
 
         self.ensure_open().await?;
-        let reader = self.reader.as_mut().ok_or_else(|| {
-            AeonError::state("FileSource reader not initialized")
-        })?;
+        let reader = self
+            .reader
+            .as_mut()
+            .ok_or_else(|| AeonError::state("FileSource reader not initialized"))?;
 
         let mut events = Vec::with_capacity(self.config.batch_size);
         let now = std::time::Instant::now();
 
         for _ in 0..self.config.batch_size {
             self.line_buf.clear();
-            let bytes_read = reader.read_line(&mut self.line_buf).await.map_err(|e| {
-                AeonError::connection(format!("file read error: {e}"))
-            })?;
+            let bytes_read = reader
+                .read_line(&mut self.line_buf)
+                .await
+                .map_err(|e| AeonError::connection(format!("file read error: {e}")))?;
 
             if bytes_read == 0 {
                 self.exhausted = true;

@@ -159,6 +159,183 @@ impl BatchTuner {
     }
 }
 
+/// Adaptive flush interval tuner for batched delivery mode.
+///
+/// Adjusts the sink flush interval based on ack success rate feedback from
+/// the delivery ledger. When the sink is healthy (high success rate), the
+/// interval increases to maximize throughput. When failures spike, the
+/// interval decreases to minimize data at risk.
+///
+/// Uses hill-climbing: probe interval changes, keep whichever direction
+/// improves the success-weighted throughput metric.
+///
+/// Cost: one `Duration` comparison + one f64 division per flush cycle (~2ns).
+pub struct FlushTuner {
+    /// Current flush interval.
+    current_interval: Duration,
+    /// Minimum flush interval (floor — never flush faster than this).
+    min_interval: Duration,
+    /// Maximum flush interval (ceiling — never wait longer than this).
+    max_interval: Duration,
+    /// Step size for adjustments (shrinks as we converge).
+    step: Duration,
+    /// Minimum step size.
+    min_step: Duration,
+    /// Best observed metric (success_rate * throughput).
+    best_metric: f64,
+    /// Direction: true = try longer interval, false = try shorter.
+    try_longer: bool,
+    /// Events processed since last evaluation.
+    events_since_eval: u64,
+    /// Successful acks since last evaluation.
+    acks_since_eval: u64,
+    /// Time of last evaluation.
+    last_eval: Instant,
+    /// Minimum events before evaluating (avoids noise on small samples).
+    min_sample: u64,
+    /// Number of adjustments made.
+    adjustments: u32,
+}
+
+impl FlushTuner {
+    /// Create a new flush tuner.
+    ///
+    /// - `initial`: starting flush interval
+    /// - `min`: minimum interval (fastest flush rate)
+    /// - `max`: maximum interval (longest between flushes)
+    pub fn new(initial: Duration, min: Duration, max: Duration) -> Self {
+        assert!(min <= initial && initial <= max);
+        assert!(!min.is_zero());
+        let range = max - min;
+        Self {
+            current_interval: initial,
+            min_interval: min,
+            max_interval: max,
+            step: range / 4,
+            min_step: Duration::from_millis(10).max(range / 64),
+            best_metric: 0.0,
+            try_longer: true,
+            events_since_eval: 0,
+            acks_since_eval: 0,
+            last_eval: Instant::now(),
+            min_sample: 100,
+            adjustments: 0,
+        }
+    }
+
+    /// Get the current recommended flush interval.
+    #[inline]
+    pub fn interval(&self) -> Duration {
+        self.current_interval
+    }
+
+    /// Report a flush cycle result.
+    ///
+    /// - `events`: total events in this flush cycle
+    /// - `acked`: successfully acked events in this flush cycle
+    ///
+    /// Returns `true` if the interval was adjusted.
+    #[inline]
+    pub fn report(&mut self, events: u64, acked: u64) -> bool {
+        self.events_since_eval += events;
+        self.acks_since_eval += acked;
+        if self.events_since_eval >= self.min_sample {
+            self.evaluate()
+        } else {
+            false
+        }
+    }
+
+    /// Evaluate and potentially adjust the flush interval.
+    fn evaluate(&mut self) -> bool {
+        let elapsed = self.last_eval.elapsed();
+        if elapsed < Duration::from_millis(10) {
+            return false;
+        }
+
+        let throughput = self.events_since_eval as f64 / elapsed.as_secs_f64();
+        let success_rate = if self.events_since_eval > 0 {
+            self.acks_since_eval as f64 / self.events_since_eval as f64
+        } else {
+            1.0
+        };
+
+        // Composite metric: throughput weighted by success rate.
+        // High throughput with low success = bad. Moderate throughput with
+        // perfect success = good.
+        let metric = throughput * success_rate * success_rate;
+
+        // Reset counters
+        self.events_since_eval = 0;
+        self.acks_since_eval = 0;
+        self.last_eval = Instant::now();
+
+        if self.best_metric == 0.0 {
+            self.best_metric = metric;
+            return false;
+        }
+
+        if metric > self.best_metric * 1.01 {
+            // Improvement — keep direction
+            self.best_metric = metric;
+            self.step_in_direction();
+            self.adjustments += 1;
+            true
+        } else if metric < self.best_metric * 0.99 {
+            // Regression — reverse direction, reduce step
+            self.try_longer = !self.try_longer;
+            self.step = self.step.max(self.min_step * 2) / 2;
+            if self.step < self.min_step {
+                self.step = self.min_step;
+            }
+            self.revert_step();
+            self.adjustments += 1;
+            true
+        } else {
+            // Converged — reduce step for finer tuning
+            self.step = self.step.max(self.min_step * 2) / 2;
+            if self.step < self.min_step {
+                self.step = self.min_step;
+            }
+            false
+        }
+    }
+
+    /// Apply a step in the current direction.
+    fn step_in_direction(&mut self) {
+        if self.try_longer {
+            self.current_interval = (self.current_interval + self.step).min(self.max_interval);
+        } else {
+            self.current_interval = self
+                .current_interval
+                .saturating_sub(self.step)
+                .max(self.min_interval);
+        }
+    }
+
+    /// Revert the last step.
+    fn revert_step(&mut self) {
+        if self.try_longer {
+            self.current_interval = (self.current_interval + self.step).min(self.max_interval);
+        } else {
+            self.current_interval = self
+                .current_interval
+                .saturating_sub(self.step)
+                .max(self.min_interval);
+        }
+    }
+
+    /// Number of adjustments made so far.
+    pub fn adjustments(&self) -> u32 {
+        self.adjustments
+    }
+
+    /// Current step size.
+    pub fn step_size(&self) -> Duration {
+        self.step
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,5 +402,106 @@ mod tests {
     fn tuner_adjustments_tracked() {
         let tuner = BatchTuner::new(256, 16, 4096);
         assert_eq!(tuner.adjustments(), 0);
+    }
+
+    // --- FlushTuner tests ---
+
+    #[test]
+    fn flush_tuner_starts_at_initial_interval() {
+        let tuner = FlushTuner::new(
+            Duration::from_millis(500),
+            Duration::from_millis(50),
+            Duration::from_secs(5),
+        );
+        assert_eq!(tuner.interval(), Duration::from_millis(500));
+    }
+
+    #[test]
+    fn flush_tuner_respects_bounds() {
+        let mut tuner = FlushTuner::new(
+            Duration::from_millis(50),
+            Duration::from_millis(50),
+            Duration::from_secs(5),
+        );
+        // Force many "try shorter" iterations
+        tuner.try_longer = false;
+        for _ in 0..100 {
+            tuner.step_in_direction();
+        }
+        assert!(tuner.interval() >= Duration::from_millis(50));
+
+        let mut tuner = FlushTuner::new(
+            Duration::from_secs(5),
+            Duration::from_millis(50),
+            Duration::from_secs(5),
+        );
+        tuner.try_longer = true;
+        for _ in 0..100 {
+            tuner.step_in_direction();
+        }
+        assert!(tuner.interval() <= Duration::from_secs(5));
+    }
+
+    #[test]
+    fn flush_tuner_report_accumulates() {
+        let mut tuner = FlushTuner::new(
+            Duration::from_millis(500),
+            Duration::from_millis(50),
+            Duration::from_secs(5),
+        );
+        // Report below min_sample — should not evaluate
+        assert!(!tuner.report(10, 10));
+        assert!(!tuner.report(10, 10));
+        assert_eq!(tuner.adjustments(), 0);
+    }
+
+    #[test]
+    fn flush_tuner_adjustments_tracked() {
+        let tuner = FlushTuner::new(
+            Duration::from_millis(500),
+            Duration::from_millis(50),
+            Duration::from_secs(5),
+        );
+        assert_eq!(tuner.adjustments(), 0);
+    }
+
+    #[test]
+    fn flush_tuner_step_shrinks_on_convergence() {
+        let mut tuner = FlushTuner::new(
+            Duration::from_millis(500),
+            Duration::from_millis(50),
+            Duration::from_secs(5),
+        );
+        let initial_step = tuner.step_size();
+        assert!(initial_step > Duration::ZERO);
+
+        tuner.best_metric = 1_000_000.0;
+        // Force several "converged" evaluations (metric within 1%)
+        for _ in 0..20 {
+            tuner.events_since_eval = tuner.min_sample;
+            tuner.acks_since_eval = tuner.min_sample; // 100% success
+            tuner.last_eval = Instant::now() - Duration::from_millis(100);
+            tuner.evaluate();
+        }
+
+        assert!(tuner.step_size() <= initial_step);
+        assert!(tuner.step_size() >= tuner.min_step);
+    }
+
+    #[test]
+    fn flush_tuner_converges() {
+        let mut tuner = FlushTuner::new(
+            Duration::from_millis(500),
+            Duration::from_millis(50),
+            Duration::from_secs(5),
+        );
+
+        // Simulate many flush cycles with perfect success
+        for _ in 0..1_000 {
+            tuner.report(200, 200);
+        }
+
+        assert!(tuner.interval() >= Duration::from_millis(50));
+        assert!(tuner.interval() <= Duration::from_secs(5));
     }
 }

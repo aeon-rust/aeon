@@ -83,22 +83,16 @@ pub struct NatsSource {
 impl NatsSource {
     /// Connect to NATS and create/bind to a JetStream consumer.
     pub async fn new(config: NatsSourceConfig) -> Result<Self, AeonError> {
-        let client = async_nats::connect(&config.url).await.map_err(|e| {
-            AeonError::connection(format!("nats connect failed: {e}"))
-        })?;
+        let client = async_nats::connect(&config.url)
+            .await
+            .map_err(|e| AeonError::connection(format!("nats connect failed: {e}")))?;
 
         let jetstream = async_nats::jetstream::new(client);
 
         // Get or create stream
-        let stream = jetstream
-            .get_stream(&config.stream)
-            .await
-            .map_err(|e| {
-                AeonError::connection(format!(
-                    "nats stream '{}' not found: {e}",
-                    config.stream
-                ))
-            })?;
+        let stream = jetstream.get_stream(&config.stream).await.map_err(|e| {
+            AeonError::connection(format!("nats stream '{}' not found: {e}", config.stream))
+        })?;
 
         // Create or get durable consumer
         let consumer = stream
@@ -112,9 +106,7 @@ impl NatsSource {
                 },
             )
             .await
-            .map_err(|e| {
-                AeonError::connection(format!("nats consumer create failed: {e}"))
-            })?;
+            .map_err(|e| AeonError::connection(format!("nats consumer create failed: {e}")))?;
 
         tracing::info!(
             stream = %config.stream,
@@ -135,25 +127,24 @@ impl Source for NatsSource {
     async fn next_batch(&mut self) -> Result<Vec<Event>, AeonError> {
         // Initialize message stream if needed
         if self.messages.is_none() {
-            let msgs = self
-                .consumer
-                .messages()
-                .await
-                .map_err(|e| AeonError::connection(format!("nats messages stream failed: {e}")))?;
+            let msgs =
+                self.consumer.messages().await.map_err(|e| {
+                    AeonError::connection(format!("nats messages stream failed: {e}"))
+                })?;
             self.messages = Some(msgs);
         }
 
-        let messages = self.messages.as_mut().ok_or_else(|| {
-            AeonError::state("NatsSource messages not initialized")
-        })?;
+        let messages = self
+            .messages
+            .as_mut()
+            .ok_or_else(|| AeonError::state("NatsSource messages not initialized"))?;
 
         let mut events = Vec::with_capacity(self.config.batch_size);
         let now = std::time::Instant::now();
 
         // Read first message with full timeout
         use futures_util::StreamExt;
-        let first =
-            tokio::time::timeout(self.config.fetch_timeout, messages.next()).await;
+        let first = tokio::time::timeout(self.config.fetch_timeout, messages.next()).await;
 
         match first {
             Ok(Some(Ok(msg))) => {
@@ -189,8 +180,7 @@ impl Source for NatsSource {
         }
 
         // Drain additional messages
-        let drain_deadline =
-            tokio::time::Instant::now() + Duration::from_millis(5);
+        let drain_deadline = tokio::time::Instant::now() + Duration::from_millis(5);
         while events.len() < self.config.batch_size {
             match tokio::time::timeout_at(drain_deadline, messages.next()).await {
                 Ok(Some(Ok(msg))) => {

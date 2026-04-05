@@ -8,7 +8,7 @@
 
 use aeon_connectors::MemorySource;
 use aeon_engine::{PassthroughProcessor, PipelineConfig, PipelineMetrics, run, run_buffered};
-use aeon_types::{AeonError, Event, Output, PartitionId, Sink};
+use aeon_types::{AeonError, BatchResult, Event, Output, PartitionId, Sink};
 use bytes::Bytes;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -33,11 +33,15 @@ impl SlowSink {
 }
 
 impl Sink for SlowSink {
-    async fn write_batch(&mut self, outputs: Vec<Output>) -> Result<(), AeonError> {
+    async fn write_batch(&mut self, outputs: Vec<Output>) -> Result<BatchResult, AeonError> {
         tokio::time::sleep(self.delay).await;
         self.count
             .fetch_add(outputs.len() as u64, Ordering::Relaxed);
-        Ok(())
+        let ids = outputs
+            .iter()
+            .filter_map(|o| o.source_event_id)
+            .collect();
+        Ok(BatchResult::all_delivered(ids))
     }
 
     async fn flush(&mut self) -> Result<(), AeonError> {
@@ -109,6 +113,7 @@ async fn buffered_pipeline_slow_sink_no_loss() {
         source_buffer_capacity: 16, // Small buffers to force backpressure quickly
         sink_buffer_capacity: 16,
         max_batch_size: 64,
+        ..Default::default()
     };
     let metrics = Arc::new(PipelineMetrics::new());
     let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -120,6 +125,7 @@ async fn buffered_pipeline_slow_sink_no_loss() {
         config,
         Arc::clone(&metrics),
         shutdown,
+        None,
     )
     .await
     .unwrap();
@@ -150,6 +156,7 @@ async fn buffered_pipeline_very_slow_sink_no_loss() {
         source_buffer_capacity: 4, // Very small — forces aggressive backpressure
         sink_buffer_capacity: 4,
         max_batch_size: 32,
+        ..Default::default()
     };
     let metrics = Arc::new(PipelineMetrics::new());
     let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -161,6 +168,7 @@ async fn buffered_pipeline_very_slow_sink_no_loss() {
         config,
         Arc::clone(&metrics),
         shutdown,
+        None,
     )
     .await
     .unwrap();
@@ -186,6 +194,7 @@ async fn buffered_pipeline_bursty_source_slow_sink() {
         source_buffer_capacity: 8,
         sink_buffer_capacity: 8,
         max_batch_size: 1024,
+        ..Default::default()
     };
     let metrics = Arc::new(PipelineMetrics::new());
     let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -197,6 +206,7 @@ async fn buffered_pipeline_bursty_source_slow_sink() {
         config,
         Arc::clone(&metrics),
         shutdown,
+        None,
     )
     .await
     .unwrap();

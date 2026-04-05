@@ -115,7 +115,7 @@ fn pipeline_mode_comparison(c: &mut Criterion) {
                 let config = PipelineConfig::default();
                 let metrics = Arc::new(PipelineMetrics::new());
                 let shutdown = Arc::new(AtomicBool::new(false));
-                run_buffered(source, processor, sink, config, metrics, shutdown)
+                run_buffered(source, processor, sink, config, metrics, shutdown, None)
                     .await
                     .unwrap();
             });

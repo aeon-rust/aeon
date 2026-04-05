@@ -3,7 +3,7 @@
 //! Each output payload is sent as a WebSocket binary message.
 //! The connection is maintained across `write_batch()` calls.
 
-use aeon_types::{AeonError, Output, Sink};
+use aeon_types::{AeonError, BatchResult, Output, Sink};
 use tokio_tungstenite::tungstenite::Message;
 
 /// Configuration for `WebSocketSink`.
@@ -37,12 +37,11 @@ pub struct WebSocketSink {
 impl WebSocketSink {
     /// Connect to the WebSocket server.
     pub async fn new(config: WebSocketSinkConfig) -> Result<Self, AeonError> {
-        let (ws_stream, _) =
-            tokio_tungstenite::connect_async(&config.url)
-                .await
-                .map_err(|e| {
-                    AeonError::connection(format!("websocket connect failed: {}: {e}", config.url))
-                })?;
+        let (ws_stream, _) = tokio_tungstenite::connect_async(&config.url)
+            .await
+            .map_err(|e| {
+                AeonError::connection(format!("websocket connect failed: {}: {e}", config.url))
+            })?;
 
         tracing::info!(url = %config.url, "WebSocketSink connected");
 
@@ -62,25 +61,31 @@ impl WebSocketSink {
 }
 
 impl Sink for WebSocketSink {
-    async fn write_batch(&mut self, outputs: Vec<Output>) -> Result<(), AeonError> {
+    async fn write_batch(&mut self, outputs: Vec<Output>) -> Result<BatchResult, AeonError> {
         use futures_util::SinkExt;
 
+        let ids = outputs
+            .iter()
+            .filter_map(|o| o.source_event_id)
+            .collect();
         for output in &outputs {
             let msg = Message::Binary(output.payload.to_vec().into());
-            self.writer.send(msg).await.map_err(|e| {
-                AeonError::connection(format!("websocket send failed: {e}"))
-            })?;
+            self.writer
+                .send(msg)
+                .await
+                .map_err(|e| AeonError::connection(format!("websocket send failed: {e}")))?;
             self.delivered += 1;
         }
 
-        Ok(())
+        Ok(BatchResult::all_delivered(ids))
     }
 
     async fn flush(&mut self) -> Result<(), AeonError> {
         use futures_util::SinkExt;
 
-        self.writer.flush().await.map_err(|e| {
-            AeonError::connection(format!("websocket flush failed: {e}"))
-        })
+        self.writer
+            .flush()
+            .await
+            .map_err(|e| AeonError::connection(format!("websocket flush failed: {e}")))
     }
 }

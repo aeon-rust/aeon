@@ -120,9 +120,10 @@ impl Source for HttpPollingSource {
             )));
         }
 
-        let body = response.bytes().await.map_err(|e| {
-            AeonError::connection(format!("http poll body read failed: {e}"))
-        })?;
+        let body = response
+            .bytes()
+            .await
+            .map_err(|e| AeonError::connection(format!("http poll body read failed: {e}")))?;
 
         if body.is_empty() {
             return Ok(Vec::new());
@@ -173,10 +174,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        let app = axum::Router::new().route(
-            "/empty",
-            axum::routing::get(|| async { "" }),
-        );
+        let app = axum::Router::new().route("/empty", axum::routing::get(|| async { "" }));
 
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();

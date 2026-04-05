@@ -3,7 +3,7 @@
 //! Each output is sent as a length-prefixed message on a bidirectional stream.
 //! Protocol: `[length: u32 LE][payload]` per message.
 
-use aeon_types::{AeonError, Output, Sink};
+use aeon_types::{AeonError, BatchResult, Output, Sink};
 use std::net::SocketAddr;
 
 /// Configuration for `QuicSink`.
@@ -76,33 +76,36 @@ impl QuicSink {
 }
 
 impl Sink for QuicSink {
-    async fn write_batch(&mut self, outputs: Vec<Output>) -> Result<(), AeonError> {
+    async fn write_batch(&mut self, outputs: Vec<Output>) -> Result<BatchResult, AeonError> {
+        let ids: Vec<_> = outputs
+            .iter()
+            .filter_map(|o| o.source_event_id)
+            .collect();
         // Open a new bidirectional stream for this batch
-        let (mut send, _recv) = self.connection.open_bi().await.map_err(|e| {
-            AeonError::connection(format!("quic open stream failed: {e}"))
-        })?;
+        let (mut send, _recv) = self
+            .connection
+            .open_bi()
+            .await
+            .map_err(|e| AeonError::connection(format!("quic open stream failed: {e}")))?;
 
         for output in &outputs {
             let len = output.payload.len() as u32;
-            send.write_all(&len.to_le_bytes()).await.map_err(|e| {
-                AeonError::connection(format!("quic write length failed: {e}"))
-            })?;
+            send.write_all(&len.to_le_bytes())
+                .await
+                .map_err(|e| AeonError::connection(format!("quic write length failed: {e}")))?;
             send.write_all(output.payload.as_ref())
                 .await
-                .map_err(|e| {
-                    AeonError::connection(format!("quic write payload failed: {e}"))
-                })?;
+                .map_err(|e| AeonError::connection(format!("quic write payload failed: {e}")))?;
             self.delivered += 1;
         }
 
-        send.finish().map_err(|e| {
-            AeonError::connection(format!("quic finish stream failed: {e}"))
-        })?;
+        send.finish()
+            .map_err(|e| AeonError::connection(format!("quic finish stream failed: {e}")))?;
 
         // Wait for the stream to be fully acknowledged
         send.stopped().await.ok(); // Best-effort wait
 
-        Ok(())
+        Ok(BatchResult::all_delivered(ids))
     }
 
     async fn flush(&mut self) -> Result<(), AeonError> {
@@ -122,9 +125,8 @@ mod tests {
     #[tokio::test]
     async fn test_quic_source_sink_roundtrip() {
         let (server_config, client_config) = crate::quic::tls::dev_quic_configs();
-        let source_config =
-            QuicSourceConfig::new("127.0.0.1:0".parse().unwrap(), server_config)
-                .with_poll_timeout(Duration::from_millis(500));
+        let source_config = QuicSourceConfig::new("127.0.0.1:0".parse().unwrap(), server_config)
+            .with_poll_timeout(Duration::from_millis(500));
         let mut source = QuicSource::new(source_config).unwrap();
         let addr = source.local_addr();
 

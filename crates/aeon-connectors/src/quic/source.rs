@@ -65,17 +65,14 @@ pub struct QuicSource {
 impl QuicSource {
     /// Bind and start the QUIC listener.
     pub fn new(config: QuicSourceConfig) -> Result<Self, AeonError> {
-        let endpoint = quinn::Endpoint::server(config.server_config, config.bind_addr)
-            .map_err(|e| {
-                AeonError::connection(format!(
-                    "quic bind failed on {}: {e}",
-                    config.bind_addr
-                ))
+        let endpoint =
+            quinn::Endpoint::server(config.server_config, config.bind_addr).map_err(|e| {
+                AeonError::connection(format!("quic bind failed on {}: {e}", config.bind_addr))
             })?;
 
-        let local_addr = endpoint.local_addr().map_err(|e| {
-            AeonError::connection(format!("failed to get quic local addr: {e}"))
-        })?;
+        let local_addr = endpoint
+            .local_addr()
+            .map_err(|e| AeonError::connection(format!("failed to get quic local addr: {e}")))?;
 
         tracing::info!(%local_addr, "QuicSource listening");
 
@@ -181,9 +178,9 @@ async fn handle_stream(
 
         // Read payload
         let mut payload_buf = vec![0u8; len];
-        recv.read_exact(&mut payload_buf).await.map_err(|e| {
-            AeonError::connection(format!("quic read payload failed: {e}"))
-        })?;
+        recv.read_exact(&mut payload_buf)
+            .await
+            .map_err(|e| AeonError::connection(format!("quic read payload failed: {e}")))?;
 
         let event = Event::new(
             uuid::Uuid::nil(),
@@ -231,11 +228,7 @@ mod tests {
         let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
         endpoint.set_default_client_config(client_config);
 
-        let conn = endpoint
-            .connect(addr, "localhost")
-            .unwrap()
-            .await
-            .unwrap();
+        let conn = endpoint.connect(addr, "localhost").unwrap().await.unwrap();
 
         let (mut send, _recv) = conn.open_bi().await.unwrap();
 

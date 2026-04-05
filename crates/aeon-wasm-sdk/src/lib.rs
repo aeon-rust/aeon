@@ -12,8 +12,8 @@
 //!
 //! use aeon_wasm_sdk::prelude::*;
 //!
-//! fn my_processor(event: Event) -> Vec<WasmOutput> {
-//!     vec![WasmOutput::new("output-topic", event.payload.clone())]
+//! fn my_processor(event: Event) -> Vec<Output> {
+//!     vec![Output::new("output-topic", event.payload.clone())]
 //! }
 //!
 //! aeon_processor!(my_processor);
@@ -80,8 +80,8 @@ impl Event {
 
 /// An output to emit from the processor.
 ///
-/// Construct via [`WasmOutput::new`] or [`WasmOutput::builder`].
-pub struct WasmOutput {
+/// Construct via [`Output::new`] or [`Output::from_str`].
+pub struct Output {
     /// Destination sink/topic name.
     pub destination: String,
     /// Optional partition key.
@@ -92,7 +92,7 @@ pub struct WasmOutput {
     pub headers: Vec<(String, String)>,
 }
 
-impl WasmOutput {
+impl Output {
     /// Create a new output with a destination and payload. No key, no headers.
     pub fn new(destination: &str, payload: Vec<u8>) -> Self {
         Self {
@@ -135,7 +135,7 @@ pub mod prelude {
     pub use alloc::vec;
     pub use alloc::vec::Vec;
 
-    pub use crate::{Event, WasmOutput, aeon_processor};
+    pub use crate::{Event, Output, aeon_processor};
     pub use crate::{clock, log, metrics, state};
 }
 
@@ -143,7 +143,7 @@ pub mod prelude {
 
 /// Generate all Wasm ABI exports for an Aeon processor.
 ///
-/// Takes a function `fn(Event) -> Vec<WasmOutput>` and generates:
+/// Takes a function `fn(Event) -> Vec<Output>` and generates:
 /// - Bump allocator with `#[global_allocator]`
 /// - `alloc(size: i32) -> i32` export
 /// - `dealloc(ptr: i32, size: i32)` export
@@ -153,8 +153,8 @@ pub mod prelude {
 /// # Example
 ///
 /// ```rust,ignore
-/// fn handle(event: Event) -> Vec<WasmOutput> {
-///     vec![WasmOutput::new("output", event.payload.clone())]
+/// fn handle(event: Event) -> Vec<Output> {
+///     vec![Output::new("output", event.payload.clone())]
 /// }
 /// aeon_processor!(handle);
 /// ```

@@ -9,12 +9,12 @@
 
 use std::collections::BTreeMap;
 
+use aeon_types::AeonError;
 use aeon_types::registry::{
     BlueGreenActive, BlueGreenState, CanaryState, CanaryThresholds, PipelineAction,
     PipelineDefinition, PipelineHistoryEntry, PipelineState, ProcessorRef, RegistryCommand,
     RegistryResponse, UpgradeInfo,
 };
-use aeon_types::AeonError;
 use tokio::sync::RwLock;
 
 /// Pipeline Manager — manages the lifecycle of all pipelines on this node.
@@ -37,9 +37,7 @@ impl PipelineManager {
     /// Apply a Raft-replicated pipeline command.
     pub async fn apply(&self, cmd: RegistryCommand) -> RegistryResponse {
         match cmd {
-            RegistryCommand::CreatePipeline { definition } => {
-                self.apply_create(*definition).await
-            }
+            RegistryCommand::CreatePipeline { definition } => self.apply_create(*definition).await,
             RegistryCommand::SetPipelineState { name, state } => {
                 self.apply_set_state(&name, state, "system").await
             }
@@ -78,16 +76,24 @@ impl PipelineManager {
     /// Start a pipeline.
     pub async fn start(&self, name: &str, actor: &str) -> Result<(), AeonError> {
         let mut pipelines = self.pipelines.write().await;
-        let pipeline = pipelines.get_mut(name).ok_or_else(|| {
-            AeonError::not_found(format!("pipeline '{name}'"))
-        })?;
+        let pipeline = pipelines
+            .get_mut(name)
+            .ok_or_else(|| AeonError::not_found(format!("pipeline '{name}'")))?;
 
         match pipeline.state {
             PipelineState::Created | PipelineState::Stopped => {
                 let from = pipeline.state;
                 pipeline.state = PipelineState::Running;
                 pipeline.updated_at = now_millis();
-                self.record_history(name, PipelineAction::Started, actor, from, PipelineState::Running, None).await;
+                self.record_history(
+                    name,
+                    PipelineAction::Started,
+                    actor,
+                    from,
+                    PipelineState::Running,
+                    None,
+                )
+                .await;
                 tracing::info!(pipeline = name, "pipeline started");
                 Ok(())
             }
@@ -101,16 +107,24 @@ impl PipelineManager {
     /// Stop a pipeline.
     pub async fn stop(&self, name: &str, actor: &str) -> Result<(), AeonError> {
         let mut pipelines = self.pipelines.write().await;
-        let pipeline = pipelines.get_mut(name).ok_or_else(|| {
-            AeonError::not_found(format!("pipeline '{name}'"))
-        })?;
+        let pipeline = pipelines
+            .get_mut(name)
+            .ok_or_else(|| AeonError::not_found(format!("pipeline '{name}'")))?;
 
         match pipeline.state {
             PipelineState::Running | PipelineState::Upgrading => {
                 let from = pipeline.state;
                 pipeline.state = PipelineState::Stopped;
                 pipeline.updated_at = now_millis();
-                self.record_history(name, PipelineAction::Stopped, actor, from, PipelineState::Stopped, None).await;
+                self.record_history(
+                    name,
+                    PipelineAction::Stopped,
+                    actor,
+                    from,
+                    PipelineState::Stopped,
+                    None,
+                )
+                .await;
                 tracing::info!(pipeline = name, "pipeline stopped");
                 Ok(())
             }
@@ -163,9 +177,9 @@ impl PipelineManager {
         actor: &str,
     ) -> Result<(), AeonError> {
         let mut pipelines = self.pipelines.write().await;
-        let pipeline = pipelines.get_mut(name).ok_or_else(|| {
-            AeonError::not_found(format!("pipeline '{name}'"))
-        })?;
+        let pipeline = pipelines
+            .get_mut(name)
+            .ok_or_else(|| AeonError::not_found(format!("pipeline '{name}'")))?;
 
         if pipeline.state != PipelineState::Running {
             return Err(AeonError::Config {
@@ -224,9 +238,9 @@ impl PipelineManager {
         actor: &str,
     ) -> Result<(), AeonError> {
         let mut pipelines = self.pipelines.write().await;
-        let pipeline = pipelines.get_mut(name).ok_or_else(|| {
-            AeonError::not_found(format!("pipeline '{name}'"))
-        })?;
+        let pipeline = pipelines
+            .get_mut(name)
+            .ok_or_else(|| AeonError::not_found(format!("pipeline '{name}'")))?;
 
         if pipeline.state != PipelineState::Running {
             return Err(AeonError::Config {
@@ -272,9 +286,9 @@ impl PipelineManager {
     /// Cut over traffic from blue to green processor.
     pub async fn cutover(&self, name: &str, actor: &str) -> Result<(), AeonError> {
         let mut pipelines = self.pipelines.write().await;
-        let pipeline = pipelines.get_mut(name).ok_or_else(|| {
-            AeonError::not_found(format!("pipeline '{name}'"))
-        })?;
+        let pipeline = pipelines
+            .get_mut(name)
+            .ok_or_else(|| AeonError::not_found(format!("pipeline '{name}'")))?;
 
         let bg = match &mut pipeline.upgrade_state {
             Some(UpgradeInfo::BlueGreen(bg)) => bg,
@@ -317,9 +331,9 @@ impl PipelineManager {
     /// Roll back any in-progress upgrade (blue-green or canary).
     pub async fn rollback_upgrade(&self, name: &str, actor: &str) -> Result<(), AeonError> {
         let mut pipelines = self.pipelines.write().await;
-        let pipeline = pipelines.get_mut(name).ok_or_else(|| {
-            AeonError::not_found(format!("pipeline '{name}'"))
-        })?;
+        let pipeline = pipelines
+            .get_mut(name)
+            .ok_or_else(|| AeonError::not_found(format!("pipeline '{name}'")))?;
 
         let original_proc = match &pipeline.upgrade_state {
             Some(UpgradeInfo::BlueGreen(bg)) => bg.blue_processor.clone(),
@@ -363,9 +377,9 @@ impl PipelineManager {
         actor: &str,
     ) -> Result<(), AeonError> {
         let mut pipelines = self.pipelines.write().await;
-        let pipeline = pipelines.get_mut(name).ok_or_else(|| {
-            AeonError::not_found(format!("pipeline '{name}'"))
-        })?;
+        let pipeline = pipelines
+            .get_mut(name)
+            .ok_or_else(|| AeonError::not_found(format!("pipeline '{name}'")))?;
 
         if pipeline.state != PipelineState::Running {
             return Err(AeonError::Config {
@@ -421,9 +435,9 @@ impl PipelineManager {
     /// completes the canary by making the new processor primary.
     pub async fn promote_canary(&self, name: &str, actor: &str) -> Result<(), AeonError> {
         let mut pipelines = self.pipelines.write().await;
-        let pipeline = pipelines.get_mut(name).ok_or_else(|| {
-            AeonError::not_found(format!("pipeline '{name}'"))
-        })?;
+        let pipeline = pipelines
+            .get_mut(name)
+            .ok_or_else(|| AeonError::not_found(format!("pipeline '{name}'")))?;
 
         let cs = match &mut pipeline.upgrade_state {
             Some(UpgradeInfo::Canary(cs)) => cs,
@@ -499,13 +513,16 @@ impl PipelineManager {
                 || pipeline.state == PipelineState::Upgrading
             {
                 return Err(AeonError::Config {
-                    message: format!("cannot delete pipeline in state '{}' — stop it first", pipeline.state),
+                    message: format!(
+                        "cannot delete pipeline in state '{}' — stop it first",
+                        pipeline.state
+                    ),
                 });
             }
         }
-        pipelines.remove(name).ok_or_else(|| {
-            AeonError::not_found(format!("pipeline '{name}'"))
-        })?;
+        pipelines
+            .remove(name)
+            .ok_or_else(|| AeonError::not_found(format!("pipeline '{name}'")))?;
 
         self.history.write().await.remove(name);
         tracing::info!(pipeline = name, "pipeline deleted");
@@ -585,11 +602,7 @@ impl PipelineManager {
         }
     }
 
-    async fn apply_upgrade(
-        &self,
-        name: &str,
-        new_processor: ProcessorRef,
-    ) -> RegistryResponse {
+    async fn apply_upgrade(&self, name: &str, new_processor: ProcessorRef) -> RegistryResponse {
         let mut pipelines = self.pipelines.write().await;
         if let Some(pipeline) = pipelines.get_mut(name) {
             pipeline.processor = new_processor;
@@ -675,10 +688,7 @@ mod tests {
                 partitions: vec![0, 1],
                 config: BTreeMap::new(),
             },
-            ProcessorRef {
-                name: "proc".into(),
-                version: "1.0.0".into(),
-            },
+            ProcessorRef::new("proc", "1.0.0"),
             SinkConfig {
                 sink_type: "kafka".into(),
                 topic: Some("output".into()),
@@ -734,10 +744,7 @@ mod tests {
         mgr.create(make_pipeline("upg")).await.unwrap();
         mgr.start("upg", "test").await.unwrap();
 
-        let new_proc = ProcessorRef {
-            name: "proc".into(),
-            version: "2.0.0".into(),
-        };
+        let new_proc = ProcessorRef::new("proc", "2.0.0");
         mgr.upgrade("upg", new_proc, "test").await.unwrap();
 
         let pipeline = mgr.get("upg").await.unwrap();
@@ -750,10 +757,7 @@ mod tests {
         let mgr = PipelineManager::new();
         mgr.create(make_pipeline("upg-fail")).await.unwrap();
 
-        let new_proc = ProcessorRef {
-            name: "proc".into(),
-            version: "2.0.0".into(),
-        };
+        let new_proc = ProcessorRef::new("proc", "2.0.0");
         let result = mgr.upgrade("upg-fail", new_proc, "test").await;
         assert!(result.is_err());
     }
@@ -831,10 +835,7 @@ mod tests {
         mgr.create(make_pipeline("bg")).await.unwrap();
         mgr.start("bg", "test").await.unwrap();
 
-        let new_proc = ProcessorRef {
-            name: "proc".into(),
-            version: "2.0.0".into(),
-        };
+        let new_proc = ProcessorRef::new("proc", "2.0.0");
         mgr.upgrade_blue_green("bg", new_proc, "test")
             .await
             .unwrap();
@@ -859,10 +860,7 @@ mod tests {
         mgr.create(make_pipeline("bg-rb")).await.unwrap();
         mgr.start("bg-rb", "test").await.unwrap();
 
-        let new_proc = ProcessorRef {
-            name: "proc".into(),
-            version: "2.0.0".into(),
-        };
+        let new_proc = ProcessorRef::new("proc", "2.0.0");
         mgr.upgrade_blue_green("bg-rb", new_proc, "test")
             .await
             .unwrap();
@@ -881,13 +879,8 @@ mod tests {
         let mgr = PipelineManager::new();
         mgr.create(make_pipeline("bg-stop")).await.unwrap();
 
-        let new_proc = ProcessorRef {
-            name: "proc".into(),
-            version: "2.0.0".into(),
-        };
-        let result = mgr
-            .upgrade_blue_green("bg-stop", new_proc, "test")
-            .await;
+        let new_proc = ProcessorRef::new("proc", "2.0.0");
+        let result = mgr.upgrade_blue_green("bg-stop", new_proc, "test").await;
         assert!(result.is_err());
     }
 
@@ -897,19 +890,11 @@ mod tests {
         mgr.create(make_pipeline("bg-dbl")).await.unwrap();
         mgr.start("bg-dbl", "test").await.unwrap();
 
-        let p1 = ProcessorRef {
-            name: "proc".into(),
-            version: "2.0.0".into(),
-        };
-        mgr.upgrade_blue_green("bg-dbl", p1, "test")
-            .await
-            .unwrap();
+        let p1 = ProcessorRef::new("proc", "2.0.0");
+        mgr.upgrade_blue_green("bg-dbl", p1, "test").await.unwrap();
 
         // Second upgrade while first is in progress should fail
-        let p2 = ProcessorRef {
-            name: "proc".into(),
-            version: "3.0.0".into(),
-        };
+        let p2 = ProcessorRef::new("proc", "3.0.0");
         let result = mgr.upgrade_blue_green("bg-dbl", p2, "test").await;
         assert!(result.is_err());
     }
@@ -920,10 +905,7 @@ mod tests {
         mgr.create(make_pipeline("bg-hist")).await.unwrap();
         mgr.start("bg-hist", "test").await.unwrap();
 
-        let new_proc = ProcessorRef {
-            name: "proc".into(),
-            version: "2.0.0".into(),
-        };
+        let new_proc = ProcessorRef::new("proc", "2.0.0");
         mgr.upgrade_blue_green("bg-hist", new_proc, "test")
             .await
             .unwrap();
@@ -942,10 +924,7 @@ mod tests {
         mgr.create(make_pipeline("can")).await.unwrap();
         mgr.start("can", "test").await.unwrap();
 
-        let new_proc = ProcessorRef {
-            name: "proc".into(),
-            version: "2.0.0".into(),
-        };
+        let new_proc = ProcessorRef::new("proc", "2.0.0");
         mgr.upgrade_canary(
             "can",
             new_proc,
@@ -988,10 +967,7 @@ mod tests {
         mgr.create(make_pipeline("can-rb")).await.unwrap();
         mgr.start("can-rb", "test").await.unwrap();
 
-        let new_proc = ProcessorRef {
-            name: "proc".into(),
-            version: "2.0.0".into(),
-        };
+        let new_proc = ProcessorRef::new("proc", "2.0.0");
         mgr.upgrade_canary(
             "can-rb",
             new_proc,
@@ -1019,10 +995,7 @@ mod tests {
         mgr.create(make_pipeline("can-empty")).await.unwrap();
         mgr.start("can-empty", "test").await.unwrap();
 
-        let new_proc = ProcessorRef {
-            name: "proc".into(),
-            version: "2.0.0".into(),
-        };
+        let new_proc = ProcessorRef::new("proc", "2.0.0");
         let result = mgr
             .upgrade_canary(
                 "can-empty",
@@ -1041,10 +1014,7 @@ mod tests {
         mgr.create(make_pipeline("can-hist")).await.unwrap();
         mgr.start("can-hist", "test").await.unwrap();
 
-        let new_proc = ProcessorRef {
-            name: "proc".into(),
-            version: "2.0.0".into(),
-        };
+        let new_proc = ProcessorRef::new("proc", "2.0.0");
         mgr.upgrade_canary(
             "can-hist",
             new_proc,

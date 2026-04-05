@@ -3,7 +3,7 @@
 //! Connects to a WebTransport server and sends outputs as
 //! length-prefixed messages on bidirectional streams.
 
-use aeon_types::{AeonError, Output, Sink};
+use aeon_types::{AeonError, BatchResult, Output, Sink};
 
 /// Configuration for `WebTransportSink`.
 pub struct WebTransportSinkConfig {
@@ -61,24 +61,27 @@ impl WebTransportSink {
 }
 
 impl Sink for WebTransportSink {
-    async fn write_batch(&mut self, outputs: Vec<Output>) -> Result<(), AeonError> {
-        let opening = self.connection.open_bi().await.map_err(|e| {
-            AeonError::connection(format!("webtransport open stream failed: {e}"))
-        })?;
-        let (mut send, _recv) = opening.await.map_err(|e| {
-            AeonError::connection(format!("webtransport stream open failed: {e}"))
-        })?;
+    async fn write_batch(&mut self, outputs: Vec<Output>) -> Result<BatchResult, AeonError> {
+        let ids: Vec<_> = outputs
+            .iter()
+            .filter_map(|o| o.source_event_id)
+            .collect();
+        let opening =
+            self.connection.open_bi().await.map_err(|e| {
+                AeonError::connection(format!("webtransport open stream failed: {e}"))
+            })?;
+        let (mut send, _recv) = opening
+            .await
+            .map_err(|e| AeonError::connection(format!("webtransport stream open failed: {e}")))?;
 
         for output in &outputs {
             let len = output.payload.len() as u32;
             send.write_all(&len.to_le_bytes()).await.map_err(|e| {
                 AeonError::connection(format!("webtransport write length failed: {e}"))
             })?;
-            send.write_all(output.payload.as_ref())
-                .await
-                .map_err(|e| {
-                    AeonError::connection(format!("webtransport write payload failed: {e}"))
-                })?;
+            send.write_all(output.payload.as_ref()).await.map_err(|e| {
+                AeonError::connection(format!("webtransport write payload failed: {e}"))
+            })?;
             self.delivered += 1;
         }
 
@@ -86,7 +89,7 @@ impl Sink for WebTransportSink {
             AeonError::connection(format!("webtransport finish stream failed: {e}"))
         })?;
 
-        Ok(())
+        Ok(BatchResult::all_delivered(ids))
     }
 
     async fn flush(&mut self) -> Result<(), AeonError> {

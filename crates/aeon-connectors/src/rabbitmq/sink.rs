@@ -3,7 +3,7 @@
 //! Publishes outputs to a RabbitMQ exchange. Each output becomes an AMQP
 //! basic.publish with the payload as the message body.
 
-use aeon_types::{AeonError, Output, Sink};
+use aeon_types::{AeonError, BatchResult, Output, Sink};
 use lapin::options::*;
 use lapin::types::FieldTable;
 use lapin::{BasicProperties, Channel, Connection, ConnectionProperties};
@@ -85,13 +85,12 @@ impl RabbitMqSink {
     pub async fn new(config: RabbitMqSinkConfig) -> Result<Self, AeonError> {
         let conn = Connection::connect(&config.uri, ConnectionProperties::default())
             .await
-            .map_err(|e| {
-                AeonError::connection(format!("rabbitmq connect failed: {e}"))
-            })?;
+            .map_err(|e| AeonError::connection(format!("rabbitmq connect failed: {e}")))?;
 
-        let channel = conn.create_channel().await.map_err(|e| {
-            AeonError::connection(format!("rabbitmq channel create failed: {e}"))
-        })?;
+        let channel = conn
+            .create_channel()
+            .await
+            .map_err(|e| AeonError::connection(format!("rabbitmq channel create failed: {e}")))?;
 
         // Enable publisher confirms if configured
         if config.publisher_confirms {
@@ -148,7 +147,11 @@ impl RabbitMqSink {
 }
 
 impl Sink for RabbitMqSink {
-    async fn write_batch(&mut self, outputs: Vec<Output>) -> Result<(), AeonError> {
+    async fn write_batch(&mut self, outputs: Vec<Output>) -> Result<BatchResult, AeonError> {
+        let ids = outputs
+            .iter()
+            .filter_map(|o| o.source_event_id)
+            .collect();
         for output in &outputs {
             let confirm = self
                 .channel
@@ -162,9 +165,7 @@ impl Sink for RabbitMqSink {
                         .with_content_type("application/octet-stream".into()),
                 )
                 .await
-                .map_err(|e| {
-                    AeonError::connection(format!("rabbitmq publish failed: {e}"))
-                })?;
+                .map_err(|e| AeonError::connection(format!("rabbitmq publish failed: {e}")))?;
 
             if self.config.publisher_confirms {
                 confirm.await.map_err(|e| {
@@ -175,7 +176,7 @@ impl Sink for RabbitMqSink {
             self.delivered += 1;
         }
 
-        Ok(())
+        Ok(BatchResult::all_delivered(ids))
     }
 
     async fn flush(&mut self) -> Result<(), AeonError> {

@@ -4,7 +4,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Default REST API address for CLI commands.
-const DEFAULT_API: &str = "http://localhost:4471";
+/// Overridable via `AEON_API_URL` environment variable (12-Factor Config).
+fn default_api() -> String {
+    std::env::var("AEON_API_URL").unwrap_or_else(|_| "http://localhost:4471".into())
+}
 
 #[derive(Parser)]
 #[command(
@@ -47,7 +50,7 @@ enum Commands {
     /// Manage processors in the registry
     Processor {
         /// Aeon REST API address
-        #[arg(long, default_value = DEFAULT_API, global = true)]
+        #[arg(long, default_value_t = default_api(), global = true)]
         api: String,
         #[command(subcommand)]
         action: ProcessorAction,
@@ -55,7 +58,7 @@ enum Commands {
     /// Manage pipelines
     Pipeline {
         /// Aeon REST API address
-        #[arg(long, default_value = DEFAULT_API, global = true)]
+        #[arg(long, default_value_t = default_api(), global = true)]
         api: String,
         #[command(subcommand)]
         action: PipelineAction,
@@ -74,13 +77,13 @@ enum Commands {
         #[arg(long)]
         version: String,
         /// Aeon REST API address
-        #[arg(long, default_value = DEFAULT_API)]
+        #[arg(long, default_value_t = default_api())]
         api: String,
     },
     /// Show real-time pipeline status (simple text dashboard)
     Top {
         /// Aeon REST API address
-        #[arg(long, default_value = DEFAULT_API)]
+        #[arg(long, default_value_t = default_api())]
         api: String,
     },
     /// Verify PoH/Merkle chain integrity (placeholder)
@@ -89,7 +92,7 @@ enum Commands {
         #[arg(default_value = "all")]
         target: String,
         /// Aeon REST API address
-        #[arg(long, default_value = DEFAULT_API)]
+        #[arg(long, default_value_t = default_api())]
         api: String,
     },
     /// Apply a YAML manifest (declarative processors + pipelines)
@@ -98,7 +101,7 @@ enum Commands {
         #[arg(short, long)]
         file: PathBuf,
         /// Aeon REST API address
-        #[arg(long, default_value = DEFAULT_API)]
+        #[arg(long, default_value_t = default_api())]
         api: String,
         /// Dry run (show what would change without applying)
         #[arg(long)]
@@ -110,7 +113,7 @@ enum Commands {
         #[arg(short, long)]
         file: Option<PathBuf>,
         /// Aeon REST API address
-        #[arg(long, default_value = DEFAULT_API)]
+        #[arg(long, default_value_t = default_api())]
         api: String,
     },
     /// Diff a manifest against the current state
@@ -119,7 +122,7 @@ enum Commands {
         #[arg(short, long)]
         file: PathBuf,
         /// Aeon REST API address
-        #[arg(long, default_value = DEFAULT_API)]
+        #[arg(long, default_value_t = default_api())]
         api: String,
     },
     /// Start/stop the local development environment (Redpanda)
@@ -161,6 +164,37 @@ enum ProcessorAction {
         /// Version to delete
         #[arg(long)]
         version: String,
+    },
+    /// Manage processor identities (ED25519 keys for T3/T4 auth)
+    Identity {
+        /// Processor name
+        name: String,
+        #[command(subcommand)]
+        action: IdentityAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum IdentityAction {
+    /// Register an ED25519 public key for a processor
+    Add {
+        /// ED25519 public key ("ed25519:<base64>")
+        #[arg(long)]
+        public_key: String,
+        /// Comma-separated pipeline names (or "all" for all matching)
+        #[arg(long, default_value = "all")]
+        pipelines: String,
+        /// Maximum concurrent connections
+        #[arg(long, default_value = "1")]
+        max_instances: u32,
+    },
+    /// List registered identities for a processor
+    List,
+    /// Revoke a processor identity by fingerprint
+    Revoke {
+        /// Key fingerprint (SHA256:...)
+        #[arg(long)]
+        fingerprint: String,
     },
 }
 
@@ -274,9 +308,41 @@ fn main() -> Result<()> {
     }
 }
 
+// ── Input validation ──────────────────────────────────────────────────
+
+/// Validate a resource name (processor, pipeline, project).
+/// Prevents path traversal (OWASP A03) and injection via names containing
+/// special characters, `..`, `/`, `\`, or control chars.
+fn validate_name(name: &str, kind: &str) -> Result<()> {
+    if name.is_empty() {
+        bail!("{kind} name must not be empty");
+    }
+    if name.len() > 128 {
+        bail!("{kind} name must be 128 characters or fewer");
+    }
+    if name.contains("..") || name.contains('/') || name.contains('\\') {
+        bail!("{kind} name must not contain '..', '/', or '\\'");
+    }
+    if name.starts_with('.') || name.starts_with('-') {
+        bail!("{kind} name must not start with '.' or '-'");
+    }
+    if name.chars().any(|c| c.is_control()) {
+        bail!("{kind} name must not contain control characters");
+    }
+    // Allow alphanumeric, hyphens, underscores, dots (not leading)
+    if !name
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        bail!("{kind} name may only contain alphanumeric characters, hyphens, underscores, and dots");
+    }
+    Ok(())
+}
+
 // ── aeon new ───────────────────────────────────────────────────────────
 
 fn cmd_new(name: &str, runtime: &Runtime, lang: &Lang) -> Result<()> {
+    validate_name(name, "project")?;
     match (runtime, lang) {
         (Runtime::Wasm, Lang::Rust) => scaffold_wasm_rust(name),
         (Runtime::Native, Lang::Rust) => scaffold_native_rust(name),
@@ -327,9 +393,9 @@ extern crate alloc;
 
 use aeon_wasm_sdk::prelude::*;
 
-fn process(event: Event) -> Vec<WasmOutput> {{
+fn process(event: Event) -> Vec<Output> {{
     // Passthrough: forward payload to "output" topic
-    vec![WasmOutput::new("output", event.payload.clone())]
+    vec![Output::new("output", event.payload.clone())]
 }}
 
 aeon_processor!(process);
@@ -390,13 +456,8 @@ struct MyProcessor;
 impl Processor for MyProcessor {{
     fn process(&self, event: Event) -> Result<Vec<Output>, AeonError> {{
         // Passthrough: forward payload to "output" topic
-        Ok(vec![Output {{
-            destination: Arc::from("output"),
-            key: None,
-            payload: event.payload.clone(),
-            headers: Default::default(),
-            source_ts: event.source_ts,
-        }}])
+        Ok(vec![Output::new(Arc::from("output"), event.payload.clone())
+            .with_event_identity(&event)])
     }}
 
     fn process_batch(&self, events: Vec<Event>) -> Result<Vec<Output>, AeonError> {{
@@ -782,11 +843,10 @@ fn cmd_processor(api: &str, action: &ProcessorAction) -> Result<()> {
                 },
             });
 
-            let body: serde_json::Value =
-                ureq::post(&format!("{api}/api/v1/processors"))
-                    .send_json(&payload)
-                    .context("failed to register processor")?
-                    .into_json()?;
+            let body: serde_json::Value = ureq::post(&format!("{api}/api/v1/processors"))
+                .send_json(&payload)
+                .context("failed to register processor")?
+                .into_json()?;
             println!("{}", serde_json::to_string_pretty(&body)?);
             Ok(())
         }
@@ -798,6 +858,82 @@ fn cmd_processor(api: &str, action: &ProcessorAction) -> Result<()> {
             .context("failed to delete processor version")?
             .into_json()?;
             println!("{}", serde_json::to_string_pretty(&body)?);
+            Ok(())
+        }
+        ProcessorAction::Identity { name, action: id_action } => {
+            cmd_identity(api, name, id_action)
+        }
+    }
+}
+
+// ── aeon processor identity ──────────────────────────────────────────
+
+fn cmd_identity(api: &str, name: &str, action: &IdentityAction) -> Result<()> {
+    match action {
+        IdentityAction::Add {
+            public_key,
+            pipelines,
+            max_instances,
+        } => {
+            let allowed_pipelines = if pipelines == "all" {
+                serde_json::json!("all-matching-pipelines")
+            } else {
+                let names: Vec<&str> = pipelines.split(',').map(str::trim).collect();
+                serde_json::json!({"named": names})
+            };
+
+            let body = serde_json::json!({
+                "public_key": public_key,
+                "allowed_pipelines": allowed_pipelines,
+                "max_instances": max_instances,
+            });
+
+            let resp: serde_json::Value = ureq::post(&format!(
+                "{api}/api/v1/processors/{name}/identities"
+            ))
+            .send_json(&body)
+            .context("failed to register identity")?
+            .into_json()?;
+            println!("{}", serde_json::to_string_pretty(&resp)?);
+            Ok(())
+        }
+        IdentityAction::List => {
+            let body: serde_json::Value = ureq::get(&format!(
+                "{api}/api/v1/processors/{name}/identities"
+            ))
+            .call()
+            .context("failed to list identities")?
+            .into_json()?;
+
+            let empty_vec = vec![];
+            let identities = body["identities"].as_array().unwrap_or(&empty_vec);
+            if identities.is_empty() {
+                println!("No identities registered for '{name}'.");
+            } else {
+                println!("{:<50} {:<8} {:<20}", "FINGERPRINT", "STATUS", "PIPELINES");
+                for id in identities {
+                    let fp = id["fingerprint"].as_str().unwrap_or("?");
+                    let status = if id["revoked_at"].is_null() {
+                        "active"
+                    } else {
+                        "revoked"
+                    };
+                    let pipelines = serde_json::to_string(&id["allowed_pipelines"])
+                        .unwrap_or_else(|_| "?".into());
+                    println!("{:<50} {:<8} {:<20}", fp, status, pipelines);
+                }
+            }
+            Ok(())
+        }
+        IdentityAction::Revoke { fingerprint } => {
+            let encoded_fp = fingerprint.replace(':', "%3A");
+            let resp: serde_json::Value = ureq::delete(&format!(
+                "{api}/api/v1/processors/{name}/identities/{encoded_fp}"
+            ))
+            .call()
+            .context("failed to revoke identity")?
+            .into_json()?;
+            println!("{}", serde_json::to_string_pretty(&resp)?);
             Ok(())
         }
     }
@@ -829,11 +965,10 @@ fn cmd_pipeline(api: &str, action: &PipelineAction) -> Result<()> {
             Ok(())
         }
         PipelineAction::Inspect { name } => {
-            let body: serde_json::Value =
-                ureq::get(&format!("{api}/api/v1/pipelines/{name}"))
-                    .call()
-                    .context("failed to reach Aeon API")?
-                    .into_json()?;
+            let body: serde_json::Value = ureq::get(&format!("{api}/api/v1/pipelines/{name}"))
+                .call()
+                .context("failed to reach Aeon API")?
+                .into_json()?;
             println!("{}", serde_json::to_string_pretty(&body)?);
             Ok(())
         }
@@ -843,11 +978,10 @@ fn cmd_pipeline(api: &str, action: &PipelineAction) -> Result<()> {
             let payload: serde_json::Value =
                 serde_json::from_str(&content).context("invalid JSON in pipeline definition")?;
 
-            let body: serde_json::Value =
-                ureq::post(&format!("{api}/api/v1/pipelines"))
-                    .send_json(&payload)
-                    .context("failed to create pipeline")?
-                    .into_json()?;
+            let body: serde_json::Value = ureq::post(&format!("{api}/api/v1/pipelines"))
+                .send_json(&payload)
+                .context("failed to create pipeline")?
+                .into_json()?;
             println!("{}", serde_json::to_string_pretty(&body)?);
             Ok(())
         }
@@ -951,11 +1085,10 @@ fn cmd_pipeline(api: &str, action: &PipelineAction) -> Result<()> {
             Ok(())
         }
         PipelineAction::Delete { name } => {
-            let body: serde_json::Value =
-                ureq::delete(&format!("{api}/api/v1/pipelines/{name}"))
-                    .call()
-                    .context("failed to delete pipeline")?
-                    .into_json()?;
+            let body: serde_json::Value = ureq::delete(&format!("{api}/api/v1/pipelines/{name}"))
+                .call()
+                .context("failed to delete pipeline")?
+                .into_json()?;
             println!("{}", serde_json::to_string_pretty(&body)?);
             Ok(())
         }
@@ -1048,16 +1181,15 @@ fn cmd_top(api: &str) -> Result<()> {
         let name = item["name"].as_str().unwrap_or("-");
 
         // Fetch full details
-        let detail: serde_json::Value = match ureq::get(&format!("{api}/api/v1/pipelines/{name}"))
-            .call()
-        {
-            Ok(resp) => resp.into_json().unwrap_or_default(),
-            Err(_) => serde_json::json!({}),
-        };
+        let detail: serde_json::Value =
+            match ureq::get(&format!("{api}/api/v1/pipelines/{name}")).call() {
+                Ok(resp) => resp.into_json().unwrap_or_default(),
+                Err(_) => serde_json::json!({}),
+            };
 
-        let state = detail["state"].as_str().unwrap_or(
-            item["state"].as_str().unwrap_or("-"),
-        );
+        let state = detail["state"]
+            .as_str()
+            .unwrap_or(item["state"].as_str().unwrap_or("-"));
         let proc_name = detail["processor"]["name"].as_str().unwrap_or("-");
         let proc_ver = detail["processor"]["version"].as_str().unwrap_or("-");
         let proc_str = format!("{proc_name}:{proc_ver}");
@@ -1068,15 +1200,11 @@ fn cmd_top(api: &str) -> Result<()> {
                 .unwrap_or("unknown");
             match strategy {
                 "canary" => {
-                    let pct = detail["upgrade_state"]["traffic_pct"]
-                        .as_u64()
-                        .unwrap_or(0);
+                    let pct = detail["upgrade_state"]["traffic_pct"].as_u64().unwrap_or(0);
                     format!("canary {pct}%")
                 }
                 "blue-green" => {
-                    let active = detail["upgrade_state"]["active"]
-                        .as_str()
-                        .unwrap_or("blue");
+                    let active = detail["upgrade_state"]["active"].as_str().unwrap_or("blue");
                     format!("bg:{active}")
                 }
                 _ => strategy.to_string(),
@@ -1085,7 +1213,10 @@ fn cmd_top(api: &str) -> Result<()> {
             "-".to_string()
         };
 
-        println!("{:<25} {:<12} {:<20} {:<12}", name, state, proc_str, upgrade);
+        println!(
+            "{:<25} {:<12} {:<20} {:<12}",
+            name, state, proc_str, upgrade
+        );
     }
     Ok(())
 }
@@ -1124,9 +1255,21 @@ struct Manifest {
     pipelines: Vec<serde_json::Value>,
 }
 
+/// Maximum YAML manifest size (1 MB) to prevent resource exhaustion (OWASP A04).
+const MAX_MANIFEST_SIZE: u64 = 1024 * 1024;
+
 fn cmd_apply(file: &Path, api: &str, dry_run: bool) -> Result<()> {
-    let content =
-        std::fs::read_to_string(file).with_context(|| format!("failed to read {}", file.display()))?;
+    let metadata = std::fs::metadata(file)
+        .with_context(|| format!("failed to stat {}", file.display()))?;
+    if metadata.len() > MAX_MANIFEST_SIZE {
+        bail!(
+            "manifest file exceeds maximum size ({} bytes > {} bytes)",
+            metadata.len(),
+            MAX_MANIFEST_SIZE
+        );
+    }
+    let content = std::fs::read_to_string(file)
+        .with_context(|| format!("failed to read {}", file.display()))?;
     let manifest: Manifest = serde_yaml::from_str(&content).context("invalid YAML manifest")?;
 
     if manifest.pipelines.is_empty() {
@@ -1212,8 +1355,8 @@ fn cmd_export(file: Option<&Path>, api: &str) -> Result<()> {
 }
 
 fn cmd_diff(file: &Path, api: &str) -> Result<()> {
-    let content =
-        std::fs::read_to_string(file).with_context(|| format!("failed to read {}", file.display()))?;
+    let content = std::fs::read_to_string(file)
+        .with_context(|| format!("failed to read {}", file.display()))?;
     let manifest: Manifest = serde_yaml::from_str(&content).context("invalid YAML manifest")?;
 
     let existing: serde_json::Value = ureq::get(&format!("{api}/api/v1/pipelines"))

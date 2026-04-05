@@ -32,7 +32,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::{Event, WasmOutput};
+use crate::{Event, Output};
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
@@ -154,7 +154,7 @@ pub fn deserialize_event(data: &[u8]) -> Option<Event> {
 ///
 /// The result does NOT include the 4-byte length prefix — the caller
 /// (the `aeon_processor!` macro) prepends that.
-pub fn serialize_outputs(outputs: &[WasmOutput]) -> Vec<u8> {
+pub fn serialize_outputs(outputs: &[Output]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(256);
 
     // Output count
@@ -293,7 +293,7 @@ mod tests {
 
     #[test]
     fn serialize_single_output_no_key() {
-        let output = WasmOutput::new("dest", b"data".to_vec());
+        let output = Output::new("dest", b"data".to_vec());
         let result = serialize_outputs(&[output]);
 
         // Parse it back manually
@@ -325,7 +325,7 @@ mod tests {
 
     #[test]
     fn serialize_output_with_key_and_headers() {
-        let output = WasmOutput::new("topic-out", b"payload".to_vec())
+        let output = Output::new("topic-out", b"payload".to_vec())
             .with_key_str("my-key")
             .with_header("h1", "v1");
 
@@ -373,9 +373,9 @@ mod tests {
     #[test]
     fn serialize_multiple_outputs() {
         let outputs = vec![
-            WasmOutput::new("a", b"1".to_vec()),
-            WasmOutput::new("b", b"2".to_vec()),
-            WasmOutput::new("c", b"3".to_vec()),
+            Output::new("a", b"1".to_vec()),
+            Output::new("b", b"2".to_vec()),
+            Output::new("c", b"3".to_vec()),
         ];
         let result = serialize_outputs(&outputs);
 
@@ -413,7 +413,7 @@ mod tests {
 
     #[test]
     fn output_builder_api() {
-        let out = WasmOutput::from_str("dest", "hello world")
+        let out = Output::from_str("dest", "hello world")
             .with_key(vec![1, 2, 3])
             .with_header("content-type", "text/plain")
             .with_header("x-source", "test");

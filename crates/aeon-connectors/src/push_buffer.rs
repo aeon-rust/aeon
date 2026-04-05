@@ -88,7 +88,7 @@ impl PushBufferRx {
         match tokio::time::timeout(poll_timeout, self.rx.recv()).await {
             Ok(Some(event)) => events.push(event),
             Ok(None) => return Ok(Vec::new()), // Channel closed
-            Err(_) => return Ok(events),        // Timeout — empty batch
+            Err(_) => return Ok(events),       // Timeout — empty batch
         }
 
         // Drain additional events with short timeout
@@ -206,10 +206,7 @@ mod tests {
     #[tokio::test]
     async fn test_push_buffer_timeout_empty() {
         let (_tx, mut rx) = push_buffer(PushBufferConfig::default());
-        let batch = rx
-            .next_batch(Duration::from_millis(50))
-            .await
-            .unwrap();
+        let batch = rx.next_batch(Duration::from_millis(50)).await.unwrap();
         assert!(batch.is_empty());
     }
 

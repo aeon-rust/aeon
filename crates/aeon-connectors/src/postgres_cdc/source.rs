@@ -95,9 +95,7 @@ impl PostgresCdcSource {
     pub async fn new(config: PostgresCdcSourceConfig) -> Result<Self, AeonError> {
         let (client, connection) = tokio_postgres::connect(&config.connection_string, NoTls)
             .await
-            .map_err(|e| {
-                AeonError::connection(format!("postgres connect failed: {e}"))
-            })?;
+            .map_err(|e| AeonError::connection(format!("postgres connect failed: {e}")))?;
 
         let conn_handle = tokio::spawn(async move {
             if let Err(e) = connection.await {
@@ -146,9 +144,7 @@ impl Source for PostgresCdcSource {
         // This returns text-format changes from the pgoutput plugin
         let query = format!(
             "SELECT lsn::text, xid, data FROM pg_logical_slot_get_changes('{}', NULL, {}, 'proto_version', '1', 'publication_names', '{}')",
-            self.config.slot_name,
-            self.config.batch_size,
-            self.config.publication,
+            self.config.slot_name, self.config.batch_size, self.config.publication,
         );
 
         let rows = self.client.simple_query(&query).await.map_err(|e| {
@@ -172,8 +168,7 @@ impl Source for PostgresCdcSource {
                     "slot": self.config.slot_name,
                 });
 
-                let payload_bytes =
-                    Bytes::from(serde_json::to_vec(&payload).unwrap_or_default());
+                let payload_bytes = Bytes::from(serde_json::to_vec(&payload).unwrap_or_default());
 
                 let mut event = Event::new(
                     uuid::Uuid::nil(),

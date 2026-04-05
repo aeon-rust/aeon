@@ -71,9 +71,7 @@ impl WebTransportDatagramSource {
     /// Bind and start the datagram source.
     ///
     /// Returns `Err` if `accept_loss` is not set to `true`.
-    pub async fn new(
-        config: WebTransportDatagramSourceConfig,
-    ) -> Result<Self, AeonError> {
+    pub async fn new(config: WebTransportDatagramSourceConfig) -> Result<Self, AeonError> {
         if !config.accept_loss {
             return Err(AeonError::config(
                 "WebTransportDatagramSource requires accept_loss: true — \
@@ -82,10 +80,9 @@ impl WebTransportDatagramSource {
             ));
         }
 
-        let endpoint = wtransport::Endpoint::server(config.server_config)
-            .map_err(|e| {
-                AeonError::connection(format!("webtransport datagram bind failed: {e}"))
-            })?;
+        let endpoint = wtransport::Endpoint::server(config.server_config).map_err(|e| {
+            AeonError::connection(format!("webtransport datagram bind failed: {e}"))
+        })?;
 
         tracing::info!("WebTransportDatagramSource listening (lossy mode)");
 

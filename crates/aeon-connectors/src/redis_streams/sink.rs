@@ -3,7 +3,7 @@
 //! Each output is added to a Redis Stream as an entry with a "data" field
 //! containing the output payload.
 
-use aeon_types::{AeonError, Output, Sink};
+use aeon_types::{AeonError, BatchResult, Output, Sink};
 use redis::AsyncCommands;
 use redis::aio::MultiplexedConnection;
 
@@ -47,13 +47,13 @@ pub struct RedisSink {
 impl RedisSink {
     /// Connect to Redis.
     pub async fn new(config: RedisSinkConfig) -> Result<Self, AeonError> {
-        let client = redis::Client::open(config.url.as_str()).map_err(|e| {
-            AeonError::connection(format!("redis client create failed: {e}"))
-        })?;
+        let client = redis::Client::open(config.url.as_str())
+            .map_err(|e| AeonError::connection(format!("redis client create failed: {e}")))?;
 
-        let conn = client.get_multiplexed_async_connection().await.map_err(|e| {
-            AeonError::connection(format!("redis connect failed: {e}"))
-        })?;
+        let conn = client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| AeonError::connection(format!("redis connect failed: {e}")))?;
 
         tracing::info!(stream = %config.stream_key, "RedisSink connected");
 
@@ -71,7 +71,11 @@ impl RedisSink {
 }
 
 impl Sink for RedisSink {
-    async fn write_batch(&mut self, outputs: Vec<Output>) -> Result<(), AeonError> {
+    async fn write_batch(&mut self, outputs: Vec<Output>) -> Result<BatchResult, AeonError> {
+        let ids: Vec<_> = outputs
+            .iter()
+            .filter_map(|o| o.source_event_id)
+            .collect();
         for output in &outputs {
             let payload_str = String::from_utf8_lossy(output.payload.as_ref());
 
@@ -99,23 +103,19 @@ impl Sink for RedisSink {
                     .arg(&fields)
                     .query_async(&mut self.conn)
                     .await
-                    .map_err(|e| {
-                        AeonError::connection(format!("redis XADD failed: {e}"))
-                    })?;
+                    .map_err(|e| AeonError::connection(format!("redis XADD failed: {e}")))?;
             } else {
                 let _: String = self
                     .conn
                     .xadd(&self.config.stream_key, "*", &fields)
                     .await
-                    .map_err(|e| {
-                        AeonError::connection(format!("redis XADD failed: {e}"))
-                    })?;
+                    .map_err(|e| AeonError::connection(format!("redis XADD failed: {e}")))?;
             }
 
             self.delivered += 1;
         }
 
-        Ok(())
+        Ok(BatchResult::all_delivered(ids))
     }
 
     async fn flush(&mut self) -> Result<(), AeonError> {
