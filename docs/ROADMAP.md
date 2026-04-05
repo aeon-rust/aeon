@@ -476,7 +476,11 @@ Universal processor development model enabling 26+ programming languages across 
 - `ProcessorTransport` async trait: one interface for all four tiers
 - `InProcessTransport`: zero-cost sync→async adapter for T1/T2 (compiler optimizes away)
 - `WebTransportTransport` / `WebSocketTransport`: network transports for T3/T4
-- AWPP (Aeon Wire Processor Protocol): control stream + binary data streams
+- AWPP (Aeon Wire Processor Protocol): control stream (JSON) + binary data streams
+- Transport codec: MessagePack (default) or JSON (fallback), configurable per-pipeline
+  - Codec applies to Event/Output envelope serialization within AWPP batch frames (T3/T4 only)
+  - Event.payload passes through as opaque bytes — user data format is user's domain
+  - Negotiated during AWPP handshake; pipeline config takes precedence over processor preference
 
 **Security (Aeon-managed processor RBAC for T3/T4, four-layer model):**
 - Layer 1: TLS 1.3 mandatory (QUIC = always TLS; WSS required in production for T4)
@@ -567,7 +571,7 @@ Universal processor development model enabling 26+ programming languages across 
     - **Scala**: T3 via Netty QUIC (shares Java SDK core). `http4s` integration.
     - **Haskell**: T4 via `websockets` (Hackage). Binary deployment.
 
-**New dependencies**: `ed25519-dalek`, `jsonwebtoken` (feature-gated behind `oauth`)
+**New dependencies**: `ed25519-dalek`, `rmp-serde`, `jsonwebtoken` (feature-gated behind `oauth`)
 
 **Acceptance (Phase 12b core, 12b-1 through 12b-8)**:
 - All existing T1/T2 tests pass unchanged via `InProcessTransport`

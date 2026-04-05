@@ -11,6 +11,8 @@
 //!   `[8B batch_id][4B event_count][per event: 4B output_count, per output: 4B len + bytes][4B CRC32][64B signature]`
 
 use aeon_types::error::AeonError;
+use aeon_types::event::{Event, Output};
+use aeon_types::transport_codec::TransportCodec;
 
 // ── Request ──────────────────────────────────────────────────────────────
 
@@ -249,6 +251,77 @@ pub fn deserialize_batch_response(data: &[u8]) -> Result<BatchResponse<'_>, Aeon
     })
 }
 
+// ── Codec-aware helpers ─────────────────────────────────────────────────
+
+/// Serialize a batch of Events into a wire-format request using the given codec.
+///
+/// Encodes each event via the codec, then wraps in the batch frame with CRC32.
+pub fn encode_batch_request(
+    batch_id: u64,
+    events: &[Event],
+    codec: TransportCodec,
+) -> Result<Vec<u8>, AeonError> {
+    let encoded = codec.encode_events(events)?;
+    let slices: Vec<&[u8]> = encoded.iter().map(|e| e.as_slice()).collect();
+    Ok(serialize_batch_request(batch_id, &slices))
+}
+
+/// Deserialize a wire-format batch request into Events using the given codec.
+pub fn decode_batch_request(
+    data: &[u8],
+    codec: TransportCodec,
+) -> Result<(u64, Vec<Event>), AeonError> {
+    let parsed = deserialize_batch_request(data)?;
+    let events = codec.decode_events(&parsed.events)?;
+    Ok((parsed.batch_id, events))
+}
+
+/// Serialize a batch of Outputs (grouped per input event) into a wire-format
+/// response using the given codec.
+pub fn encode_batch_response(
+    batch_id: u64,
+    outputs_per_event: &[Vec<Output>],
+    signature: &[u8; 64],
+    codec: TransportCodec,
+) -> Result<Vec<u8>, AeonError> {
+    let mut encoded_groups: Vec<Vec<Vec<u8>>> = Vec::with_capacity(outputs_per_event.len());
+    for group in outputs_per_event {
+        encoded_groups.push(codec.encode_outputs(group)?);
+    }
+    let wire_groups: Vec<Vec<&[u8]>> = encoded_groups
+        .iter()
+        .map(|g| g.iter().map(|o| o.as_slice()).collect())
+        .collect();
+    Ok(serialize_batch_response(batch_id, &wire_groups, signature))
+}
+
+/// Decoded batch response with typed Outputs.
+pub struct DecodedBatchResponse {
+    /// Batch identifier.
+    pub batch_id: u64,
+    /// Per-input-event decoded outputs.
+    pub outputs_per_event: Vec<Vec<Output>>,
+    /// ED25519 signature bytes.
+    pub signature: Vec<u8>,
+}
+
+/// Deserialize a wire-format batch response into Outputs using the given codec.
+pub fn decode_batch_response(
+    data: &[u8],
+    codec: TransportCodec,
+) -> Result<DecodedBatchResponse, AeonError> {
+    let parsed = deserialize_batch_response(data)?;
+    let mut all_outputs = Vec::with_capacity(parsed.outputs_per_event.len());
+    for group in &parsed.outputs_per_event {
+        all_outputs.push(codec.decode_outputs(group)?);
+    }
+    Ok(DecodedBatchResponse {
+        batch_id: parsed.batch_id,
+        outputs_per_event: all_outputs,
+        signature: parsed.signature.to_vec(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,6 +411,91 @@ mod tests {
     #[test]
     fn response_too_short() {
         let result = deserialize_batch_response(&[0u8; 50]);
+        assert!(result.is_err());
+    }
+
+    // ── Codec-aware helper tests ────────────────────────────────────────
+
+    use std::sync::Arc;
+    use bytes::Bytes;
+    use aeon_types::partition::PartitionId;
+
+    fn make_test_event(id: u8) -> Event {
+        Event::new(
+            uuid::Uuid::from_bytes([id; 16]),
+            1712345678000000000,
+            Arc::from("test-source"),
+            PartitionId::new(0),
+            Bytes::from(format!("payload-{id}")),
+        )
+    }
+
+    fn make_test_output(id: u8) -> Output {
+        Output::new(
+            Arc::from("test-dest"),
+            Bytes::from(format!("output-{id}")),
+        )
+        .with_source_event_id(uuid::Uuid::from_bytes([id; 16]))
+    }
+
+    #[test]
+    fn encode_decode_batch_request_msgpack() {
+        let events = vec![make_test_event(1), make_test_event(2)];
+        let wire = encode_batch_request(42, &events, TransportCodec::MsgPack).unwrap();
+        let (batch_id, decoded) = decode_batch_request(&wire, TransportCodec::MsgPack).unwrap();
+
+        assert_eq!(batch_id, 42);
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].id, events[0].id);
+        assert_eq!(decoded[1].id, events[1].id);
+        assert_eq!(decoded[0].payload, events[0].payload);
+    }
+
+    #[test]
+    fn encode_decode_batch_request_json() {
+        let events = vec![make_test_event(3)];
+        let wire = encode_batch_request(7, &events, TransportCodec::Json).unwrap();
+        let (batch_id, decoded) = decode_batch_request(&wire, TransportCodec::Json).unwrap();
+
+        assert_eq!(batch_id, 7);
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(&*decoded[0].source, "test-source");
+    }
+
+    #[test]
+    fn encode_decode_batch_response_msgpack() {
+        let outputs = vec![
+            vec![make_test_output(1), make_test_output(2)],
+            vec![make_test_output(3)],
+        ];
+        let sig = [0xAAu8; 64];
+        let wire =
+            encode_batch_response(99, &outputs, &sig, TransportCodec::MsgPack).unwrap();
+        let resp = decode_batch_response(&wire, TransportCodec::MsgPack).unwrap();
+
+        assert_eq!(resp.batch_id, 99);
+        assert_eq!(resp.outputs_per_event.len(), 2);
+        assert_eq!(resp.outputs_per_event[0].len(), 2);
+        assert_eq!(resp.outputs_per_event[1].len(), 1);
+        assert_eq!(&*resp.outputs_per_event[0][0].destination, "test-dest");
+        assert_eq!(resp.signature, sig.to_vec());
+    }
+
+    #[test]
+    fn encode_decode_empty_batch_with_codec() {
+        let events: Vec<Event> = vec![];
+        let wire = encode_batch_request(0, &events, TransportCodec::MsgPack).unwrap();
+        let (batch_id, decoded) = decode_batch_request(&wire, TransportCodec::MsgPack).unwrap();
+        assert_eq!(batch_id, 0);
+        assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn cross_codec_request_fails() {
+        let events = vec![make_test_event(1)];
+        let wire = encode_batch_request(1, &events, TransportCodec::MsgPack).unwrap();
+        // Try decoding MsgPack-encoded events with JSON codec
+        let result = decode_batch_request(&wire, TransportCodec::Json);
         assert!(result.is_err());
     }
 }

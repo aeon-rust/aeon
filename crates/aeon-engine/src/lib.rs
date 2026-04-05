@@ -35,8 +35,10 @@ pub use affinity::{
 };
 pub use batch_tuner::{BatchTuner, FlushTuner};
 pub use batch_wire::{
-    BatchRequest, BatchResponse, deserialize_batch_request, deserialize_batch_response,
-    serialize_batch_request, serialize_batch_response,
+    BatchRequest, BatchResponse, DecodedBatchResponse, decode_batch_request,
+    decode_batch_response, deserialize_batch_request, deserialize_batch_response,
+    encode_batch_request, encode_batch_response, serialize_batch_request,
+    serialize_batch_response,
 };
 
 pub use checkpoint::{CheckpointReader, CheckpointRecord, CheckpointWriter};

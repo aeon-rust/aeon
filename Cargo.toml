@@ -33,7 +33,7 @@ homepage = "https://github.com/aeon-rust/aeon"
 # Core
 bytes = "1"
 smallvec = "1"
-uuid = { version = "1", features = ["v7"] }
+uuid = { version = "1", features = ["v7", "serde"] }
 thiserror = "2"
 anyhow = "1"
 
@@ -50,7 +50,9 @@ dashmap = "6"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
 bincode = "1"
+rmp-serde = "1"
 crc32fast = "1"
 
 # Kafka / Redpanda

@@ -250,6 +250,10 @@ pub struct PipelineDefinition {
     pub updated_at: i64,
     /// Node ID this pipeline is assigned to (for cluster mode).
     pub assigned_node: Option<u64>,
+    /// Transport codec for T3/T4 AWPP data stream serialization.
+    /// Defaults to MsgPack. Only applies when processor uses T3/T4 transport.
+    #[serde(default)]
+    pub transport_codec: crate::transport_codec::TransportCodec,
     /// In-progress upgrade state (blue-green or canary). None when stable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upgrade_state: Option<UpgradeInfo>,
@@ -274,6 +278,7 @@ impl PipelineDefinition {
             created_at: now,
             updated_at: now,
             assigned_node: None,
+            transport_codec: crate::transport_codec::TransportCodec::default(),
             upgrade_state: None,
         }
     }

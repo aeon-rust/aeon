@@ -775,7 +775,7 @@ Batch Request (Aeon → Processor):
 │ [4B: event_count u32 LE]                    │  Number of events
 │ for each event:                             │
 │   [4B: event_len u32 LE]                    │  Per-event length prefix
-│   [event_len bytes: serialized Event]       │  Standard wire format
+│   [event_len bytes: serialized Event]       │  Codec-encoded (see §8.4)
 │ [4B: checksum CRC32]                        │  Integrity check
 └─────────────────────────────────────────────┘
 
@@ -808,7 +808,7 @@ Simplified Batch Response:
 │   [4B: output_count u32 LE]                 │  Outputs for this event
 │   for each output:                          │
 │     [4B: output_len u32 LE]                 │
-│     [output_len bytes: serialized Output]   │
+│     [output_len bytes: serialized Output]   │  Codec-encoded (see §8.4)
 │ [4B: checksum CRC32]                        │
 └─────────────────────────────────────────────┘
 ```
@@ -862,6 +862,7 @@ in the registration message. This is `false` (or absent) when OAuth is not confi
     "oauth_token": "eyJhbGciOiJSUzI1NiIs...",
     "capabilities": ["batch"],
     "max_batch_size": 1024,
+    "transport_codec": "msgpack",
     "requested_pipelines": ["orders-pipeline", "payments-pipeline"],
     "binding": "dedicated"
 }
@@ -870,6 +871,10 @@ in the registration message. This is `false` (or absent) when OAuth is not confi
 The processor signs the nonce with its ED25519 private key. Aeon verifies the signature
 against the registered public key for this processor name. The `oauth_token` field is
 included when OAuth is required (omitted or null when OAuth is disabled).
+
+The `transport_codec` field specifies how Event/Output envelopes are serialized within
+batch frames on data streams (see §8.4). Valid values: `"msgpack"` (default), `"json"`.
+If omitted, defaults to `"msgpack"`. The control stream always uses JSON regardless.
 
 #### Step 3 — Aeon Validates:
 
@@ -914,6 +919,7 @@ If any check fails → reject with specific error code.
         }
     ],
     "wire_format": "binary/v1",
+    "transport_codec": "msgpack",
     "heartbeat_interval_ms": 5000,
     "batch_signing": true
 }
@@ -1035,6 +1041,64 @@ WebSocket Binary Frame:
 This ensures pipeline isolation even on a single WebSocket connection. The processor
 must include the correct pipeline name and partition in responses; Aeon validates that
 outputs are routed only to the correct pipeline's sink.
+
+### 8.5 Transport Codec (Event/Output Envelope Serialization)
+
+The batch frames in §8.1 carry length-prefixed `serialized Event` and `serialized Output`
+blobs. The **transport codec** determines how those Event/Output envelopes are serialized
+within the frames.
+
+**Important distinction**: The transport codec serializes the Event *envelope* (id,
+timestamp, source, partition, metadata, payload). The `Event.payload` field is the user's
+data — it passes through as opaque bytes regardless of codec. Aeon never interprets
+payload content.
+
+#### Supported Codecs
+
+| Codec | Wire ID | Description | Use Case |
+|-------|---------|-------------|----------|
+| **MessagePack** | `msgpack` | Binary, compact, schema-less | Default — best balance of speed, size, cross-language support |
+| **JSON** | `json` | Text, human-readable | Debugging, prototyping, languages with weak MsgPack support |
+
+#### Codec Negotiation
+
+The codec is configured **per-pipeline** and communicated during AWPP handshake:
+
+1. Processor declares preferred codec in Registration message (`transport_codec` field)
+2. Aeon confirms (or overrides to pipeline's configured codec) in Accepted response
+3. All subsequent data stream batches use the confirmed codec
+
+If the processor omits `transport_codec`, it defaults to `msgpack`. If the processor
+requests a codec that doesn't match the pipeline's configuration, Aeon responds with
+the pipeline's configured codec in the Accepted message — the processor must comply.
+
+#### Pipeline Configuration
+
+```yaml
+pipeline:
+  name: orders
+  transport_codec: msgpack   # default, can be omitted
+  source: ...
+  processor: ...
+  sink: ...
+```
+
+#### Performance Characteristics
+
+| Codec | Encode (per event) | Decode (per event) | Envelope Size (typical) |
+|-------|-------------------|-------------------|------------------------|
+| MessagePack | ~200ns | ~180ns | ~200-400B |
+| JSON | ~800ns | ~1μs | ~400-800B |
+
+At batch size 1024, the difference is ~600μs per batch — negligible compared to T3/T4
+network RTT (500μs-10ms). The codec choice is primarily about debuggability vs compactness,
+not performance.
+
+#### Scope
+
+- **Applies to**: T3 (WebTransport) and T4 (WebSocket) data streams only
+- **Does NOT apply to**: T1 (native, in-process), T2 (Wasm, uses its own binary wire format),
+  AWPP control stream (always JSON), cluster inter-node transport (uses Bincode)
 
 ---
 
@@ -2437,6 +2501,7 @@ These are P3/P4 priority and built on demand:
 | D14 | **Dedicated binding as default**, shared as opt-in | Dedicated is simpler, safer, easier to reason about. Shared requires careful pipeline isolation. Default to safe; let operators opt into shared when they understand the tradeoffs. | Shared as default — higher risk of data leakage; No shared mode — limits ROI for cost-conscious deployments |
 | D15 | **Per-pipeline data streams** in shared mode | Physical isolation even within shared mode. Aeon validates pipeline tag on every batch. Prevents cross-pipeline data leakage by construction. | Logical tagging without validation — vulnerable to processor bugs; Shared streams with pipeline field — harder to enforce |
 | D16 | **OAuth 2.0 Client Credentials as optional Layer 2.5** | Defense-in-depth: ED25519 key theft alone insufficient without valid OAuth token. Integrates with org's existing IdP (Keycloak, Auth0, Okta, Azure AD). Auto-expiring tokens limit exposure window. Independent audit stream via IdP. M2M flow — no MFA/device binding (not applicable to machine-to-machine). | OAuth-only — no per-batch signing, bearer tokens copyable; ED25519-only (current) — no IdP federation, single point of compromise; mTLS client certs — harder to manage across 26+ language SDKs |
+| D17 | **MessagePack default, JSON fallback for AWPP transport codec** | MsgPack is compact (~2x smaller than JSON), fast (~4x faster encode/decode), and has mature libraries in all target languages (Python, Go, JS, Java, C#, PHP, Ruby). JSON fallback for debugging and prototyping. Per-pipeline config because each pipeline has a dedicated processor — no need for per-processor codec when binding is dedicated. Codec only applies to T3/T4 data streams; T1/T2 are in-process and never serialize Event envelopes. | Protobuf — adds schema management (.proto files, codegen) for a fixed internal envelope; Bincode — Rust-only, excludes all T3/T4 target languages; JSON-only — 2x larger wire size, 4x slower encode; Configurable per-processor — unnecessary complexity given dedicated binding model |
 
 ---
 
@@ -2449,6 +2514,7 @@ These are P3/P4 priority and built on demand:
 | `crates/aeon-types/src/processor_transport.rs` | **New** | `ProcessorHealth`, `ProcessorInfo`, `ProcessorTier`, `ProcessorBinding`, `ProcessorConnectionConfig` |
 | `crates/aeon-types/src/processor_identity.rs` | **New** | `ProcessorIdentity`, `PipelineScope` (ED25519 identity types) |
 | `crates/aeon-types/src/registry.rs` | Modified | Add `WebTransport`/`WebSocket` to `ProcessorType`, extend `ProcessorVersion`, extend `ProcessorRef` with `binding`/`connection` |
+| `crates/aeon-types/src/transport_codec.rs` | **New** | `TransportCodec` enum, codec encode/decode for Event/Output envelopes (MsgPack + JSON) |
 | `crates/aeon-types/src/batch_wire.rs` | **New** | Batch framing serialization/deserialization (including ED25519 signature slot) |
 | `crates/aeon-engine/src/transport/mod.rs` | **New** | Transport module |
 | `crates/aeon-engine/src/transport/in_process.rs` | **New** | `InProcessTransport` adapter |
@@ -2472,6 +2538,7 @@ These are P3/P4 priority and built on demand:
 | `wtransport` | `aeon-engine` (optional) | T3 processor host | Yes (`aeon-connectors`) |
 | `tokio-tungstenite` | `aeon-engine` (optional) | T4 processor host | Yes (`aeon-connectors`) |
 | `futures-util` | `aeon-engine` (optional) | WebSocket stream handling | Yes (`aeon-connectors`) |
+| `rmp-serde` | `aeon-types`, `aeon-engine` | MessagePack Event/Output envelope codec | **New** |
 | `crc32fast` | `aeon-engine` | Batch checksum | Yes (already a dependency) |
 | `ed25519-dalek` | `aeon-engine`, `aeon-crypto` | ED25519 sign/verify for processor identity | **New** (but `aeon-crypto` already uses `sha2` + `hex`) |
 | `jsonwebtoken` | `aeon-engine` (optional) | JWT validation for OAuth 2.0 Layer 2.5 | **New** (feature-gated behind `oauth`) |

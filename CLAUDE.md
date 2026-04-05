@@ -225,7 +225,8 @@ cargo fmt --all -- --check
 |---------|----------|
 | Async runtime | Tokio (+ tokio-uring behind feature flag) |
 | Wasm runtime | Wasmtime (Component Model) |
-| Hot-path serialization | Bincode |
+| Hot-path serialization | Bincode (cluster inter-node) |
+| AWPP transport codec | MessagePack (default) / JSON (fallback), per-pipeline config |
 | Event IDs | UUIDv7 (per-core pre-generation pool) |
 | SIMD | memchr crate |
 | QUIC | quinn (not quiche) — async-native Tokio |

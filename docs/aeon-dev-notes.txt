@@ -16272,6 +16272,232 @@ claude's response:
  how do you think?
  
  ====================================================================================
+ claude's response:
  
+Now to your question about serialization format:
+
+  Currently, Aeon's Event.payload is bytes::Bytes — it's opaque at the engine level. The engine doesn't care what's inside; it just moves bytes through the
+  pipeline. Serialization only matters at two boundaries:
+
+  1. Batch wire framing (AWPP, T3/T4 transport) — currently uses a custom binary format with length-prefixed frames + CRC32
+  2. Event payload encoding — whatever the source produces (JSON from Kafka, Protobuf, etc.)
+
+  You're right that we should make this configurable. Here's what I'd recommend:
+
+  Approach: Configurable codec at the pipeline level
+
+  pipeline:
+    name: orders
+    codec: json          # or: msgpack, protobuf, bincode, raw
+    source: ...
+    processor: ...
+    sink: ...
+
+  - json — default, human-readable, debugging-friendly, ~3-5x slower than binary
+  - msgpack — compact binary, schema-less like JSON but ~2-10x faster, good middle ground
+  - bincode — fastest for Rust-to-Rust, but not cross-language
+  - protobuf — schema-enforced, best for cross-language with strict contracts
+  - raw — passthrough, no encoding/decoding (current behavior)
+
+  The codec would apply to the AWPP transport layer (how events are serialized over the wire to T3/T4 processors) and optionally to source/sink
+  serialization. The internal engine hot path stays zero-copy Bytes regardless.
+
+  For the AWPP batch wire format specifically, msgpack is a strong default — it's compact, fast, and has libraries in every language (important for T3/T4
+  where processors may be Python/JS/Go). JSON should be the fallback for debugging and simplicity.
+
+  Want me to implement this as a configurable codec abstraction, or would you prefer to discuss the design further first?
+
+✻ Baked for 3m 0s
+
+=======================================================================================
+ let us discuss in detail, once again, before you update roadmap and other documents and implement changes
+
+==========================================================================================
+claude's response:
+
+ Good call. Let me lay out the full picture so we can make a deliberate decision.
+
+  Where Serialization Happens in Aeon
+
+  There are three distinct serialization boundaries — each with different constraints:
+
+  Boundary 1: Event Envelope over AWPP (T3/T4 transport)
+
+  When a T3/T4 remote processor receives a batch, Aeon must serialize the Event struct (id, timestamp, source, partition, metadata, payload) across the
+  network. The processor deserializes it, processes, and sends back Output structs.
+
+  This is the envelope — the payload inside Event.payload is opaque bytes that pass through untouched.
+
+  ┌─ AWPP Binary Frame (batch_id, event_count, CRC32) ──────────┐
+  │  ┌─ Event Envelope Serialization (JSON? MsgPack? Proto?) ──┐ │
+  │  │  id: UUIDv7                                              │ │
+  │  │  timestamp: i64                                          │ │
+  │  │  source: "orders-topic"                                  │ │
+  │  │  partition: 3                                            │ │
+  │  │  metadata: [("trace-id", "abc123")]                      │ │
+  │  │  payload: <opaque bytes — user's data>                   │ │
+  │  └──────────────────────────────────────────────────────────┘ │
+  └──────────────────────────────────────────────────────────────┘
+
+  Boundary 2: Wasm SDK Wire Format (T2)
+
+  The existing aeon-wasm-sdk already has a custom binary format for crossing the Wasm boundary. This is memory-mapped, not network — different constraints
+  entirely. Already implemented, works well.
+
+  Boundary 3: User Payload Content
+
+  What's inside Event.payload. This is the user's data — Aeon doesn't interpret it. A Kafka source reads bytes, the processor gets bytes, the sink writes
+  bytes. The processor SDK in whatever language can parse it however it wants.
+
+  Aeon has no business dictating this format. That's the user's domain.
+
+  ---
+  So the Real Question
+
+  The question is specifically about Boundary 1: what format should the Event/Output envelope use when serialized for AWPP transport to T3/T4 processors?
+
+  Options Analysis
+
+  ┌─────────────┬─────────────────────────┬───────────────────────┬────────────────┬──────────────────┬───────────────────┐
+  │   Format    │ Envelope Size (typical) │  Encode/Decode Speed  │ Cross-Language │ Schema Evolution │   Debuggability   │
+  ├─────────────┼─────────────────────────┼───────────────────────┼────────────────┼──────────────────┼───────────────────┤
+  │ JSON        │ ~400-800B               │ Slowest (~1μs/event)  │ Excellent      │ Flexible         │ Excellent         │
+  ├─────────────┼─────────────────────────┼───────────────────────┼────────────────┼──────────────────┼───────────────────┤
+  │ MessagePack │ ~200-400B               │ Fast (~200ns/event)   │ Excellent      │ Flexible         │ Moderate (binary) │
+  ├─────────────┼─────────────────────────┼───────────────────────┼────────────────┼──────────────────┼───────────────────┤
+  │ Protobuf    │ ~180-350B               │ Fast (~250ns/event)   │ Excellent      │ Best (schema)    │ Low (binary)      │
+  ├─────────────┼─────────────────────────┼───────────────────────┼────────────────┼──────────────────┼───────────────────┤
+  │ Bincode     │ ~150-300B               │ Fastest (~50ns/event) │ Rust-only      │ Poor             │ None              │
+  ├─────────────┼─────────────────────────┼───────────────────────┼────────────────┼──────────────────┼───────────────────┤
+  │ FlatBuffers │ ~200-350B               │ Zero-copy reads       │ Good (codegen) │ Good             │ None              │
+  └─────────────┴─────────────────────────┴───────────────────────┴────────────────┴──────────────────┴───────────────────┘
+
+  Key observations:
+
+  1. T3/T4 processors are inherently network-bound. Network RTT (100μs-10ms) dominates. The difference between JSON at 1μs and MsgPack at 200ns is noise
+  compared to a 500μs network round-trip. This is NOT the hot path — the hot path is T1/T2 which never serialize.
+  2. Cross-language support is non-negotiable. T3/T4 exist specifically so people can write processors in Python, Go, JS, Java. Bincode is out.
+  3. Debuggability matters early. When someone is building a T3 processor in Python and it's not working, being able to tcpdump and read JSON is invaluable.
+   Binary formats need separate tooling.
+  4. The envelope is small. The bulk of the bytes is Event.payload (user data) which passes through as raw bytes in every format. We're only serializing
+  ~100-200B of metadata per event. At batch size 1024, that's 100-200KB of overhead per batch — negligible either way.
+
+  My Recommendation
+
+  Default to MessagePack, support JSON as an alternative. No others for now.
+
+  Rationale:
+  - MsgPack is the sweet spot: compact, fast, and has mature libraries in every language (Python msgpack, JS msgpack-lite, Go msgpack, Java
+  jackson-dataformat-msgpack)
+  - JSON as fallback for debugging and for ecosystems where MsgPack support is weak
+  - Protobuf adds schema management complexity (.proto files, codegen) that doesn't buy us much for a fixed internal envelope — it shines for user data
+  contracts, not transport plumbing
+  - Two formats is manageable. More creates a testing/maintenance matrix problem.
+
+  Configuration would be per-pipeline:
+
+  pipeline:
+    name: orders
+    processor:
+      name: enricher
+      version: "1.0"
+      transport_codec: msgpack   # or: json (default: msgpack)
+
+  Open Questions for You
+
+  1. Do you agree that Boundary 3 (user payload content) should stay opaque? Or do you see a use case where Aeon should parse/transform user payloads at the
+   engine level?
+  2. Is MsgPack + JSON sufficient for launch, or do you want Protobuf from day one? Protobuf makes more sense if you expect strict schema enforcement at the
+   transport layer.
+  3. Should the Wasm SDK wire format (Boundary 2) also be configurable, or is the current custom binary format fine? It's memory-mapped, not network, so the
+   constraints are different.
+  4. Per-pipeline or per-processor config? A pipeline could have one processor using MsgPack and another using JSON, but that adds complexity. Per-pipeline
+  is simpler.
+
+✻ Baked for 52s
+
+==================================================================================
+ when it comes to user payload content, you are right, you are right, it is user domain. But, the only thing is, user need to write processor, the way,
+based on which format they have provided content in, and which format they wanted processed data in, and based upon the business logic they require during
+processing. Regarding point 2, msgpack is default and json as fallback. This thought process is ok. let us leave existing WASM SDK wire format as-is. Then,
+ let us implement pipeline configuration, on a per pipeline basis.
+
+=====================================================================================
+claude's response:
+
+ Good, we're aligned. Let me summarize the decisions before implementation:
+
+  Decisions locked:
+
+  1. User payload — opaque bytes, user's responsibility. Their processor knows the format.
+  2. AWPP transport codec — MessagePack default, JSON fallback. Configurable per-pipeline.
+  3. Wasm SDK — existing custom binary wire format stays as-is.
+  4. Config scope — per-pipeline, not per-processor.
+
+  What this means in practice:
+
+  pipeline:
+    name: orders
+    transport_codec: msgpack   # default, can omit
+    source: ...
+    processor: ...
+    sink: ...
+
+  The codec only affects T3/T4 AWPP transport — how the Event envelope (id, timestamp, source, partition, metadata, payload-as-raw-bytes) is serialized over
+   the wire. T1/T2 are unaffected.
+
+  Implementation scope:
+
+  - TransportCodec enum (MsgPack, Json) in aeon-types
+  - Codec trait with encode_events / decode_events and encode_outputs / decode_outputs
+  - MsgPack implementation (using rmp-serde crate)
+  - JSON implementation (using serde_json, already in deps)
+  - transport_codec field on pipeline config
+  - Update batch_wire to use the codec for event/output serialization within frames
+  - Tests for both codecs, roundtrip, cross-codec error handling
+
+  Shall I proceed with implementation?
 
 
+===========================================================================================
+regarding config scope, if we think to do on a per processor basis, it has to be considered as per-pipeline & per-processor both, to support dedicated processor deployment for a pipeline and processor being used for multiple pipeline scenarios both. Since, even though, technically the latter is ok, to keep things simple, we chose to go with dedicated processor per pipeline approach. In this context, doing on per-pipeline basis is absolutely fine. Let us update in respective documents including roadmap. Then, proceed to implementation
+
+ 
+ =====================================================================================
+
+claude's response:
+
+ All tasks complete. Here's the summary of what was done:
+
+  Documents updated:
+  - docs/FOUR-TIER-PROCESSORS.md — Added Section 8.5 (Transport Codec), transport_codec field to AWPP Registration/Accepted messages, batch frame
+  annotations, D17 decision, Appendix A/B updates
+  - docs/ROADMAP.md — Added transport codec to Phase 12b description and dependency list
+  - CLAUDE.md — Clarified serialization decisions (Bincode for cluster, MsgPack/JSON for AWPP)
+
+  Implementation:
+  - crates/aeon-types/src/transport_codec.rs — New module with TransportCodec enum (MsgPack/Json), WireEvent/WireOutput serde-friendly structs,
+  Event↔WireEvent/Output↔WireOutput conversions, encode/decode functions for single items and batches (14 tests)
+  - crates/aeon-types/src/awpp.rs — Added transport_codec field to Registration, Accepted, RegisterPayload, AcceptedPayload
+  - crates/aeon-types/src/registry.rs — Added transport_codec field to PipelineDefinition
+  - crates/aeon-types/src/lib.rs — Module + re-exports for TransportCodec, WireEvent, WireOutput
+  - crates/aeon-engine/src/batch_wire.rs — Added codec-aware helpers: encode_batch_request, decode_batch_request, encode_batch_response,
+  decode_batch_response, DecodedBatchResponse struct (5 new tests)
+  - crates/aeon-engine/src/lib.rs — Re-exports for new codec-aware functions
+  - Cargo.toml — Added rmp-serde, serde_bytes to workspace deps; enabled serde feature on uuid
+  - crates/aeon-types/Cargo.toml — Added rmp-serde, serde_bytes, serde_json deps
+
+  Test results: 226 engine tests pass, 110 types tests pass, clippy clean.
+
+✻ Churned for 23m 54s
+
+● Background command "Run full workspace tests" completed (exit code 0)
+
+● Background command "Run full workspace tests" completed (exit code 0)
+
+● Both background workspace test runs also passed (exit code 0). The transport codec implementation is complete and all tests are green across the full
+  workspace.
+  
+  ===================================================================================
+  
+  

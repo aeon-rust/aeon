@@ -14,6 +14,7 @@ pub mod partition;
 pub mod processor_identity;
 pub mod processor_transport;
 pub mod registry;
+pub mod transport_codec;
 pub mod scanner;
 pub mod traits;
 pub mod uuid;
@@ -41,4 +42,5 @@ pub use processor_transport::{
     ProcessorBinding, ProcessorConnectionConfig, ProcessorHealth, ProcessorInfo, ProcessorTier,
 };
 pub use traits::{IdempotentSink, Processor, ProcessorTransport, Seekable, Sink, Source, StateOps};
+pub use transport_codec::{TransportCodec, WireEvent, WireOutput};
 pub use uuid::CoreLocalUuidGenerator;

@@ -6,6 +6,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::transport_codec::TransportCodec;
+
 /// Protocol version identifier.
 pub const PROTOCOL_VERSION: &str = "awpp/1";
 
@@ -67,6 +69,9 @@ pub struct Registration {
     /// Maximum batch size the processor can handle.
     #[serde(default)]
     pub max_batch_size: Option<u32>,
+    /// Preferred transport codec for data stream serialization.
+    #[serde(default)]
+    pub transport_codec: TransportCodec,
     /// Pipelines the processor wants to serve.
     #[serde(default)]
     pub requested_pipelines: Vec<String>,
@@ -104,6 +109,10 @@ pub struct Accepted {
     pub pipelines: Vec<PipelineAssignment>,
     /// Wire format for data streams.
     pub wire_format: String,
+    /// Confirmed transport codec for data stream serialization.
+    /// Pipeline config takes precedence over processor preference.
+    #[serde(default)]
+    pub transport_codec: TransportCodec,
     /// Heartbeat interval in milliseconds.
     pub heartbeat_interval_ms: u64,
     /// Whether per-batch ED25519 signing is required.
@@ -298,6 +307,8 @@ pub struct RegisterPayload {
     #[serde(default)]
     pub max_batch_size: Option<u32>,
     #[serde(default)]
+    pub transport_codec: TransportCodec,
+    #[serde(default)]
     pub requested_pipelines: Vec<String>,
     #[serde(default = "default_binding")]
     pub binding: String,
@@ -309,6 +320,8 @@ pub struct AcceptedPayload {
     pub session_id: String,
     pub pipelines: Vec<PipelineAssignment>,
     pub wire_format: String,
+    #[serde(default)]
+    pub transport_codec: TransportCodec,
     pub heartbeat_interval_ms: u64,
     #[serde(default = "default_true")]
     pub batch_signing: bool,
