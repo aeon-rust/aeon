@@ -1253,6 +1253,31 @@ fn cmd_verify(target: &str, _api: &str) -> Result<()> {
 struct Manifest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pipelines: Vec<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    identities: Vec<ManifestIdentity>,
+}
+
+/// Identity declaration within a YAML manifest.
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+struct ManifestIdentity {
+    /// Processor name this identity belongs to.
+    processor: String,
+    /// ED25519 public key (e.g. "ed25519:<base64>").
+    public_key: String,
+    /// Pipeline scope: "all" or comma-separated names.
+    #[serde(default = "default_pipelines_all")]
+    pipelines: String,
+    /// Maximum concurrent connections.
+    #[serde(default = "default_max_instances")]
+    max_instances: u32,
+}
+
+fn default_pipelines_all() -> String {
+    "all".into()
+}
+
+fn default_max_instances() -> u32 {
+    1
 }
 
 /// Maximum YAML manifest size (1 MB) to prevent resource exhaustion (OWASP A04).
@@ -1272,7 +1297,7 @@ fn cmd_apply(file: &Path, api: &str, dry_run: bool) -> Result<()> {
         .with_context(|| format!("failed to read {}", file.display()))?;
     let manifest: Manifest = serde_yaml::from_str(&content).context("invalid YAML manifest")?;
 
-    if manifest.pipelines.is_empty() {
+    if manifest.pipelines.is_empty() && manifest.identities.is_empty() {
         println!("Manifest is empty — nothing to apply.");
         return Ok(());
     }
@@ -1309,6 +1334,51 @@ fn cmd_apply(file: &Path, api: &str, dry_run: bool) -> Result<()> {
         }
     }
 
+    // Apply identities
+    for identity in &manifest.identities {
+        let allowed_pipelines = if identity.pipelines == "all" {
+            serde_json::json!("all-matching-pipelines")
+        } else {
+            let names: Vec<&str> = identity.pipelines.split(',').map(str::trim).collect();
+            serde_json::json!({"named": names})
+        };
+
+        let body = serde_json::json!({
+            "public_key": identity.public_key,
+            "allowed_pipelines": allowed_pipelines,
+            "max_instances": identity.max_instances,
+        });
+
+        if dry_run {
+            println!(
+                "[dry-run] identity for '{}' (key={}...) — would register",
+                identity.processor,
+                &identity.public_key[..identity.public_key.len().min(20)]
+            );
+        } else {
+            match ureq::post(&format!(
+                "{api}/api/v1/processors/{}/identities",
+                identity.processor
+            ))
+            .send_json(&body)
+            {
+                Ok(_) => {
+                    println!(
+                        "identity for '{}' (key={}...) — registered",
+                        identity.processor,
+                        &identity.public_key[..identity.public_key.len().min(20)]
+                    );
+                }
+                Err(e) => {
+                    eprintln!(
+                        "identity for '{}' — failed: {e}",
+                        identity.processor
+                    );
+                }
+            }
+        }
+    }
+
     if dry_run {
         println!("\nDry run complete. No changes applied.");
     } else {
@@ -1338,8 +1408,52 @@ fn cmd_export(file: Option<&Path>, api: &str) -> Result<()> {
         }
     }
 
+    // Fetch identities for each known processor
+    let mut identities = Vec::new();
+    let processors: serde_json::Value = ureq::get(&format!("{api}/api/v1/processors"))
+        .call()
+        .ok()
+        .and_then(|r| r.into_json().ok())
+        .unwrap_or(serde_json::json!([]));
+    if let Some(procs) = processors.as_array() {
+        for p in procs {
+            let Some(proc_name) = p["name"].as_str() else { continue; };
+            if let Ok(resp) = ureq::get(&format!("{api}/api/v1/processors/{proc_name}/identities")).call() {
+                if let Ok(body) = resp.into_json::<serde_json::Value>() {
+                    if let Some(ids) = body["identities"].as_array() {
+                        for id in ids {
+                            if id["revoked_at"].is_null() {
+                                let pipelines = match &id["allowed_pipelines"] {
+                                    serde_json::Value::String(s) if s == "all-matching-pipelines" => "all".to_string(),
+                                    serde_json::Value::Object(o) => {
+                                        if let Some(named) = o.get("named").and_then(|n| n.as_array()) {
+                                            named.iter()
+                                                .filter_map(|v| v.as_str())
+                                                .collect::<Vec<_>>()
+                                                .join(",")
+                                        } else {
+                                            "all".to_string()
+                                        }
+                                    }
+                                    _ => "all".to_string(),
+                                };
+                                identities.push(ManifestIdentity {
+                                    processor: proc_name.to_string(),
+                                    public_key: id["public_key"].as_str().unwrap_or("").to_string(),
+                                    pipelines,
+                                    max_instances: id["max_instances"].as_u64().unwrap_or(1) as u32,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let manifest = Manifest {
         pipelines: full_pipelines,
+        identities,
     };
     let yaml = serde_yaml::to_string(&manifest).context("failed to serialize manifest")?;
 
@@ -1393,6 +1507,16 @@ fn cmd_diff(file: &Path, api: &str) -> Result<()> {
         if existing_names.contains(name) {
             println!("  pipeline '{name}' (unchanged)");
         }
+    }
+
+    // Compare identities
+    for identity in &manifest.identities {
+        let key_preview = &identity.public_key[..identity.public_key.len().min(20)];
+        println!(
+            "? identity for '{}' (key={key_preview}...) — cannot diff (requires live check)",
+            identity.processor
+        );
+        changes = true;
     }
 
     if !changes {

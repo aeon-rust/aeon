@@ -809,7 +809,7 @@ Rolling binary upgrade: zero event loss during Aeon v1→v2 transition under loa
 
 ### Phase 12b — Four-Tier Processor Runtime (In Progress, 2026-04-05)
 
-Sub-phases 12b-1 through 12b-4 are complete. Sub-phases 12b-5 through 12b-8 are next.
+Sub-phases 12b-1 through 12b-7 are complete. Sub-phase 12b-8 (benchmarks & hardening) is next.
 
 | Sub-phase | Completed | Key Result |
 |-----------|-----------|------------|
@@ -818,14 +818,14 @@ Sub-phases 12b-1 through 12b-4 are complete. Sub-phases 12b-5 through 12b-8 are 
 | Transport codec | 2026-04-05 | `TransportCodec` enum (MsgPack default, JSON fallback), `WireEvent`/`WireOutput` serde-friendly structs, `rmp_serde::to_vec_named` for correct newtype handling, per-pipeline config in AWPP negotiation, 14 tests |
 | 12b-3: WebTransport host (T3) | 2026-04-05 | `WebTransportProcessorHost` with QUIC accept loop, `WtControlChannel` (4B LE length-prefix framing), AWPP handshake integration, session routing table, `ProcessorTransport` impl (health/drain working, `call_batch` scaffolded), cleanup on disconnect |
 | 12b-4: WebSocket host (T4) | 2026-04-05 | `WebSocketProcessorHost` with `WsSharedSocket` (Mutex-wrapped axum WebSocket), text/binary frame demux, routing header protocol (`[4B name_len LE][name][2B partition LE][data]`), `WsControlChannel`, axum `/api/v1/processors/connect` upgrade route (bypasses Bearer auth), `ProcessorTransport` impl, 5 tests |
-| 12b-5: Python SDK | — | Not started |
-| 12b-6: Go SDK | — | Not started |
-| 12b-7: CLI/REST/Registry | — | Not started |
+| 12b-5: Python SDK | 2026-04-06 | `aeon_transport.py`: AWPP WebSocket client, ED25519 (PyNaCl), MsgPack/JSON codec, batch wire encode/decode (CRC32), `@processor`/`@batch_processor` decorators, heartbeat loop, `run()` entrypoint. 24 tests |
+| 12b-6: Go SDK | 2026-04-06 | `sdks/go/aeon.go`: AWPP WebSocket client (gorilla/websocket), ED25519 (stdlib crypto), MsgPack (vmihailenco/msgpack), batch wire encode/decode, `ProcessorFunc`/`BatchProcessorFunc`, `Run()`/`RunContext()`, heartbeat goroutine. 20 tests |
+| 12b-7: CLI/REST/Registry | 2026-04-06 | YAML manifest `identities` field with `ManifestIdentity` struct, `aeon apply` registers identities, `aeon export` includes active identities, `aeon diff` flags identity entries. CLI/REST/identity store were already complete from 12b-2 |
 | 12b-8: Benchmarks & hardening | — | Not started |
 
-**Commits**: `8e7b25b` (12b-1+2), `03afba7` (transport codec), `ee45b03` (12b-3/4)
+**Commits**: `8e7b25b` (12b-1+2), `03afba7` (transport codec), `ee45b03` (12b-3/4), `9ad9dea` (12b-5 Python SDK), `f273076` (12b-6 Go SDK)
 
-**Test count**: 674 (up from 563 — identity store 8 tests, processor auth 9 tests, batch_wire 10 tests, transport codec 14 tests, AWPP types 3 tests, ProcessorTransport 5 tests, session 10 tests, T3 1 test, T4 5 tests, REST API identity 3 tests, + adjustments from existing test updates)
+**Test count**: 674 Rust + 24 Python + 20 Go = 718 total (Rust up from 563 — identity store 8, processor auth 9, batch_wire 10, transport codec 14, AWPP types 3, ProcessorTransport 5, session 10, T3 1, T4 5, REST API identity 3, + existing test updates)
 
 **Note**: T3/T4 `call_batch` implementations are scaffolded (return error) — full data-stream batch routing will be implemented during 12b-8 hardening when end-to-end integration tests are built. All session lifecycle, authentication, heartbeat, drain, and binary frame protocols are complete.
 
