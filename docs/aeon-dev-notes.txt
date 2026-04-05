@@ -16498,6 +16498,173 @@ claude's response:
 ● Both background workspace test runs also passed (exit code 0). The transport codec implementation is complete and all tests are green across the full
   workspace.
   
+   All tasks complete. Here's the summary of what was done:
+
+  Documents updated:
+  - docs/FOUR-TIER-PROCESSORS.md — Added Section 8.5 (Transport Codec), transport_codec field to AWPP Registration/Accepted messages, batch frame
+  annotations, D17 decision, Appendix A/B updates
+  - docs/ROADMAP.md — Added transport codec to Phase 12b description and dependency list
+  - CLAUDE.md — Clarified serialization decisions (Bincode for cluster, MsgPack/JSON for AWPP)
+
+  Implementation:
+  - crates/aeon-types/src/transport_codec.rs — New module with TransportCodec enum (MsgPack/Json), WireEvent/WireOutput serde-friendly structs,
+  Event↔WireEvent/Output↔WireOutput conversions, encode/decode functions for single items and batches (14 tests)
+  - crates/aeon-types/src/awpp.rs — Added transport_codec field to Registration, Accepted, RegisterPayload, AcceptedPayload
+  - crates/aeon-types/src/registry.rs — Added transport_codec field to PipelineDefinition
+  - crates/aeon-types/src/lib.rs — Module + re-exports for TransportCodec, WireEvent, WireOutput
+  - crates/aeon-engine/src/batch_wire.rs — Added codec-aware helpers: encode_batch_request, decode_batch_request, encode_batch_response,
+  decode_batch_response, DecodedBatchResponse struct (5 new tests)
+  - crates/aeon-engine/src/lib.rs — Re-exports for new codec-aware functions
+  - Cargo.toml — Added rmp-serde, serde_bytes to workspace deps; enabled serde feature on uuid
+  - crates/aeon-types/Cargo.toml — Added rmp-serde, serde_bytes, serde_json deps
+
+  Test results: 226 engine tests pass, 110 types tests pass, clippy clean.
+
+✻ Churned for 23m 54s
+
+● Background command "Run full workspace tests" completed (exit code 0)
+
+● Background command "Run full workspace tests" completed (exit code 0)
+
+● Both background workspace test runs also passed (exit code 0). The transport codec implementation is complete and all tests are green across the full
+  workspace.
+  
+  
   ===================================================================================
   
+  are we using server sessions or tokens?
   
+  ======================================================================================
+  claude's response:
+  
+  Good question. Let me clarify the authentication model in the plan.
+
+  In the AWPP design, we use ED25519 challenge-response (not sessions or bearer tokens) as the primary auth mechanism:
+
+  1. Connection setup: Processor connects → Aeon sends a random nonce → Processor signs the nonce with its ED25519 private key → Aeon verifies the signature
+   against the registered public key
+  2. Once authenticated: Aeon assigns a session_id (just a correlation identifier for the duration of the connection) — this is NOT a "session token" that
+  gets passed around. It's just an internal label.
+  3. Per-batch signing: Every batch response from the processor includes an ED25519 signature. Aeon verifies this on every batch for non-repudiation.
+  4. OAuth (optional Layer 2.5): If enabled, the processor also provides a JWT during registration. This is a token from an external IdP, not an
+  Aeon-managed token.
+
+  So to directly answer: neither sessions nor tokens in the traditional web sense. It's:
+  - ED25519 keypair per processor instance (mandatory)
+  - Challenge-response at connection time (one-time proof of key ownership)
+  - Per-batch signatures for ongoing authentication/non-repudiation
+  - Optional OAuth JWT from external IdP for defense-in-depth
+
+  The session_id in the Accepted message is just an identifier for logging/tracing — not a session token. The connection itself (QUIC session or WebSocket
+  connection) IS the session. If the connection drops, the processor reconnects and does a fresh challenge-response.
+
+  Is this the model you want, or would you prefer a different approach (e.g., session tokens with expiry, or something else)?
+
+✻ Sautéed for 9m 1s
+
+=========================================================================================
+this is good. proceed.
+==========================================================================================
+claude's response:
+
+ Hmm, the placeholder approach is ugly. A better design: take server_config as a separate parameter, or make the config field an Option. Let me simplify —
+  just take server_config out of the config struct and pass it separately to start.
+
+  Read 1 file (ctrl+o to expand)
+
+● Let me take a cleaner approach — restructure so start() takes the ServerConfig separately since it's not Clone and only needed once.
+
+● Now let me rewrite webtransport_host.rs properly. The key changes: remove server_config from the config struct, pass it directly to start(), and fix the
+  lifetime on send_control.
+
+  Read 1 file (ctrl+o to expand)
+
+● Now let me check the ControlChannel trait definition to understand the lifetime requirements.
+
+  Read 1 file (ctrl+o to expand)
+
+● The send_control signature uses &self and msg: &[u8] with + '_ — the '_ ties to &self but Rust can't tell that msg is used within the future. The trait
+  definition has this exact signature. The fix is that WtControlChannel::send_control needs to copy the msg before entering the async block, since the
+  future must outlive the msg borrow.
+
+
+ Compiles clean (just one expected warning about routing being unused — it'll be used when call_batch is fully implemented). Now let me create
+  websocket_host.rs.
+
+  Read 1 file (ctrl+o to expand)
+
+● Good. Now I have enough context. Let me also check the wtransport::SendStream and RecvStream API for write_all/read_exact since we passed the compile
+  check — and now create the websocket_host.rs.
+
+● Let me check the axum WebSocket API available in axum 0.8.
+
+
+ Good — axum 0.8 has ws feature with WebSocketUpgrade, WebSocket, Message, send/recv. Let me check if ws is a feature that needs to be enabled.
+
+  Searched for 2 patterns, read 1 file (ctrl+o to expand)
+
+● Need to enable ws feature on axum for WebSocket support. Let me check the current workspace axum dependency.
+
+  The workspace has axum = "0.8" without features. I need to add ws feature for the websocket-host. Let me update the Cargo.toml files.
+
+  Read 1 file (ctrl+o to expand)
+
+● The engine Cargo.toml has axum = { workspace = true, optional = true } under deps and axum = { workspace = true } under dev-dependencies. The
+  websocket-host feature enables rest-api which enables axum. But we need axum's ws feature specifically for the websocket host.
+
+ Now let me create websocket_host.rs. Per the plan: T4 uses axum WebSocket upgrade, text frames for JSON control messages, binary frames for tagged data
+  with routing header.
+  
+   Wait — I realized the approach with split_websocket using unreachable! and WsReadHalf/WsWriteHalf is dead code. The actual design should use
+  WsSharedSocket throughout. Let me clean this up properly, removing the dead types and the unreachable! function, and reworking handle_upgrade to use
+  WsSharedSocket.
+ All clean. Now let me wire up the WebSocket upgrade route in rest_api.rs.
+
+  Read 1 file (ctrl+o to expand)
+
+● I need to add:
+  1. The WS host to AppState
+  2. A WebSocket upgrade route (bypassing Bearer auth — AWPP handles its own auth)
+  3. The handler function
+
+Now add the WS upgrade route — it should bypass Bearer auth (placed outside the auth middleware layer). Let me add it alongside the health routes.
+
+All clean — workspace clippy passes with zero warnings and all tests pass.
+
+● Phase 12b-3/4 implementation is complete. Here's a summary of what was built:
+
+  Session layer (session.rs — already done):
+  - ControlChannel trait, PipelineResolver trait, AwppSession, BatchInflight, SessionState
+  - AWPP handshake function, heartbeat tracking, drain signaling
+  - 10 tests
+
+  T3 WebTransport Host (webtransport_host.rs):
+  - WebTransportHostConfig + WebTransportProcessorHost with accept loop
+  - WtControlChannel — 4B LE length-prefix framing over QUIC bidi streams
+  - Session lifecycle: AWPP handshake → routing table → data stream loop → cleanup
+  - ProcessorTransport impl (health/drain working, call_batch scaffolded)
+
+  T4 WebSocket Host (websocket_host.rs):
+  - WebSocketHostConfig + WebSocketProcessorHost
+  - WsSharedSocket — Mutex-wrapped axum WebSocket (no split in axum 0.8)
+  - WsControlChannel — text frames for JSON control messages
+  - Binary frame format: [4B name_len LE][name][2B partition LE][batch_wire]
+  - Read loop demultiplexes text (control) and binary (data) frames
+  - ProcessorTransport impl, 5 tests
+
+  Wiring:
+  - websocket-host feature now enables axum/ws
+  - AppState has optional ws_host field (feature-gated)
+  - /api/v1/processors/connect route for WS upgrade (bypasses Bearer auth)
+  - lib.rs re-exports all new types
+
+  Verification: 242 tests pass, clippy clean with all features, workspace clean.
+
+✻ Crunched for 19m 43s
+
+===============================================================================
+continue
+================================================================================
+claude's response:
+
+

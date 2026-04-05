@@ -9,8 +9,10 @@ rust-version.workspace = true
 [features]
 default = ["native-loader", "rest-api", "processor-auth"]
 native-loader = ["libloading", "aeon-native-sdk", "sha2", "hex"]
-rest-api = ["axum", "serde_json", "tower-http"]
+rest-api = ["axum", "tower-http"]
 processor-auth = ["aeon-crypto", "rand", "sha2", "hex", "base64"]
+webtransport-host = ["wtransport", "rustls", "processor-auth"]
+websocket-host = ["processor-auth", "rest-api", "axum/ws"]
 
 [dependencies]
 aeon-types = { workspace = true }
@@ -24,6 +26,7 @@ dashmap = { workspace = true }
 serde = { workspace = true }
 bincode = { workspace = true }
 crc32fast = { workspace = true }
+serde_json = { workspace = true }
 
 # Native .so processor loading (feature-gated)
 libloading = { version = "0.8", optional = true }
@@ -35,13 +38,18 @@ rand = { version = "0.8", optional = true }
 
 # REST API (feature-gated)
 axum = { workspace = true, optional = true }
-serde_json = { workspace = true, optional = true }
 tower-http = { workspace = true, optional = true }
 
 # Integrity verification for native processors (feature-gated)
 sha2 = { workspace = true, optional = true }
 hex = { workspace = true, optional = true }
 base64 = { workspace = true, optional = true }
+
+# T3 WebTransport processor host (feature-gated)
+wtransport = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+
+# T4 WebSocket uses axum (via rest-api feature) — no extra deps needed
 
 [dev-dependencies]
 aeon-connectors = { workspace = true, features = ["kafka", "file"] }
@@ -53,7 +61,6 @@ smallvec = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tower = "0.5"
 axum = { workspace = true }
-serde_json = { workspace = true }
 serde = { workspace = true }
 
 [[bench]]

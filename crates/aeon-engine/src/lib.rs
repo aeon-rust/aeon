@@ -60,9 +60,16 @@ pub use retry::{RetryConfig, RetryOutcome, backoff_delay, retry_async, retry_syn
 pub use shutdown::{ShutdownConfig, ShutdownCoordinator};
 pub use identity_store::ProcessorIdentityStore;
 pub use transport::InProcessTransport;
+pub use transport::{AwppSession, BatchInflight, ControlChannel, HandshakeConfig, PipelineResolver, SessionState};
 
 #[cfg(feature = "native-loader")]
 pub use native_loader::NativeProcessor;
 
 #[cfg(feature = "rest-api")]
 pub use rest_api::{AppState, api_router, serve};
+
+#[cfg(feature = "webtransport-host")]
+pub use transport::WebTransportProcessorHost;
+
+#[cfg(feature = "websocket-host")]
+pub use transport::{WebSocketProcessorHost, websocket_host::{build_ws_data_frame, parse_ws_routing_header}};

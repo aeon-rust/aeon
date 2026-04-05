@@ -1,0 +1,470 @@
+//! T4 WebSocket Processor Host — axum WebSocket server for out-of-process processors.
+//!
+//! Accepts WebSocket connections on the existing REST API port (4471) at
+//! `/api/v1/processors/connect`. Runs the AWPP handshake over text frames
+//! and exchanges batch data over binary frames with a routing header.
+//!
+//! Feature-gated behind `websocket-host` (implies `rest-api` + `processor-auth`).
+
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use axum::extract::ws::{Message, WebSocket};
+use dashmap::DashMap;
+use tokio::sync::Mutex;
+
+use aeon_types::error::AeonError;
+use aeon_types::event::{Event, Output};
+use aeon_types::processor_transport::{ProcessorHealth, ProcessorInfo, ProcessorTier};
+use aeon_types::traits::ProcessorTransport;
+use aeon_types::transport_codec::TransportCodec;
+
+use crate::identity_store::ProcessorIdentityStore;
+use crate::transport::session::{AwppSession, ControlChannel, PipelineResolver};
+
+// ── Configuration ───────────────────────────────────────────────────────
+
+/// Configuration for the WebSocket processor host.
+pub struct WebSocketHostConfig {
+    /// Identity store for ED25519 challenge-response auth.
+    pub identity_store: Arc<ProcessorIdentityStore>,
+    /// Pipeline resolver for partition assignment.
+    pub pipeline_resolver: Arc<dyn PipelineResolver>,
+    /// Whether OAuth is required in addition to ED25519.
+    pub oauth_required: bool,
+    /// Heartbeat interval (default: 10s).
+    pub heartbeat_interval: Duration,
+    /// Handshake timeout (default: 5s).
+    pub handshake_timeout: Duration,
+    /// Batch response timeout (default: 30s).
+    pub batch_timeout: Duration,
+    /// Processor name (for ProcessorInfo).
+    pub processor_name: String,
+    /// Processor version (for ProcessorInfo).
+    pub processor_version: String,
+    /// Pipeline codec override (if set, overrides processor preference).
+    pub pipeline_codec: Option<TransportCodec>,
+}
+
+impl WebSocketHostConfig {
+    /// Create a new config with required fields and sensible defaults.
+    pub fn new(
+        identity_store: Arc<ProcessorIdentityStore>,
+        pipeline_resolver: Arc<dyn PipelineResolver>,
+    ) -> Self {
+        Self {
+            identity_store,
+            pipeline_resolver,
+            oauth_required: false,
+            heartbeat_interval: Duration::from_secs(10),
+            handshake_timeout: Duration::from_secs(5),
+            batch_timeout: Duration::from_secs(30),
+            processor_name: String::new(),
+            processor_version: String::new(),
+            pipeline_codec: None,
+        }
+    }
+}
+
+// ── WebSocket Processor Host ────────────────────────────────────────────
+
+/// T4 WebSocket processor host — accepts WebSocket connections from processors.
+///
+/// Integrates with the axum REST API server. Call [`WebSocketProcessorHost::handle_upgrade`]
+/// from the WebSocket upgrade handler to process a new connection.
+pub struct WebSocketProcessorHost {
+    /// Active sessions keyed by session_id.
+    sessions: Arc<DashMap<String, Arc<AwppSession>>>,
+    /// Routing table: (pipeline_name, partition_id) → session_id.
+    routing: Arc<DashMap<(String, u16), String>>,
+    /// Host configuration.
+    config: Arc<WebSocketHostConfig>,
+    /// When the host was created.
+    created_at: Instant,
+}
+
+impl WebSocketProcessorHost {
+    /// Create a new WebSocket processor host.
+    pub fn new(config: WebSocketHostConfig) -> Self {
+        Self {
+            sessions: Arc::new(DashMap::new()),
+            routing: Arc::new(DashMap::new()),
+            config: Arc::new(config),
+            created_at: Instant::now(),
+        }
+    }
+
+    /// Handle a WebSocket upgrade — runs the AWPP handshake and manages
+    /// the session lifecycle. Call this from the axum upgrade handler.
+    pub async fn handle_upgrade(&self, socket: WebSocket) -> Result<(), AeonError> {
+        let shared = Arc::new(WsSharedSocket::new(socket));
+
+        let control = WsControlChannel {
+            socket: shared.clone(),
+        };
+
+        // Run AWPP handshake with timeout
+        let handshake_config = crate::transport::session::HandshakeConfig {
+            oauth_required: self.config.oauth_required,
+            heartbeat_interval: self.config.heartbeat_interval,
+            batch_signing: true,
+            pipeline_codec: self.config.pipeline_codec,
+        };
+
+        let awpp = tokio::time::timeout(
+            self.config.handshake_timeout,
+            crate::transport::session::handshake(
+                &control,
+                &self.config.identity_store,
+                &*self.config.pipeline_resolver,
+                &handshake_config,
+            ),
+        )
+        .await
+        .map_err(|_| AeonError::connection("T4 handshake timeout"))??;
+
+        let session = Arc::new(awpp);
+        let session_id = session.session_id.clone();
+        self.sessions.insert(session_id.clone(), session.clone());
+
+        // Update routing table
+        for assignment in &session.pipeline_assignments {
+            for &partition in &assignment.partitions {
+                self.routing.insert(
+                    (assignment.name.clone(), partition),
+                    session_id.clone(),
+                );
+            }
+        }
+
+        tracing::info!(
+            session_id = %session_id,
+            processor = %session.processor_name,
+            "T4 processor connected via WebSocket"
+        );
+
+        // Read loop — demultiplex text (control) and binary (data) frames
+        let result = ws_read_loop(&shared, &session).await;
+
+        // Cleanup
+        session.close();
+        self.sessions.remove(&session_id);
+        for assignment in &session.pipeline_assignments {
+            for &partition in &assignment.partitions {
+                self.routing.remove(&(assignment.name.clone(), partition));
+            }
+        }
+        self.config
+            .identity_store
+            .disconnect(&session.fingerprint);
+
+        tracing::debug!(session_id = %session_id, "T4 processor disconnected");
+
+        result
+    }
+
+    /// Number of active sessions.
+    pub fn session_count(&self) -> usize {
+        self.sessions.len()
+    }
+
+    /// Total pending batches across all sessions.
+    fn total_pending_batches(&self) -> u32 {
+        self.sessions
+            .iter()
+            .map(|s| s.batch_inflight.pending_count())
+            .sum()
+    }
+}
+
+impl ProcessorTransport for WebSocketProcessorHost {
+    fn call_batch(
+        &self,
+        _events: Vec<Event>,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Output>, AeonError>> + Send + '_>> {
+        Box::pin(async move {
+            // TODO: Phase 12b-4 full implementation
+            // 1. Determine target session from events
+            // 2. Allocate batch_id via BatchInflight
+            // 3. Build binary frame: routing header + codec-encoded batch
+            // 4. Send via WsSharedSocket
+            // 5. Await response via oneshot with timeout
+            Err(AeonError::processor(
+                "T4 WebSocket call_batch not yet fully implemented",
+            ))
+        })
+    }
+
+    fn health(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<ProcessorHealth, AeonError>> + Send + '_>> {
+        Box::pin(async move {
+            let any_healthy = self.sessions.iter().any(|s| s.is_healthy());
+            Ok(ProcessorHealth {
+                healthy: any_healthy,
+                pending_batches: Some(self.total_pending_batches()),
+                uptime_secs: Some(self.created_at.elapsed().as_secs()),
+                latency_us: None,
+            })
+        })
+    }
+
+    fn drain(&self) -> Pin<Box<dyn Future<Output = Result<(), AeonError>> + Send + '_>> {
+        Box::pin(async move {
+            for session in self.sessions.iter() {
+                session.close();
+            }
+            Ok(())
+        })
+    }
+
+    fn info(&self) -> ProcessorInfo {
+        ProcessorInfo {
+            name: self.config.processor_name.clone(),
+            version: self.config.processor_version.clone(),
+            tier: ProcessorTier::WebSocket,
+            capabilities: vec!["batch".into()],
+        }
+    }
+}
+
+// ── Shared WebSocket ────────────────────────────────────────────────────
+
+/// Shared WebSocket — axum 0.8's `WebSocket` doesn't support split,
+/// so we wrap it in a Mutex for controlled send/recv.
+struct WsSharedSocket {
+    inner: Mutex<WebSocket>,
+}
+
+impl WsSharedSocket {
+    fn new(socket: WebSocket) -> Self {
+        Self {
+            inner: Mutex::new(socket),
+        }
+    }
+
+    async fn send(&self, msg: Message) -> Result<(), AeonError> {
+        let mut ws = self.inner.lock().await;
+        ws.send(msg).await.map_err(|e| {
+            AeonError::connection(format!("T4 WebSocket send failed: {e}"))
+        })
+    }
+
+    async fn recv(&self) -> Option<Result<Message, AeonError>> {
+        let mut ws = self.inner.lock().await;
+        match ws.recv().await {
+            Some(Ok(msg)) => Some(Ok(msg)),
+            Some(Err(e)) => Some(Err(AeonError::connection(format!(
+                "T4 WebSocket recv failed: {e}"
+            )))),
+            None => None,
+        }
+    }
+}
+
+// ── WebSocket Read Loop ─────────────────────────────────────────────────
+
+/// Demultiplex incoming WebSocket frames.
+///
+/// - **Text frames**: AWPP control messages (heartbeat, drain, error).
+/// - **Binary frames**: Batch response data with routing header.
+async fn ws_read_loop(
+    socket: &WsSharedSocket,
+    session: &AwppSession,
+) -> Result<(), AeonError> {
+    loop {
+        let msg = match socket.recv().await {
+            Some(Ok(msg)) => msg,
+            Some(Err(e)) => return Err(e),
+            None => return Ok(()), // connection closed
+        };
+
+        match msg {
+            Message::Text(text) => {
+                let bytes = text.as_bytes();
+                match crate::transport::session::parse_control_message(bytes) {
+                    Ok(aeon_types::awpp::ControlMessage::Heartbeat(hb)) => {
+                        session.record_heartbeat(hb.timestamp_ms);
+                    }
+                    Ok(aeon_types::awpp::ControlMessage::Error(err)) => {
+                        tracing::warn!(
+                            code = err.code,
+                            message = %err.message,
+                            "T4 processor reported error"
+                        );
+                    }
+                    Ok(other) => {
+                        tracing::debug!(
+                            msg_type = ?std::mem::discriminant(&other),
+                            "T4 unexpected control message"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "T4 malformed control message");
+                    }
+                }
+            }
+            Message::Binary(data) => {
+                if let Err(e) = handle_ws_data_frame(&data, session) {
+                    tracing::warn!(error = %e, "T4 data frame error");
+                }
+            }
+            Message::Ping(_) | Message::Pong(_) => {
+                // axum handles ping/pong automatically
+            }
+            Message::Close(_) => {
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Parse and handle a binary data frame (batch response).
+///
+/// Frame format: `[4B name_len LE][name][2B partition LE][batch_wire data]`
+fn handle_ws_data_frame(data: &[u8], session: &AwppSession) -> Result<(), AeonError> {
+    let (_name, _partition, offset) = parse_ws_routing_header(data)?;
+    let batch_data = &data[offset..];
+
+    let decoded = crate::batch_wire::decode_batch_response(batch_data, session.codec)?;
+
+    let outputs: Vec<Output> = decoded.outputs_per_event.into_iter().flatten().collect();
+    session
+        .batch_inflight
+        .complete_batch(decoded.batch_id, Ok(outputs));
+
+    Ok(())
+}
+
+// ── Data Frame Helpers ──────────────────────────────────────────────────
+
+/// Build a binary data frame for sending a batch request.
+///
+/// Frame format: `[4B name_len LE][name][2B partition LE][batch_wire data]`
+pub fn build_ws_data_frame(
+    pipeline_name: &str,
+    partition: u16,
+    batch_wire_data: &[u8],
+) -> Vec<u8> {
+    let name_bytes = pipeline_name.as_bytes();
+    let name_len = (name_bytes.len() as u32).to_le_bytes();
+    let part_bytes = partition.to_le_bytes();
+
+    let mut frame = Vec::with_capacity(4 + name_bytes.len() + 2 + batch_wire_data.len());
+    frame.extend_from_slice(&name_len);
+    frame.extend_from_slice(name_bytes);
+    frame.extend_from_slice(&part_bytes);
+    frame.extend_from_slice(batch_wire_data);
+    frame
+}
+
+/// Parse the routing header from a binary data frame, returning
+/// `(pipeline_name, partition, batch_data_offset)`.
+pub fn parse_ws_routing_header(data: &[u8]) -> Result<(&str, u16, usize), AeonError> {
+    if data.len() < 7 {
+        return Err(AeonError::serialization("T4 data frame too short"));
+    }
+    let name_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+    if data.len() < 4 + name_len + 2 {
+        return Err(AeonError::serialization("T4 data frame name truncated"));
+    }
+    let name = std::str::from_utf8(&data[4..4 + name_len]).map_err(|e| {
+        AeonError::serialization(format!("T4 invalid pipeline name: {e}"))
+    })?;
+    let partition = u16::from_le_bytes([data[4 + name_len], data[4 + name_len + 1]]);
+    Ok((name, partition, 4 + name_len + 2))
+}
+
+// ── Control Channel (WebSocket) ─────────────────────────────────────────
+
+/// Control channel over WebSocket text frames.
+struct WsControlChannel {
+    socket: Arc<WsSharedSocket>,
+}
+
+impl ControlChannel for WsControlChannel {
+    fn send_control(
+        &self,
+        msg: &[u8],
+    ) -> Pin<Box<dyn Future<Output = Result<(), AeonError>> + Send + '_>> {
+        // Control messages are JSON — safe to interpret as UTF-8.
+        let text = String::from_utf8_lossy(msg).into_owned();
+        Box::pin(async move { self.socket.send(Message::Text(text.into())).await })
+    }
+
+    fn recv_control(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, AeonError>> + Send + '_>> {
+        Box::pin(async move {
+            loop {
+                match self.socket.recv().await {
+                    Some(Ok(Message::Text(text))) => {
+                        return Ok(text.as_bytes().to_vec());
+                    }
+                    Some(Ok(Message::Binary(_))) => {
+                        // Skip binary frames during handshake
+                        continue;
+                    }
+                    Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
+                    Some(Ok(Message::Close(_))) => {
+                        return Err(AeonError::connection(
+                            "T4 WebSocket closed during handshake",
+                        ));
+                    }
+                    Some(Err(e)) => return Err(e),
+                    None => {
+                        return Err(AeonError::connection("T4 WebSocket connection lost"));
+                    }
+                }
+            }
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ws_data_frame_build_parse() {
+        let pipeline = "my-pipeline";
+        let partition = 7u16;
+        let batch_data = b"some-batch-wire-data";
+
+        let frame = build_ws_data_frame(pipeline, partition, batch_data);
+
+        let (name, part, offset) = parse_ws_routing_header(&frame).unwrap();
+        assert_eq!(name, pipeline);
+        assert_eq!(part, partition);
+        assert_eq!(&frame[offset..], batch_data);
+    }
+
+    #[test]
+    fn ws_data_frame_empty_name() {
+        let frame = build_ws_data_frame("", 0, b"data");
+        let (name, part, offset) = parse_ws_routing_header(&frame).unwrap();
+        assert_eq!(name, "");
+        assert_eq!(part, 0);
+        assert_eq!(&frame[offset..], b"data");
+    }
+
+    #[test]
+    fn ws_data_frame_too_short() {
+        assert!(parse_ws_routing_header(&[0; 5]).is_err());
+    }
+
+    #[test]
+    fn ws_data_frame_truncated_name() {
+        // name_len says 100 but only 2 bytes of name present
+        let mut frame = vec![100, 0, 0, 0, b'a', b'b'];
+        frame.extend_from_slice(&[0, 0]); // partition
+        assert!(parse_ws_routing_header(&frame).is_err());
+    }
+
+    #[test]
+    fn ws_host_config_defaults() {
+        assert_eq!(ProcessorTier::WebSocket.to_string(), "web-socket");
+    }
+}

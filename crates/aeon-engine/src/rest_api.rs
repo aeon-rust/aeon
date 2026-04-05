@@ -69,6 +69,9 @@ pub struct AppState {
     /// API token for Bearer authentication. `None` disables auth (dev mode).
     /// Set via `AEON_API_TOKEN` environment variable.
     pub api_token: Option<String>,
+    /// T4 WebSocket processor host (feature-gated).
+    #[cfg(feature = "websocket-host")]
+    pub ws_host: Option<Arc<crate::transport::websocket_host::WebSocketProcessorHost>>,
 }
 
 /// Build the axum Router with all API routes.
@@ -138,6 +141,13 @@ pub fn api_router(state: Arc<AppState>) -> Router {
             state.clone(),
             auth_middleware,
         ));
+
+    // WebSocket processor connect — no Bearer auth (AWPP handshake handles auth)
+    #[cfg(feature = "websocket-host")]
+    let health_routes = health_routes.route(
+        "/api/v1/processors/connect",
+        get(ws_processor_connect),
+    );
 
     health_routes
         .merge(api_routes)
@@ -805,6 +815,29 @@ async fn revoke_identity(
     }
 }
 
+// ── WebSocket Processor Connect (T4) ────────────────────────────────────
+
+#[cfg(feature = "websocket-host")]
+async fn ws_processor_connect(
+    State(state): State<Arc<AppState>>,
+    ws: axum::extract::ws::WebSocketUpgrade,
+) -> impl IntoResponse {
+    let Some(ref ws_host) = state.ws_host else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "WebSocket processor host not configured",
+        )
+            .into_response();
+    };
+    let host = ws_host.clone();
+    ws.on_upgrade(move |socket| async move {
+        if let Err(e) = host.handle_upgrade(socket).await {
+            tracing::debug!(error = %e, "T4 WebSocket session ended");
+        }
+    })
+    .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -828,6 +861,8 @@ mod tests {
             delivery_ledgers: dashmap::DashMap::new(),
             identities: Arc::new(ProcessorIdentityStore::new()),
             api_token: None, // Auth disabled in tests by default
+            #[cfg(feature = "websocket-host")]
+            ws_host: None,
         })
     }
 
@@ -845,6 +880,8 @@ mod tests {
             delivery_ledgers: dashmap::DashMap::new(),
             identities: Arc::new(ProcessorIdentityStore::new()),
             api_token: Some(token.to_string()),
+            #[cfg(feature = "websocket-host")]
+            ws_host: None,
         })
     }
 
