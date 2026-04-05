@@ -807,6 +807,28 @@ Rolling binary upgrade: zero event loss during Aeon v1→v2 transition under loa
 | Phase 9 — PoH + Merkle | 2026-03-30 | SHA-512 Merkle trees, Ed25519 signing, MMR, per-partition PoH chains, 71 tests |
 | Phase 10 — Security & Crypto | 2026-04-04 | EtM encryption, KeyProvider, FIPS guard, CertificateStore, TLS 3-mode (none/auto/pem), auto-cert gen, per-connector TLS, REST API auth, 147 tests |
 
+### Phase 12b — Four-Tier Processor Runtime (In Progress, 2026-04-05)
+
+Sub-phases 12b-1 through 12b-4 are complete. Sub-phases 12b-5 through 12b-8 are next.
+
+| Sub-phase | Completed | Key Result |
+|-----------|-----------|------------|
+| 12b-1: Core abstractions | 2026-04-05 | `ProcessorTransport` async trait, `InProcessTransport` (zero-cost sync→async), `ProcessorHealth`/`ProcessorInfo`/`ProcessorTier` types, pipeline refactored to use `&dyn ProcessorTransport` |
+| 12b-2: Security & AWPP types | 2026-04-05 | `ProcessorIdentityStore` (DashMap CRUD, connection counting, max instances), `processor_auth` (ED25519 challenge-response, nonce gen, batch signature verify, authorization), AWPP message types (`Challenge`/`Registration`/`Accepted`/`Rejected`/`Heartbeat`/`Drain`/`Error`/`TokenRefresh`), `batch_wire` codec-aware encode/decode, REST API identity CRUD endpoints |
+| Transport codec | 2026-04-05 | `TransportCodec` enum (MsgPack default, JSON fallback), `WireEvent`/`WireOutput` serde-friendly structs, `rmp_serde::to_vec_named` for correct newtype handling, per-pipeline config in AWPP negotiation, 14 tests |
+| 12b-3: WebTransport host (T3) | 2026-04-05 | `WebTransportProcessorHost` with QUIC accept loop, `WtControlChannel` (4B LE length-prefix framing), AWPP handshake integration, session routing table, `ProcessorTransport` impl (health/drain working, `call_batch` scaffolded), cleanup on disconnect |
+| 12b-4: WebSocket host (T4) | 2026-04-05 | `WebSocketProcessorHost` with `WsSharedSocket` (Mutex-wrapped axum WebSocket), text/binary frame demux, routing header protocol (`[4B name_len LE][name][2B partition LE][data]`), `WsControlChannel`, axum `/api/v1/processors/connect` upgrade route (bypasses Bearer auth), `ProcessorTransport` impl, 5 tests |
+| 12b-5: Python SDK | — | Not started |
+| 12b-6: Go SDK | — | Not started |
+| 12b-7: CLI/REST/Registry | — | Not started |
+| 12b-8: Benchmarks & hardening | — | Not started |
+
+**Commits**: `8e7b25b` (12b-1+2), `03afba7` (transport codec), `ee45b03` (12b-3/4)
+
+**Test count**: 674 (up from 563 — identity store 8 tests, processor auth 9 tests, batch_wire 10 tests, transport codec 14 tests, AWPP types 3 tests, ProcessorTransport 5 tests, session 10 tests, T3 1 test, T4 5 tests, REST API identity 3 tests, + adjustments from existing test updates)
+
+**Note**: T3/T4 `call_batch` implementations are scaffolded (return error) — full data-stream batch routing will be implemented during 12b-8 hardening when end-to-end integration tests are built. All session lifecycle, authentication, heartbeat, drain, and binary frame protocols are complete.
+
 ### Phase 12a — Processor SDKs + Dev Tooling (Complete)
 
 | Component | Completed | Key Result |
