@@ -363,7 +363,7 @@ for streaming connectors, tokio-rustls for TCP-based connectors, etc.).
 | Encryption-at-rest (Raft store) | ✅ | EtM for snapshots, feature-gated `encryption-at-rest` |
 | REST API auth wiring | ✅ | Bearer token middleware, health bypasses auth, 8 auth tests |
 
-**Test count**: 688 Rust + 24 Python + 20 Go = 732 total (up from 718 — 14 new tests from Phase 10 completion tasks)
+**Test count**: 688 Rust + 24 Python + 20 Go = 732 total (up from 718 — 14 new tests from Phase 10 completion tasks). Note: total workspace tests now 741 Rust (688 + 36 L2/L3 + 17 processor-client) + 44 SDK = 785 as of Phase 12b-15.
 
 ---
 
@@ -866,7 +866,7 @@ Rolling binary upgrade: zero event loss during Aeon v1→v2 transition under loa
 | Phase 6 — Observability | 2026-03-28 | Histograms, logging, per-partition metrics, Grafana dashboard, 34 tests |
 | Phase 7 — Wasm Runtime | 2026-03-28 | Wasmtime, host functions, WIT contract, ~794K wasm events/sec, 21 tests |
 
-**Total workspace tests**: 724 Rust passing (688 base + 36 feature-gated L2/L3, 0 failed, 10 ignored) + 24 Python + 20 Go = 768 total | **Clippy**: clean | **Rustfmt**: clean | **Audit date**: 2026-04-06
+**Total workspace tests**: 741 Rust passing (688 base + 36 feature-gated L2/L3 + 17 aeon-processor-client, 0 failed, 10 ignored) + 24 Python + 20 Go = 785 total | **Clippy**: clean | **Rustfmt**: clean | **Audit date**: 2026-04-06
 
 ### Gate 2 — Complete (Phases 8–10) ✅
 
@@ -892,9 +892,9 @@ All 8 core sub-phases complete.
 | 12b-7: CLI/REST/Registry | 2026-04-06 | YAML manifest `identities` field with `ManifestIdentity` struct, `aeon apply` registers identities, `aeon export` includes active identities, `aeon diff` flags identity entries. CLI/REST/identity store were already complete from 12b-2 |
 | 12b-8: Benchmarks & hardening | 2026-04-06 | `transport_bench.rs`: InProcessTransport overhead <1% (zero-cost confirmed), MsgPack 1.5-3.5x faster than JSON, batch wire encode ~0.44μs/event, decode ~0.38μs/event at batch 1024 |
 
-**Commits**: `8e7b25b` (12b-1+2), `03afba7` (transport codec), `ee45b03` (12b-3/4), `9ad9dea` (12b-5 Python SDK), `f273076` (12b-6 Go SDK)
+**Commits**: `8e7b25b` (12b-1+2), `03afba7` (transport codec), `ee45b03` (12b-3/4), `9ad9dea` (12b-5 Python SDK), `f273076` (12b-6 Go SDK), `588320c` (12b-15 Rust T3/T4 SDK)
 
-**Test count**: 674 Rust + 24 Python + 20 Go = 718 total (Rust up from 563 — identity store 8, processor auth 9, batch_wire 10, transport codec 14, AWPP types 3, ProcessorTransport 5, session 10, T3 1, T4 5, REST API identity 3, + existing test updates)
+**Test count**: 691 Rust + 24 Python + 20 Go = 735 total (Rust up from 563 — identity store 8, processor auth 9, batch_wire 10, transport codec 14, AWPP types 3, ProcessorTransport 5, session 10, T3 1, T4 5, REST API identity 3, aeon-processor-client 17, + existing test updates)
 
 **Note**: T3/T4 `call_batch` fully implemented — data stream routing, batch encode/send, response awaiting with timeout all wired. Both hosts add `pipeline_name` to config for routing lookup. T3 uses length-prefixed framing on QUIC bidi streams; T4 uses binary WebSocket frames with routing header. All session lifecycle, authentication, heartbeat, drain, and binary frame protocols are complete.
 
@@ -2334,7 +2334,7 @@ docker compose up -d
 | 1 | Minimal Pipeline | ✅ Complete | — |
 | 2 | Redpanda Connector | ✅ Complete | — |
 | 3 | Performance Validation | ✅ Complete | — |
-| 4 | Multi-Tier State | ⚠️ **Partial** | **L2 mmap + L3 RocksDB are placeholders** |
+| 4 | Multi-Tier State | ✅ Complete | L1 DashMap + L2 MmapStore + L3 redb (2026-04-06) |
 | 5 | Fault Tolerance | ✅ Complete | — |
 | 6 | Observability | ✅ Complete | — |
 | 7 | Wasm Runtime | ✅ Complete | — |
@@ -2393,7 +2393,7 @@ Every language gets T3/T4 (network) access. T1/T2 (in-process) are additional hi
 ### Outstanding Work
 
 **Critical (blocks production use)**:
-1. **Phase 4 L2/L3**: Implement mmap-backed L2 and RocksDB L3 state tiers. Without L3, state does not survive restart, and Source-Anchor offset recovery is non-functional.
+1. ~~**Phase 4 L2/L3**: Implement mmap-backed L2 and RocksDB L3 state tiers.~~ ✅ **Done (2026-04-06)** — L2 MmapStore (append-only log + recovery + compaction) + L3 redb (pure Rust B-tree, ACID, `L3Store` adapter trait). State survives restart via L3 write-through.
 
 **Gate 1 unchecked metrics**:
 2. Aeon CPU <50% when Redpanda saturated — not formally measured
