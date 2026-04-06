@@ -148,10 +148,8 @@ pub fn api_router(state: Arc<AppState>) -> Router {
 
     // WebSocket processor connect — no Bearer auth (AWPP handshake handles auth)
     #[cfg(feature = "websocket-host")]
-    let health_routes = health_routes.route(
-        "/api/v1/processors/connect",
-        get(ws_processor_connect),
-    );
+    let health_routes =
+        health_routes.route("/api/v1/processors/connect", get(ws_processor_connect));
 
     health_routes
         .merge(api_routes)
@@ -263,9 +261,13 @@ async fn auth_middleware(
 pub async fn serve(state: Arc<AppState>, addr: &str) -> Result<(), Box<dyn std::error::Error>> {
     let auth_enabled = {
         #[cfg(feature = "processor-auth")]
-        { state.authenticator.is_some() }
+        {
+            state.authenticator.is_some()
+        }
         #[cfg(not(feature = "processor-auth"))]
-        { state.api_token.is_some() }
+        {
+            state.api_token.is_some()
+        }
     };
     if auth_enabled {
         tracing::info!(addr = addr, "REST API server listening (auth enabled)");
@@ -515,7 +517,8 @@ async fn upgrade_pipeline(
     Path(name): Path<String>,
     Json(req): Json<UpgradeRequest>,
 ) -> impl IntoResponse {
-    let proc_ref = aeon_types::registry::ProcessorRef::new(req.processor_name, req.processor_version);
+    let proc_ref =
+        aeon_types::registry::ProcessorRef::new(req.processor_name, req.processor_version);
     match state.pipelines.upgrade(&name, proc_ref, "api").await {
         Ok(()) => Json(serde_json::json!({"status": "upgraded"})).into_response(),
         Err(e) => api_error(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
@@ -529,7 +532,8 @@ async fn upgrade_blue_green(
     Path(name): Path<String>,
     Json(req): Json<UpgradeRequest>,
 ) -> impl IntoResponse {
-    let proc_ref = aeon_types::registry::ProcessorRef::new(req.processor_name, req.processor_version);
+    let proc_ref =
+        aeon_types::registry::ProcessorRef::new(req.processor_name, req.processor_version);
     match state
         .pipelines
         .upgrade_blue_green(&name, proc_ref, "api")
@@ -559,7 +563,8 @@ async fn upgrade_canary(
     Path(name): Path<String>,
     Json(req): Json<CanaryUpgradeRequest>,
 ) -> impl IntoResponse {
-    let proc_ref = aeon_types::registry::ProcessorRef::new(req.processor_name, req.processor_version);
+    let proc_ref =
+        aeon_types::registry::ProcessorRef::new(req.processor_name, req.processor_version);
     match state
         .pipelines
         .upgrade_canary(&name, proc_ref, req.steps, req.thresholds, "api")
@@ -1191,11 +1196,7 @@ mod tests {
         // Start blue-green
         state
             .pipelines
-            .upgrade_blue_green(
-                "rb-api",
-                ProcessorRef::new("proc", "2.0.0"),
-                "test",
-            )
+            .upgrade_blue_green("rb-api", ProcessorRef::new("proc", "2.0.0"), "test")
             .await
             .unwrap();
 

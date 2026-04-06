@@ -139,10 +139,8 @@ impl WebSocketProcessorHost {
         // Update routing table
         for assignment in &session.pipeline_assignments {
             for &partition in &assignment.partitions {
-                self.routing.insert(
-                    (assignment.name.clone(), partition),
-                    session_id.clone(),
-                );
+                self.routing
+                    .insert((assignment.name.clone(), partition), session_id.clone());
             }
         }
 
@@ -164,9 +162,7 @@ impl WebSocketProcessorHost {
                 self.routing.remove(&(assignment.name.clone(), partition));
             }
         }
-        self.config
-            .identity_store
-            .disconnect(&session.fingerprint);
+        self.config.identity_store.disconnect(&session.fingerprint);
 
         tracing::debug!(session_id = %session_id, "T4 processor disconnected");
 
@@ -308,9 +304,9 @@ impl WsSharedSocket {
 
     async fn send(&self, msg: Message) -> Result<(), AeonError> {
         let mut ws = self.inner.lock().await;
-        ws.send(msg).await.map_err(|e| {
-            AeonError::connection(format!("T4 WebSocket send failed: {e}"))
-        })
+        ws.send(msg)
+            .await
+            .map_err(|e| AeonError::connection(format!("T4 WebSocket send failed: {e}")))
     }
 
     async fn recv(&self) -> Option<Result<Message, AeonError>> {
@@ -331,10 +327,7 @@ impl WsSharedSocket {
 ///
 /// - **Text frames**: AWPP control messages (heartbeat, drain, error).
 /// - **Binary frames**: Batch response data with routing header.
-async fn ws_read_loop(
-    socket: &WsSharedSocket,
-    session: &AwppSession,
-) -> Result<(), AeonError> {
+async fn ws_read_loop(socket: &WsSharedSocket, session: &AwppSession) -> Result<(), AeonError> {
     loop {
         let msg = match socket.recv().await {
             Some(Ok(msg)) => msg,
@@ -404,11 +397,7 @@ fn handle_ws_data_frame(data: &[u8], session: &AwppSession) -> Result<(), AeonEr
 /// Build a binary data frame for sending a batch request.
 ///
 /// Frame format: `[4B name_len LE][name][2B partition LE][batch_wire data]`
-pub fn build_ws_data_frame(
-    pipeline_name: &str,
-    partition: u16,
-    batch_wire_data: &[u8],
-) -> Vec<u8> {
+pub fn build_ws_data_frame(pipeline_name: &str, partition: u16, batch_wire_data: &[u8]) -> Vec<u8> {
     let name_bytes = pipeline_name.as_bytes();
     let name_len = (name_bytes.len() as u32).to_le_bytes();
     let part_bytes = partition.to_le_bytes();
@@ -431,9 +420,8 @@ pub fn parse_ws_routing_header(data: &[u8]) -> Result<(&str, u16, usize), AeonEr
     if data.len() < 4 + name_len + 2 {
         return Err(AeonError::serialization("T4 data frame name truncated"));
     }
-    let name = std::str::from_utf8(&data[4..4 + name_len]).map_err(|e| {
-        AeonError::serialization(format!("T4 invalid pipeline name: {e}"))
-    })?;
+    let name = std::str::from_utf8(&data[4..4 + name_len])
+        .map_err(|e| AeonError::serialization(format!("T4 invalid pipeline name: {e}")))?;
     let partition = u16::from_le_bytes([data[4 + name_len], data[4 + name_len + 1]]);
     Ok((name, partition, 4 + name_len + 2))
 }

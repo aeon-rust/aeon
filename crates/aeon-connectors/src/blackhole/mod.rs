@@ -39,10 +39,7 @@ impl Sink for BlackholeSink {
     async fn write_batch(&mut self, outputs: Vec<Output>) -> Result<BatchResult, AeonError> {
         self.count
             .fetch_add(outputs.len() as u64, Ordering::Relaxed);
-        let ids = outputs
-            .iter()
-            .filter_map(|o| o.source_event_id)
-            .collect();
+        let ids = outputs.iter().filter_map(|o| o.source_event_id).collect();
         Ok(BatchResult::all_delivered(ids))
     }
 

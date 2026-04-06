@@ -13,7 +13,9 @@ use crate::batch_tuner::FlushTuner;
 use crate::checkpoint::{CheckpointRecord, CheckpointWriter};
 use crate::delivery::{CheckpointBackend, DeliveryConfig};
 use crate::delivery_ledger::DeliveryLedger;
-use aeon_types::{AeonError, BatchFailurePolicy, Event, Output, PartitionId, Processor, Sink, Source};
+use aeon_types::{
+    AeonError, BatchFailurePolicy, Event, Output, PartitionId, Processor, Sink, Source,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -480,15 +482,11 @@ where
 
     // Initialize checkpoint writer if WAL backend is configured.
     let checkpoint_writer = if config.delivery.checkpoint.backend == CheckpointBackend::Wal {
-        let dir = config
-            .delivery
-            .checkpoint
-            .dir
-            .unwrap_or_else(|| {
-                std::env::var("AEON_CHECKPOINT_DIR")
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or_else(|_| std::env::temp_dir().join("aeon-checkpoints"))
-            });
+        let dir = config.delivery.checkpoint.dir.unwrap_or_else(|| {
+            std::env::var("AEON_CHECKPOINT_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| std::env::temp_dir().join("aeon-checkpoints"))
+        });
         let wal_path = dir.join("pipeline.wal");
         match CheckpointWriter::new(&wal_path) {
             Ok(writer) => {
@@ -586,8 +584,7 @@ where
                                 }
                                 // Pending outputs remain tracked — acked at flush.
                             }
-                            let delivered_count =
-                                batch_result.delivered.len() as u64;
+                            let delivered_count = batch_result.delivered.len() as u64;
                             let total_count = count;
                             metrics_sink
                                 .outputs_sent
@@ -598,9 +595,7 @@ where
 
                             // Apply BatchFailurePolicy if there are partial failures.
                             if batch_result.has_failures() {
-                                let original = outputs_for_retry
-                                    .as_deref()
-                                    .unwrap_or(&[]);
+                                let original = outputs_for_retry.as_deref().unwrap_or(&[]);
                                 handle_batch_failures(
                                     &mut sink,
                                     original,
@@ -612,8 +607,7 @@ where
                                     &sink_ledger,
                                 )
                                 .await?;
-                                failed_since_checkpoint +=
-                                    batch_result.failed.len() as u64;
+                                failed_since_checkpoint += batch_result.failed.len() as u64;
                             }
                         }
                         Err(e) => {
@@ -1564,10 +1558,7 @@ mod tests {
     }
 
     impl Sink for PartialFailSink {
-        async fn write_batch(
-            &mut self,
-            outputs: Vec<Output>,
-        ) -> Result<BatchResult, AeonError> {
+        async fn write_batch(&mut self, outputs: Vec<Output>) -> Result<BatchResult, AeonError> {
             let call_num = self.calls.fetch_add(1, Ordering::Relaxed);
             let healed = call_num >= self.heal_after;
 

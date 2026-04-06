@@ -11,9 +11,9 @@
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
+use crate::AeonError;
 use crate::event::{Event, Output};
 use crate::partition::PartitionId;
-use crate::AeonError;
 
 /// Which codec to use for Event/Output envelope serialization on data streams.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -189,14 +189,13 @@ impl TransportCodec {
 
     /// Decode a single Event envelope from bytes.
     pub fn decode_event(&self, data: &[u8]) -> Result<Event, AeonError> {
-        let wire: WireEvent = match self {
-            Self::MsgPack => {
-                rmp_serde::from_slice(data).map_err(|e| AeonError::serialization(e.to_string()))?
-            }
-            Self::Json => {
-                serde_json::from_slice(data).map_err(|e| AeonError::serialization(e.to_string()))?
-            }
-        };
+        let wire: WireEvent =
+            match self {
+                Self::MsgPack => rmp_serde::from_slice(data)
+                    .map_err(|e| AeonError::serialization(e.to_string()))?,
+                Self::Json => serde_json::from_slice(data)
+                    .map_err(|e| AeonError::serialization(e.to_string()))?,
+            };
         Ok(Event::from(wire))
     }
 
@@ -225,14 +224,13 @@ impl TransportCodec {
 
     /// Decode a single Output envelope from bytes.
     pub fn decode_output(&self, data: &[u8]) -> Result<Output, AeonError> {
-        let wire: WireOutput = match self {
-            Self::MsgPack => {
-                rmp_serde::from_slice(data).map_err(|e| AeonError::serialization(e.to_string()))?
-            }
-            Self::Json => {
-                serde_json::from_slice(data).map_err(|e| AeonError::serialization(e.to_string()))?
-            }
-        };
+        let wire: WireOutput =
+            match self {
+                Self::MsgPack => rmp_serde::from_slice(data)
+                    .map_err(|e| AeonError::serialization(e.to_string()))?,
+                Self::Json => serde_json::from_slice(data)
+                    .map_err(|e| AeonError::serialization(e.to_string()))?,
+            };
         Ok(Output::from(wire))
     }
 
@@ -335,7 +333,10 @@ mod tests {
 
         let back = Output::from(wire);
         assert_eq!(&*back.destination, "enriched-orders");
-        assert_eq!(back.key.as_ref().map(|k| k.as_ref()), Some(b"user-123".as_ref()));
+        assert_eq!(
+            back.key.as_ref().map(|k| k.as_ref()),
+            Some(b"user-123".as_ref())
+        );
         assert_eq!(back.headers.len(), 1);
         assert_eq!(back.source_event_id, Some(uuid::Uuid::nil()));
     }

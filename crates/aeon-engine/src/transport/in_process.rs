@@ -25,7 +25,12 @@ pub struct InProcessTransport<P: Processor> {
 
 impl<P: Processor> InProcessTransport<P> {
     /// Create a new in-process transport wrapping the given processor.
-    pub fn new(processor: P, name: impl Into<String>, version: impl Into<String>, tier: ProcessorTier) -> Self {
+    pub fn new(
+        processor: P,
+        name: impl Into<String>,
+        version: impl Into<String>,
+        tier: ProcessorTier,
+    ) -> Self {
         Self {
             processor: Arc::new(processor),
             info: ProcessorInfo {
@@ -61,9 +66,7 @@ impl<P: Processor + 'static> ProcessorTransport for InProcessTransport<P> {
         })
     }
 
-    fn drain(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = Result<(), AeonError>> + Send + '_>> {
+    fn drain(&self) -> Pin<Box<dyn Future<Output = Result<(), AeonError>> + Send + '_>> {
         // In-process processors have no in-flight network work to drain.
         Box::pin(async { Ok(()) })
     }
@@ -84,10 +87,7 @@ mod tests {
 
     impl Processor for TestProcessor {
         fn process(&self, event: Event) -> Result<Vec<Output>, AeonError> {
-            Ok(vec![Output::new(
-                Arc::from("out"),
-                event.payload.clone(),
-            )])
+            Ok(vec![Output::new(Arc::from("out"), event.payload.clone())])
         }
     }
 
@@ -111,12 +111,8 @@ mod tests {
 
     #[tokio::test]
     async fn call_batch_passthrough() {
-        let transport = InProcessTransport::new(
-            TestProcessor,
-            "test-proc",
-            "1.0.0",
-            ProcessorTier::Native,
-        );
+        let transport =
+            InProcessTransport::new(TestProcessor, "test-proc", "1.0.0", ProcessorTier::Native);
         let events = vec![make_event(b"hello"), make_event(b"world")];
         let outputs = transport.call_batch(events).await.unwrap();
         assert_eq!(outputs.len(), 2);
@@ -126,36 +122,24 @@ mod tests {
 
     #[tokio::test]
     async fn call_batch_empty() {
-        let transport = InProcessTransport::new(
-            TestProcessor,
-            "test-proc",
-            "1.0.0",
-            ProcessorTier::Wasm,
-        );
+        let transport =
+            InProcessTransport::new(TestProcessor, "test-proc", "1.0.0", ProcessorTier::Wasm);
         let outputs = transport.call_batch(vec![]).await.unwrap();
         assert!(outputs.is_empty());
     }
 
     #[tokio::test]
     async fn call_batch_error_propagation() {
-        let transport = InProcessTransport::new(
-            FailProcessor,
-            "fail-proc",
-            "1.0.0",
-            ProcessorTier::Native,
-        );
+        let transport =
+            InProcessTransport::new(FailProcessor, "fail-proc", "1.0.0", ProcessorTier::Native);
         let result = transport.call_batch(vec![make_event(b"x")]).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn health_always_healthy() {
-        let transport = InProcessTransport::new(
-            TestProcessor,
-            "test-proc",
-            "1.0.0",
-            ProcessorTier::Native,
-        );
+        let transport =
+            InProcessTransport::new(TestProcessor, "test-proc", "1.0.0", ProcessorTier::Native);
         let health = transport.health().await.unwrap();
         assert!(health.healthy);
         assert!(health.uptime_secs.is_some());
@@ -163,23 +147,15 @@ mod tests {
 
     #[tokio::test]
     async fn drain_is_noop() {
-        let transport = InProcessTransport::new(
-            TestProcessor,
-            "test-proc",
-            "1.0.0",
-            ProcessorTier::Native,
-        );
+        let transport =
+            InProcessTransport::new(TestProcessor, "test-proc", "1.0.0", ProcessorTier::Native);
         transport.drain().await.unwrap();
     }
 
     #[tokio::test]
     async fn info_returns_metadata() {
-        let transport = InProcessTransport::new(
-            TestProcessor,
-            "my-proc",
-            "2.5.0",
-            ProcessorTier::Wasm,
-        );
+        let transport =
+            InProcessTransport::new(TestProcessor, "my-proc", "2.5.0", ProcessorTier::Wasm);
         let info = transport.info();
         assert_eq!(info.name, "my-proc");
         assert_eq!(info.version, "2.5.0");
@@ -190,12 +166,8 @@ mod tests {
     /// Compile-time proof that InProcessTransport can be used as &dyn ProcessorTransport.
     #[tokio::test]
     async fn dyn_dispatch() {
-        let transport = InProcessTransport::new(
-            TestProcessor,
-            "dyn-test",
-            "1.0.0",
-            ProcessorTier::Native,
-        );
+        let transport =
+            InProcessTransport::new(TestProcessor, "dyn-test", "1.0.0", ProcessorTier::Native);
         let dyn_ref: &dyn ProcessorTransport = &transport;
         let outputs = dyn_ref.call_batch(vec![make_event(b"dyn")]).await.unwrap();
         assert_eq!(outputs.len(), 1);

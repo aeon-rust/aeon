@@ -14,19 +14,22 @@ pub mod partition;
 pub mod processor_identity;
 pub mod processor_transport;
 pub mod registry;
-pub mod transport_codec;
 pub mod scanner;
 pub mod traits;
+pub mod transport_codec;
 pub mod uuid;
 
 // Re-export primary types at crate root for convenience.
-pub use delivery::{
-    BatchFailurePolicy, BatchResult, DeliverySemantics, DeliveryStrategy,
-};
+pub use delivery::{BatchFailurePolicy, BatchResult, DeliverySemantics, DeliveryStrategy};
 pub use error::{AeonError, Result};
 pub use event::{Event, Output};
 pub use interner::StringInterner;
+pub use oauth::OAuthConfig;
 pub use partition::PartitionId;
+pub use processor_identity::{PipelineScope, ProcessorIdentity};
+pub use processor_transport::{
+    ProcessorBinding, ProcessorConnectionConfig, ProcessorHealth, ProcessorInfo, ProcessorTier,
+};
 pub use registry::{
     BlueGreenActive, BlueGreenState, CanaryState, CanaryThresholds, PipelineAction,
     PipelineDefinition, PipelineHistoryEntry, PipelineState, ProcessorRecord, ProcessorRef,
@@ -35,11 +38,6 @@ pub use registry::{
 };
 pub use scanner::{
     BytesFinder, contains_byte, contains_bytes, find_byte, find_bytes, json_field_value,
-};
-pub use oauth::OAuthConfig;
-pub use processor_identity::{PipelineScope, ProcessorIdentity};
-pub use processor_transport::{
-    ProcessorBinding, ProcessorConnectionConfig, ProcessorHealth, ProcessorInfo, ProcessorTier,
 };
 pub use traits::{IdempotentSink, Processor, ProcessorTransport, Seekable, Sink, Source, StateOps};
 pub use transport_codec::{TransportCodec, WireEvent, WireOutput};

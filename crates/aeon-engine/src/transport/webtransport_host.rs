@@ -309,7 +309,9 @@ async fn wt_accept_loop(
         let config = config.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = handle_wt_session(session, sessions, routing, data_streams, config).await {
+            if let Err(e) =
+                handle_wt_session(session, sessions, routing, data_streams, config).await
+            {
                 tracing::debug!(error = %e, "T3 session ended");
             }
         });
@@ -325,9 +327,10 @@ async fn handle_wt_session(
     config: Arc<WebTransportHostConfig>,
 ) -> Result<(), AeonError> {
     // Accept the first bidirectional stream as the control stream
-    let (ctrl_send, ctrl_recv) = connection.accept_bi().await.map_err(|e| {
-        AeonError::connection(format!("failed to accept control stream: {e}"))
-    })?;
+    let (ctrl_send, ctrl_recv) = connection
+        .accept_bi()
+        .await
+        .map_err(|e| AeonError::connection(format!("failed to accept control stream: {e}")))?;
 
     let control = WtControlChannel::new(ctrl_send, ctrl_recv);
 
@@ -358,10 +361,7 @@ async fn handle_wt_session(
     // Update routing table
     for assignment in &session.pipeline_assignments {
         for &partition in &assignment.partitions {
-            routing.insert(
-                (assignment.name.clone(), partition),
-                session_id.clone(),
-            );
+            routing.insert((assignment.name.clone(), partition), session_id.clone());
         }
     }
 
@@ -482,9 +482,9 @@ async fn wt_data_stream_reader(
 
         // Read frame body
         let mut frame = vec![0u8; frame_len];
-        recv.read_exact(&mut frame).await.map_err(|e| {
-            AeonError::connection(format!("T3 data frame read failed: {e}"))
-        })?;
+        recv.read_exact(&mut frame)
+            .await
+            .map_err(|e| AeonError::connection(format!("T3 data frame read failed: {e}")))?;
 
         // Decode batch response and complete the in-flight batch
         match crate::batch_wire::decode_batch_response(&frame, session.codec) {
@@ -540,9 +540,9 @@ impl ControlChannel for WtControlChannel {
             send.write_all(&len).await.map_err(|e| {
                 AeonError::connection(format!("T3 control send length failed: {e}"))
             })?;
-            send.write_all(&data).await.map_err(|e| {
-                AeonError::connection(format!("T3 control send data failed: {e}"))
-            })?;
+            send.write_all(&data)
+                .await
+                .map_err(|e| AeonError::connection(format!("T3 control send data failed: {e}")))?;
             Ok(())
         })
     }
@@ -563,9 +563,9 @@ impl ControlChannel for WtControlChannel {
                 )));
             }
             let mut buf = vec![0u8; len];
-            recv.read_exact(&mut buf).await.map_err(|e| {
-                AeonError::connection(format!("T3 control recv data failed: {e}"))
-            })?;
+            recv.read_exact(&mut buf)
+                .await
+                .map_err(|e| AeonError::connection(format!("T3 control recv data failed: {e}")))?;
             Ok(buf)
         })
     }
@@ -579,9 +579,6 @@ mod tests {
     fn wt_host_config_defaults() {
         // Verify config construction doesn't panic
         // (can't actually start a server without TLS certs in tests)
-        assert_eq!(
-            ProcessorTier::WebTransport.to_string(),
-            "web-transport"
-        );
+        assert_eq!(ProcessorTier::WebTransport.to_string(), "web-transport");
     }
 }

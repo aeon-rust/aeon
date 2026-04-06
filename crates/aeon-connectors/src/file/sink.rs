@@ -107,10 +107,7 @@ impl Sink for FileSink {
             .as_mut()
             .ok_or_else(|| AeonError::state("FileSink writer not initialized"))?;
 
-        let event_ids: Vec<_> = outputs
-            .iter()
-            .filter_map(|o| o.source_event_id)
-            .collect();
+        let event_ids: Vec<_> = outputs.iter().filter_map(|o| o.source_event_id).collect();
 
         match self.config.strategy {
             DeliveryStrategy::PerEvent => {

@@ -1,0 +1,47 @@
+[package]
+name = "aeon-processor-client"
+description = "Rust SDK for building standalone Aeon processors (T3 WebTransport + T4 WebSocket)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["websocket"]
+websocket = ["tokio-tungstenite"]
+webtransport = ["wtransport"]
+webtransport-insecure = ["webtransport", "wtransport/dangerous-configuration"]
+
+[dependencies]
+# Core
+aeon-types = { workspace = true }
+bytes = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_bytes = { workspace = true }
+
+# Codec
+rmp-serde = { workspace = true }
+crc32fast = { workspace = true }
+
+# Crypto
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }
+hex = { workspace = true }
+base64 = { workspace = true }
+
+# Async
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
+futures-util = { workspace = true }
+
+# Transport (feature-gated)
+tokio-tungstenite = { workspace = true, optional = true }
+wtransport = { workspace = true, optional = true }
+
+# Logging
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }

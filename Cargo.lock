@@ -190,6 +190,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "aeon-processor-client"
+version = "0.1.0"
+dependencies = [
+ "aeon-types",
+ "base64 0.22.1",
+ "bytes",
+ "crc32fast",
+ "ed25519-dalek",
+ "futures-util",
+ "hex",
+ "rand 0.8.5",
+ "rmp-serde",
+ "serde",
+ "serde_bytes",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-tungstenite 0.26.2",
+ "tracing",
+ "uuid",
+ "wtransport",
+]
+
+[[package]]
 name = "aeon-sample-rust-native"
 version = "0.1.0"
 dependencies = [

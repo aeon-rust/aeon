@@ -64,10 +64,7 @@ impl Sink for WebSocketSink {
     async fn write_batch(&mut self, outputs: Vec<Output>) -> Result<BatchResult, AeonError> {
         use futures_util::SinkExt;
 
-        let ids = outputs
-            .iter()
-            .filter_map(|o| o.source_event_id)
-            .collect();
+        let ids = outputs.iter().filter_map(|o| o.source_event_id).collect();
         for output in &outputs {
             let msg = Message::Binary(output.payload.to_vec().into());
             self.writer

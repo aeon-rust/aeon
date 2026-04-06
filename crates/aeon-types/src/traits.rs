@@ -136,9 +136,7 @@ pub trait ProcessorTransport: Send + Sync {
     ///
     /// For T1/T2: no-op (in-process, nothing to drain).
     /// For T3/T4: sends drain signal on control stream, awaits acknowledgment.
-    fn drain(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = Result<(), AeonError>> + Send + '_>>;
+    fn drain(&self) -> Pin<Box<dyn Future<Output = Result<(), AeonError>> + Send + '_>>;
 
     /// Processor metadata (sync — always available without I/O).
     fn info(&self) -> ProcessorInfo;

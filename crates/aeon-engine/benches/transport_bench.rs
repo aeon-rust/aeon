@@ -3,11 +3,11 @@
 //! Run: `cargo bench -p aeon-engine --bench transport_bench`
 
 use aeon_engine::{InProcessTransport, PassthroughProcessor};
+use aeon_types::PartitionId;
 use aeon_types::event::{Event, Output};
 use aeon_types::processor_transport::ProcessorTier;
 use aeon_types::traits::{Processor, ProcessorTransport};
 use aeon_types::transport_codec::TransportCodec;
-use aeon_types::PartitionId;
 use bytes::Bytes;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::sync::Arc;
@@ -82,26 +82,20 @@ fn bench_transport_codec(c: &mut Criterion) {
 
         // Encode batch
         group.throughput(Throughput::Elements(64));
-        group.bench_function(
-            BenchmarkId::new("encode_64_events", label),
-            |b| {
-                b.iter(|| {
-                    let _ = codec.encode_events(&events);
-                });
-            },
-        );
+        group.bench_function(BenchmarkId::new("encode_64_events", label), |b| {
+            b.iter(|| {
+                let _ = codec.encode_events(&events);
+            });
+        });
 
         // Decode batch
         let encoded = codec.encode_events(&events).unwrap();
         let encoded_refs: Vec<&[u8]> = encoded.iter().map(|v| v.as_slice()).collect();
-        group.bench_function(
-            BenchmarkId::new("decode_64_events", label),
-            |b| {
-                b.iter(|| {
-                    let _ = codec.decode_events(&encoded_refs);
-                });
-            },
-        );
+        group.bench_function(BenchmarkId::new("decode_64_events", label), |b| {
+            b.iter(|| {
+                let _ = codec.decode_events(&encoded_refs);
+            });
+        });
     }
     group.finish();
 }

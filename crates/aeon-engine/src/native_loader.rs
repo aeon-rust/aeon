@@ -108,7 +108,10 @@ impl NativeProcessor {
         use sha2::{Digest, Sha256};
 
         let file_bytes = std::fs::read(path).map_err(|e| AeonError::Config {
-            message: format!("failed to read '{}' for integrity check: {e}", path.display()),
+            message: format!(
+                "failed to read '{}' for integrity check: {e}",
+                path.display()
+            ),
         })?;
 
         let mut hasher = Sha256::new();

@@ -35,10 +35,9 @@ pub use affinity::{
 };
 pub use batch_tuner::{BatchTuner, FlushTuner};
 pub use batch_wire::{
-    BatchRequest, BatchResponse, DecodedBatchResponse, decode_batch_request,
-    decode_batch_response, deserialize_batch_request, deserialize_batch_response,
-    encode_batch_request, encode_batch_response, serialize_batch_request,
-    serialize_batch_response,
+    BatchRequest, BatchResponse, DecodedBatchResponse, decode_batch_request, decode_batch_response,
+    deserialize_batch_request, deserialize_batch_response, encode_batch_request,
+    encode_batch_response, serialize_batch_request, serialize_batch_response,
 };
 
 pub use checkpoint::{CheckpointReader, CheckpointRecord, CheckpointWriter};
@@ -48,6 +47,7 @@ pub use delivery::{CheckpointBackend, CheckpointConfig, DeliveryConfig, FlushStr
 pub use delivery_ledger::{DeliveryLedger, DeliveryState, FailedEntry, LedgerEntry};
 pub use dlq::{DeadLetterQueue, DlqConfig, DlqRecord};
 pub use health::{HealthState, serve_health};
+pub use identity_store::ProcessorIdentityStore;
 pub use metrics_server::{MetricsConfig, serve_metrics, serve_metrics_with_config};
 pub use pipeline::{
     CorePinning, MultiPartitionConfig, PipelineConfig, PipelineMetrics, run, run_buffered,
@@ -58,9 +58,10 @@ pub use processor::PassthroughProcessor;
 pub use registry::ProcessorRegistry;
 pub use retry::{RetryConfig, RetryOutcome, backoff_delay, retry_async, retry_sync};
 pub use shutdown::{ShutdownConfig, ShutdownCoordinator};
-pub use identity_store::ProcessorIdentityStore;
 pub use transport::InProcessTransport;
-pub use transport::{AwppSession, BatchInflight, ControlChannel, HandshakeConfig, PipelineResolver, SessionState};
+pub use transport::{
+    AwppSession, BatchInflight, ControlChannel, HandshakeConfig, PipelineResolver, SessionState,
+};
 
 #[cfg(feature = "native-loader")]
 pub use native_loader::NativeProcessor;
@@ -72,4 +73,7 @@ pub use rest_api::{AppState, api_router, serve};
 pub use transport::WebTransportProcessorHost;
 
 #[cfg(feature = "websocket-host")]
-pub use transport::{WebSocketProcessorHost, websocket_host::{build_ws_data_frame, parse_ws_routing_header}};
+pub use transport::{
+    WebSocketProcessorHost,
+    websocket_host::{build_ws_data_frame, parse_ws_routing_header},
+};

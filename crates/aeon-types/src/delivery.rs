@@ -59,12 +59,18 @@ impl DeliveryStrategy {
     /// `PerEvent` blocks per-event. `OrderedBatch` blocks at batch boundary.
     /// `UnorderedBatch` does not block (acks collected at flush).
     pub fn is_blocking(&self) -> bool {
-        matches!(self, DeliveryStrategy::PerEvent | DeliveryStrategy::OrderedBatch)
+        matches!(
+            self,
+            DeliveryStrategy::PerEvent | DeliveryStrategy::OrderedBatch
+        )
     }
 
     /// Returns `true` if this strategy preserves event ordering.
     pub fn preserves_order(&self) -> bool {
-        matches!(self, DeliveryStrategy::PerEvent | DeliveryStrategy::OrderedBatch)
+        matches!(
+            self,
+            DeliveryStrategy::PerEvent | DeliveryStrategy::OrderedBatch
+        )
     }
 
     /// Returns `true` if this strategy sends events one at a time.

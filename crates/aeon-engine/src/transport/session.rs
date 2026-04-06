@@ -6,8 +6,8 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicI64, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
@@ -38,9 +38,8 @@ pub trait ControlChannel: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<(), AeonError>> + Send + '_>>;
 
     /// Receive a JSON-encoded control message.
-    fn recv_control(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, AeonError>> + Send + '_>>;
+    fn recv_control(&self)
+    -> Pin<Box<dyn Future<Output = Result<Vec<u8>, AeonError>> + Send + '_>>;
 }
 
 // ── Pipeline Resolver ───────────────────────────────────────────────────
@@ -217,8 +216,7 @@ impl AwppSession {
             reason: reason.into(),
             deadline_ms,
         });
-        let json = serde_json::to_vec(&msg)
-            .map_err(|e| AeonError::serialization(e.to_string()))?;
+        let json = serde_json::to_vec(&msg).map_err(|e| AeonError::serialization(e.to_string()))?;
         control.send_control(&json).await
     }
 
@@ -231,8 +229,7 @@ impl AwppSession {
         let msg = ControlMessage::Heartbeat(HeartbeatPayload {
             timestamp_ms: now_ms,
         });
-        let json = serde_json::to_vec(&msg)
-            .map_err(|e| AeonError::serialization(e.to_string()))?;
+        let json = serde_json::to_vec(&msg).map_err(|e| AeonError::serialization(e.to_string()))?;
         control.send_control(&json).await
     }
 
@@ -285,8 +282,8 @@ pub async fn handshake(
         nonce: challenge.nonce,
         oauth_required: challenge.oauth_required,
     });
-    let challenge_json = serde_json::to_vec(&challenge_msg)
-        .map_err(|e| AeonError::serialization(e.to_string()))?;
+    let challenge_json =
+        serde_json::to_vec(&challenge_msg).map_err(|e| AeonError::serialization(e.to_string()))?;
     control.send_control(&challenge_json).await?;
 
     // Step 2: Receive Registration
@@ -334,9 +331,11 @@ pub async fn handshake(
 
     // 3c: Check authorization (pipeline scope, instance limits)
     let current_connections = identity_store.active_connections(&identity.fingerprint);
-    if let Err(rejected) =
-        processor_auth::check_authorization(&identity, &reg.requested_pipelines, current_connections)
-    {
+    if let Err(rejected) = processor_auth::check_authorization(
+        &identity,
+        &reg.requested_pipelines,
+        current_connections,
+    ) {
         let rejected_msg = ControlMessage::Rejected(RejectedPayload {
             code: rejected.code,
             message: rejected.message,
@@ -363,8 +362,8 @@ pub async fn handshake(
         heartbeat_interval_ms: config.heartbeat_interval.as_millis() as u64,
         batch_signing: config.batch_signing,
     });
-    let json = serde_json::to_vec(&accepted_msg)
-        .map_err(|e| AeonError::serialization(e.to_string()))?;
+    let json =
+        serde_json::to_vec(&accepted_msg).map_err(|e| AeonError::serialization(e.to_string()))?;
     control.send_control(&json).await?;
 
     // Register connection in identity store
@@ -396,7 +395,8 @@ fn send_rejected_sync(rejected: aeon_types::awpp::Rejected) -> AeonError {
 
 /// Parse a received control message from JSON bytes.
 pub fn parse_control_message(data: &[u8]) -> Result<ControlMessage, AeonError> {
-    serde_json::from_slice(data).map_err(|e| AeonError::serialization(format!("invalid control message: {e}")))
+    serde_json::from_slice(data)
+        .map_err(|e| AeonError::serialization(format!("invalid control message: {e}")))
 }
 
 /// Serialize a control message to JSON bytes.

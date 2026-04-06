@@ -243,9 +243,17 @@ async fn bench_blackhole(strategy: DeliveryStrategy) -> BenchResult {
     let shutdown = Arc::new(AtomicBool::new(false));
 
     let t = Instant::now();
-    run_buffered(source, processor, sink, config, Arc::clone(&metrics), shutdown, None)
-        .await
-        .expect("pipeline run");
+    run_buffered(
+        source,
+        processor,
+        sink,
+        config,
+        Arc::clone(&metrics),
+        shutdown,
+        None,
+    )
+    .await
+    .expect("pipeline run");
     let elapsed = t.elapsed();
 
     BenchResult {
@@ -279,9 +287,17 @@ async fn bench_file(strategy: DeliveryStrategy) -> BenchResult {
     let shutdown = Arc::new(AtomicBool::new(false));
 
     let t = Instant::now();
-    run_buffered(source, processor, sink, config, Arc::clone(&metrics), shutdown, None)
-        .await
-        .expect("pipeline run");
+    run_buffered(
+        source,
+        processor,
+        sink,
+        config,
+        Arc::clone(&metrics),
+        shutdown,
+        None,
+    )
+    .await
+    .expect("pipeline run");
     let elapsed = t.elapsed();
 
     // Verify output file has the right number of lines
@@ -289,9 +305,7 @@ async fn bench_file(strategy: DeliveryStrategy) -> BenchResult {
     let line_count = content.lines().count();
     let expected = metrics.outputs_sent.load(Ordering::Relaxed) as usize;
     if line_count != expected {
-        eprintln!(
-            "  WARNING: File line count mismatch: got {line_count}, expected {expected}"
-        );
+        eprintln!("  WARNING: File line count mismatch: got {line_count}, expected {expected}");
     }
 
     BenchResult {
@@ -325,8 +339,7 @@ async fn bench_redpanda(strategy: DeliveryStrategy) -> BenchResult {
     let source = make_source(SOURCE_TOPIC);
     let processor = PassthroughProcessor::new(Arc::from(SINK_TOPIC));
 
-    let mut sink_config = KafkaSinkConfig::new(&brokers(), SINK_TOPIC)
-        .with_strategy(strategy);
+    let mut sink_config = KafkaSinkConfig::new(&brokers(), SINK_TOPIC).with_strategy(strategy);
     // Optimize producer settings per strategy
     match strategy {
         DeliveryStrategy::PerEvent => {
@@ -352,9 +365,17 @@ async fn bench_redpanda(strategy: DeliveryStrategy) -> BenchResult {
     let shutdown = Arc::new(AtomicBool::new(false));
 
     let t = Instant::now();
-    run_buffered(source, processor, sink, config, Arc::clone(&metrics), shutdown, None)
-        .await
-        .expect("pipeline run");
+    run_buffered(
+        source,
+        processor,
+        sink,
+        config,
+        Arc::clone(&metrics),
+        shutdown,
+        None,
+    )
+    .await
+    .expect("pipeline run");
     let elapsed = t.elapsed();
 
     BenchResult {
@@ -415,8 +436,10 @@ fn main() {
     // ─── Test 1: Blackhole Sink ──────────────────────────────────
     println!("--- Test 1: Blackhole Sink (pure pipeline overhead) ---");
     println!();
-    println!("  {:>10} | {:>10} | {:>10}        | {:>10}      | {:>13}    | {:>12}    | Duration",
-             "Mode", "Sink", "Received", "Sent", "Throughput", "Per-event");
+    println!(
+        "  {:>10} | {:>10} | {:>10}        | {:>10}      | {:>13}    | {:>12}    | Duration",
+        "Mode", "Sink", "Received", "Sent", "Throughput", "Per-event"
+    );
 
     let bh_per_event = rt.block_on(bench_blackhole(DeliveryStrategy::PerEvent));
     print_result(&bh_per_event);
@@ -432,10 +455,15 @@ fn main() {
     println!();
     println!("  OrdBatch/PerEvent speedup: {bh_ob_speedup:.2}x");
     println!("  UnordBatch/PerEvent speedup: {bh_ub_speedup:.2}x");
-    println!("  Event loss: pe={}/{}, ob={}/{}, ub={}/{}",
-        bh_per_event.outputs_sent, bh_per_event.events_received,
-        bh_ord_batch.outputs_sent, bh_ord_batch.events_received,
-        bh_unord_batch.outputs_sent, bh_unord_batch.events_received);
+    println!(
+        "  Event loss: pe={}/{}, ob={}/{}, ub={}/{}",
+        bh_per_event.outputs_sent,
+        bh_per_event.events_received,
+        bh_ord_batch.outputs_sent,
+        bh_ord_batch.events_received,
+        bh_unord_batch.outputs_sent,
+        bh_unord_batch.events_received
+    );
     println!();
 
     // ─── Test 2: File Sink ───────────────────────────────────────
@@ -456,10 +484,15 @@ fn main() {
     println!();
     println!("  OrdBatch/PerEvent speedup: {file_ob_speedup:.2}x");
     println!("  UnordBatch/PerEvent speedup: {file_ub_speedup:.2}x");
-    println!("  Event loss: pe={}/{}, ob={}/{}, ub={}/{}",
-        file_per_event.outputs_sent, file_per_event.events_received,
-        file_ord_batch.outputs_sent, file_ord_batch.events_received,
-        file_unord_batch.outputs_sent, file_unord_batch.events_received);
+    println!(
+        "  Event loss: pe={}/{}, ob={}/{}, ub={}/{}",
+        file_per_event.outputs_sent,
+        file_per_event.events_received,
+        file_ord_batch.outputs_sent,
+        file_ord_batch.events_received,
+        file_unord_batch.outputs_sent,
+        file_unord_batch.events_received
+    );
     println!();
 
     // ─── Test 3: Redpanda Sink ───────────────────────────────────
@@ -481,51 +514,119 @@ fn main() {
         println!();
         println!("  OrdBatch/PerEvent speedup: {rp_ob_speedup:.2}x");
         println!("  UnordBatch/PerEvent speedup: {rp_ub_speedup:.2}x");
-        println!("  Event loss: pe={}/{}, ob={}/{}, ub={}/{}",
-            rp_per_event.outputs_sent, rp_per_event.events_received,
-            rp_ord_batch.outputs_sent, rp_ord_batch.events_received,
-            rp_unord_batch.outputs_sent, rp_unord_batch.events_received);
+        println!(
+            "  Event loss: pe={}/{}, ob={}/{}, ub={}/{}",
+            rp_per_event.outputs_sent,
+            rp_per_event.events_received,
+            rp_ord_batch.outputs_sent,
+            rp_ord_batch.events_received,
+            rp_unord_batch.outputs_sent,
+            rp_unord_batch.events_received
+        );
         println!();
 
         // ─── Summary ─────────────────────────────────────────────
         println!("=== Summary ===");
         println!();
-        println!("  {:>12} | {:>12} | {:>12} | {:>12} | {:>10} | {:>10}",
-                 "Sink", "PerEvent", "OrdBatch", "UnordBatch", "OB/PE", "UB/PE");
-        println!("  {:>12} | {:>12} | {:>12} | {:>12} | {:>10} | {:>10}",
-                 "────────────", "────────────", "────────────", "────────────", "──────────", "──────────");
-        println!("  {:>12} | {:>10.0}/s | {:>10.0}/s | {:>10.0}/s | {:>8.2}x | {:>8.2}x",
-                 "Blackhole", bh_per_event.throughput(), bh_ord_batch.throughput(), bh_unord_batch.throughput(), bh_ob_speedup, bh_ub_speedup);
-        println!("  {:>12} | {:>10.0}/s | {:>10.0}/s | {:>10.0}/s | {:>8.2}x | {:>8.2}x",
-                 "FileSink", file_per_event.throughput(), file_ord_batch.throughput(), file_unord_batch.throughput(), file_ob_speedup, file_ub_speedup);
-        println!("  {:>12} | {:>10.0}/s | {:>10.0}/s | {:>10.0}/s | {:>8.2}x | {:>8.2}x",
-                 "Redpanda", rp_per_event.throughput(), rp_ord_batch.throughput(), rp_unord_batch.throughput(), rp_ob_speedup, rp_ub_speedup);
+        println!(
+            "  {:>12} | {:>12} | {:>12} | {:>12} | {:>10} | {:>10}",
+            "Sink", "PerEvent", "OrdBatch", "UnordBatch", "OB/PE", "UB/PE"
+        );
+        println!(
+            "  {:>12} | {:>12} | {:>12} | {:>12} | {:>10} | {:>10}",
+            "────────────",
+            "────────────",
+            "────────────",
+            "────────────",
+            "──────────",
+            "──────────"
+        );
+        println!(
+            "  {:>12} | {:>10.0}/s | {:>10.0}/s | {:>10.0}/s | {:>8.2}x | {:>8.2}x",
+            "Blackhole",
+            bh_per_event.throughput(),
+            bh_ord_batch.throughput(),
+            bh_unord_batch.throughput(),
+            bh_ob_speedup,
+            bh_ub_speedup
+        );
+        println!(
+            "  {:>12} | {:>10.0}/s | {:>10.0}/s | {:>10.0}/s | {:>8.2}x | {:>8.2}x",
+            "FileSink",
+            file_per_event.throughput(),
+            file_ord_batch.throughput(),
+            file_unord_batch.throughput(),
+            file_ob_speedup,
+            file_ub_speedup
+        );
+        println!(
+            "  {:>12} | {:>10.0}/s | {:>10.0}/s | {:>10.0}/s | {:>8.2}x | {:>8.2}x",
+            "Redpanda",
+            rp_per_event.throughput(),
+            rp_ord_batch.throughput(),
+            rp_unord_batch.throughput(),
+            rp_ob_speedup,
+            rp_ub_speedup
+        );
         println!();
 
         // Acceptance criteria
         println!("=== Acceptance Criteria ===");
         println!();
         let all_results = [
-            &bh_per_event, &bh_ord_batch, &bh_unord_batch,
-            &file_per_event, &file_ord_batch, &file_unord_batch,
-            &rp_per_event, &rp_ord_batch, &rp_unord_batch,
+            &bh_per_event,
+            &bh_ord_batch,
+            &bh_unord_batch,
+            &file_per_event,
+            &file_ord_batch,
+            &file_unord_batch,
+            &rp_per_event,
+            &rp_ord_batch,
+            &rp_unord_batch,
         ];
-        let zero_loss = all_results.iter().all(|r| r.events_received == r.outputs_sent);
+        let zero_loss = all_results
+            .iter()
+            .all(|r| r.events_received == r.outputs_sent);
 
         let checks = [
-            ("Blackhole UnordBatch >= PerEvent", bh_ub_speedup >= 0.95, format!("{bh_ub_speedup:.2}x")),
-            ("FileSink UnordBatch > 2x PerEvent", file_ub_speedup > 2.0, format!("{file_ub_speedup:.2}x")),
-            ("Redpanda UnordBatch > 5x PerEvent", rp_ub_speedup > 5.0, format!("{rp_ub_speedup:.2}x")),
-            ("Redpanda OrdBatch > PerEvent", rp_ob_speedup > 1.0, format!("{rp_ob_speedup:.2}x")),
-            ("Redpanda UnordBatch > 10K/s", rp_unord_batch.throughput() > 10_000.0,
-             format!("{:.0}/s", rp_unord_batch.throughput())),
-            ("Zero event loss (all 9 tests)", zero_loss, "check all".to_string()),
+            (
+                "Blackhole UnordBatch >= PerEvent",
+                bh_ub_speedup >= 0.95,
+                format!("{bh_ub_speedup:.2}x"),
+            ),
+            (
+                "FileSink UnordBatch > 2x PerEvent",
+                file_ub_speedup > 2.0,
+                format!("{file_ub_speedup:.2}x"),
+            ),
+            (
+                "Redpanda UnordBatch > 5x PerEvent",
+                rp_ub_speedup > 5.0,
+                format!("{rp_ub_speedup:.2}x"),
+            ),
+            (
+                "Redpanda OrdBatch > PerEvent",
+                rp_ob_speedup > 1.0,
+                format!("{rp_ob_speedup:.2}x"),
+            ),
+            (
+                "Redpanda UnordBatch > 10K/s",
+                rp_unord_batch.throughput() > 10_000.0,
+                format!("{:.0}/s", rp_unord_batch.throughput()),
+            ),
+            (
+                "Zero event loss (all 9 tests)",
+                zero_loss,
+                "check all".to_string(),
+            ),
         ];
 
         let mut all_pass = true;
         for (name, pass, value) in &checks {
             let status = if *pass { "PASS" } else { "FAIL" };
-            if !pass { all_pass = false; }
+            if !pass {
+                all_pass = false;
+            }
             println!("  {status}: {name} — {value}");
         }
         println!();
@@ -538,14 +639,37 @@ fn main() {
         // No Redpanda — just summary for blackhole + file
         println!("=== Summary (no Redpanda) ===");
         println!();
-        println!("  {:>12} | {:>12} | {:>12} | {:>12} | {:>10} | {:>10}",
-                 "Sink", "PerEvent", "OrdBatch", "UnordBatch", "OB/PE", "UB/PE");
-        println!("  {:>12} | {:>12} | {:>12} | {:>12} | {:>10} | {:>10}",
-                 "────────────", "────────────", "────────────", "────────────", "──────────", "──────────");
-        println!("  {:>12} | {:>10.0}/s | {:>10.0}/s | {:>10.0}/s | {:>8.2}x | {:>8.2}x",
-                 "Blackhole", bh_per_event.throughput(), bh_ord_batch.throughput(), bh_unord_batch.throughput(), bh_ob_speedup, bh_ub_speedup);
-        println!("  {:>12} | {:>10.0}/s | {:>10.0}/s | {:>10.0}/s | {:>8.2}x | {:>8.2}x",
-                 "FileSink", file_per_event.throughput(), file_ord_batch.throughput(), file_unord_batch.throughput(), file_ob_speedup, file_ub_speedup);
+        println!(
+            "  {:>12} | {:>12} | {:>12} | {:>12} | {:>10} | {:>10}",
+            "Sink", "PerEvent", "OrdBatch", "UnordBatch", "OB/PE", "UB/PE"
+        );
+        println!(
+            "  {:>12} | {:>12} | {:>12} | {:>12} | {:>10} | {:>10}",
+            "────────────",
+            "────────────",
+            "────────────",
+            "────────────",
+            "──────────",
+            "──────────"
+        );
+        println!(
+            "  {:>12} | {:>10.0}/s | {:>10.0}/s | {:>10.0}/s | {:>8.2}x | {:>8.2}x",
+            "Blackhole",
+            bh_per_event.throughput(),
+            bh_ord_batch.throughput(),
+            bh_unord_batch.throughput(),
+            bh_ob_speedup,
+            bh_ub_speedup
+        );
+        println!(
+            "  {:>12} | {:>10.0}/s | {:>10.0}/s | {:>10.0}/s | {:>8.2}x | {:>8.2}x",
+            "FileSink",
+            file_per_event.throughput(),
+            file_ord_batch.throughput(),
+            file_unord_batch.throughput(),
+            file_ob_speedup,
+            file_ub_speedup
+        );
     }
 
     println!();

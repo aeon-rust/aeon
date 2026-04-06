@@ -17809,3 +17809,350 @@ The last excerpt from the to do list,
 ====================================================================================
 claude's response:
 
+Committed. Now let me explore the existing state module to understand the current L1/tiered infrastructure before implementing L2 and L3.
+
+
+ I have a full picture now. Let me plan and implement Phase 4 completion. I'll work through the three P0 items: L2 MmapStore, L3 RocksDB, and L1→L2→L3
+  wiring.
+
+  Let me enter plan mode to align on the approach first.
+
+ RocksDB needs libclang on Windows. Let me check if LLVM is installed.
+
+
+ LLVM/libclang isn't installed, which RocksDB's build requires on Windows. We have two options:
+
+  1. Install LLVM — winget install LLVM.LLVM then retry (RocksDB is the industry standard)
+  2. Use redb — Pure Rust embedded database, no C dependencies, ACID transactions, well-maintained. Functionally equivalent for our L3 use case (key-value
+  get/put/delete/scan).
+
+  redb is a great fit because:
+  - Zero C dependencies (no cmake, no libclang, no bindgen)
+  - ACID transactions, crash-safe
+  - B-tree based (good for prefix scans)
+  - Active development, production-ready
+  - Cross-platform without friction
+
+  The StateOps trait is simple (get/put/delete) — either backend works identically from the consumer's perspective. We can always swap to RocksDB later if
+  needed (same trait, same interface).
+
+  Which do you prefer? I'd recommend redb for development velocity — we can always add RocksDB as an alternative backend behind a separate feature flag
+  later.
+
+✻ Cooked for 5m 12s
+
+=======================================================================
+seen about redb. Interesting to know. If this is B-tree-based, it shows compatibility to SQL interface with ACID compliant transactions. Can I expect more write performance over rocksDB? Likewise, our usecase is to keep state till acknowledgement is confirmed for processed events of different pipeline configurations and with respective processor jobs. Likewise, We will use to serve as backup of L1 cache, L2 cache, being a L3 cache.
+
+do you think, in read vs write ratio, read will be more or write will be more? I suspect write will be more...
+
+thinking...
+=========================================================================
+claude's response:
+
+ Good analysis. Let me think through this with you.
+
+  Read vs Write Ratio for L3
+
+  For your use case — state backing for pipeline processor jobs until ack confirmation — let's trace the data flow:
+
+  Writes happen when:
+  - Every processed event's state gets persisted (write-behind from L1)
+  - Checkpoint offsets written on flush cycles
+  - L1 demotion pushes cold entries down
+  - Every new key first seen
+
+  Reads happen when:
+  - Pipeline restart / crash recovery (bulk read, but infrequent)
+  - L1 miss + L2 miss → L3 read-through (should be rare if L1/L2 are sized correctly)
+  - Offset recovery on startup
+
+  Verdict: Write-heavy. In steady state, L3 is mostly a durable write-behind sink. Reads are rare — they happen on cold starts, failovers, and L1/L2 cache
+  misses. The hot path (L1 DashMap at 7.7M ops/sec) absorbs almost all reads.
+
+  redb vs RocksDB for Write-Heavy
+
+  ┌─────────────────────┬───────────────────────────────────────────┬─────────────────────────────────────────────┐
+  │       Aspect        │               redb (B-tree)               │             RocksDB (LSM-tree)              │
+  ├─────────────────────┼───────────────────────────────────────────┼─────────────────────────────────────────────┤
+  │ Write pattern       │ Copy-on-write B-tree, in-place updates    │ Append-only WAL + memtable → SST compaction │
+  ├─────────────────────┼───────────────────────────────────────────┼─────────────────────────────────────────────┤
+  │ Write amplification │ Lower (no compaction)                     │ Higher (compaction rewrites data)           │
+  ├─────────────────────┼───────────────────────────────────────────┼─────────────────────────────────────────────┤
+  │ Small writes        │ Good — B-tree page splits are local       │ Good — batches in memtable                  │
+  ├─────────────────────┼───────────────────────────────────────────┼─────────────────────────────────────────────┤
+  │ Bulk writes         │ Decent with transactions                  │ Excellent — LSM is optimized for this       │
+  ├─────────────────────┼───────────────────────────────────────────┼─────────────────────────────────────────────┤
+  │ Read after write    │ Immediate (B-tree lookup)                 │ May need to check multiple levels           │
+  ├─────────────────────┼───────────────────────────────────────────┼─────────────────────────────────────────────┤
+  │ Space amplification │ Lower (no stale SSTs)                     │ Higher (until compaction runs)              │
+  ├─────────────────────┼───────────────────────────────────────────┼─────────────────────────────────────────────┤
+  │ Crash safety        │ ACID, copy-on-write                       │ WAL-based recovery                          │
+  ├─────────────────────┼───────────────────────────────────────────┼─────────────────────────────────────────────┤
+  │ Compaction stalls   │ None (no compaction)                      │ Possible under sustained write load         │
+  ├─────────────────────┼───────────────────────────────────────────┼─────────────────────────────────────────────┤
+  │ Maturity            │ Newer (~2022), production-used in Mozilla │ Battle-tested at Facebook/Meta scale        │
+  └─────────────────────┴───────────────────────────────────────────┴─────────────────────────────────────────────┘
+
+  For your specific pattern (write-heavy, reads mostly on recovery, moderate data volume per pipeline):
+
+  - RocksDB's LSM advantage (write-optimized append) matters less here because your write volume per pipeline is moderate — you're not doing millions of
+  persistent writes/sec. L1 absorbs that. L3 sees the write-behind trickle.
+  - redb's no-compaction advantage matters more — no background compaction stalls, predictable latency, simpler operational profile.
+  - redb's ACID B-tree means reads on recovery are fast (single B-tree lookup vs LSM multi-level search).
+
+  My Recommendation
+
+  redb for L3, for these reasons:
+
+  1. Your write rate to L3 is throttled by design — L1 absorbs the hot path, L3 only sees write-behind and demotion. Neither DB will be write-bottlenecked
+  at this volume.
+  2. No compaction stalls — important for a real-time pipeline engine where predictable latency matters.
+  3. Pure Rust — zero build friction across platforms, fits the project philosophy ("no unnecessary dependencies", "idiomatic Rust").
+  4. ACID without WAL complexity — copy-on-write B-tree is simpler to reason about for crash recovery.
+  5. RocksDB can be added later as an alternative L3Backend behind a feature flag if someone needs it at Meta-scale write volumes.
+
+  The trait interface (StateOps) is the same either way — the backend is an implementation detail.
+
+  Want to proceed with redb? I'll feature-gate it as persistent (or redb) so the door stays open for a rocksdb backend later.
+
+
+================================================================================
+Thanks for the details. Can we expect redb to support 20M events/second throughput as is being planned in Aeon or how are the possibilities?
+
+I do like the concept of using adapter design pattern and interface-first implementation while providing configuration to choose L3 backend. This is good thought process, so users can configure either or, during deployment. can we use redb in Aeon single-node cluster and Aeon multi-node cluster too?
+
+how do you think? let us discuss and plan this up
+
+==================================================================================
+claude's response:
+
+redb at 20M events/sec — Can It Keep Up?
+
+  The key insight: L3 never sees 20M events/sec. The tiered architecture ensures that:
+
+  20M events/sec → L1 DashMap (7.7M ops/sec per node, hot path)
+                      ↓ write-behind (async, batched)
+                   L2 Mmap (warm cache, memory-mapped)
+                      ↓ demotion (cold entries only)
+                   L3 redb (persistence, crash recovery)
+
+  L3's actual write load depends on:
+  - Write-behind batch size — if we flush every 1000 events or every 100ms, L3 sees ~10-20K batched writes/sec, not 20M
+  - Demotion rate — only cold entries evicted from L1 trickle down
+  - Checkpoint frequency — offset snapshots every N events or M seconds
+
+  redb benchmarks show ~500K-1M point writes/sec and ~1-2M reads/sec on NVMe. That's 25-50x more than L3 will ever need in steady state. Even worst case
+  (aggressive flush, every event persisted), batched transactions amortize the cost.
+
+  Where L3 throughput matters: Recovery after crash — reading back all state. But that's a one-time bulk read, not sustained throughput. redb's B-tree is
+  excellent for sequential scan during recovery.
+
+  Single-Node vs Multi-Node Cluster
+
+  This is the important architectural question. Let me break it down:
+
+  Single-Node — No Issues
+
+  - One redb instance per node, exclusive file lock
+  - Each pipeline partition gets its own key prefix (namespace isolation)
+  - Clean and simple
+
+  Multi-Node Cluster — Design Considerations
+
+  redb (like RocksDB) is an embedded database — it's local to each node. It is NOT a distributed database. This is actually exactly what we want:
+
+  ┌─────────────────────┐  ┌─────────────────────┐  ┌─────────────────────┐
+  │      Node 1         │  │      Node 2         │  │      Node 3         │
+  │  ┌──────────────┐   │  │  ┌──────────────┐   │  │  ┌──────────────┐   │
+  │  │ L1 DashMap   │   │  │  │ L1 DashMap   │   │  │  │ L1 DashMap   │   │
+  │  │ L2 Mmap      │   │  │  │ L2 Mmap      │   │  │  │ L2 Mmap      │   │
+  │  │ L3 redb      │   │  │  │ L3 redb      │   │  │  │ L3 redb      │   │
+  │  └──────────────┘   │  │  └──────────────┘   │  │  └──────────────┘   │
+  │  Partitions: 0,1,2  │  │  Partitions: 3,4,5  │  │  Partitions: 6,7,8 │
+  └─────────────────────┘  └─────────────────────┘  └─────────────────────┘
+           ↕ Raft replication (consensus, not state data) ↕
+
+  Each node owns its partitions' state locally. This matches how Aeon already works:
+  - Partitions are assigned to nodes by the Raft-based Partition Manager
+  - Each node processes its assigned partitions independently
+  - State is partition-local — partition 0's state never needs to be on Node 2
+
+  During partition transfer (rebalance/failover):
+  - Source node exports partition state from its L3 (bulk read)
+  - Transfer via QUIC (already implemented in Phase 8)
+  - Target node imports into its L3 (bulk write)
+  - This is the two-phase transfer protocol already designed
+
+  This is identical to how Kafka Streams, Flink, and RisingWave handle embedded state — each node has its own RocksDB/state store, partition assignment
+  determines which node owns which state. RocksDB vs redb is irrelevant at this layer — both are local embedded stores.
+
+  Where RocksDB Would Add Value (Future)
+
+  RocksDB's only advantage over redb in a cluster scenario would be:
+  - SST file ingestion — bulk import of state snapshots (RocksDB-specific optimization)
+  - Column families — physical isolation per pipeline (redb uses tables, equivalent)
+  - Proven at extreme scale — if a single node has 100GB+ state
+
+  For Aeon's use case (state-until-ack, pipeline processor state), redb is sufficient. State per partition is typically MB-to-low-GB range, not 100GB+.
+
+  Proposed Architecture — L3Backend Trait
+
+  /// L3 persistent storage backend.
+  /// Implementations: redb (default), RocksDB (future, feature-gated).
+  pub trait L3Backend: Send + Sync {
+      fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, AeonError>;
+      fn put(&self, key: &[u8], value: &[u8]) -> Result<(), AeonError>;
+      fn delete(&self, key: &[u8]) -> Result<(), AeonError>;
+      fn write_batch(&self, ops: &[(BatchOp, &[u8], Option<&[u8]>)]) -> Result<(), AeonError>;
+      fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, AeonError>;
+      fn flush(&self) -> Result<(), AeonError>;
+  }
+
+  - Sync interface (not async) — L3 ops run on a background thread/task, the async boundary is at the TieredStore level
+  - write_batch — amortizes disk I/O, critical for write-heavy pattern
+  - scan_prefix — needed for typed state recovery (MapState, ListState)
+  - redb implements this with redb::Database + redb::Table
+  - RocksDB can implement the same trait later behind feature = "rocksdb"
+
+  TieredConfig Extension
+
+  state:
+    l1_max_bytes: 268435456  # 256 MiB
+    l2:
+      enabled: true
+      path: "data/state/l2"
+      max_bytes: 1073741824  # 1 GiB
+    l3:
+      enabled: true
+      backend: redb           # or "rocksdb" (future)
+      path: "data/state/l3.redb"
+      sync_writes: false      # fsync on every write (durability vs speed)
+      write_batch_size: 1000  # batch N ops before flushing
+
+  Want me to proceed with this design? To summarize the decisions:
+
+  1. redb as default L3 — feature-gated as redb (or persistent)
+  2. L3Backend trait — adapter pattern, RocksDB pluggable later
+  3. Per-node local state — same model for single-node and multi-node
+  4. Partition state transfer via QUIC — already designed, L3 provides export/import
+  5. Write batching — amortize L3 writes from the async write-behind path
+
+✻ Sautéed for 41s
+
+======================================================================
+variable can be, "l3_backend / l3_state_backend / l3_cache_backend" or other. values can be redb | rocksdb etc....
+
+==========================================================================
+claude's response:
+
+ Good call. Let me settle the naming:
+
+  l3_backend — clean, concise, and the tier prefix already scopes it. No need for state or cache redundancy since it's inside the state: config block:
+
+  state:
+    l1_max_bytes: 268435456
+    l2:
+      enabled: true
+      path: "data/state/l2"
+      max_bytes: 1073741824
+    l3:
+      enabled: true
+      l3_backend: redb        # redb | rocksdb
+      path: "data/state/l3.redb"
+      sync_writes: false
+      write_batch_size: 1000
+
+  Actually — since it's already nested under l3:, just backend is cleanest:
+
+  state:
+    l3:
+      backend: redb           # redb | rocksdb
+
+  The fully qualified path reads as state.l3.backend = redb — self-documenting.
+
+  In Rust:
+
+  #[derive(Debug, Clone, PartialEq, Eq)]
+  pub enum L3Backend {
+      Redb,
+      RocksDb,  // future, feature-gated
+  }
+
+  The trait itself: L3Store (matches L1Store, L2Store naming convention). The enum L3Backend is the config discriminator that selects which L3Store
+  implementation to construct.
+
+  Shall I proceed with implementation? I'll start with L2 MmapStore, then L3 with redb, then wire the tiered promotion/demotion.
+
+  5 tasks (0 done, 1 in progress, 4 open)
+  ■ Add memmap2 and rocksdb workspace dependencies
+  □ Implement L2 MmapStore
+  □ Implement L3 RocksDB store
+  □ Wire L1→L2→L3 promotion/demotion in TieredStore
+  □ Update benchmarks and verify cargo check/clippy/test
+
+
+==================================================================
+do mark the configuration discussions thought process and about adapter pattern and two solutions (redb / rocksdb) that are being planned to be setup in
+a configurable way. Based on whichever solution is configured and as per its setup, that will work as L3 backend.
+
+=======================================================================
+claude's response:
+
+ Let me save these design decisions to memory, then update the task for rocksdb → redb, and proceed.
+
+  Reading 1 file, recalling 1 memory, writing 1 memory… (ctrl+o to expand)
+
+
+ Phase 4 is complete. Here's the summary:
+
+  Phase 4 Completion — Multi-Tier State
+
+  ┌────────────────────┬────────┬────────────────────────────────────────────────────────────────────────────────────┐
+  │     Component      │ Status │                                    Key Details                                     │
+  ├────────────────────┼────────┼────────────────────────────────────────────────────────────────────────────────────┤
+  │ L2 MmapStore       │ ✅     │ Append-only log + in-memory index, compaction, file recovery, 12 tests             │
+  ├────────────────────┼────────┼────────────────────────────────────────────────────────────────────────────────────┤
+  │ L3 redb            │ ✅     │ L3Store adapter trait, RedbStore impl, ACID B-tree, write_batch, 14 tests          │
+  ├────────────────────┼────────┼────────────────────────────────────────────────────────────────────────────────────┤
+  │ L3Backend config   │ ✅     │ Redb | RocksDb enum, RocksDB pluggable via same trait                              │
+  ├────────────────────┼────────┼────────────────────────────────────────────────────────────────────────────────────┤
+  │ Tiered wiring      │ ✅     │ Read-through (L1→L2→L3), write-through to L3, L1→L2 demotion, 10 integration tests │
+  ├────────────────────┼────────┼────────────────────────────────────────────────────────────────────────────────────┤
+  │ State persistence  │ ✅     │ Survives restart via L3 write-through                                              │
+  ├────────────────────┼────────┼────────────────────────────────────────────────────────────────────────────────────┤
+  │ Partition transfer │ ✅     │ export_partition/import_partition for cluster rebalance                            │
+  ├────────────────────┼────────┼────────────────────────────────────────────────────────────────────────────────────┤
+  │ Tests              │ 79     │ 43 existing + 12 L2 + 14 L3 + 10 tiered                                            │
+  └────────────────────┴────────┴────────────────────────────────────────────────────────────────────────────────────┘
+
+  Next up per the TODO priority list:
+
+  - P1 #4/#5: Gate 1 validation (CPU%, P99 latency) — can run in parallel
+  - P2 #11: Rust T3/T4 network SDK (dogfood first)
+  - P3 #22: Benchmark Run 5 (multi-partition scaling)
+
+  Shall I continue with the next priority items?
+
+✻ Cooked for 25m 3s · 1 shell still running
+
+============================================================
+continue
+==================================================================
+claude's response:
+
+
+● Moving to the next priorities. P0 (state tiers) is done. P1 #4/#5 (Gate validation) require Docker/Redpanda infrastructure. Let me proceed with P2 #11:
+  Rust T3/T4 network SDK — pure code work, high value (dogfood the transport layer), and unblocked.
+
+● Let me first explore the existing AWPP protocol types, batch wire format, and Python/Go SDKs to understand the wire contract I need to match.
+
+
+Wait, that has the same problem — process_fn is captured. The real issue is BatchProcessFn is a fn pointer type. Let me change the approach: make the
+  batch functions accept a generic Fn or just inline the mapping in the processing loop for run_websocket.
+
+  Actually, the simplest approach: make run_websocket duplicate the core logic but call process_fn per-event. But that's a lot of duplication. Better:
+  change BatchProcessFn to Box<dyn Fn(...)> or make the internal functions generic.
+
+  Let me take the generic approach for internal functions and keep the public API with fn pointers:
+

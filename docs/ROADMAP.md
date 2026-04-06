@@ -914,9 +914,9 @@ All 8 core sub-phases complete.
 | 12b-14 | Ruby | T4 (T3 future) | ❌ Not started | No directory |
 | 12b-14 | Scala | T3 + T4 | ❌ Not started | No directory |
 | 12b-14 | Haskell | T3 + T4 | ❌ Not started | No directory |
-| 12b-15 | Rust (Network) | T3 + T4 | ❌ Not started | `aeon-processor-client` crate for standalone Rust processor binaries |
+| 12b-15 | Rust (Network) | T3 + T4 | ✅ 2026-04-06 | `aeon-processor-client` crate: AWPP handshake, ED25519 auth, batch wire format, CRC32, heartbeat, T4 WebSocket + T3 WebTransport clients, 17 tests |
 
-**Summary**: 2 of 14 target language SDKs implemented (Python, Go). Remaining 12 are demand-driven per ROADMAP design. Core platform (12b-1 through 12b-8) is complete — all language SDKs can be built against the existing `ProcessorTransport`, AWPP, `batch_wire`, and `processor_auth` infrastructure. Every language gets T3/T4 network access; T1/T2 in-process tiers are bonus options where the language supports it.
+**Summary**: 3 of 14 target language SDKs implemented (Python, Go, Rust). Remaining 11 are demand-driven per ROADMAP design. Core platform (12b-1 through 12b-8) is complete — all language SDKs can be built against the existing `ProcessorTransport`, AWPP, `batch_wire`, and `processor_auth` infrastructure. Every language gets T3/T4 network access; T1/T2 in-process tiers are bonus options where the language supports it.
 
 ### Phase 12a — Processor SDKs + Dev Tooling (Complete)
 
@@ -2361,7 +2361,7 @@ Every language gets T3/T4 (network) access. T1/T2 (in-process) are additional hi
 |----------|----------------|--------|----------|
 | Rust (Native) | T1 | ✅ Complete | `crates/aeon-native-sdk/` (Phase 12a) |
 | Rust (Wasm) | T2 | ✅ Complete | `crates/aeon-wasm-sdk/` (Phase 12a) |
-| Rust (Network) | T3 + T4 | ❌ Not started | 12b-15 (`aeon-processor-client` crate) |
+| Rust (Network) | T3 + T4 | ✅ 2026-04-06 | 12b-15 (`aeon-processor-client` crate, 17 tests) |
 | AssemblyScript | T2 + T4 | T2 ✅ / T4 ❌ | `sdks/typescript/` (12a), T4 via 12b-9 |
 | Python | T3 + T4 | ✅ Complete | `sdks/python/` (12b-5) |
 | Go | T3 + T4 | ✅ Complete | `sdks/go/` (12b-6) |
@@ -2388,7 +2388,7 @@ Every language gets T3/T4 (network) access. T1/T2 (in-process) are additional hi
 | Memory alignment (64-byte) | ✅ `#[repr(align(64))]` on Event and Output |
 | Batch-first APIs | ✅ `next_batch() → Vec<Event>`, `write_batch(Vec<Output>)` |
 | Error handling (thiserror/anyhow) | ✅ thiserror in libs, anyhow in CLI only |
-| Test coverage | ✅ 700 Rust + 44 SDK tests = 744 total |
+| Test coverage | ✅ 717 Rust + 44 SDK tests = 761 total |
 
 ### Outstanding Work
 
@@ -2407,4 +2407,4 @@ Every language gets T3/T4 (network) access. T1/T2 (in-process) are additional hi
 8. PoH chain continuity across transfers
 
 **Language SDKs (demand-driven, not blocking)**:
-9. 12 language SDKs not started (12b-9 through 12b-15, including Rust T3/T4 network SDK)
+9. 11 language SDKs not started (12b-9 through 12b-14; Rust T3/T4 12b-15 complete)

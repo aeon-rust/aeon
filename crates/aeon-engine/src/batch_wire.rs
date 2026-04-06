@@ -56,9 +56,7 @@ pub struct BatchRequest<'a> {
 /// Returns zero-copy slices into the input buffer for each event.
 pub fn deserialize_batch_request(data: &[u8]) -> Result<BatchRequest<'_>, AeonError> {
     if data.len() < 16 {
-        return Err(AeonError::serialization(
-            "batch request too short",
-        ));
+        return Err(AeonError::serialization("batch request too short"));
     }
 
     // Verify CRC32 (last 4 bytes)
@@ -91,9 +89,7 @@ pub fn deserialize_batch_request(data: &[u8]) -> Result<BatchRequest<'_>, AeonEr
 
     for _ in 0..event_count {
         if offset + 4 > payload.len() {
-            return Err(AeonError::serialization(
-                "unexpected end of batch request",
-            ));
+            return Err(AeonError::serialization("unexpected end of batch request"));
         }
         let len = u32::from_le_bytes(
             data[offset..offset + 4]
@@ -103,9 +99,7 @@ pub fn deserialize_batch_request(data: &[u8]) -> Result<BatchRequest<'_>, AeonEr
         offset += 4;
 
         if offset + len > payload.len() {
-            return Err(AeonError::serialization(
-                "event data exceeds buffer",
-            ));
+            return Err(AeonError::serialization("event data exceeds buffer"));
         }
         events.push(&data[offset..offset + len]);
         offset += len;
@@ -167,9 +161,7 @@ pub struct BatchResponse<'a> {
 pub fn deserialize_batch_response(data: &[u8]) -> Result<BatchResponse<'_>, AeonError> {
     // Minimum: header(12) + CRC(4) + signature(64) = 80
     if data.len() < 80 {
-        return Err(AeonError::serialization(
-            "batch response too short",
-        ));
+        return Err(AeonError::serialization("batch response too short"));
     }
 
     let signature = &data[data.len() - 64..];
@@ -204,39 +196,29 @@ pub fn deserialize_batch_response(data: &[u8]) -> Result<BatchResponse<'_>, Aeon
 
     for _ in 0..event_count {
         if offset + 4 > payload.len() {
-            return Err(AeonError::serialization(
-                "unexpected end of batch response",
-            ));
+            return Err(AeonError::serialization("unexpected end of batch response"));
         }
         let output_count = u32::from_le_bytes(
             data[offset..offset + 4]
                 .try_into()
-                .map_err(|_| {
-                    AeonError::serialization("invalid output_count")
-                })?,
+                .map_err(|_| AeonError::serialization("invalid output_count"))?,
         ) as usize;
         offset += 4;
 
         let mut outputs = Vec::with_capacity(output_count);
         for _ in 0..output_count {
             if offset + 4 > payload.len() {
-                return Err(AeonError::serialization(
-                    "unexpected end of output data",
-                ));
+                return Err(AeonError::serialization("unexpected end of output data"));
             }
             let len = u32::from_le_bytes(
                 data[offset..offset + 4]
                     .try_into()
-                    .map_err(|_| {
-                        AeonError::serialization("invalid output length")
-                    })?,
+                    .map_err(|_| AeonError::serialization("invalid output length"))?,
             ) as usize;
             offset += 4;
 
             if offset + len > payload.len() {
-                return Err(AeonError::serialization(
-                    "output data exceeds buffer",
-                ));
+                return Err(AeonError::serialization("output data exceeds buffer"));
             }
             outputs.push(&data[offset..offset + len]);
             offset += len;
@@ -416,9 +398,9 @@ mod tests {
 
     // ── Codec-aware helper tests ────────────────────────────────────────
 
-    use std::sync::Arc;
-    use bytes::Bytes;
     use aeon_types::partition::PartitionId;
+    use bytes::Bytes;
+    use std::sync::Arc;
 
     fn make_test_event(id: u8) -> Event {
         Event::new(
@@ -431,11 +413,8 @@ mod tests {
     }
 
     fn make_test_output(id: u8) -> Output {
-        Output::new(
-            Arc::from("test-dest"),
-            Bytes::from(format!("output-{id}")),
-        )
-        .with_source_event_id(uuid::Uuid::from_bytes([id; 16]))
+        Output::new(Arc::from("test-dest"), Bytes::from(format!("output-{id}")))
+            .with_source_event_id(uuid::Uuid::from_bytes([id; 16]))
     }
 
     #[test]
@@ -469,8 +448,7 @@ mod tests {
             vec![make_test_output(3)],
         ];
         let sig = [0xAAu8; 64];
-        let wire =
-            encode_batch_response(99, &outputs, &sig, TransportCodec::MsgPack).unwrap();
+        let wire = encode_batch_response(99, &outputs, &sig, TransportCodec::MsgPack).unwrap();
         let resp = decode_batch_response(&wire, TransportCodec::MsgPack).unwrap();
 
         assert_eq!(resp.batch_id, 99);

@@ -1342,11 +1342,19 @@ mod tests {
 
         // Expiry should be in the future (at least 1 year from now)
         let secs = expiry_secs.unwrap();
-        assert!(secs > now_secs + 365 * 86400, "cert should expire > 1 year from now, got {} days", (secs - now_secs) / 86400);
+        assert!(
+            secs > now_secs + 365 * 86400,
+            "cert should expire > 1 year from now, got {} days",
+            (secs - now_secs) / 86400
+        );
 
         let days = store.leaf_cert_days_until_expiry();
         assert!(days.is_some());
-        assert!(days.unwrap() > 365, "expected > 365 days, got {}", days.unwrap());
+        assert!(
+            days.unwrap() > 365,
+            "expected > 365 days, got {}",
+            days.unwrap()
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

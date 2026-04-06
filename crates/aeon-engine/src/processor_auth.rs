@@ -78,8 +78,8 @@ pub fn verify_challenge(
     let public_key_bytes = decode_public_key(&identity.public_key)?;
     let verifying_key = VerifyingKey::from_bytes(&public_key_bytes)?;
 
-    let nonce_bytes =
-        hex::decode(nonce_hex).map_err(|e| AeonError::serialization(format!("invalid nonce hex: {e}")))?;
+    let nonce_bytes = hex::decode(nonce_hex)
+        .map_err(|e| AeonError::serialization(format!("invalid nonce hex: {e}")))?;
 
     let sig_bytes = hex::decode(signature_hex)
         .map_err(|e| AeonError::serialization(format!("invalid signature hex: {e}")))?;
@@ -185,10 +185,7 @@ mod tests {
             public_key,
             fingerprint,
             processor_name: "test-proc".into(),
-            allowed_pipelines: PipelineScope::Named(vec![
-                "orders".into(),
-                "payments".into(),
-            ]),
+            allowed_pipelines: PipelineScope::Named(vec!["orders".into(), "payments".into()]),
             max_instances: 2,
             registered_at: 1000,
             registered_by: "test".into(),
@@ -289,11 +286,7 @@ mod tests {
     #[test]
     fn check_authorization_ok() {
         let (_, identity) = make_keypair_and_identity();
-        let result = check_authorization(
-            &identity,
-            &["orders".into(), "payments".into()],
-            0,
-        );
+        let result = check_authorization(&identity, &["orders".into(), "payments".into()], 0);
         assert!(result.is_ok());
     }
 

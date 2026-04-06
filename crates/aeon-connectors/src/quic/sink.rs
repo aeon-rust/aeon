@@ -77,10 +77,7 @@ impl QuicSink {
 
 impl Sink for QuicSink {
     async fn write_batch(&mut self, outputs: Vec<Output>) -> Result<BatchResult, AeonError> {
-        let ids: Vec<_> = outputs
-            .iter()
-            .filter_map(|o| o.source_event_id)
-            .collect();
+        let ids: Vec<_> = outputs.iter().filter_map(|o| o.source_event_id).collect();
         // Open a new bidirectional stream for this batch
         let (mut send, _recv) = self
             .connection

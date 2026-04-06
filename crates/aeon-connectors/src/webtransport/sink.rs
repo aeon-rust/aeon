@@ -62,10 +62,7 @@ impl WebTransportSink {
 
 impl Sink for WebTransportSink {
     async fn write_batch(&mut self, outputs: Vec<Output>) -> Result<BatchResult, AeonError> {
-        let ids: Vec<_> = outputs
-            .iter()
-            .filter_map(|o| o.source_event_id)
-            .collect();
+        let ids: Vec<_> = outputs.iter().filter_map(|o| o.source_event_id).collect();
         let opening =
             self.connection.open_bi().await.map_err(|e| {
                 AeonError::connection(format!("webtransport open stream failed: {e}"))

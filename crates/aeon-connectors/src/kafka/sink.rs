@@ -139,7 +139,6 @@ impl KafkaSink {
     pub fn pending(&self) -> u64 {
         self.pending
     }
-
 }
 
 impl Sink for KafkaSink {
@@ -147,10 +146,7 @@ impl Sink for KafkaSink {
         let count = outputs.len();
 
         // Collect event IDs for BatchResult tracking.
-        let event_ids: Vec<_> = outputs
-            .iter()
-            .filter_map(|o| o.source_event_id)
-            .collect();
+        let event_ids: Vec<_> = outputs.iter().filter_map(|o| o.source_event_id).collect();
 
         // Enqueue all outputs into rdkafka's internal producer queue.
         // FutureProducer.send() copies data into librdkafka's buffer and returns

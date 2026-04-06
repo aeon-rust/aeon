@@ -47,7 +47,11 @@ impl std::fmt::Display for ProcessorIdentity {
             "{}:{} ({})",
             self.processor_name,
             &self.fingerprint[..core::cmp::min(20, self.fingerprint.len())],
-            if self.is_active() { "active" } else { "revoked" }
+            if self.is_active() {
+                "active"
+            } else {
+                "revoked"
+            }
         )
     }
 }

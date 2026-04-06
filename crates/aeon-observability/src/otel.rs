@@ -121,12 +121,9 @@ fn init_with_otlp(config: &LogConfig, filter: EnvFilter) -> Result<bool, String>
         .build()
         .map_err(|e| format!("failed to create OTLP exporter: {e}"))?;
 
-    let service_name =
-        std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "aeon".to_string());
+    let service_name = std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "aeon".to_string());
 
-    let resource = Resource::new(vec![
-        KeyValue::new("service.name", service_name.clone()),
-    ]);
+    let resource = Resource::new(vec![KeyValue::new("service.name", service_name.clone())]);
 
     let provider = TracerProvider::builder()
         .with_batch_exporter(exporter, Tokio)

@@ -101,10 +101,7 @@ impl NatsSink {
 
 impl Sink for NatsSink {
     async fn write_batch(&mut self, outputs: Vec<Output>) -> Result<BatchResult, AeonError> {
-        let event_ids: Vec<_> = outputs
-            .iter()
-            .filter_map(|o| o.source_event_id)
-            .collect();
+        let event_ids: Vec<_> = outputs.iter().filter_map(|o| o.source_event_id).collect();
 
         if let Some(js) = &self.jetstream {
             match self.config.strategy {

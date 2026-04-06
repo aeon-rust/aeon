@@ -72,10 +72,7 @@ impl RedisSink {
 
 impl Sink for RedisSink {
     async fn write_batch(&mut self, outputs: Vec<Output>) -> Result<BatchResult, AeonError> {
-        let ids: Vec<_> = outputs
-            .iter()
-            .filter_map(|o| o.source_event_id)
-            .collect();
+        let ids: Vec<_> = outputs.iter().filter_map(|o| o.source_event_id).collect();
         for output in &outputs {
             let payload_str = String::from_utf8_lossy(output.payload.as_ref());
 

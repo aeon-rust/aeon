@@ -618,7 +618,10 @@ mod tests {
         };
         let json = serde_json::to_string(&pv).unwrap();
         let back: ProcessorVersion = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.endpoint.as_deref(), Some("https://proc.example.com:4462"));
+        assert_eq!(
+            back.endpoint.as_deref(),
+            Some("https://proc.example.com:4462")
+        );
         assert_eq!(back.max_batch_size, Some(2048));
     }
 

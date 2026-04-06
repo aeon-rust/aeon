@@ -86,9 +86,9 @@ impl ProcessorIdentityStore {
     /// Increment the active connection count for an identity.
     /// Returns the new count, or None if the identity doesn't exist.
     pub fn connect(&self, fingerprint: &str) -> Option<u32> {
-        self.connections.get(fingerprint).map(|counter| {
-            counter.fetch_add(1, Ordering::Relaxed) + 1
-        })
+        self.connections
+            .get(fingerprint)
+            .map(|counter| counter.fetch_add(1, Ordering::Relaxed) + 1)
     }
 
     /// Decrement the active connection count for an identity.

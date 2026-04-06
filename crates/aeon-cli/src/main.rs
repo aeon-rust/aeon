@@ -358,7 +358,9 @@ fn validate_name(name: &str, kind: &str) -> Result<()> {
         .chars()
         .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
     {
-        bail!("{kind} name may only contain alphanumeric characters, hyphens, underscores, and dots");
+        bail!(
+            "{kind} name may only contain alphanumeric characters, hyphens, underscores, and dots"
+        );
     }
     Ok(())
 }
@@ -884,9 +886,10 @@ fn cmd_processor(api: &str, action: &ProcessorAction) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&body)?);
             Ok(())
         }
-        ProcessorAction::Identity { name, action: id_action } => {
-            cmd_identity(api, name, id_action)
-        }
+        ProcessorAction::Identity {
+            name,
+            action: id_action,
+        } => cmd_identity(api, name, id_action),
     }
 }
 
@@ -912,22 +915,20 @@ fn cmd_identity(api: &str, name: &str, action: &IdentityAction) -> Result<()> {
                 "max_instances": max_instances,
             });
 
-            let resp: serde_json::Value = ureq::post(&format!(
-                "{api}/api/v1/processors/{name}/identities"
-            ))
-            .send_json(&body)
-            .context("failed to register identity")?
-            .into_json()?;
+            let resp: serde_json::Value =
+                ureq::post(&format!("{api}/api/v1/processors/{name}/identities"))
+                    .send_json(&body)
+                    .context("failed to register identity")?
+                    .into_json()?;
             println!("{}", serde_json::to_string_pretty(&resp)?);
             Ok(())
         }
         IdentityAction::List => {
-            let body: serde_json::Value = ureq::get(&format!(
-                "{api}/api/v1/processors/{name}/identities"
-            ))
-            .call()
-            .context("failed to list identities")?
-            .into_json()?;
+            let body: serde_json::Value =
+                ureq::get(&format!("{api}/api/v1/processors/{name}/identities"))
+                    .call()
+                    .context("failed to list identities")?
+                    .into_json()?;
 
             let empty_vec = vec![];
             let identities = body["identities"].as_array().unwrap_or(&empty_vec);
@@ -1308,8 +1309,8 @@ fn default_max_instances() -> u32 {
 const MAX_MANIFEST_SIZE: u64 = 1024 * 1024;
 
 fn cmd_apply(file: &Path, api: &str, dry_run: bool) -> Result<()> {
-    let metadata = std::fs::metadata(file)
-        .with_context(|| format!("failed to stat {}", file.display()))?;
+    let metadata =
+        std::fs::metadata(file).with_context(|| format!("failed to stat {}", file.display()))?;
     if metadata.len() > MAX_MANIFEST_SIZE {
         bail!(
             "manifest file exceeds maximum size ({} bytes > {} bytes)",
@@ -1394,10 +1395,7 @@ fn cmd_apply(file: &Path, api: &str, dry_run: bool) -> Result<()> {
                     );
                 }
                 Err(e) => {
-                    eprintln!(
-                        "identity for '{}' — failed: {e}",
-                        identity.processor
-                    );
+                    eprintln!("identity for '{}' — failed: {e}", identity.processor);
                 }
             }
         }
@@ -1441,17 +1439,28 @@ fn cmd_export(file: Option<&Path>, api: &str) -> Result<()> {
         .unwrap_or(serde_json::json!([]));
     if let Some(procs) = processors.as_array() {
         for p in procs {
-            let Some(proc_name) = p["name"].as_str() else { continue; };
-            if let Ok(resp) = ureq::get(&format!("{api}/api/v1/processors/{proc_name}/identities")).call() {
+            let Some(proc_name) = p["name"].as_str() else {
+                continue;
+            };
+            if let Ok(resp) =
+                ureq::get(&format!("{api}/api/v1/processors/{proc_name}/identities")).call()
+            {
                 if let Ok(body) = resp.into_json::<serde_json::Value>() {
                     if let Some(ids) = body["identities"].as_array() {
                         for id in ids {
                             if id["revoked_at"].is_null() {
                                 let pipelines = match &id["allowed_pipelines"] {
-                                    serde_json::Value::String(s) if s == "all-matching-pipelines" => "all".to_string(),
+                                    serde_json::Value::String(s)
+                                        if s == "all-matching-pipelines" =>
+                                    {
+                                        "all".to_string()
+                                    }
                                     serde_json::Value::Object(o) => {
-                                        if let Some(named) = o.get("named").and_then(|n| n.as_array()) {
-                                            named.iter()
+                                        if let Some(named) =
+                                            o.get("named").and_then(|n| n.as_array())
+                                        {
+                                            named
+                                                .iter()
                                                 .filter_map(|v| v.as_str())
                                                 .collect::<Vec<_>>()
                                                 .join(",")
@@ -1693,7 +1702,9 @@ fn cmd_tls(action: &TlsAction) -> Result<()> {
 
             for (i, der) in certs.iter().enumerate() {
                 println!("Certificate #{} ({} bytes DER)", i, der.as_ref().len());
-                if let Some(expiry) = aeon_crypto::tls::CertificateStore::parse_cert_expiry_secs(der.as_ref()) {
+                if let Some(expiry) =
+                    aeon_crypto::tls::CertificateStore::parse_cert_expiry_secs(der.as_ref())
+                {
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
