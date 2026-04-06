@@ -209,8 +209,12 @@ dependencies = [
  "bytes",
  "criterion",
  "dashmap",
+ "memmap2",
+ "redb",
  "serde",
+ "tempfile",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -3376,6 +3380,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "memmap2"
+version = "0.9.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "714098028fe011992e1c3962653c96b2d578c4b4bce9036e15ff220319b1e0e3"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4649,6 +4662,15 @@ dependencies = [
  "async-trait",
  "futures-core",
  "futures-io",
+]
+
+[[package]]
+name = "redb"
+version = "2.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8eca1e9d98d5a7e9002d0013e18d5a9b000aee942eb134883a82f06ebffb6c01"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

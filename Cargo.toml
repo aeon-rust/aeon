@@ -47,6 +47,8 @@ core_affinity = "0.8"
 
 # State
 dashmap = "6"
+memmap2 = "0.9"
+redb = "2"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -106,6 +108,7 @@ opentelemetry-otlp = { version = "0.27", features = ["tonic", "logs"] }
 
 # Testing
 criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3"
 
 # Workspace internal (version required for crates.io publishing)
 aeon-types = { path = "crates/aeon-types", version = "0.1.0" }

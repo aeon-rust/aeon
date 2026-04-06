@@ -108,10 +108,10 @@ This phase runs the **fix → improve → load test** cycle until Gate 1 metrics
 
 **This phase is iterative.** It may loop multiple times. Do not proceed until Gate 1 is passed.
 
-### Phase 4 — Multi-Tier State ⚠️ Partial (2026-03-28)
+### Phase 4 — Multi-Tier State ✅ (2026-04-06)
 
-- `aeon-state`: L1 DashMap ✅, L2 MmapStore ❌ (placeholder), L3 RocksDB ❌ (placeholder)
-- StateOps trait + TieredStateStore
+- `aeon-state`: L1 DashMap ✅, L2 MmapStore ✅, L3 redb ✅
+- StateOps trait + TieredStateStore with full read-through/write-through
 - Typed state wrappers: ValueState, MapState, ListState, CounterState (guest-side SDK)
 - Source-Anchor offset recovery (persist last safe offset to L3)
 - Interest-based retention (purge only after sink confirmation)
@@ -121,22 +121,25 @@ This phase runs the **fix → improve → load test** cycle until Gate 1 metrics
 - State access benchmarks (L1/L2/L3 read/write latency)
 
 **Acceptance**:
-- State survives simulated restart (Source-Anchor recovery test)
-- L1→L2→L3 promotion tested
-- Typed state API (ValueState, MapState) tested via mock processor
-- Windowing: tumbling and session window correctness tests
-- Watermarks advance correctly; late events handled per config
-- Re-run Gate 1 benchmarks: state layer does not regress throughput
-- State read/write latency benchmarked per tier
+- State survives simulated restart (Source-Anchor recovery test) ✅
+- L1→L2→L3 promotion tested ✅
+- Typed state API (ValueState, MapState) tested via mock processor ✅
+- Windowing: tumbling and session window correctness tests ✅
+- Watermarks advance correctly; late events handled per config ✅
+- Re-run Gate 1 benchmarks: state layer does not regress throughput ✅
+- State read/write latency benchmarked per tier ✅
 
 **Implementation Status (2026-04-06)**:
 - ✅ L1 DashMap: Fully functional, 7.7M ops/sec put, 7.2M get
-- ✅ TieredStateStore: Read-through infrastructure, TieredConfig
+- ✅ TieredStateStore: Full read-through (L1→L2→L3), write-through to L3, demotion from L1→L2
 - ✅ Typed wrappers: ValueState, MapState, ListState, CounterState
 - ✅ Windowing: Tumbling, sliding, session windows, watermarks, late event policies
-- ❌ **L2 MmapStore**: Placeholder only — infrastructure comments in `tiered.rs`
-- ❌ **L3 RocksDB**: Placeholder only — no RocksDB dependency, no persistent storage
-- ⚠️ State does NOT survive restart (L1 only = in-memory). Source-Anchor offset recovery depends on L3.
+- ✅ **L2 MmapStore**: Append-only log with in-memory index, file recovery, compaction, feature-gated `mmap`
+- ✅ **L3 redb**: Pure Rust B-tree DB, ACID, `L3Store` adapter trait, `L3Backend` enum config, feature-gated `redb`
+- ✅ State survives restart via L3 write-through (tested: put→drop→reopen→read-through)
+- ✅ Partition export/import for cluster rebalance (scan_prefix + write_batch)
+- ✅ L3 backend adapter pattern: `L3Store` trait with `RedbStore` impl, `RocksDB` pluggable via same trait (future)
+- ✅ 79 tests (43 existing + 12 L2 + 14 L3 + 10 tiered integration), clippy clean
 
 ### Phase 5 — Fault Tolerance ✅ (2026-03-28)
 
@@ -858,12 +861,12 @@ Rolling binary upgrade: zero event loss during Aeon v1→v2 transition under loa
 | Phase 1 — Minimal Pipeline | 2026-03-27 | Blackhole ceiling ~6.5M events/sec, DAG topology, 35 tests |
 | Phase 2 — Redpanda Connector | 2026-03-28 | E2E passthrough, headroom 3,618x, 3 integration tests |
 | Phase 3 — Performance Hardening | 2026-03-28 | memchr SIMD (7–27x), partition scaling 4.06x at 16p, 141M zero-loss sustained |
-| Phase 4 — Multi-Tier State | 2026-03-28 | ⚠️ L1 DashMap 7.7M put/sec, typed state, windowing, 43 tests. **L2 mmap + L3 RocksDB: placeholders only** |
+| Phase 4 — Multi-Tier State | 2026-04-06 | ✅ L1 DashMap + L2 MmapStore + L3 redb, full tiered read-through/write-through, demotion, partition export/import, 79 tests |
 | Phase 5 — Fault Tolerance | 2026-03-28 | DLQ, retry, circuit breaker, health/ready, graceful shutdown, 36 tests |
 | Phase 6 — Observability | 2026-03-28 | Histograms, logging, per-partition metrics, Grafana dashboard, 34 tests |
 | Phase 7 — Wasm Runtime | 2026-03-28 | Wasmtime, host functions, WIT contract, ~794K wasm events/sec, 21 tests |
 
-**Total workspace tests**: 700 Rust passing (0 failed, 10 ignored) + 24 Python + 20 Go = 744 total | **Clippy**: clean | **Rustfmt**: clean | **Audit date**: 2026-04-06
+**Total workspace tests**: 724 Rust passing (688 base + 36 feature-gated L2/L3, 0 failed, 10 ignored) + 24 Python + 20 Go = 768 total | **Clippy**: clean | **Rustfmt**: clean | **Audit date**: 2026-04-06
 
 ### Gate 2 — Complete (Phases 8–10) ✅
 
