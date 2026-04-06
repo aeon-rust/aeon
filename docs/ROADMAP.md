@@ -807,9 +807,9 @@ Rolling binary upgrade: zero event loss during Aeon v1→v2 transition under loa
 | Phase 9 — PoH + Merkle | 2026-03-30 | SHA-512 Merkle trees, Ed25519 signing, MMR, per-partition PoH chains, 71 tests |
 | Phase 10 — Security & Crypto | 2026-04-04 | EtM encryption, KeyProvider, FIPS guard, CertificateStore, TLS 3-mode (none/auto/pem), auto-cert gen, per-connector TLS, REST API auth, 147 tests |
 
-### Phase 12b — Four-Tier Processor Runtime (In Progress, 2026-04-05)
+### Phase 12b — Four-Tier Processor Runtime ✅ (2026-04-06)
 
-Sub-phases 12b-1 through 12b-7 are complete. Sub-phase 12b-8 (benchmarks & hardening) is next.
+All 8 core sub-phases complete.
 
 | Sub-phase | Completed | Key Result |
 |-----------|-----------|------------|
@@ -821,7 +821,7 @@ Sub-phases 12b-1 through 12b-7 are complete. Sub-phase 12b-8 (benchmarks & harde
 | 12b-5: Python SDK | 2026-04-06 | `aeon_transport.py`: AWPP WebSocket client, ED25519 (PyNaCl), MsgPack/JSON codec, batch wire encode/decode (CRC32), `@processor`/`@batch_processor` decorators, heartbeat loop, `run()` entrypoint. 24 tests |
 | 12b-6: Go SDK | 2026-04-06 | `sdks/go/aeon.go`: AWPP WebSocket client (gorilla/websocket), ED25519 (stdlib crypto), MsgPack (vmihailenco/msgpack), batch wire encode/decode, `ProcessorFunc`/`BatchProcessorFunc`, `Run()`/`RunContext()`, heartbeat goroutine. 20 tests |
 | 12b-7: CLI/REST/Registry | 2026-04-06 | YAML manifest `identities` field with `ManifestIdentity` struct, `aeon apply` registers identities, `aeon export` includes active identities, `aeon diff` flags identity entries. CLI/REST/identity store were already complete from 12b-2 |
-| 12b-8: Benchmarks & hardening | — | Not started |
+| 12b-8: Benchmarks & hardening | 2026-04-06 | `transport_bench.rs`: InProcessTransport overhead <1% (zero-cost confirmed), MsgPack 1.5-3.5x faster than JSON, batch wire encode ~0.44μs/event, decode ~0.38μs/event at batch 1024 |
 
 **Commits**: `8e7b25b` (12b-1+2), `03afba7` (transport codec), `ee45b03` (12b-3/4), `9ad9dea` (12b-5 Python SDK), `f273076` (12b-6 Go SDK)
 

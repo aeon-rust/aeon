@@ -86,3 +86,7 @@ harness = false
 [[bench]]
 name = "e2e_delivery_bench"
 harness = false
+
+[[bench]]
+name = "transport_bench"
+harness = false
