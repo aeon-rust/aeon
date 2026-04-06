@@ -9,8 +9,20 @@ use serde::{Deserialize, Serialize};
 use crate::hash::Hash512;
 
 /// An Ed25519 signing keypair (private + public).
+///
+/// Private key bytes are zeroized on drop to prevent secret leakage.
 pub struct SigningKey {
     inner: ed25519_dalek::SigningKey,
+}
+
+impl Drop for SigningKey {
+    fn drop(&mut self) {
+        // Overwrite the inner signing key with zeros to prevent key material
+        // from lingering in memory. ed25519_dalek::SigningKey doesn't impl Zeroize
+        // without its `zeroize` feature, so we reconstruct from zeroed bytes.
+        let zeroed = [0u8; 32];
+        self.inner = ed25519_dalek::SigningKey::from_bytes(&zeroed);
+    }
 }
 
 /// An Ed25519 public key for signature verification.

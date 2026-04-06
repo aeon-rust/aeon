@@ -18,6 +18,7 @@ rest-api = ["aeon-engine/rest-api"]
 [dependencies]
 aeon-types = { workspace = true }
 aeon-engine = { workspace = true }
+aeon-crypto = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
@@ -25,3 +26,4 @@ serde_json = { workspace = true }
 serde_yaml = "0.9"
 ureq = { version = "2", features = ["json"] }
 wasmtime = { workspace = true }
+rustls-pemfile = { workspace = true }

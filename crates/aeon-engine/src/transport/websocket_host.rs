@@ -44,6 +44,8 @@ pub struct WebSocketHostConfig {
     pub processor_name: String,
     /// Processor version (for ProcessorInfo).
     pub processor_version: String,
+    /// Pipeline name — used by `call_batch` to route events to the correct session.
+    pub pipeline_name: String,
     /// Pipeline codec override (if set, overrides processor preference).
     pub pipeline_codec: Option<TransportCodec>,
 }
@@ -63,6 +65,7 @@ impl WebSocketHostConfig {
             batch_timeout: Duration::from_secs(30),
             processor_name: String::new(),
             processor_version: String::new(),
+            pipeline_name: String::new(),
             pipeline_codec: None,
         }
     }
@@ -79,6 +82,8 @@ pub struct WebSocketProcessorHost {
     sessions: Arc<DashMap<String, Arc<AwppSession>>>,
     /// Routing table: (pipeline_name, partition_id) → session_id.
     routing: Arc<DashMap<(String, u16), String>>,
+    /// WebSocket handles: session_id → shared socket for sending frames.
+    sockets: Arc<DashMap<String, Arc<WsSharedSocket>>>,
     /// Host configuration.
     config: Arc<WebSocketHostConfig>,
     /// When the host was created.
@@ -91,6 +96,7 @@ impl WebSocketProcessorHost {
         Self {
             sessions: Arc::new(DashMap::new()),
             routing: Arc::new(DashMap::new()),
+            sockets: Arc::new(DashMap::new()),
             config: Arc::new(config),
             created_at: Instant::now(),
         }
@@ -128,6 +134,7 @@ impl WebSocketProcessorHost {
         let session = Arc::new(awpp);
         let session_id = session.session_id.clone();
         self.sessions.insert(session_id.clone(), session.clone());
+        self.sockets.insert(session_id.clone(), shared.clone());
 
         // Update routing table
         for assignment in &session.pipeline_assignments {
@@ -151,6 +158,7 @@ impl WebSocketProcessorHost {
         // Cleanup
         session.close();
         self.sessions.remove(&session_id);
+        self.sockets.remove(&session_id);
         for assignment in &session.pipeline_assignments {
             for &partition in &assignment.partitions {
                 self.routing.remove(&(assignment.name.clone(), partition));
@@ -182,18 +190,71 @@ impl WebSocketProcessorHost {
 impl ProcessorTransport for WebSocketProcessorHost {
     fn call_batch(
         &self,
-        _events: Vec<Event>,
+        events: Vec<Event>,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Output>, AeonError>> + Send + '_>> {
         Box::pin(async move {
-            // TODO: Phase 12b-4 full implementation
-            // 1. Determine target session from events
-            // 2. Allocate batch_id via BatchInflight
-            // 3. Build binary frame: routing header + codec-encoded batch
-            // 4. Send via WsSharedSocket
-            // 5. Await response via oneshot with timeout
-            Err(AeonError::processor(
-                "T4 WebSocket call_batch not yet fully implemented",
-            ))
+            if events.is_empty() {
+                return Ok(vec![]);
+            }
+
+            // Route by pipeline_name + first event's partition
+            let partition = events[0].partition.as_u16();
+            let key = (self.config.pipeline_name.clone(), partition);
+
+            // Look up session via routing table
+            let session_id = self
+                .routing
+                .get(&key)
+                .map(|r| r.value().clone())
+                .ok_or_else(|| {
+                    AeonError::connection(format!(
+                        "no T4 session for pipeline={} partition={partition}",
+                        self.config.pipeline_name,
+                    ))
+                })?;
+
+            let session = self
+                .sessions
+                .get(&session_id)
+                .map(|s| Arc::clone(s.value()))
+                .ok_or_else(|| {
+                    AeonError::connection(format!("T4 session {session_id} not found"))
+                })?;
+
+            // Look up WebSocket handle
+            let socket = self
+                .sockets
+                .get(&session_id)
+                .map(|s| Arc::clone(s.value()))
+                .ok_or_else(|| {
+                    AeonError::connection(format!("T4 socket for session {session_id} not found"))
+                })?;
+
+            // Allocate batch_id and get response receiver
+            let (batch_id, rx) = session.batch_inflight.start_batch();
+
+            // Encode batch request, then wrap in data frame with routing header
+            let wire = crate::batch_wire::encode_batch_request(batch_id, &events, session.codec)?;
+            let frame = build_ws_data_frame(&self.config.pipeline_name, partition, &wire);
+
+            // Send as binary WebSocket frame
+            socket.send(Message::Binary(frame.into())).await?;
+
+            // Await response with timeout
+            let result = tokio::time::timeout(self.config.batch_timeout, rx)
+                .await
+                .map_err(|_| {
+                    session.batch_inflight.complete_batch(
+                        batch_id,
+                        Err(AeonError::connection("T4 batch response timeout")),
+                    );
+                    AeonError::connection(format!(
+                        "T4 batch {batch_id} timed out after {:?}",
+                        self.config.batch_timeout,
+                    ))
+                })?;
+
+            result.map_err(|_| AeonError::connection("T4 session closed before batch response"))?
         })
     }
 

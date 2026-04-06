@@ -13,11 +13,11 @@ use crate::batch_tuner::FlushTuner;
 use crate::checkpoint::{CheckpointRecord, CheckpointWriter};
 use crate::delivery::{CheckpointBackend, DeliveryConfig};
 use crate::delivery_ledger::DeliveryLedger;
-use aeon_types::{AeonError, Event, Output, PartitionId, Processor, Sink, Source};
+use aeon_types::{AeonError, BatchFailurePolicy, Event, Output, PartitionId, Processor, Sink, Source};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Default SPSC ring buffer capacity (events/outputs).
 const DEFAULT_BUFFER_CAPACITY: usize = 8192;
@@ -93,6 +93,10 @@ pub struct PipelineMetrics {
     pub outputs_sent: AtomicU64,
     /// Number of checkpoints written (UnorderedBatch mode).
     pub checkpoints_written: AtomicU64,
+    /// Events permanently failed after retry exhaustion or SkipToDlq policy.
+    pub events_failed: AtomicU64,
+    /// Individual retry attempts (each retry of a failed output counts as 1).
+    pub events_retried: AtomicU64,
 }
 
 impl PipelineMetrics {
@@ -102,6 +106,8 @@ impl PipelineMetrics {
             events_processed: AtomicU64::new(0),
             outputs_sent: AtomicU64::new(0),
             checkpoints_written: AtomicU64::new(0),
+            events_failed: AtomicU64::new(0),
+            events_retried: AtomicU64::new(0),
         }
     }
 }
@@ -149,6 +155,201 @@ where
     }
 
     sink.flush().await?;
+    Ok(())
+}
+
+/// Run the direct pipeline with full delivery configuration (failure policy, retries).
+///
+/// Unlike `run`, this variant applies `BatchFailurePolicy` to partial failures:
+/// - `RetryFailed`: retry failed outputs up to `max_retries` with backoff
+/// - `FailBatch`: abort pipeline on any failure
+/// - `SkipToDlq`: count failures, continue processing
+pub async fn run_with_delivery<S, P, K>(
+    source: &mut S,
+    processor: &P,
+    sink: &mut K,
+    delivery: &DeliveryConfig,
+    metrics: &PipelineMetrics,
+    shutdown: &AtomicBool,
+) -> Result<(), AeonError>
+where
+    S: Source,
+    P: Processor,
+    K: Sink,
+{
+    while !shutdown.load(Ordering::Relaxed) {
+        let events = source.next_batch().await?;
+        if events.is_empty() {
+            break;
+        }
+
+        let count = events.len() as u64;
+        metrics.events_received.fetch_add(count, Ordering::Relaxed);
+
+        let outputs = processor.process_batch(events)?;
+        metrics.events_processed.fetch_add(count, Ordering::Relaxed);
+
+        let batch_result = sink.write_batch(outputs.clone()).await?;
+        let delivered = batch_result.delivered.len() as u64;
+        metrics.outputs_sent.fetch_add(delivered, Ordering::Relaxed);
+
+        if batch_result.has_failures() {
+            handle_batch_failures(
+                sink,
+                &outputs,
+                &batch_result,
+                delivery.failure_policy,
+                delivery.max_retries,
+                delivery.retry_backoff,
+                metrics,
+                &None, // no ledger in direct pipeline
+            )
+            .await?;
+        }
+    }
+
+    sink.flush().await?;
+    Ok(())
+}
+
+/// Applies `BatchFailurePolicy` to partial write_batch failures.
+///
+/// Called when `batch_result.has_failures()` is true. The policy determines behavior:
+/// - **RetryFailed**: Collect failed outputs by `source_event_id`, retry up to `max_retries`
+///   with `retry_backoff`. Events that still fail after exhaustion are counted as permanently
+///   failed. If all retries succeed, their delivered count is added to metrics.
+/// - **FailBatch**: Return an error immediately, aborting the pipeline.
+/// - **SkipToDlq**: Count failures in metrics, mark in ledger, continue processing.
+///   (Actual DLQ sink routing is Phase 15b — for now, failures are tracked but not routed.)
+#[allow(clippy::too_many_arguments)]
+async fn handle_batch_failures<K: Sink>(
+    sink: &mut K,
+    original_outputs: &[Output],
+    batch_result: &aeon_types::BatchResult,
+    policy: BatchFailurePolicy,
+    max_retries: u32,
+    retry_backoff: Duration,
+    metrics: &PipelineMetrics,
+    ledger: &Option<Arc<DeliveryLedger>>,
+) -> Result<(), AeonError> {
+    match policy {
+        BatchFailurePolicy::FailBatch => {
+            let failed_count = batch_result.failed.len();
+            let first_err = batch_result
+                .failed
+                .first()
+                .map(|(id, e)| format!("event {id}: {e}"))
+                .unwrap_or_default();
+            metrics
+                .events_failed
+                .fetch_add(failed_count as u64, Ordering::Relaxed);
+            return Err(AeonError::Connection {
+                message: format!(
+                    "FailBatch: {failed_count} events failed in batch, first: {first_err}"
+                ),
+                source: None,
+                retryable: false,
+            });
+        }
+        BatchFailurePolicy::SkipToDlq => {
+            let failed_count = batch_result.failed.len() as u64;
+            metrics
+                .events_failed
+                .fetch_add(failed_count, Ordering::Relaxed);
+            // Mark failed events in ledger (already done by caller for ledger-enabled paths).
+            // Actual DLQ routing is Phase 15b — for now we count and continue.
+            tracing::warn!(
+                failed = failed_count,
+                "SkipToDlq: skipping failed events (DLQ routing pending Phase 15b)"
+            );
+        }
+        BatchFailurePolicy::RetryFailed => {
+            // Build index: source_event_id → outputs for that event
+            let failed_ids: std::collections::HashSet<uuid::Uuid> =
+                batch_result.failed.iter().map(|(id, _)| *id).collect();
+
+            let mut retry_outputs: Vec<Output> = original_outputs
+                .iter()
+                .filter(|o| {
+                    o.source_event_id
+                        .as_ref()
+                        .map(|id| failed_ids.contains(id))
+                        .unwrap_or(false)
+                })
+                .cloned()
+                .collect();
+
+            if retry_outputs.is_empty() {
+                // Failed events couldn't be matched to outputs (no source_event_id).
+                // Count as permanently failed.
+                metrics
+                    .events_failed
+                    .fetch_add(batch_result.failed.len() as u64, Ordering::Relaxed);
+                tracing::warn!(
+                    failed = batch_result.failed.len(),
+                    "RetryFailed: cannot match failed events to outputs (missing source_event_id)"
+                );
+                return Ok(());
+            }
+
+            for attempt in 1..=max_retries {
+                if retry_backoff > Duration::ZERO {
+                    tokio::time::sleep(retry_backoff).await;
+                }
+
+                metrics
+                    .events_retried
+                    .fetch_add(retry_outputs.len() as u64, Ordering::Relaxed);
+
+                let retry_result = sink.write_batch(retry_outputs.clone()).await?;
+
+                // Mark newly delivered in ledger
+                if let Some(ledger) = ledger {
+                    if !retry_result.delivered.is_empty() {
+                        ledger.mark_batch_acked(&retry_result.delivered);
+                    }
+                }
+
+                let delivered = retry_result.delivered.len() as u64;
+                metrics.outputs_sent.fetch_add(delivered, Ordering::Relaxed);
+
+                if !retry_result.has_failures() {
+                    // All retried events succeeded
+                    return Ok(());
+                }
+
+                if attempt == max_retries {
+                    // Exhausted retries — count remaining as permanently failed
+                    let still_failed = retry_result.failed.len() as u64;
+                    metrics
+                        .events_failed
+                        .fetch_add(still_failed, Ordering::Relaxed);
+
+                    if let Some(ledger) = ledger {
+                        for (id, err) in &retry_result.failed {
+                            ledger.mark_failed(id, format!("retry exhausted: {err}"));
+                        }
+                    }
+
+                    tracing::warn!(
+                        failed = still_failed,
+                        attempts = max_retries,
+                        "RetryFailed: events permanently failed after retry exhaustion"
+                    );
+                } else {
+                    // Narrow to still-failed outputs for next retry
+                    let still_failed_ids: std::collections::HashSet<uuid::Uuid> =
+                        retry_result.failed.iter().map(|(id, _)| *id).collect();
+                    retry_outputs.retain(|o| {
+                        o.source_event_id
+                            .as_ref()
+                            .map(|id| still_failed_ids.contains(id))
+                            .unwrap_or(false)
+                    });
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -273,6 +474,9 @@ where
     let adaptive_flush = config.delivery.flush.adaptive;
     let adaptive_min_divisor = config.delivery.flush.adaptive_min_divisor;
     let adaptive_max_multiplier = config.delivery.flush.adaptive_max_multiplier;
+    let failure_policy = config.delivery.failure_policy;
+    let max_retries = config.delivery.max_retries;
+    let retry_backoff = config.delivery.retry_backoff;
 
     // Initialize checkpoint writer if WAL backend is configured.
     let checkpoint_writer = if config.delivery.checkpoint.backend == CheckpointBackend::Wal {
@@ -361,6 +565,14 @@ where
                         Vec::new()
                     };
 
+                    // Clone outputs before write_batch if failure policy may need them for retry.
+                    // Only clone when RetryFailed is configured — avoid the cost otherwise.
+                    let outputs_for_retry = if failure_policy == BatchFailurePolicy::RetryFailed {
+                        Some(outputs.clone())
+                    } else {
+                        None
+                    };
+
                     match sink.write_batch(outputs).await {
                         Ok(batch_result) => {
                             // Mark delivered outputs as acked in ledger.
@@ -383,6 +595,26 @@ where
                             delivered_since_checkpoint += delivered_count;
                             acked_since_last_flush += delivered_count;
                             events_since_last_flush += total_count;
+
+                            // Apply BatchFailurePolicy if there are partial failures.
+                            if batch_result.has_failures() {
+                                let original = outputs_for_retry
+                                    .as_deref()
+                                    .unwrap_or(&[]);
+                                handle_batch_failures(
+                                    &mut sink,
+                                    original,
+                                    &batch_result,
+                                    failure_policy,
+                                    max_retries,
+                                    retry_backoff,
+                                    &metrics_sink,
+                                    &sink_ledger,
+                                )
+                                .await?;
+                                failed_since_checkpoint +=
+                                    batch_result.failed.len() as u64;
+                            }
                         }
                         Err(e) => {
                             // Mark all tracked outputs as failed
@@ -1300,5 +1532,331 @@ mod tests {
         .unwrap();
 
         assert_eq!(metrics.outputs_sent.load(Ordering::Relaxed), 200);
+    }
+
+    // ── PartialFailSink: test helper that fails specific events ──────────
+
+    use aeon_types::{BatchFailurePolicy, BatchResult};
+    use std::sync::atomic::AtomicU32;
+
+    /// A sink that fails events whose `source_event_id` is in the fail set.
+    /// After `heal_after` calls, it stops failing (simulates transient errors).
+    struct PartialFailSink {
+        fail_ids: std::collections::HashSet<uuid::Uuid>,
+        calls: AtomicU32,
+        heal_after: u32,
+        delivered: std::sync::Mutex<Vec<Output>>,
+    }
+
+    impl PartialFailSink {
+        fn new(fail_ids: Vec<uuid::Uuid>, heal_after: u32) -> Self {
+            Self {
+                fail_ids: fail_ids.into_iter().collect(),
+                calls: AtomicU32::new(0),
+                heal_after,
+                delivered: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn delivered_count(&self) -> usize {
+            self.delivered.lock().unwrap().len()
+        }
+    }
+
+    impl Sink for PartialFailSink {
+        async fn write_batch(
+            &mut self,
+            outputs: Vec<Output>,
+        ) -> Result<BatchResult, AeonError> {
+            let call_num = self.calls.fetch_add(1, Ordering::Relaxed);
+            let healed = call_num >= self.heal_after;
+
+            let mut delivered = Vec::new();
+            let mut failed = Vec::new();
+
+            for output in outputs {
+                let should_fail = !healed
+                    && output
+                        .source_event_id
+                        .map(|id| self.fail_ids.contains(&id))
+                        .unwrap_or(false);
+
+                if should_fail {
+                    let id = output.source_event_id.unwrap();
+                    failed.push((id, AeonError::connection("transient failure")));
+                } else {
+                    if let Some(id) = output.source_event_id {
+                        delivered.push(id);
+                    }
+                    self.delivered.lock().unwrap().push(output);
+                }
+            }
+
+            Ok(BatchResult {
+                delivered,
+                pending: Vec::new(),
+                failed,
+            })
+        }
+
+        async fn flush(&mut self) -> Result<(), AeonError> {
+            Ok(())
+        }
+    }
+
+    /// Make events with unique UUIDv7 IDs suitable for failure policy tests.
+    fn make_events_unique(count: usize) -> Vec<Event> {
+        let source: Arc<str> = Arc::from("test");
+        (0..count)
+            .map(|i| {
+                Event::new(
+                    uuid::Uuid::now_v7(),
+                    i as i64,
+                    Arc::clone(&source),
+                    PartitionId::new(0),
+                    Bytes::from(format!("event-{i}")),
+                )
+                .with_source_offset(i as i64)
+            })
+            .collect()
+    }
+
+    // ── FailBatch policy tests ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn fail_batch_policy_aborts_on_partial_failure() {
+        let events = make_events_unique(10);
+        // Fail the 3rd event
+        let fail_id = events[2].id;
+
+        let mut source = MemorySource::new(events, 32);
+        let processor = PassthroughProcessor::new(Arc::from("out"));
+        let mut sink = PartialFailSink::new(vec![fail_id], 999); // never heals
+        let delivery = DeliveryConfig {
+            failure_policy: BatchFailurePolicy::FailBatch,
+            ..Default::default()
+        };
+        let metrics = PipelineMetrics::new();
+        let shutdown = AtomicBool::new(false);
+
+        let result = run_with_delivery(
+            &mut source,
+            &processor,
+            &mut sink,
+            &delivery,
+            &metrics,
+            &shutdown,
+        )
+        .await;
+
+        assert!(result.is_err(), "FailBatch should return error");
+        let err = result.unwrap_err();
+        assert!(
+            format!("{err}").contains("FailBatch"),
+            "error message should mention FailBatch: {err}"
+        );
+        assert_eq!(
+            metrics.events_failed.load(Ordering::Relaxed),
+            1,
+            "one event should be marked failed"
+        );
+    }
+
+    // ── SkipToDlq policy tests ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn skip_to_dlq_policy_continues_on_failure() {
+        let events = make_events_unique(10);
+        let fail_id = events[2].id;
+
+        let mut source = MemorySource::new(events, 32);
+        let processor = PassthroughProcessor::new(Arc::from("out"));
+        let mut sink = PartialFailSink::new(vec![fail_id], 999);
+        let delivery = DeliveryConfig {
+            failure_policy: BatchFailurePolicy::SkipToDlq,
+            ..Default::default()
+        };
+        let metrics = PipelineMetrics::new();
+        let shutdown = AtomicBool::new(false);
+
+        let result = run_with_delivery(
+            &mut source,
+            &processor,
+            &mut sink,
+            &delivery,
+            &metrics,
+            &shutdown,
+        )
+        .await;
+
+        assert!(result.is_ok(), "SkipToDlq should not abort: {result:?}");
+        assert_eq!(metrics.events_received.load(Ordering::Relaxed), 10);
+        assert_eq!(
+            metrics.events_failed.load(Ordering::Relaxed),
+            1,
+            "one event should be marked as failed"
+        );
+        // 9 delivered in first write_batch + 0 retries
+        assert_eq!(sink.delivered_count(), 9);
+    }
+
+    // ── RetryFailed policy tests ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn retry_failed_policy_retries_and_succeeds() {
+        let events = make_events_unique(10);
+        let fail_id = events[4].id;
+
+        let mut source = MemorySource::new(events, 32);
+        let processor = PassthroughProcessor::new(Arc::from("out"));
+        // heal_after=1: first write_batch fails the event, retry succeeds
+        let mut sink = PartialFailSink::new(vec![fail_id], 1);
+        let delivery = DeliveryConfig {
+            failure_policy: BatchFailurePolicy::RetryFailed,
+            max_retries: 3,
+            retry_backoff: Duration::ZERO, // no delay in tests
+            ..Default::default()
+        };
+        let metrics = PipelineMetrics::new();
+        let shutdown = AtomicBool::new(false);
+
+        let result = run_with_delivery(
+            &mut source,
+            &processor,
+            &mut sink,
+            &delivery,
+            &metrics,
+            &shutdown,
+        )
+        .await;
+
+        assert!(result.is_ok(), "RetryFailed should succeed: {result:?}");
+        assert_eq!(metrics.events_received.load(Ordering::Relaxed), 10);
+        assert_eq!(
+            metrics.events_failed.load(Ordering::Relaxed),
+            0,
+            "no permanently failed events"
+        );
+        assert!(
+            metrics.events_retried.load(Ordering::Relaxed) >= 1,
+            "at least one retry should have happened"
+        );
+        // All 10 events delivered (9 initially + 1 on retry)
+        assert_eq!(sink.delivered_count(), 10);
+    }
+
+    #[tokio::test]
+    async fn retry_failed_policy_exhausts_retries() {
+        let events = make_events_unique(10);
+        let fail_id = events[0].id;
+
+        let mut source = MemorySource::new(events, 32);
+        let processor = PassthroughProcessor::new(Arc::from("out"));
+        // Never heals — all retries will fail
+        let mut sink = PartialFailSink::new(vec![fail_id], 999);
+        let delivery = DeliveryConfig {
+            failure_policy: BatchFailurePolicy::RetryFailed,
+            max_retries: 2,
+            retry_backoff: Duration::ZERO,
+            ..Default::default()
+        };
+        let metrics = PipelineMetrics::new();
+        let shutdown = AtomicBool::new(false);
+
+        let result = run_with_delivery(
+            &mut source,
+            &processor,
+            &mut sink,
+            &delivery,
+            &metrics,
+            &shutdown,
+        )
+        .await;
+
+        // Pipeline continues after retry exhaustion (doesn't abort)
+        assert!(result.is_ok(), "RetryFailed should not abort: {result:?}");
+        assert_eq!(
+            metrics.events_failed.load(Ordering::Relaxed),
+            1,
+            "one event permanently failed"
+        );
+        assert_eq!(
+            metrics.events_retried.load(Ordering::Relaxed),
+            2,
+            "two retry attempts"
+        );
+        // 9 delivered initially, retried event never delivered
+        assert_eq!(sink.delivered_count(), 9);
+    }
+
+    #[tokio::test]
+    async fn retry_failed_multiple_events_partial_heal() {
+        let events = make_events_unique(20);
+        let fail_ids = vec![events[3].id, events[7].id, events[15].id];
+
+        let mut source = MemorySource::new(events, 32);
+        let processor = PassthroughProcessor::new(Arc::from("out"));
+        // heal_after=2: first two write_batch calls fail, third succeeds
+        let mut sink = PartialFailSink::new(fail_ids, 2);
+        let delivery = DeliveryConfig {
+            failure_policy: BatchFailurePolicy::RetryFailed,
+            max_retries: 3,
+            retry_backoff: Duration::ZERO,
+            ..Default::default()
+        };
+        let metrics = PipelineMetrics::new();
+        let shutdown = AtomicBool::new(false);
+
+        let result = run_with_delivery(
+            &mut source,
+            &processor,
+            &mut sink,
+            &delivery,
+            &metrics,
+            &shutdown,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(metrics.events_received.load(Ordering::Relaxed), 20);
+        assert_eq!(
+            metrics.events_failed.load(Ordering::Relaxed),
+            0,
+            "all events eventually succeeded"
+        );
+        assert_eq!(sink.delivered_count(), 20);
+    }
+
+    #[tokio::test]
+    async fn no_failure_policy_overhead_when_all_succeed() {
+        // Verify that RetryFailed policy adds no overhead when there are no failures
+        let events = make_events_unique(1000);
+        let mut source = MemorySource::new(events, 64);
+        let processor = PassthroughProcessor::new(Arc::from("out"));
+        let mut sink = PartialFailSink::new(vec![], 0); // nothing to fail
+        let delivery = DeliveryConfig {
+            failure_policy: BatchFailurePolicy::RetryFailed,
+            max_retries: 3,
+            retry_backoff: Duration::from_millis(100),
+            ..Default::default()
+        };
+        let metrics = PipelineMetrics::new();
+        let shutdown = AtomicBool::new(false);
+
+        run_with_delivery(
+            &mut source,
+            &processor,
+            &mut sink,
+            &delivery,
+            &metrics,
+            &shutdown,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(metrics.events_received.load(Ordering::Relaxed), 1000);
+        assert_eq!(metrics.events_failed.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.events_retried.load(Ordering::Relaxed), 0);
+        assert_eq!(sink.delivered_count(), 1000);
     }
 }

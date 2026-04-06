@@ -252,6 +252,33 @@ impl CertificateStore {
             .with_no_client_auth())
     }
 
+    /// Get the leaf certificate's expiry as seconds since Unix epoch.
+    ///
+    /// Returns `None` if no identity is loaded or the cert can't be parsed.
+    /// Useful for Prometheus metrics: `aeon_tls_cert_expiry_seconds`.
+    pub fn leaf_cert_expiry_secs(&self) -> Option<i64> {
+        let identity = self.identity.as_ref()?;
+        let leaf = identity.certs.first()?;
+        parse_x509_not_after(leaf.as_ref())
+    }
+
+    /// Seconds until the leaf certificate expires, or negative if already expired.
+    /// Returns `None` if no identity is loaded or the cert can't be parsed.
+    pub fn leaf_cert_days_until_expiry(&self) -> Option<i64> {
+        let expiry_secs = self.leaf_cert_expiry_secs()?;
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs() as i64;
+        Some((expiry_secs - now_secs) / 86400)
+    }
+
+    /// Parse the expiry (notAfter) from a DER-encoded X.509 certificate.
+    /// Returns seconds since Unix epoch, or `None` if parsing fails.
+    pub fn parse_cert_expiry_secs(der: &[u8]) -> Option<i64> {
+        parse_x509_not_after(der)
+    }
+
     /// Reload certificates from the original file paths.
     /// Useful for certificate rotation without restart.
     pub fn reload(&mut self) -> Result<(), AeonError> {
@@ -694,6 +721,157 @@ impl ConnectorTlsConfig {
     }
 }
 
+// ── Minimal X.509 DER parser (notAfter extraction only) ────────────────
+
+/// Parse the `notAfter` field from a DER-encoded X.509 certificate.
+///
+/// Returns seconds since Unix epoch, or `None` if the cert can't be parsed.
+/// This is a minimal parser that only extracts the validity period — no
+/// external X.509 crate needed.
+fn parse_x509_not_after(der: &[u8]) -> Option<i64> {
+    // X.509 structure:
+    //   SEQUENCE {
+    //     SEQUENCE (tbsCertificate) {
+    //       [0] EXPLICIT version (optional)
+    //       INTEGER serialNumber
+    //       SEQUENCE signatureAlgorithm
+    //       SEQUENCE issuer
+    //       SEQUENCE validity { notBefore, notAfter }
+    //       ...
+    //     }
+    //   }
+    let (_, cert_body) = read_der_sequence(der)?;
+    let (_, tbs_body) = read_der_sequence(cert_body)?;
+
+    let mut pos = tbs_body;
+
+    // Skip version [0] EXPLICIT if present (tag 0xA0)
+    if pos.first() == Some(&0xA0) {
+        let (rest, _) = read_der_tlv(pos)?;
+        pos = rest;
+    }
+
+    // Skip serialNumber (INTEGER)
+    let (rest, _) = read_der_tlv(pos)?;
+    pos = rest;
+
+    // Skip signatureAlgorithm (SEQUENCE)
+    let (rest, _) = read_der_tlv(pos)?;
+    pos = rest;
+
+    // Skip issuer (SEQUENCE)
+    let (rest, _) = read_der_tlv(pos)?;
+    pos = rest;
+
+    // Validity SEQUENCE { notBefore, notAfter }
+    let (_, validity_body) = read_der_sequence(pos)?;
+
+    // Skip notBefore
+    let (rest, _) = read_der_tlv(validity_body)?;
+
+    // Read notAfter (UTCTime tag=0x17 or GeneralizedTime tag=0x18)
+    let (_rest, not_after_bytes) = read_der_tlv(rest)?;
+    let tag = rest[0];
+
+    parse_asn1_time(tag, not_after_bytes)
+}
+
+/// Read a DER SEQUENCE tag+length, returning (remaining, body).
+fn read_der_sequence(data: &[u8]) -> Option<(&[u8], &[u8])> {
+    if data.first()? != &0x30 {
+        return None;
+    }
+    let (rest, body) = read_der_tlv(data)?;
+    Some((rest, body))
+}
+
+/// Read a DER TLV (tag-length-value), returning (remaining_after, value).
+fn read_der_tlv(data: &[u8]) -> Option<(&[u8], &[u8])> {
+    if data.is_empty() {
+        return None;
+    }
+    let (_tag, rest) = (data[0], &data[1..]);
+    let (len, header_extra) = read_der_length(rest)?;
+    let value_start = 1 + header_extra;
+    let value_end = value_start + len;
+    if value_end > data.len() {
+        return None;
+    }
+    Some((&data[value_end..], &data[value_start..value_end]))
+}
+
+/// Read a DER length field, returning (length, bytes_consumed_for_length).
+fn read_der_length(data: &[u8]) -> Option<(usize, usize)> {
+    let first = *data.first()?;
+    if first < 0x80 {
+        Some((first as usize, 1))
+    } else {
+        let num_bytes = (first & 0x7F) as usize;
+        if num_bytes == 0 || num_bytes > 4 || data.len() < 1 + num_bytes {
+            return None;
+        }
+        let mut len: usize = 0;
+        for &b in &data[1..1 + num_bytes] {
+            len = (len << 8) | (b as usize);
+        }
+        Some((len, 1 + num_bytes))
+    }
+}
+
+/// Parse ASN.1 UTCTime (YYMMDDHHMMSSZ) or GeneralizedTime (YYYYMMDDHHMMSSZ)
+/// into seconds since Unix epoch.
+fn parse_asn1_time(tag: u8, data: &[u8]) -> Option<i64> {
+    let s = std::str::from_utf8(data).ok()?;
+    let (year, rest) = if tag == 0x17 {
+        // UTCTime: YY (≥50 → 19xx, <50 → 20xx)
+        let yy: i64 = s.get(..2)?.parse().ok()?;
+        let year = if yy >= 50 { 1900 + yy } else { 2000 + yy };
+        (year, s.get(2..)?)
+    } else if tag == 0x18 {
+        // GeneralizedTime: YYYY
+        let yyyy: i64 = s.get(..4)?.parse().ok()?;
+        (yyyy, s.get(4..)?)
+    } else {
+        return None;
+    };
+
+    let month: i64 = rest.get(..2)?.parse().ok()?;
+    let day: i64 = rest.get(2..4)?.parse().ok()?;
+    let hour: i64 = rest.get(4..6)?.parse().ok()?;
+    let min: i64 = rest.get(6..8)?.parse().ok()?;
+    let sec: i64 = rest.get(8..10)?.parse().ok()?;
+
+    // Simplified days-from-epoch (good enough for expiry gauge)
+    Some(datetime_to_epoch(year, month, day, hour, min, sec))
+}
+
+/// Convert a UTC date/time to seconds since Unix epoch.
+/// Only needs to be correct for dates in the range 1970–2099.
+fn datetime_to_epoch(year: i64, month: i64, day: i64, hour: i64, min: i64, sec: i64) -> i64 {
+    // Days per month (non-leap)
+    const DAYS: [i64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+    let mut days: i64 = 0;
+    // Years since 1970
+    for y in 1970..year {
+        days += if is_leap(y) { 366 } else { 365 };
+    }
+    // Months in current year
+    for m in 1..month {
+        days += DAYS[(m - 1) as usize];
+        if m == 2 && is_leap(year) {
+            days += 1;
+        }
+    }
+    days += day - 1;
+
+    days * 86400 + hour * 3600 + min * 60 + sec
+}
+
+fn is_leap(y: i64) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1111,5 +1289,72 @@ mod tests {
             assert_eq!(config.cert, decoded.cert);
             assert_eq!(config.key, decoded.key);
         }
+    }
+
+    // ── Certificate expiry tests ─────────────────────────────────────
+
+    #[test]
+    fn datetime_to_epoch_known_values() {
+        // 2024-01-01 00:00:00 UTC
+        let epoch = super::datetime_to_epoch(2024, 1, 1, 0, 0, 0);
+        assert_eq!(epoch, 1704067200);
+
+        // 1970-01-01 00:00:00 UTC
+        assert_eq!(super::datetime_to_epoch(1970, 1, 1, 0, 0, 0), 0);
+
+        // 2000-01-01 00:00:00 UTC
+        assert_eq!(super::datetime_to_epoch(2000, 1, 1, 0, 0, 0), 946684800);
+    }
+
+    #[test]
+    fn parse_asn1_utc_time() {
+        // UTCTime "250101120000Z" → 2025-01-01 12:00:00 UTC
+        let time = super::parse_asn1_time(0x17, b"250101120000Z");
+        assert!(time.is_some());
+        let expected = super::datetime_to_epoch(2025, 1, 1, 12, 0, 0);
+        assert_eq!(time.unwrap(), expected);
+    }
+
+    #[test]
+    fn parse_asn1_generalized_time() {
+        // GeneralizedTime "20250601000000Z" → 2025-06-01 00:00:00 UTC
+        let time = super::parse_asn1_time(0x18, b"20250601000000Z");
+        assert!(time.is_some());
+        let expected = super::datetime_to_epoch(2025, 6, 1, 0, 0, 0);
+        assert_eq!(time.unwrap(), expected);
+    }
+
+    #[test]
+    fn leaf_cert_expiry_from_pem() {
+        let dir = std::env::temp_dir().join("aeon_tls_test_expiry");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (cert_path, key_path, ca_path) = generate_test_pem_files(&dir);
+        let store = CertificateStore::from_pem_files(cert_path, key_path, ca_path).unwrap();
+
+        // rcgen default validity is ~4096 days from now
+        let expiry_secs = store.leaf_cert_expiry_secs();
+        assert!(expiry_secs.is_some(), "should parse cert expiry");
+
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        // Expiry should be in the future (at least 1 year from now)
+        let secs = expiry_secs.unwrap();
+        assert!(secs > now_secs + 365 * 86400, "cert should expire > 1 year from now, got {} days", (secs - now_secs) / 86400);
+
+        let days = store.leaf_cert_days_until_expiry();
+        assert!(days.is_some());
+        assert!(days.unwrap() > 365, "expected > 365 days, got {}", days.unwrap());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn insecure_store_has_no_expiry() {
+        let store = CertificateStore::new_insecure();
+        assert!(store.leaf_cert_expiry_secs().is_none());
+        assert!(store.leaf_cert_days_until_expiry().is_none());
     }
 }

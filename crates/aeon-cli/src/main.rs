@@ -130,6 +130,11 @@ enum Commands {
         #[command(subcommand)]
         action: DevAction,
     },
+    /// TLS certificate management
+    Tls {
+        #[command(subcommand)]
+        action: TlsAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -262,6 +267,24 @@ enum DevAction {
     Status,
 }
 
+#[derive(Subcommand)]
+enum TlsAction {
+    /// Export the CA certificate (for distributing to clients)
+    ExportCa {
+        /// Path to the CA PEM file to export
+        #[arg(long)]
+        ca: PathBuf,
+        /// Output file (stdout if omitted)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+    /// Show certificate information (expiry, subject, issuer)
+    Info {
+        /// Path to a PEM certificate file
+        cert: PathBuf,
+    },
+}
+
 #[derive(Clone, ValueEnum)]
 enum Runtime {
     Wasm,
@@ -300,6 +323,7 @@ fn main() -> Result<()> {
         Some(Commands::Export { file, api }) => cmd_export(file.as_deref(), &api),
         Some(Commands::Diff { file, api }) => cmd_diff(&file, &api),
         Some(Commands::Dev { action }) => cmd_dev(&action),
+        Some(Commands::Tls { action }) => cmd_tls(&action),
         None => {
             println!("Aeon v{}", env!("CARGO_PKG_VERSION"));
             println!("Run `aeon --help` for available commands.");
@@ -1628,4 +1652,59 @@ fn find_compose_file() -> Result<PathBuf> {
         "could not find {target}. Run `aeon dev` from within the Aeon workspace, \
          or ensure docker/docker-compose.dev.yml exists."
     )
+}
+
+// ── aeon tls ──────────────────────────────────────────────────────────
+
+fn cmd_tls(action: &TlsAction) -> Result<()> {
+    match action {
+        TlsAction::ExportCa { ca, output } => {
+            let ca_pem = std::fs::read_to_string(ca)
+                .with_context(|| format!("failed to read CA file: {}", ca.display()))?;
+
+            // Validate it looks like a PEM certificate
+            if !ca_pem.contains("-----BEGIN CERTIFICATE-----") {
+                bail!("file does not contain a PEM certificate: {}", ca.display());
+            }
+
+            match output {
+                Some(path) => {
+                    std::fs::write(path, &ca_pem)
+                        .with_context(|| format!("failed to write to {}", path.display()))?;
+                    println!("CA certificate exported to {}", path.display());
+                }
+                None => {
+                    print!("{ca_pem}");
+                }
+            }
+            Ok(())
+        }
+        TlsAction::Info { cert } => {
+            let pem_data = std::fs::read(cert)
+                .with_context(|| format!("failed to read cert file: {}", cert.display()))?;
+
+            let certs: Vec<_> = rustls_pemfile::certs(&mut pem_data.as_slice())
+                .collect::<Result<Vec<_>, _>>()
+                .with_context(|| "failed to parse PEM certificates")?;
+
+            if certs.is_empty() {
+                bail!("no certificates found in {}", cert.display());
+            }
+
+            for (i, der) in certs.iter().enumerate() {
+                println!("Certificate #{} ({} bytes DER)", i, der.as_ref().len());
+                if let Some(expiry) = aeon_crypto::tls::CertificateStore::parse_cert_expiry_secs(der.as_ref()) {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64;
+                    let days = (expiry - now) / 86400;
+                    println!("  Expires: epoch {expiry} ({days} days from now)");
+                } else {
+                    println!("  Expires: (could not parse)");
+                }
+            }
+            Ok(())
+        }
+    }
 }

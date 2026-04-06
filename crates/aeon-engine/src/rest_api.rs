@@ -66,8 +66,12 @@ pub struct AppState {
     pub delivery_ledgers: dashmap::DashMap<String, Arc<DeliveryLedger>>,
     /// Processor identity store (ED25519 public keys for T3/T4 auth).
     pub identities: Arc<ProcessorIdentityStore>,
-    /// API token for Bearer authentication. `None` disables auth (dev mode).
-    /// Set via `AEON_API_TOKEN` environment variable.
+    /// API key authenticator for Bearer token auth. `None` disables auth (dev mode).
+    /// Uses constant-time comparison and supports multiple named API keys.
+    #[cfg(feature = "processor-auth")]
+    pub authenticator: Option<aeon_crypto::auth::ApiKeyAuthenticator>,
+    /// Fallback: simple API token when processor-auth feature is disabled.
+    #[cfg(not(feature = "processor-auth"))]
     pub api_token: Option<String>,
     /// T4 WebSocket processor host (feature-gated).
     #[cfg(feature = "websocket-host")]
@@ -173,15 +177,54 @@ pub fn api_router(state: Arc<AppState>) -> Router {
 
 /// Bearer token authentication middleware.
 ///
-/// Checks the `Authorization: Bearer <token>` header against `AppState::api_token`.
-/// When `api_token` is `None`, all requests pass through (dev mode).
+/// When `processor-auth` feature is enabled, uses `ApiKeyAuthenticator` with
+/// constant-time comparison and multi-key support. When the authenticator is
+/// `None`, all requests pass through (dev mode).
+#[cfg(feature = "processor-auth")]
+async fn auth_middleware(
+    State(state): State<Arc<AppState>>,
+    req: Request,
+    next: Next,
+) -> impl IntoResponse {
+    let Some(ref authenticator) = state.authenticator else {
+        return next.run(req).await;
+    };
+
+    let auth_header = req
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+
+    match auth_header {
+        Some(header) => match authenticator.validate_header(header) {
+            Ok(_key_name) => next.run(req).await,
+            Err(_) => (
+                StatusCode::UNAUTHORIZED,
+                Json(ApiError {
+                    error: "invalid bearer token".into(),
+                }),
+            )
+                .into_response(),
+        },
+        None => (
+            StatusCode::UNAUTHORIZED,
+            Json(ApiError {
+                error: "missing or malformed Authorization header (expected: Bearer <token>)"
+                    .into(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+/// Fallback auth middleware when `processor-auth` feature is disabled.
+#[cfg(not(feature = "processor-auth"))]
 async fn auth_middleware(
     State(state): State<Arc<AppState>>,
     req: Request,
     next: Next,
 ) -> impl IntoResponse {
     let Some(ref expected_token) = state.api_token else {
-        // No token configured — auth disabled (dev mode)
         return next.run(req).await;
     };
 
@@ -217,16 +260,19 @@ async fn auth_middleware(
 }
 
 /// Start the REST API server on the given address.
-///
-/// Reads `AEON_API_TOKEN` from environment. When set, all `/api/v1/` endpoints
-/// require `Authorization: Bearer <token>`. When unset, auth is disabled.
 pub async fn serve(state: Arc<AppState>, addr: &str) -> Result<(), Box<dyn std::error::Error>> {
-    if state.api_token.is_some() {
+    let auth_enabled = {
+        #[cfg(feature = "processor-auth")]
+        { state.authenticator.is_some() }
+        #[cfg(not(feature = "processor-auth"))]
+        { state.api_token.is_some() }
+    };
+    if auth_enabled {
         tracing::info!(addr = addr, "REST API server listening (auth enabled)");
     } else {
         tracing::warn!(
             addr = addr,
-            "REST API server listening (auth DISABLED — set AEON_API_TOKEN to enable)"
+            "REST API server listening (auth DISABLED — configure api_keys to enable)"
         );
     }
     let app = api_router(state);
@@ -860,7 +906,10 @@ mod tests {
             pipelines: Arc::new(PipelineManager::new()),
             delivery_ledgers: dashmap::DashMap::new(),
             identities: Arc::new(ProcessorIdentityStore::new()),
-            api_token: None, // Auth disabled in tests by default
+            #[cfg(feature = "processor-auth")]
+            authenticator: None,
+            #[cfg(not(feature = "processor-auth"))]
+            api_token: None,
             #[cfg(feature = "websocket-host")]
             ws_host: None,
         })
@@ -874,11 +923,34 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
+
+        // Set env var for ApiKeyAuthenticator and create authenticator
+        let env_key = format!(
+            "AEON_TEST_API_KEY_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        // SAFETY: test-only, single-threaded test setup before any concurrent access.
+        unsafe { std::env::set_var(&env_key, token) };
+
         Arc::new(AppState {
             registry: Arc::new(ProcessorRegistry::new(&dir).unwrap()),
             pipelines: Arc::new(PipelineManager::new()),
             delivery_ledgers: dashmap::DashMap::new(),
             identities: Arc::new(ProcessorIdentityStore::new()),
+            #[cfg(feature = "processor-auth")]
+            authenticator: Some(
+                aeon_crypto::auth::ApiKeyAuthenticator::from_config(&[
+                    aeon_crypto::auth::ApiKeyEntry {
+                        name: "test".into(),
+                        key_env: env_key,
+                    },
+                ])
+                .unwrap(),
+            ),
+            #[cfg(not(feature = "processor-auth"))]
             api_token: Some(token.to_string()),
             #[cfg(feature = "websocket-host")]
             ws_host: None,

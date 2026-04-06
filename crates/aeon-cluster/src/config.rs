@@ -87,6 +87,15 @@ impl ClusterConfig {
             }
         }
 
+        // Multi-node clusters require TLS — plaintext inter-node traffic is not allowed
+        if !self.is_single_node() && self.tls.is_none() {
+            return Err(AeonError::Config {
+                message: "multi-node clusters require TLS configuration. \
+                          Set cluster.tls with cert, key, and ca paths"
+                    .to_string(),
+            });
+        }
+
         // Odd-number enforcement for multi-node clusters
         let cluster_size = self.initial_cluster_size();
         if cluster_size > 1 && cluster_size % 2 == 0 {
@@ -128,6 +137,31 @@ mod tests {
         assert!(err.to_string().contains("node_id"));
     }
 
+    fn test_tls() -> Option<TlsConfig> {
+        Some(TlsConfig {
+            cert: PathBuf::from("/etc/aeon/tls/node.pem"),
+            key: PathBuf::from("/etc/aeon/tls/node.key"),
+            ca: PathBuf::from("/etc/aeon/tls/ca.pem"),
+        })
+    }
+
+    #[test]
+    fn rejects_multi_node_without_tls() {
+        let cfg = ClusterConfig {
+            node_id: 1,
+            bind: "0.0.0.0:4470".parse().unwrap(),
+            num_partitions: 16,
+            peers: vec![
+                NodeAddress::new("10.0.0.2", 4433),
+                NodeAddress::new("10.0.0.3", 4433),
+            ],
+            seed_nodes: Vec::new(),
+            tls: None,
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("TLS"));
+    }
+
     #[test]
     fn rejects_even_cluster_size() {
         let cfg = ClusterConfig {
@@ -136,7 +170,7 @@ mod tests {
             num_partitions: 16,
             peers: vec![NodeAddress::new("10.0.0.2", 4433)],
             seed_nodes: Vec::new(),
-            tls: None,
+            tls: test_tls(),
         };
         // 1 self + 1 peer = 2 (even)
         let err = cfg.validate().unwrap_err();
@@ -155,7 +189,7 @@ mod tests {
                 num_partitions: 16,
                 peers,
                 seed_nodes: Vec::new(),
-                tls: None,
+                tls: test_tls(),
             };
             // 1 + 2=3, 1+4=5, 1+6=7 — all odd
             cfg.validate().unwrap();
@@ -173,15 +207,15 @@ mod tests {
                 NodeAddress::new("10.0.0.2", 4433), // duplicate
             ],
             seed_nodes: Vec::new(),
-            tls: None,
+            tls: test_tls(),
         };
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("duplicate"));
     }
 
     #[test]
-    fn single_node_allows_seed_nodes() {
-        // seed_nodes doesn't count toward initial cluster size
+    fn seed_nodes_require_tls() {
+        // seed_nodes implies joining a cluster, so TLS is required
         let cfg = ClusterConfig {
             node_id: 1,
             bind: "0.0.0.0:4470".parse().unwrap(),
@@ -190,9 +224,23 @@ mod tests {
             seed_nodes: vec![NodeAddress::new("10.0.0.1", 4433)],
             tls: None,
         };
-        // is_single_node checks peers AND seed_nodes
         assert!(!cfg.is_single_node());
-        // but cluster size = 1 (self only), so odd-number check passes
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("TLS"));
+    }
+
+    #[test]
+    fn seed_nodes_with_tls_valid() {
+        let cfg = ClusterConfig {
+            node_id: 1,
+            bind: "0.0.0.0:4470".parse().unwrap(),
+            num_partitions: 16,
+            peers: Vec::new(),
+            seed_nodes: vec![NodeAddress::new("10.0.0.1", 4433)],
+            tls: test_tls(),
+        };
+        assert!(!cfg.is_single_node());
+        // cluster size = 1 (self only), odd-number check passes
         cfg.validate().unwrap();
     }
 

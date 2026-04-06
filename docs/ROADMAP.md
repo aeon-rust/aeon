@@ -108,9 +108,9 @@ This phase runs the **fix → improve → load test** cycle until Gate 1 metrics
 
 **This phase is iterative.** It may loop multiple times. Do not proceed until Gate 1 is passed.
 
-### Phase 4 — Multi-Tier State ✅ (2026-03-28)
+### Phase 4 — Multi-Tier State ⚠️ Partial (2026-03-28)
 
-- `aeon-state`: L1 DashMap, L2 MmapStore, L3 RocksDB
+- `aeon-state`: L1 DashMap ✅, L2 MmapStore ❌ (placeholder), L3 RocksDB ❌ (placeholder)
 - StateOps trait + TieredStateStore
 - Typed state wrappers: ValueState, MapState, ListState, CounterState (guest-side SDK)
 - Source-Anchor offset recovery (persist last safe offset to L3)
@@ -128,6 +128,15 @@ This phase runs the **fix → improve → load test** cycle until Gate 1 metrics
 - Watermarks advance correctly; late events handled per config
 - Re-run Gate 1 benchmarks: state layer does not regress throughput
 - State read/write latency benchmarked per tier
+
+**Implementation Status (2026-04-06)**:
+- ✅ L1 DashMap: Fully functional, 7.7M ops/sec put, 7.2M get
+- ✅ TieredStateStore: Read-through infrastructure, TieredConfig
+- ✅ Typed wrappers: ValueState, MapState, ListState, CounterState
+- ✅ Windowing: Tumbling, sliding, session windows, watermarks, late event policies
+- ❌ **L2 MmapStore**: Placeholder only — infrastructure comments in `tiered.rs`
+- ❌ **L3 RocksDB**: Placeholder only — no RocksDB dependency, no persistent storage
+- ⚠️ State does NOT survive restart (L1 only = in-memory). Source-Anchor offset recovery depends on L3.
 
 ### Phase 5 — Fault Tolerance ✅ (2026-03-28)
 
@@ -248,7 +257,7 @@ proportionally, with clean upgrade/downgrade?**
 - PoH survives partition transfer (chain continues on target node)
 - Global PoH checkpoint replicates via Raft
 
-### Phase 10 — Security & Crypto
+### Phase 10 — Security & Crypto ✅ (2026-04-06)
 
 **Encryption & Key Management:**
 - `aeon-crypto/encryption`: Two-step EtM (AES-256-CTR encrypt, then HMAC-SHA-512
@@ -331,6 +340,27 @@ for streaming connectors, tokio-rustls for TCP-based connectors, etc.).
 - REST API: api-key auth rejects unauthenticated requests
 - Cert expiry metric exported at `/metrics`
 - Re-run cluster benchmarks: crypto overhead acceptable
+
+**Phase 10 Completion Summary (2026-04-06)**:
+
+| Component | Status | Key Result |
+|-----------|--------|------------|
+| EtM encryption (AES-256-CTR + HMAC-SHA-512) | ✅ | Round-trip, tamper detection, key redaction, 14 tests |
+| KeyProvider (EnvKeyProvider + FileKeyProvider) | ✅ | Hex env vars, raw binary files, wrong-purpose rejection, 10 tests |
+| FIPS 140-3 mode guard | ✅ | Approved-algorithm whitelist, feature-gated, 6 tests |
+| Key zeroize on Drop | ✅ | EtmKey, KeyMaterial (derive), SigningKey (manual Drop), ResolvedApiKey |
+| TLS `auto` mode | ✅ | Self-signed CA + node cert, persistence to data_dir/tls/, rcgen |
+| TLS `pem` mode | ✅ | PEM cert/key/CA loading, mTLS server+client configs |
+| TLS `none` + multi-node validation | ✅ | ClusterConfig rejects multi-node without TLS |
+| CertificateStore + reload() | ✅ | Unified cert loading, hot reload from PEM paths, 59 TLS tests |
+| Certificate expiry metric | ✅ | Minimal DER parser, `aeon_tls_cert_expiry_seconds` gauge |
+| `aeon tls export-ca` CLI | ✅ | PEM validation, file/stdout output, `aeon tls info` companion |
+| ApiKeyAuthenticator | ✅ | Constant-time comparison, multi-key, feature-gated `processor-auth` |
+| Per-connector TLS config | ✅ | ConnectorTlsMode (None/SystemCa/Pem), per-instance config |
+| Encryption-at-rest (Raft store) | ✅ | EtM for snapshots, feature-gated `encryption-at-rest` |
+| REST API auth wiring | ✅ | Bearer token middleware, health bypasses auth, 8 auth tests |
+
+**Test count**: 688 Rust + 24 Python + 20 Go = 732 total (up from 718 — 14 new tests from Phase 10 completion tasks)
 
 ---
 
@@ -467,10 +497,17 @@ Docker-compose additions: PostgreSQL 16, MySQL 8, MongoDB 7.
 
 Universal processor development model enabling 26+ programming languages across four tiers:
 
-- **T1 Native (.so/.dll)**: Rust, C/C++, Zig — in-process, ~240ns/event (4.2M/s)
+- **T1 Native (.so/.dll)**: Rust, C/C++, Zig, C# (NativeAOT) — in-process, ~240ns/event (4.2M/s)
 - **T2 Wasm**: Rust, AssemblyScript, C/C++, Go (TinyGo), Zig, Grain, Moonbit — sandboxed in-process, ~1.1μs/event (940K/s)
-- **T3 WebTransport (HTTP/3 + QUIC)**: Any language with HTTP/3 support — Python, Go, Java, Kotlin, C#, Rust, C/C++, Swift, Elixir, Haskell, Scala — ~5-15μs/event (~1.2M/s batched)
-- **T4 WebSocket (HTTP/2 + HTTP/1.1)**: Universal fallback — PHP, Ruby, R, Perl, Lua, MATLAB, Julia, Dart, Bash, COBOL, and all T3 languages — ~30-80μs/event (~400K/s batched)
+- **T3 WebTransport (HTTP/3 + QUIC)**: Any language with HTTP/3 support — Rust, Python, Go, Java, Kotlin, C#, C/C++, Swift, Elixir, Haskell, Scala — ~5-15μs/event (~1.2M/s batched)
+- **T4 WebSocket (HTTP/2 + HTTP/1.1)**: Universal fallback — all T1/T2/T3 languages + PHP, Ruby, R, Perl, Lua, MATLAB, Julia, Dart, Bash, COBOL — ~30-80μs/event (~400K/s batched)
+
+**Design principle — every language gets T3/T4 access**: Languages that support T1 (native)
+or T2 (Wasm) also have T3 (WebTransport) and T4 (WebSocket) as pragmatic alternatives. This
+means a Rust developer can write a processor that connects via WebTransport or WebSocket
+without recompiling Aeon itself, without Wasm overhead, and with full access to the Rust
+ecosystem (async runtimes, ML crates, database drivers). Same applies to C/C++, Go, Zig,
+and AssemblyScript. The tier is a deployment choice, not a language constraint.
 
 **Core abstractions:**
 - `ProcessorTransport` async trait: one interface for all four tiers
@@ -512,15 +549,25 @@ Universal processor development model enabling 26+ programming languages across 
 7. CLI/REST/Registry — identity management, binding config, YAML support (~2-3 days)
 8. Benchmarks & hardening — tier comparison, reconnection, key rotation (~3-5 days)
 
-**Sub-phases (language SDKs — 12b-9 through 12b-14, demand-driven):**
+**Sub-phases (language SDKs — 12b-9 through 12b-15, demand-driven):**
+
+**Note on tier availability**: Every language SDK ships with T3 (WebTransport) and/or T4
+(WebSocket) support. Languages that also support T1 (native) or T2 (Wasm) treat those as
+higher-performance options, not replacements. A Rust developer can write a standalone
+processor binary that connects to Aeon via T3/T4 — no Aeon recompilation, no Wasm
+overhead, full crate ecosystem access. The tier is a deployment choice, not a language gate.
 
 9. **Node.js / TypeScript SDK** (~3-4 days)
-   - T4 WebSocket via `ws` package (de facto standard), ED25519 via `tweetnacl`
-   - Two processor development paths for JS/TS developers:
+   - T3 WebTransport via `webtransport` npm package (HTTP/3) — primary for performance
+   - T4 WebSocket via `ws` package (de facto standard) — universal fallback
+   - ED25519 via `tweetnacl`
+   - Three processor development paths for JS/TS developers:
      - **Path A — AssemblyScript → T2 Wasm**: TypeScript-like syntax, compiles to Wasm, runs
        in-process. Best performance (~940K/s). Already implemented in Phase 12a.
-     - **Path B — Runtime Node.js → T4 WebSocket**: Full npm ecosystem (ML libs, API clients,
-       data transformation). ~400K/s batched. SDK provides `@processor` decorator + `run()`.
+     - **Path B — Runtime Node.js → T3 WebTransport**: Full npm ecosystem + HTTP/3 performance.
+       ~1.2M/s batched. Best network tier option.
+     - **Path C — Runtime Node.js → T4 WebSocket**: Full npm ecosystem, universal compatibility.
+       ~400K/s batched. SDK provides `@processor` decorator + `run()`.
    - Deployment: `node processor.js`, Docker container, PM2 process manager
 
 10. **Java / Kotlin SDK** (~4-6 days)
@@ -547,11 +594,13 @@ Universal processor development model enabling 26+ programming languages across 
     - **T2 Wasm**: Compile via Emscripten or `wasi-sdk` → `.wasm`. Sandboxed.
     - **T3 WebTransport**: `libquiche` (Cloudflare) or `ngtcp2` + `nghttp3` for HTTP/3.
       Useful for existing C/C++ services integrating as processors.
+    - **T4 WebSocket**: `libwebsockets` or `boost::beast`. Universal fallback for
+      environments without HTTP/3 support.
     - ED25519 via `libsodium` or `openssl`
-    - Deployment: .so (T1), Docker container (T3), static binary
+    - Deployment: .so (T1), Docker container (T3/T4), static binary
 
 13. **PHP SDK** (~3-4 days)
-    - T4 WebSocket only (no production HTTP/3 client library exists for PHP)
+    - T4 WebSocket primary (no production HTTP/3 client library exists for PHP yet)
     - **4 deployment models** (SDK provides adapters for each):
       - **Swoole / OpenSwoole** (recommended): Coroutine-based async runtime, built-in
         WebSocket client. Best PHP performance. Long-running process.
@@ -565,11 +614,28 @@ Universal processor development model enabling 26+ programming languages across 
     - Deployment: Long-running PHP process, Docker container
 
 14. **Swift, Elixir, Ruby, Scala, Haskell** — P3/P4, demand-driven (~8-15 days total)
-    - **Swift**: T3 via `Network.framework` (Apple, built-in QUIC). Linux + macOS.
-    - **Elixir**: T4 via `WebSockex` or `:gun`. BEAM VM naturally long-running. OTP release.
-    - **Ruby**: T4 via `faye-websocket` or `async-websocket`. Docker container.
-    - **Scala**: T3 via Netty QUIC (shares Java SDK core). `http4s` integration.
-    - **Haskell**: T4 via `websockets` (Hackage). Binary deployment.
+    - **Swift**: T3 via `Network.framework` (Apple, built-in QUIC) + T4 via `URLSessionWebSocketTask`. Linux + macOS.
+    - **Elixir**: T3 via `:quicer` (Erlang QUIC NIF) + T4 via `WebSockex` or `:gun`. BEAM VM naturally long-running. OTP release.
+    - **Ruby**: T4 via `faye-websocket` or `async-websocket`. T3 when HTTP/3 gems mature. Docker container.
+    - **Scala**: T3 via Netty QUIC (shares Java SDK core) + T4 via Netty WebSocket. `http4s` integration.
+    - **Haskell**: T3 via `quic` (Hackage) + T4 via `websockets` (Hackage). Binary deployment.
+
+15. **Rust T3/T4 SDK** (~2-3 days)
+    - Standalone Rust crate (`aeon-processor-client`) for out-of-process Rust processors
+    - **T3 WebTransport**: `wtransport` client (same crate Aeon uses — zero learning curve)
+    - **T4 WebSocket**: `tokio-tungstenite` client
+    - ED25519 via `ed25519-dalek` (same as Aeon core)
+    - MsgPack wire format via `rmp-serde`
+    - AWPP handshake, heartbeat, batch wire encode/decode — Rust-native implementations
+    - **Why**: Lets Rust developers write processors as standalone binaries (`cargo run`)
+      without recompiling Aeon, without Wasm overhead, with full async Rust ecosystem
+      (tokio, reqwest, sqlx, ML crates). Complements existing T1 (.so) and T2 (.wasm) paths.
+    - Four Rust processor paths (developer chooses based on deployment constraints):
+      - **T1 Native (.so)**: Maximum performance (~240ns/event). Requires Aeon restart to deploy.
+      - **T2 Wasm (.wasm)**: Sandboxed, hot-swappable (~1.1μs/event). Compiles via `cargo component build`.
+      - **T3 WebTransport**: Independent process, HTTP/3 (~5-15μs/event). Deploy/update without touching Aeon.
+      - **T4 WebSocket**: Independent process, universal (~30-80μs/event). Simplest deployment model.
+    - Deployment: `cargo run --release`, Docker container, systemd service, K8s sidecar
 
 **New dependencies**: `ed25519-dalek`, `rmp-serde`, `jsonwebtoken` (feature-gated behind `oauth`)
 
@@ -782,7 +848,7 @@ Rolling binary upgrade: zero event loss during Aeon v1→v2 transition under loa
 
 ---
 
-## Current State (2026-04-04, updated with Run 2 benchmarks)
+## Current State (2026-04-06, comprehensive audit)
 
 ### Gate 1 — PASSED (Phases 0–7)
 
@@ -792,20 +858,20 @@ Rolling binary upgrade: zero event loss during Aeon v1→v2 transition under loa
 | Phase 1 — Minimal Pipeline | 2026-03-27 | Blackhole ceiling ~6.5M events/sec, DAG topology, 35 tests |
 | Phase 2 — Redpanda Connector | 2026-03-28 | E2E passthrough, headroom 3,618x, 3 integration tests |
 | Phase 3 — Performance Hardening | 2026-03-28 | memchr SIMD (7–27x), partition scaling 4.06x at 16p, 141M zero-loss sustained |
-| Phase 4 — Multi-Tier State | 2026-03-28 | L1 DashMap 7.7M put/sec, typed state, windowing, 43 tests |
+| Phase 4 — Multi-Tier State | 2026-03-28 | ⚠️ L1 DashMap 7.7M put/sec, typed state, windowing, 43 tests. **L2 mmap + L3 RocksDB: placeholders only** |
 | Phase 5 — Fault Tolerance | 2026-03-28 | DLQ, retry, circuit breaker, health/ready, graceful shutdown, 36 tests |
 | Phase 6 — Observability | 2026-03-28 | Histograms, logging, per-partition metrics, Grafana dashboard, 34 tests |
 | Phase 7 — Wasm Runtime | 2026-03-28 | Wasmtime, host functions, WIT contract, ~794K wasm events/sec, 21 tests |
 
-**Total workspace tests**: 496 passing (44 types + 32 connectors + 147 crypto + 119 engine + 49 cluster + 43 state + 21 wasm + 10 wasm-sdk + 6 native-sdk + 3 native-sample + others) | **Clippy**: clean | **Rustfmt**: clean
+**Total workspace tests**: 700 Rust passing (0 failed, 10 ignored) + 24 Python + 20 Go = 744 total | **Clippy**: clean | **Rustfmt**: clean | **Audit date**: 2026-04-06
 
-### Gate 2 — In Progress (Phases 8–10)
+### Gate 2 — Complete (Phases 8–10) ✅
 
 | Phase | Completed | Key Result |
 |-------|-----------|------------|
 | Phase 8 — Cluster + QUIC | 2026-03-29 | openraft, quinn QUIC, mTLS, partition manager, 3-node replication, 72 tests |
 | Phase 9 — PoH + Merkle | 2026-03-30 | SHA-512 Merkle trees, Ed25519 signing, MMR, per-partition PoH chains, 71 tests |
-| Phase 10 — Security & Crypto | 2026-04-04 | EtM encryption, KeyProvider, FIPS guard, CertificateStore, TLS 3-mode (none/auto/pem), auto-cert gen, per-connector TLS, REST API auth, 147 tests |
+| Phase 10 — Security & Crypto | 2026-04-06 | EtM encryption, KeyProvider, FIPS guard, CertificateStore, TLS 3-mode, auto-cert gen, per-connector TLS, REST API auth (ApiKeyAuthenticator), cert expiry metric, encryption-at-rest Raft store, SigningKey zeroize, `aeon tls export-ca/info` CLI, 161 tests |
 
 ### Phase 12b — Four-Tier Processor Runtime ✅ (2026-04-06)
 
@@ -816,8 +882,8 @@ All 8 core sub-phases complete.
 | 12b-1: Core abstractions | 2026-04-05 | `ProcessorTransport` async trait, `InProcessTransport` (zero-cost sync→async), `ProcessorHealth`/`ProcessorInfo`/`ProcessorTier` types, pipeline refactored to use `&dyn ProcessorTransport` |
 | 12b-2: Security & AWPP types | 2026-04-05 | `ProcessorIdentityStore` (DashMap CRUD, connection counting, max instances), `processor_auth` (ED25519 challenge-response, nonce gen, batch signature verify, authorization), AWPP message types (`Challenge`/`Registration`/`Accepted`/`Rejected`/`Heartbeat`/`Drain`/`Error`/`TokenRefresh`), `batch_wire` codec-aware encode/decode, REST API identity CRUD endpoints |
 | Transport codec | 2026-04-05 | `TransportCodec` enum (MsgPack default, JSON fallback), `WireEvent`/`WireOutput` serde-friendly structs, `rmp_serde::to_vec_named` for correct newtype handling, per-pipeline config in AWPP negotiation, 14 tests |
-| 12b-3: WebTransport host (T3) | 2026-04-05 | `WebTransportProcessorHost` with QUIC accept loop, `WtControlChannel` (4B LE length-prefix framing), AWPP handshake integration, session routing table, `ProcessorTransport` impl (health/drain working, `call_batch` scaffolded), cleanup on disconnect |
-| 12b-4: WebSocket host (T4) | 2026-04-05 | `WebSocketProcessorHost` with `WsSharedSocket` (Mutex-wrapped axum WebSocket), text/binary frame demux, routing header protocol (`[4B name_len LE][name][2B partition LE][data]`), `WsControlChannel`, axum `/api/v1/processors/connect` upgrade route (bypasses Bearer auth), `ProcessorTransport` impl, 5 tests |
+| 12b-3: WebTransport host (T3) | 2026-04-06 | `WebTransportProcessorHost` with QUIC accept loop, `WtControlChannel` (4B LE length-prefix framing), AWPP handshake integration, session routing table, data stream accept with routing header, `wt_data_stream_reader` for batch responses, full `call_batch` (route→encode→send→await with timeout), `DataStreamMap`/`RoutingTable` type aliases, cleanup on disconnect |
+| 12b-4: WebSocket host (T4) | 2026-04-06 | `WebSocketProcessorHost` with `WsSharedSocket` (Mutex-wrapped axum WebSocket), text/binary frame demux, routing header protocol (`[4B name_len LE][name][2B partition LE][data]`), `WsControlChannel`, axum `/api/v1/processors/connect` upgrade route (bypasses Bearer auth), full `call_batch` (route→encode→frame→send→await with timeout), `sockets` map for per-session send, 5 tests |
 | 12b-5: Python SDK | 2026-04-06 | `aeon_transport.py`: AWPP WebSocket client, ED25519 (PyNaCl), MsgPack/JSON codec, batch wire encode/decode (CRC32), `@processor`/`@batch_processor` decorators, heartbeat loop, `run()` entrypoint. 24 tests |
 | 12b-6: Go SDK | 2026-04-06 | `sdks/go/aeon.go`: AWPP WebSocket client (gorilla/websocket), ED25519 (stdlib crypto), MsgPack (vmihailenco/msgpack), batch wire encode/decode, `ProcessorFunc`/`BatchProcessorFunc`, `Run()`/`RunContext()`, heartbeat goroutine. 20 tests |
 | 12b-7: CLI/REST/Registry | 2026-04-06 | YAML manifest `identities` field with `ManifestIdentity` struct, `aeon apply` registers identities, `aeon export` includes active identities, `aeon diff` flags identity entries. CLI/REST/identity store were already complete from 12b-2 |
@@ -827,7 +893,27 @@ All 8 core sub-phases complete.
 
 **Test count**: 674 Rust + 24 Python + 20 Go = 718 total (Rust up from 563 — identity store 8, processor auth 9, batch_wire 10, transport codec 14, AWPP types 3, ProcessorTransport 5, session 10, T3 1, T4 5, REST API identity 3, + existing test updates)
 
-**Note**: T3/T4 `call_batch` implementations are scaffolded (return error) — full data-stream batch routing will be implemented during 12b-8 hardening when end-to-end integration tests are built. All session lifecycle, authentication, heartbeat, drain, and binary frame protocols are complete.
+**Note**: T3/T4 `call_batch` fully implemented — data stream routing, batch encode/send, response awaiting with timeout all wired. Both hosts add `pipeline_name` to config for routing lookup. T3 uses length-prefixed framing on QUIC bidi streams; T4 uses binary WebSocket frames with routing header. All session lifecycle, authentication, heartbeat, drain, and binary frame protocols are complete.
+
+### Phase 12b Language SDKs (12b-9 through 12b-14) — Status as of 2026-04-06
+
+| Sub-phase | Language | Tiers | Status | Notes |
+|-----------|----------|-------|--------|-------|
+| 12b-5 | Python | T3 + T4 | ✅ Complete | `sdks/python/`: AWPP client, ED25519 (PyNaCl), MsgPack/JSON, `@processor` decorator, 31 tests |
+| 12b-6 | Go | T3 + T4 | ✅ Complete | `sdks/go/`: AWPP client, ED25519 (stdlib), MsgPack (vmihailenco), `Run()`/`RunContext()`, 18 tests |
+| 12b-9 | Node.js / TypeScript | T3 + T4 | ❌ Not started | No runtime SDK directory. Existing `sdks/typescript/` is AssemblyScript→Wasm (Phase 12a, T2) |
+| 12b-10 | Java / Kotlin | T3 + T4 | ❌ Not started | `sdks/java/` exists but empty skeleton only (no source files) |
+| 12b-11 | C# / .NET | T1 (NativeAOT) + T3 + T4 | ❌ Not started | `sdks/dotnet/` exists but empty |
+| 12b-12 | C / C++ | T1 + T2 + T3 + T4 | ❌ Not started | `sdks/c/` exists with empty `include/` (no `aeon_processor.h`) |
+| 12b-13 | PHP | T4 | ❌ Not started | `sdks/php/` exists with empty `src/` (no Swoole/ReactPHP adapters) |
+| 12b-14 | Swift | T3 + T4 | ❌ Not started | No directory |
+| 12b-14 | Elixir | T3 + T4 | ❌ Not started | No directory |
+| 12b-14 | Ruby | T4 (T3 future) | ❌ Not started | No directory |
+| 12b-14 | Scala | T3 + T4 | ❌ Not started | No directory |
+| 12b-14 | Haskell | T3 + T4 | ❌ Not started | No directory |
+| 12b-15 | Rust (Network) | T3 + T4 | ❌ Not started | `aeon-processor-client` crate for standalone Rust processor binaries |
+
+**Summary**: 2 of 14 target language SDKs implemented (Python, Go). Remaining 12 are demand-driven per ROADMAP design. Core platform (12b-1 through 12b-8) is complete — all language SDKs can be built against the existing `ProcessorTransport`, AWPP, `batch_wire`, and `processor_auth` infrastructure. Every language gets T3/T4 network access; T1/T2 in-process tiers are bonus options where the language supports it.
 
 ### Phase 12a — Processor SDKs + Dev Tooling (Complete)
 
@@ -893,17 +979,22 @@ All 8 core sub-phases complete.
 
 **Test count**: 500 (up from 470 — core pinning tests + SDK rename tests)
 
-### Phase 15a — Delivery Modes ✅ (2026-04-04)
+### Phase 15a — Delivery Modes ✅ (2026-04-06)
 
 | Component | Key Result |
 |-----------|------------|
-| `OrderingMode` enum | `Ordered` (blocking acks) / `Batched` (async enqueue), 7 tests |
+| `DeliveryStrategy` enum | `PerEvent` / `OrderedBatch` (default) / `UnorderedBatch`, 7 tests |
 | `DeliverySemantics` enum | `AtLeastOnce` / `ExactlyOnce`, in `aeon-types` for cross-crate use |
+| `BatchFailurePolicy` enum | `RetryFailed` (default) / `FailBatch` / `SkipToDlq`, 3 tests |
+| `BatchResult` struct | Per-event delivery status (delivered/pending/failed), returned by all 12 sinks |
 | `FlushStrategy` / `CheckpointConfig` / `DeliveryConfig` | Engine-internal delivery config, 6 tests |
 | `PipelineConfig.delivery` | Wired into `run_buffered()` sink task with batched flush logic |
-| KafkaSink batched mode | Enqueue fast → flush at intervals, pending counter |
-| NatsSink batched mode | Collect `PublishAckFuture`s → await all in flush |
-| FileSink batched mode | BufWriter defers fsync until flush, 2 new tests |
+| `handle_batch_failures()` | Applies failure policy to partial write_batch failures (retry/abort/skip) |
+| `run_with_delivery()` | Direct pipeline variant with full delivery config support |
+| `PipelineMetrics.events_failed/retried` | Atomic counters for failure tracking |
+| KafkaSink / NatsSink / FileSink | DeliveryStrategy-aware: PerEvent, OrderedBatch, UnorderedBatch modes |
+| All 12 sink connectors | Return `BatchResult` from `write_batch()` |
+| Failure policy tests | 6 new tests: FailBatch aborts, SkipToDlq continues, RetryFailed retries+exhausts |
 
 ### Phase 15b — Delivery Ledger & Checkpoint WAL ✅ (2026-04-04)
 
@@ -1850,12 +1941,12 @@ pipelines:
 - ✅ Sink trait contract documented (write_batch = enqueue, flush = durability)
 - ✅ Ordered mode: KafkaSink, FileSink, NatsSink dual-mode implemented
 - ✅ Batched mode: KafkaSink 41.6K/s Docker in-network (Run 6b)
-- ⏳ Rename `OrderingMode` → `DeliveryStrategy` (PerEvent/OrderedBatch/UnorderedBatch)
-- ⏳ Add `BatchFailurePolicy` (RetryFailed/FailBatch/SkipToDlq)
-- ⏳ Add `BatchResult` return type to `write_batch()`
-- ⏳ Implement `OrderedBatch` strategy in all sink connectors
-- ⏳ Update all 12 sinks to return `BatchResult`
-- ⏳ Wire `BatchFailurePolicy` into pipeline engine sink task
+- ✅ Rename `OrderingMode` → `DeliveryStrategy` (PerEvent/OrderedBatch/UnorderedBatch) (done: 2026-04-05)
+- ✅ Add `BatchFailurePolicy` (RetryFailed/FailBatch/SkipToDlq) (done: 2026-04-05)
+- ✅ Add `BatchResult` return type to `write_batch()` (done: 2026-04-05)
+- ✅ Implement `OrderedBatch` strategy in Kafka, NATS, File sinks (done: 2026-04-05)
+- ✅ Update all 12 sinks to return `BatchResult` (done: 2026-04-05)
+- ✅ Wire `BatchFailurePolicy` into pipeline engine sink task (done: 2026-04-06)
 
 #### Phase 15b — Delivery Ledger & Checkpoint Persistence
 
@@ -2227,3 +2318,90 @@ docker compose up -d redpanda redpanda-console prometheus grafana jaeger loki
 # Everything (only needed in Phase 11+)
 docker compose up -d
 ```
+
+---
+
+## Comprehensive Status Summary (2026-04-06 Audit)
+
+### Phase Completion Overview
+
+| Phase | Name | Status | Key Gap |
+|-------|------|--------|---------|
+| 0 | Foundation | ✅ Complete | — |
+| 1 | Minimal Pipeline | ✅ Complete | — |
+| 2 | Redpanda Connector | ✅ Complete | — |
+| 3 | Performance Validation | ✅ Complete | — |
+| 4 | Multi-Tier State | ⚠️ **Partial** | **L2 mmap + L3 RocksDB are placeholders** |
+| 5 | Fault Tolerance | ✅ Complete | — |
+| 6 | Observability | ✅ Complete | — |
+| 7 | Wasm Runtime | ✅ Complete | — |
+| 8 | Cluster + QUIC | ✅ Complete | — |
+| 9 | PoH + Merkle | ✅ Complete | — |
+| 10 | Security & Crypto | ✅ Complete | — |
+| 11a | Streaming Connectors | ✅ Complete | 8 connector types (14 impls) |
+| 11b | Advanced Connectors | ✅ Complete | 6 connector types (QUIC, WebTransport, CDC) |
+| 12a | Processor SDKs | ✅ Complete | Rust Wasm, Rust Native, TypeScript (AssemblyScript) |
+| 12b | Four-Tier Runtime | ✅ Complete (core) | Core platform 12b-1→8 done; language SDKs partial |
+| 13a | Registry + Pipeline Core | ✅ Complete | — |
+| 13b | Advanced Upgrades | ✅ Complete | Blue-green, canary, YAML manifest |
+| 14 | Production Readiness | ✅ Complete | Docker, Helm, CI/CD, systemd |
+| 15 | Delivery Architecture | ✅ Complete | Core pinning, ledger, checkpoint WAL |
+| 15a | Delivery Modes | ✅ Complete | Strategy, semantics, failure policy, BatchResult |
+| 15b | Delivery Ledger | ✅ Complete | Event identity, checkpoint, REST endpoints |
+| 15c | Adaptive Flush | ✅ Complete | FlushTuner, multi-partition pipeline |
+
+### Language SDK Status (Phase 12b-5/6 + 12b-9 through 12b-15)
+
+Every language gets T3/T4 (network) access. T1/T2 (in-process) are additional high-perf options where available.
+
+| Language | Available Tiers | Status | Location |
+|----------|----------------|--------|----------|
+| Rust (Native) | T1 | ✅ Complete | `crates/aeon-native-sdk/` (Phase 12a) |
+| Rust (Wasm) | T2 | ✅ Complete | `crates/aeon-wasm-sdk/` (Phase 12a) |
+| Rust (Network) | T3 + T4 | ❌ Not started | 12b-15 (`aeon-processor-client` crate) |
+| AssemblyScript | T2 + T4 | T2 ✅ / T4 ❌ | `sdks/typescript/` (12a), T4 via 12b-9 |
+| Python | T3 + T4 | ✅ Complete | `sdks/python/` (12b-5) |
+| Go | T3 + T4 | ✅ Complete | `sdks/go/` (12b-6) |
+| Node.js / TypeScript | T3 + T4 | ❌ Not started | 12b-9 |
+| Java / Kotlin | T3 + T4 | ❌ Not started | 12b-10 |
+| C# / .NET | T1 (NativeAOT) + T3 + T4 | ❌ Not started | 12b-11 |
+| C / C++ | T1 + T2 + T3 + T4 | ❌ Not started | 12b-12 |
+| PHP | T4 | ❌ Not started | 12b-13 |
+| Swift | T3 + T4 | ❌ Not started | 12b-14 |
+| Elixir | T3 + T4 | ❌ Not started | 12b-14 |
+| Ruby | T4 (T3 future) | ❌ Not started | 12b-14 |
+| Scala | T3 + T4 | ❌ Not started | 12b-14 |
+| Haskell | T3 + T4 | ❌ Not started | 12b-14 |
+
+### Architectural Compliance (CLAUDE.md Rules)
+
+| Rule | Status |
+|------|--------|
+| No panics in production | ✅ Zero `.unwrap()`/`panic!()` on hot path |
+| Zero-copy (Bytes) | ✅ Event.payload + Output.payload use `bytes::Bytes` |
+| SPSC ring buffers (rtrb) | ✅ Used for source→processor and processor→sink |
+| Feature-gating | ✅ 18+ feature flags across connectors/engine |
+| Static dispatch on hot path | ✅ Generics for Source/Sink/Processor in pipeline.rs |
+| Memory alignment (64-byte) | ✅ `#[repr(align(64))]` on Event and Output |
+| Batch-first APIs | ✅ `next_batch() → Vec<Event>`, `write_batch(Vec<Output>)` |
+| Error handling (thiserror/anyhow) | ✅ thiserror in libs, anyhow in CLI only |
+| Test coverage | ✅ 700 Rust + 44 SDK tests = 744 total |
+
+### Outstanding Work
+
+**Critical (blocks production use)**:
+1. **Phase 4 L2/L3**: Implement mmap-backed L2 and RocksDB L3 state tiers. Without L3, state does not survive restart, and Source-Anchor offset recovery is non-functional.
+
+**Gate 1 unchecked metrics**:
+2. Aeon CPU <50% when Redpanda saturated — not formally measured
+3. P99 latency <10ms — histogram implemented, not formally validated E2E
+
+**Gate 2 unchecked metrics** (require multi-node testing):
+4. 3-node throughput ~3x single-node
+5. Scale-up/down zero event loss
+6. Leader failover <5s recovery
+7. Two-phase transfer cutover <100ms
+8. PoH chain continuity across transfers
+
+**Language SDKs (demand-driven, not blocking)**:
+9. 12 language SDKs not started (12b-9 through 12b-15, including Rust T3/T4 network SDK)

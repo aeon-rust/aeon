@@ -155,12 +155,28 @@ mod inner {
     // ─── State Machine ────────────────────────────────────────────────
 
     /// In-memory Raft state machine that applies ClusterRequests to a ClusterSnapshot.
-    #[derive(Debug)]
+    ///
+    /// When `encryption_key` is set, snapshots are encrypted at rest using
+    /// AES-256-CTR + HMAC-SHA-512 (Encrypt-then-MAC) via `aeon_crypto::EtmKey`.
     pub struct StateMachineStore {
         state: ClusterSnapshot,
         last_applied_log: Option<LogId<u64>>,
         last_membership: StoredMembership<u64, NodeAddress>,
         snapshot_idx: u64,
+        /// Optional encryption key for snapshot encryption at rest.
+        #[cfg(feature = "encryption-at-rest")]
+        encryption_key: Option<aeon_crypto::encryption::EtmKey>,
+    }
+
+    // Manual Debug impl to avoid exposing encryption key
+    impl Debug for StateMachineStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("StateMachineStore")
+                .field("state", &self.state)
+                .field("last_applied_log", &self.last_applied_log)
+                .field("snapshot_idx", &self.snapshot_idx)
+                .finish()
+        }
     }
 
     impl StateMachineStore {
@@ -170,6 +186,20 @@ mod inner {
                 last_applied_log: None,
                 last_membership: StoredMembership::new(None, openraft::Membership::new(vec![], ())),
                 snapshot_idx: 0,
+                #[cfg(feature = "encryption-at-rest")]
+                encryption_key: None,
+            }
+        }
+
+        /// Create a state machine with snapshot encryption at rest.
+        #[cfg(feature = "encryption-at-rest")]
+        pub fn with_encryption_key(key: aeon_crypto::encryption::EtmKey) -> Self {
+            Self {
+                state: ClusterSnapshot::default(),
+                last_applied_log: None,
+                last_membership: StoredMembership::new(None, openraft::Membership::new(vec![], ())),
+                snapshot_idx: 0,
+                encryption_key: Some(key),
             }
         }
 
@@ -256,21 +286,32 @@ mod inner {
 
     impl RaftSnapshotBuilder<AeonRaftConfig> for Arc<StateMachineStore> {
         async fn build_snapshot(&mut self) -> Result<Snapshot<AeonRaftConfig>, StorageError<u64>> {
-            // We need interior mutability for snapshot_idx
-            // For simplicity, use a fixed snapshot_id based on last_applied
             let snapshot_id = format!(
                 "snap-{}-{}",
                 self.last_applied_log.map(|l| l.index).unwrap_or(0),
                 self.snapshot_idx,
             );
 
-            let data = self.state.to_bytes().map_err(|e| {
+            #[allow(unused_mut)]
+            let mut data = self.state.to_bytes().map_err(|e| {
                 StorageError::from_io_error(
                     openraft::ErrorSubject::StateMachine,
                     openraft::ErrorVerb::Read,
                     std::io::Error::other(e.to_string()),
                 )
             })?;
+
+            // Encrypt snapshot if encryption-at-rest is configured
+            #[cfg(feature = "encryption-at-rest")]
+            if let Some(ref key) = self.encryption_key {
+                data = key.encrypt(&data).map_err(|e| {
+                    StorageError::from_io_error(
+                        openraft::ErrorSubject::StateMachine,
+                        openraft::ErrorVerb::Write,
+                        std::io::Error::other(format!("snapshot encryption failed: {e}")),
+                    )
+                })?;
+            }
 
             let snapshot = Snapshot {
                 meta: SnapshotMeta {
@@ -335,6 +376,8 @@ mod inner {
                 last_applied_log: self.last_applied_log,
                 last_membership: self.last_membership.clone(),
                 snapshot_idx: self.snapshot_idx,
+                #[cfg(feature = "encryption-at-rest")]
+                encryption_key: self.encryption_key.clone(),
             })
         }
 
@@ -349,7 +392,21 @@ mod inner {
             meta: &SnapshotMeta<u64, NodeAddress>,
             snapshot: Box<Cursor<Vec<u8>>>,
         ) -> Result<(), StorageError<u64>> {
-            let data = snapshot.into_inner();
+            #[allow(unused_mut)]
+            let mut data = snapshot.into_inner();
+
+            // Decrypt snapshot if encryption-at-rest is configured
+            #[cfg(feature = "encryption-at-rest")]
+            if let Some(ref key) = self.encryption_key {
+                data = key.decrypt(&data).map_err(|e| {
+                    StorageError::from_io_error(
+                        openraft::ErrorSubject::StateMachine,
+                        openraft::ErrorVerb::Read,
+                        std::io::Error::other(format!("snapshot decryption failed: {e}")),
+                    )
+                })?;
+            }
+
             let state = ClusterSnapshot::from_bytes(&data).map_err(|e| {
                 StorageError::from_io_error(
                     openraft::ErrorSubject::StateMachine,
@@ -372,13 +429,26 @@ mod inner {
                 return Ok(None);
             }
 
-            let data = self.state.to_bytes().map_err(|e| {
+            #[allow(unused_mut)]
+            let mut data = self.state.to_bytes().map_err(|e| {
                 StorageError::from_io_error(
                     openraft::ErrorSubject::StateMachine,
                     openraft::ErrorVerb::Read,
                     std::io::Error::other(e.to_string()),
                 )
             })?;
+
+            // Encrypt snapshot if encryption-at-rest is configured
+            #[cfg(feature = "encryption-at-rest")]
+            if let Some(ref key) = self.encryption_key {
+                data = key.encrypt(&data).map_err(|e| {
+                    StorageError::from_io_error(
+                        openraft::ErrorSubject::StateMachine,
+                        openraft::ErrorVerb::Write,
+                        std::io::Error::other(format!("snapshot encryption failed: {e}")),
+                    )
+                })?;
+            }
 
             Ok(Some(Snapshot {
                 meta: SnapshotMeta {
