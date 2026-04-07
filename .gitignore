@@ -20,6 +20,33 @@ samples/**/Cargo.lock
 node_modules/
 package-lock.json
 
+# ── C / C++ ───────────────────────────────────────────────────────────
+*.obj
+*.o
+*.a
+*.lib
+*.exe
+!sdks/c/build.sh
+!sdks/c/build_msvc.bat
+
+# ── .NET ──────────────────────────────────────────────────────────────
+**/bin/Debug/
+**/bin/Release/
+**/obj/
+*.csproj.user
+*.nupkg
+
+# ── Java ──────────────────────────────────────────────────────────────
+*.class
+sdks/java/build/
+
+# ── PHP ───────────────────────────────────────────────────────────────
+vendor/
+composer.lock
+composer.phar
+.phpunit.result.cache
+.phpunit.cache/
+
 # ── Python ────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
