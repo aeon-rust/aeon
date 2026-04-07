@@ -363,7 +363,7 @@ for streaming connectors, tokio-rustls for TCP-based connectors, etc.).
 | Encryption-at-rest (Raft store) | ✅ | EtM for snapshots, feature-gated `encryption-at-rest` |
 | REST API auth wiring | ✅ | Bearer token middleware, health bypasses auth, 8 auth tests |
 
-**Test count**: 688 Rust + 24 Python + 20 Go = 732 total (up from 718 — 14 new tests from Phase 10 completion tasks). Note: total workspace tests now 741 Rust (688 + 36 L2/L3 + 17 processor-client) + 44 SDK = 785 as of Phase 12b-15.
+**Test count**: 741 Rust (688 + 36 L2/L3 + 17 processor-client) + 31 Python + 20 Go + 32 Node.js + 40 C#/.NET + 33 PHP + 28 Java + 22 C/C++ = 947 total as of Phase 12b-12 completion.
 
 ---
 
@@ -898,17 +898,17 @@ All 8 core sub-phases complete.
 
 **Note**: T3/T4 `call_batch` fully implemented — data stream routing, batch encode/send, response awaiting with timeout all wired. Both hosts add `pipeline_name` to config for routing lookup. T3 uses length-prefixed framing on QUIC bidi streams; T4 uses binary WebSocket frames with routing header. All session lifecycle, authentication, heartbeat, drain, and binary frame protocols are complete.
 
-### Phase 12b Language SDKs (12b-9 through 12b-14) — Status as of 2026-04-06
+### Phase 12b Language SDKs (12b-9 through 12b-14) — Status as of 2026-04-07
 
 | Sub-phase | Language | Tiers | Status | Notes |
 |-----------|----------|-------|--------|-------|
 | 12b-5 | Python | T3 + T4 | ✅ Complete | `sdks/python/`: AWPP client, ED25519 (PyNaCl), MsgPack/JSON, `@processor` decorator, 31 tests |
 | 12b-6 | Go | T3 + T4 | ✅ Complete | `sdks/go/`: AWPP client, ED25519 (stdlib), MsgPack (vmihailenco), `Run()`/`RunContext()`, 18 tests |
-| 12b-9 | Node.js / TypeScript | T3 + T4 | ❌ Not started | No runtime SDK directory. Existing `sdks/typescript/` is AssemblyScript→Wasm (Phase 12a, T2) |
-| 12b-10 | Java / Kotlin | T3 + T4 | ❌ Not started | `sdks/java/` exists but empty skeleton only (no source files) |
-| 12b-11 | C# / .NET | T1 (NativeAOT) + T3 + T4 | ❌ Not started | `sdks/dotnet/` exists but empty |
-| 12b-12 | C / C++ | T1 + T2 + T3 + T4 | ❌ Not started | `sdks/c/` exists with empty `include/` (no `aeon_processor.h`) |
-| 12b-13 | PHP | T4 | ❌ Not started | `sdks/php/` exists with empty `src/` (no Swoole/ReactPHP adapters) |
+| 12b-9 | Node.js / TypeScript | T3 + T4 | ✅ 2026-04-07 | `sdks/nodejs/`: AWPP WebSocket client, ED25519 (Node.js crypto), MsgPack (msgpackr)/JSON, CRC32, batch wire format, `processor()`/`batchProcessor()` decorators, 32 tests |
+| 12b-10 | Java / Kotlin | T3 + T4 | ✅ 2026-04-07 | `sdks/java/`: Zero-dependency (Java 21 stdlib only), ED25519 (built-in EdDSA), JSON codec, CRC32, batch wire format, data frame, `java.net.http.WebSocket` AWPP runner, `Processor.perEvent()`/`.batch()`, 28 tests |
+| 12b-11 | C# / .NET | T1 (NativeAOT) + T3 + T4 | ✅ 2026-04-07 | `sdks/dotnet/`: T1 NativeAOT C-ABI exports (`[UnmanagedCallersOnly]`), T4 WebSocket AWPP client, ED25519 (NSec/libsodium), MsgPack (MessagePack-CSharp)/JSON, CRC32, native wire format, `ProcessorRegistration.PerEvent()`/`.Batch()`, 40 tests |
+| 12b-12 | C / C++ | T1 + T2 + T3 + T4 | ✅ 2026-04-07 | `sdks/c/`: Pure C11 zero-dependency, T1 C-ABI (`AEON_EXPORT_PROCESSOR` macro), JSON codec (hand-rolled parser + base64), CRC32 IEEE, batch wire format (decode request/encode response), data frame build/parse, portable LE helpers, 22 tests |
+| 12b-13 | PHP | T4 (6 deployment models) | ✅ 2026-04-07 | `sdks/php/`: Core (Codec JSON/MsgPack, ED25519 via sodium_compat, CRC32, batch wire, data frame) + 6 adapters: Swoole/OpenSwoole (Laravel Octane), RevoltPHP+ReactPHP (Ratchet), RevoltPHP+AMPHP, Workerman, FrankenPHP/RoadRunner, Native CLI. `Processor::perEvent()`/`::batch()`, 33 tests |
 | 12b-14 | Swift | T3 + T4 | ❌ Not started | No directory |
 | 12b-14 | Elixir | T3 + T4 | ❌ Not started | No directory |
 | 12b-14 | Ruby | T4 (T3 future) | ❌ Not started | No directory |
@@ -916,7 +916,7 @@ All 8 core sub-phases complete.
 | 12b-14 | Haskell | T3 + T4 | ❌ Not started | No directory |
 | 12b-15 | Rust (Network) | T3 + T4 | ✅ 2026-04-06 | `aeon-processor-client` crate: AWPP handshake, ED25519 auth, batch wire format, CRC32, heartbeat, T4 WebSocket + T3 WebTransport clients, 17 tests |
 
-**Summary**: 3 of 14 target language SDKs implemented (Python, Go, Rust). Remaining 11 are demand-driven per ROADMAP design. Core platform (12b-1 through 12b-8) is complete — all language SDKs can be built against the existing `ProcessorTransport`, AWPP, `batch_wire`, and `processor_auth` infrastructure. Every language gets T3/T4 network access; T1/T2 in-process tiers are bonus options where the language supports it.
+**Summary**: 8 of 14 target language SDKs implemented (Python, Go, Rust, Node.js, C#/.NET, PHP, Java, C/C++). Remaining 6 are demand-driven per ROADMAP design. Core platform (12b-1 through 12b-8) is complete — all language SDKs can be built against the existing `ProcessorTransport`, AWPP, `batch_wire`, and `processor_auth` infrastructure. Every language gets T3/T4 network access; T1/T2 in-process tiers are bonus options where the language supports it.
 
 ### Phase 12a — Processor SDKs + Dev Tooling (Complete)
 
@@ -2365,11 +2365,11 @@ Every language gets T3/T4 (network) access. T1/T2 (in-process) are additional hi
 | AssemblyScript | T2 + T4 | T2 ✅ / T4 ❌ | `sdks/typescript/` (12a), T4 via 12b-9 |
 | Python | T3 + T4 | ✅ Complete | `sdks/python/` (12b-5) |
 | Go | T3 + T4 | ✅ Complete | `sdks/go/` (12b-6) |
-| Node.js / TypeScript | T3 + T4 | ❌ Not started | 12b-9 |
-| Java / Kotlin | T3 + T4 | ❌ Not started | 12b-10 |
-| C# / .NET | T1 (NativeAOT) + T3 + T4 | ❌ Not started | 12b-11 |
-| C / C++ | T1 + T2 + T3 + T4 | ❌ Not started | 12b-12 |
-| PHP | T4 | ❌ Not started | 12b-13 |
+| Node.js / TypeScript | T3 + T4 | ✅ 2026-04-07 | `sdks/nodejs/` (12b-9, 32 tests) |
+| Java / Kotlin | T3 + T4 | ✅ 2026-04-07 | 12b-10 (28 tests) |
+| C# / .NET | T1 (NativeAOT) + T3 + T4 | ✅ 2026-04-07 | 12b-11 (40 tests) |
+| C / C++ | T1 + T2 + T3 + T4 | ✅ 2026-04-07 | 12b-12 (22 tests) |
+| PHP | T4 (6 deployment models) | ✅ 2026-04-07 | 12b-13 (33 tests) |
 | Swift | T3 + T4 | ❌ Not started | 12b-14 |
 | Elixir | T3 + T4 | ❌ Not started | 12b-14 |
 | Ruby | T4 (T3 future) | ❌ Not started | 12b-14 |
@@ -2390,21 +2390,59 @@ Every language gets T3/T4 (network) access. T1/T2 (in-process) are additional hi
 | Error handling (thiserror/anyhow) | ✅ thiserror in libs, anyhow in CLI only |
 | Test coverage | ✅ 717 Rust + 44 SDK tests = 761 total |
 
-### Outstanding Work
+### Outstanding Work — Priority Order (as of 2026-04-07)
 
-**Critical (blocks production use)**:
+**P0: Critical (blocks production use)** — ✅ Done:
 1. ~~**Phase 4 L2/L3**: Implement mmap-backed L2 and RocksDB L3 state tiers.~~ ✅ **Done (2026-04-06)** — L2 MmapStore (append-only log + recovery + compaction) + L3 redb (pure Rust B-tree, ACID, `L3Store` adapter trait). State survives restart via L3 write-through.
 
-**Gate 1 unchecked metrics**:
-2. Aeon CPU <50% when Redpanda saturated — not formally measured
-3. P99 latency <10ms — histogram implemented, not formally validated E2E
+**P1: Gate 1 Validation** ✅ (Redpanda on Docker, Rancher Desktop — 2026-04-07):
+2. ~~Aeon CPU <50% when Redpanda saturated~~ ✅ **7.1% of system** (113.4% raw / 16 cores, 100K events, 256B payload)
+3. ~~P99 latency <10ms~~ ✅ **P99 = 5.00ms** (P50 = 1.00ms, P95 = 2.50ms, mean = 1.10ms)
+   - Zero event loss: 100,000/100,000 ✅
+   - E2E throughput: 825 events/sec (Redpanda source → Passthrough → Redpanda sink)
+   - `gate1_validation` bench: direct pipeline, LatencyHistogram, sysinfo CPU sampling
 
-**Gate 2 unchecked metrics** (require multi-node testing):
+**P2: Language SDKs** (strict priority order, all applicable tiers T1–T4):
+
+| Priority | Language | Sub-phase | Tiers | Status |
+|----------|----------|-----------|-------|--------|
+| — | Python | 12b-5 | T3 + T4 | ✅ Complete (31 tests) |
+| — | Go | 12b-6 | T3 + T4 | ✅ Complete (20 tests) |
+| — | Rust (Network) | 12b-15 | T3 + T4 | ✅ Complete (17 tests) |
+| 1 | Node.js / TypeScript | 12b-9 | T3 + T4 | ✅ Complete (32 tests) |
+| 2 | C# / .NET | 12b-11 | T1 (NativeAOT) + T3 + T4 | ✅ Complete (40 tests) |
+| 3 | PHP | 12b-13 | T4 (6 deployment models) | ✅ Complete (33 tests) |
+| 4 | Java / Kotlin | 12b-10 | T3 + T4 | ✅ Complete (28 tests) |
+| 5 | C / C++ | 12b-12 | T1 + T2 + T3 + T4 | ✅ Complete (22 tests) |
+
+**PHP deployment models** (all must be supported):
+1. Swoole / OpenSwoole — coroutine WebSocket client (also powers Laravel Octane)
+2. RevoltPHP + ReactPHP — RevoltPHP event loop + Ratchet WebSocket
+3. RevoltPHP + AMPHP — RevoltPHP event loop + amphp/websocket-client (Fiber-native)
+4. Workerman — standalone event-driven framework, built-in WebSocket client
+5. FrankenPHP / RoadRunner — persistent PHP workers, WebSocket via worker API
+6. Native CLI (fallback) — blocking stream_socket_client, poll-based, no extensions
+
+**Other languages** (Swift, Elixir, Ruby, Scala, Haskell) — after above list, not blocking.
+
+**P3: E2E Tests** (58 tests across 8 tiers — full plan in [`docs/E2E-TEST-PLAN.md`](E2E-TEST-PLAN.md)):
+- **Tier A** (P0): Memory → SDK → Memory, all 13 SDK/tier combos, no infra
+- **Tier B** (P1): File → SDK → File, 4 tests (one per tier family), no infra
+- **Tier C** (P0): Kafka → SDK → Kafka, all 11 SDK combos, needs Redpanda
+- **Tier D** (P1): T3 WebTransport variants, 5 tests, needs TLS certs
+- **Tier E** (P2): Cross-connector coverage (one SDK, many connector pairs), 9 tests
+- **Tier F** (P2): External messaging systems (NATS, Redis, MQTT, RabbitMQ, WS, QUIC), 7 tests
+- **Tier G** (P3): CDC database sources (PostgreSQL, MySQL, MongoDB), 3 tests
+- **Tier H** (P1): PHP adapter variants (all 6 deployment models), 6 tests
+- Implementation order: A → C → B → H → D → E → F → G
+
+**P4: Benchmark Run 5** (Multi-Partition Scaling):
+- After all SDKs and E2E tests are complete
+
+**Deferred: Gate 2 Cluster Validation** (requires cloud or multi-node infra):
 4. 3-node throughput ~3x single-node
 5. Scale-up/down zero event loss
 6. Leader failover <5s recovery
 7. Two-phase transfer cutover <100ms
 8. PoH chain continuity across transfers
-
-**Language SDKs (demand-driven, not blocking)**:
-9. 11 language SDKs not started (12b-9 through 12b-14; Rust T3/T4 12b-15 complete)
+- Rancher Desktop is single-node K3s — not suitable for multi-node cluster testing

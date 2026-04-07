@@ -6,6 +6,7 @@
 use aeon_types::{AeonError, CoreLocalUuidGenerator, Event, PartitionId, Source};
 use bytes::Bytes;
 use rdkafka::TopicPartitionList;
+use std::time::Instant;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::message::{Headers, Message};
@@ -213,6 +214,9 @@ impl KafkaSource {
 
         // Store Kafka offset for checkpoint resume position
         event.source_offset = Some(msg.offset());
+
+        // Stamp ingestion time for E2E latency measurement
+        event = event.with_source_ts(Instant::now());
 
         // Propagate Kafka headers as event metadata
         if let Some(headers) = msg.headers() {

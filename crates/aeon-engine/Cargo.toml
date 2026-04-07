@@ -53,11 +53,13 @@ rustls = { workspace = true, optional = true }
 
 [dev-dependencies]
 aeon-connectors = { workspace = true, features = ["kafka", "file"] }
+aeon-observability = { path = "../aeon-observability" }
 tempfile = "3"
 criterion = { workspace = true }
 rdkafka = { workspace = true }
 uuid = { workspace = true }
 smallvec = { workspace = true }
+sysinfo = "0.33"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tower = "0.5"
 axum = { workspace = true }
@@ -89,4 +91,8 @@ harness = false
 
 [[bench]]
 name = "transport_bench"
+harness = false
+
+[[bench]]
+name = "gate1_validation"
 harness = false

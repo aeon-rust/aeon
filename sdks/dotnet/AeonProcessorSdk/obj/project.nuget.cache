@@ -1,0 +1,17 @@
+{
+  "version": 2,
+  "dgSpecHash": "UnlEaG3c4gc=",
+  "success": true,
+  "projectFilePath": "D:\\my-opensource\\aeon\\sdks\\dotnet\\AeonProcessorSdk\\AeonProcessorSdk.csproj",
+  "expectedPackageFiles": [
+    "C:\\Users\\raghu\\.nuget\\packages\\libsodium\\1.0.19\\libsodium.1.0.19.nupkg.sha512",
+    "C:\\Users\\raghu\\.nuget\\packages\\messagepack\\2.5.198\\messagepack.2.5.198.nupkg.sha512",
+    "C:\\Users\\raghu\\.nuget\\packages\\messagepack.annotations\\2.5.198\\messagepack.annotations.2.5.198.nupkg.sha512",
+    "C:\\Users\\raghu\\.nuget\\packages\\microsoft.dotnet.ilcompiler\\8.0.25\\microsoft.dotnet.ilcompiler.8.0.25.nupkg.sha512",
+    "C:\\Users\\raghu\\.nuget\\packages\\microsoft.net.illink.tasks\\8.0.25\\microsoft.net.illink.tasks.8.0.25.nupkg.sha512",
+    "C:\\Users\\raghu\\.nuget\\packages\\microsoft.net.stringtools\\17.6.3\\microsoft.net.stringtools.17.6.3.nupkg.sha512",
+    "C:\\Users\\raghu\\.nuget\\packages\\nsec.cryptography\\24.4.0\\nsec.cryptography.24.4.0.nupkg.sha512",
+    "C:\\Users\\raghu\\.nuget\\packages\\runtime.win-x64.microsoft.dotnet.ilcompiler\\8.0.25\\runtime.win-x64.microsoft.dotnet.ilcompiler.8.0.25.nupkg.sha512"
+  ],
+  "logs": []
+}

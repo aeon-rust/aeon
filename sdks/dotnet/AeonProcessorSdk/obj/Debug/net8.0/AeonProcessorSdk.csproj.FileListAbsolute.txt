@@ -1,0 +1,12 @@
+D:\my-opensource\aeon\sdks\dotnet\AeonProcessorSdk\obj\Debug\net8.0\AeonProcessorSdk.csproj.AssemblyReference.cache
+D:\my-opensource\aeon\sdks\dotnet\AeonProcessorSdk\obj\Debug\net8.0\AeonProcessorSdk.GeneratedMSBuildEditorConfig.editorconfig
+D:\my-opensource\aeon\sdks\dotnet\AeonProcessorSdk\obj\Debug\net8.0\AeonProcessorSdk.AssemblyInfoInputs.cache
+D:\my-opensource\aeon\sdks\dotnet\AeonProcessorSdk\obj\Debug\net8.0\AeonProcessorSdk.AssemblyInfo.cs
+D:\my-opensource\aeon\sdks\dotnet\AeonProcessorSdk\obj\Debug\net8.0\AeonProcessorSdk.csproj.CoreCompileInputs.cache
+D:\my-opensource\aeon\sdks\dotnet\AeonProcessorSdk\bin\Debug\net8.0\AeonProcessorSdk.deps.json
+D:\my-opensource\aeon\sdks\dotnet\AeonProcessorSdk\bin\Debug\net8.0\AeonProcessorSdk.dll
+D:\my-opensource\aeon\sdks\dotnet\AeonProcessorSdk\bin\Debug\net8.0\AeonProcessorSdk.pdb
+D:\my-opensource\aeon\sdks\dotnet\AeonProcessorSdk\obj\Debug\net8.0\AeonProcessorSdk.dll
+D:\my-opensource\aeon\sdks\dotnet\AeonProcessorSdk\obj\Debug\net8.0\refint\AeonProcessorSdk.dll
+D:\my-opensource\aeon\sdks\dotnet\AeonProcessorSdk\obj\Debug\net8.0\AeonProcessorSdk.pdb
+D:\my-opensource\aeon\sdks\dotnet\AeonProcessorSdk\obj\Debug\net8.0\ref\AeonProcessorSdk.dll
