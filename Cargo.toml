@@ -122,6 +122,7 @@ aeon-native-sdk = { path = "crates/aeon-native-sdk", version = "0.1.0" }
 aeon-crypto = { path = "crates/aeon-crypto", version = "0.1.0" }
 aeon-observability = { path = "crates/aeon-observability", version = "0.1.0" }
 aeon-processor-client = { path = "crates/aeon-processor-client", version = "0.1.0" }
+aeon-wasm = { path = "crates/aeon-wasm", version = "0.1.0" }
 rand = "0.8"
 
 [profile.release]

@@ -76,19 +76,19 @@ Memory Source -> Processor -> Memory Sink. Baseline correctness for every SDK.
 
 | # | Processor | Tier | Test | Status |
 |---|-----------|------|------|--------|
-| A1 | Rust Native | T1 | Memory -> RustNative -> Memory | ❌ |
-| A2 | Rust Wasm | T2 | Memory -> RustWasm -> Memory | ❌ |
-| A3 | AssemblyScript | T2 | Memory -> AssemblyScript -> Memory | ❌ |
-| A4 | C/C++ | T1 | Memory -> C_Native -> Memory | ❌ |
+| A1 | Rust Native | T1 | Memory -> RustNative -> Memory | ✅ |
+| A2 | Rust Wasm | T2 | Memory -> RustWasm -> Memory | ✅ |
+| A3 | AssemblyScript | T2 | Memory -> AssemblyScript -> Memory | ✅ |
+| A4 | C/C++ | T1 | Memory -> C_Native -> Memory | ✅ |
 | A5 | C/C++ | T2 | Memory -> C_Wasm -> Memory | ❌ |
-| A6 | C#/.NET | T1 | Memory -> DotNet_NativeAOT -> Memory | ❌ |
-| A7 | C#/.NET | T4 | Memory -> DotNet_WS -> Memory | ❌ |
-| A8 | Python | T4 | Memory -> Python_WS -> Memory | ❌ |
-| A9 | Go | T4 | Memory -> Go_WS -> Memory | ❌ |
-| A10 | Rust Network | T4 | Memory -> RustNet_WS -> Memory | ❌ |
-| A11 | Node.js | T4 | Memory -> NodeJS_WS -> Memory | ❌ |
-| A12 | Java | T4 | Memory -> Java_WS -> Memory | ❌ |
-| A13 | PHP | T4 | Memory -> PHP_WS -> Memory | ❌ |
+| A6 | C#/.NET | T1 | Memory -> DotNet_NativeAOT -> Memory | ✅ |
+| A7 | C#/.NET | T4 | Memory -> DotNet_WS -> Memory | ✅ |
+| A8 | Python | T4 | Memory -> Python_WS -> Memory | ✅ |
+| A9 | Go | T4 | Memory -> Go_WS -> Memory | ✅ |
+| A10 | Rust Network | T4 | Memory -> RustNet_WS -> Memory | ✅ |
+| A11 | Node.js | T4 | Memory -> NodeJS_WS -> Memory | ✅ |
+| A12 | Java | T4 | Memory -> Java_WS -> Memory | ✅ |
+| A13 | PHP | T4 | Memory -> PHP_WS -> Memory | ✅ |
 
 ### Tier B: File Round-Trip (tier families) — P1, no infra
 
@@ -96,10 +96,10 @@ File Source -> Processor -> File Sink. One representative per tier family.
 
 | # | Processor | Tier | Test | Status |
 |---|-----------|------|------|--------|
-| B1 | Rust Native | T1 | File -> RustNative -> File | ❌ |
-| B2 | C/C++ | T1 | File -> C_Native -> File | ❌ |
-| B3 | Python | T4 | File -> Python_WS -> File | ❌ |
-| B4 | Node.js | T4 | File -> NodeJS_WS -> File | ❌ |
+| B1 | Rust Native | T1 | File -> RustNative -> File | ✅ |
+| B2 | C/C++ | T1 | File -> C_Native -> File | ✅ |
+| B3 | Python | T4 | File -> Python_WS -> File | ✅ |
+| B4 | Node.js | T4 | File -> NodeJS_WS -> File | ✅ |
 
 ### Tier C: Kafka/Redpanda E2E (all SDKs) — P0, needs Redpanda
 
@@ -107,17 +107,17 @@ Kafka Source -> Processor -> Kafka Sink. The Gate 1 money path.
 
 | # | Processor | Tier | Test | Status |
 |---|-----------|------|------|--------|
-| C1 | Rust Native | T1 | Kafka -> RustNative -> Kafka | ❌ |
-| C2 | Rust Wasm | T2 | Kafka -> RustWasm -> Kafka | ❌ |
-| C3 | C/C++ | T1 | Kafka -> C_Native -> Kafka | ❌ |
-| C4 | C#/.NET | T1 | Kafka -> DotNet_NativeAOT -> Kafka | ❌ |
-| C5 | C#/.NET | T4 | Kafka -> DotNet_WS -> Kafka | ❌ |
-| C6 | Python | T4 | Kafka -> Python_WS -> Kafka | ❌ |
-| C7 | Go | T4 | Kafka -> Go_WS -> Kafka | ❌ |
-| C8 | Rust Network | T4 | Kafka -> RustNet_WS -> Kafka | ❌ |
-| C9 | Node.js | T4 | Kafka -> NodeJS_WS -> Kafka | ❌ |
-| C10 | Java | T4 | Kafka -> Java_WS -> Kafka | ❌ |
-| C11 | PHP | T4 | Kafka -> PHP_WS -> Kafka | ❌ |
+| C1 | Rust Native | T1 | Kafka -> RustNative -> Kafka | ✅ |
+| C2 | Rust Wasm | T2 | Kafka -> RustWasm -> Kafka | ✅ |
+| C3 | C/C++ | T1 | Kafka -> C_Native -> Kafka | ✅ |
+| C4 | C#/.NET | T1 | Kafka -> DotNet_NativeAOT -> Kafka | ✅ |
+| C5 | C#/.NET | T4 | Kafka -> DotNet_WS -> Kafka | ✅ |
+| C6 | Python | T4 | Kafka -> Python_WS -> Kafka | ✅ |
+| C7 | Go | T4 | Kafka -> Go_WS -> Kafka | ✅ |
+| C8 | Rust Network | T4 | Kafka -> RustNet_WS -> Kafka | ✅ |
+| C9 | Node.js | T4 | Kafka -> NodeJS_WS -> Kafka | ✅ |
+| C10 | Java | T4 | Kafka -> Java_WS -> Kafka | ✅ |
+| C11 | PHP | T4 | Kafka -> PHP_WS -> Kafka | ✅ |
 
 ### Tier D: T3 WebTransport Variants — P1, needs TLS certs
 
@@ -137,15 +137,15 @@ One representative SDK (Python T4) across many connector pairs.
 
 | # | Source | Sink | Test | Status |
 |---|--------|------|------|--------|
-| E1 | Memory | Blackhole | Memory -> Python -> Blackhole | ❌ |
-| E2 | Memory | Stdout | Memory -> Python -> Stdout | ❌ |
-| E3 | Memory | File | Memory -> Python -> File | ❌ |
-| E4 | File | Memory | File -> Python -> Memory | ❌ |
-| E5 | File | Kafka | File -> Python -> Kafka | ❌ |
-| E6 | Kafka | File | Kafka -> Python -> File | ❌ |
-| E7 | Kafka | Blackhole | Kafka -> Python -> Blackhole | ❌ |
-| E8 | HTTP Webhook | Memory | HTTPWebhook -> Python -> Memory | ❌ |
-| E9 | HTTP Webhook | Kafka | HTTPWebhook -> Python -> Kafka | ❌ |
+| E1 | Memory | Blackhole | Memory -> Python -> Blackhole | ✅ |
+| E2 | Memory | Stdout | Memory -> Python -> Stdout | ✅ |
+| E3 | Memory | File | Memory -> Python -> File | ✅ |
+| E4 | File | Memory | File -> Python -> Memory | ✅ |
+| E5 | File | Kafka | File -> Python -> Kafka | ✅ |
+| E6 | Kafka | File | Kafka -> Python -> File | ✅ |
+| E7 | Kafka | Blackhole | Kafka -> Python -> Blackhole | ✅ |
+| E8 | HTTP Webhook | Memory | HTTPWebhook -> Python -> Memory | ✅ |
+| E9 | HTTP Webhook | Kafka | HTTPWebhook -> Python -> Kafka | ✅ |
 
 ### Tier F: External Messaging Systems — P2, Docker services
 
@@ -158,7 +158,7 @@ Each tests a different messaging connector with a different SDK.
 | F3 | Redis -> Redis | Node.js T4 | Redis | ❌ |
 | F4 | MQTT -> MQTT | Java T4 | Mosquitto | ❌ |
 | F5 | RabbitMQ -> RabbitMQ | PHP T4 | RabbitMQ | ❌ |
-| F6 | WebSocket -> WebSocket | Rust Net T4 | None (loopback) | ❌ |
+| F6 | WebSocket -> WebSocket | Rust Net T4 | None (loopback) | ✅ |
 | F7 | QUIC -> QUIC | Go T3 | None (loopback) | ❌ |
 
 ### Tier G: CDC Database Sources — P3, heavy infra
@@ -180,7 +180,7 @@ All use Memory -> PHP -> Memory, validating each adapter E2E.
 | H3 | RevoltPHP + AMPHP | ❌ |
 | H4 | Workerman | ❌ |
 | H5 | FrankenPHP / RoadRunner | ❌ |
-| H6 | Native CLI (fallback) | ❌ |
+| H6 | Native CLI (fallback) | ✅ |
 
 ---
 

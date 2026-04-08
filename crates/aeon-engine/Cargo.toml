@@ -7,7 +7,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [features]
-default = ["native-loader", "rest-api", "processor-auth"]
+default = ["native-loader", "rest-api", "processor-auth", "websocket-host"]
 native-loader = ["libloading", "aeon-native-sdk", "sha2", "hex"]
 rest-api = ["axum", "tower-http"]
 processor-auth = ["aeon-crypto", "rand", "sha2", "hex", "base64"]
@@ -52,8 +52,9 @@ rustls = { workspace = true, optional = true }
 # T4 WebSocket uses axum (via rest-api feature) — no extra deps needed
 
 [dev-dependencies]
-aeon-connectors = { workspace = true, features = ["kafka", "file"] }
+aeon-connectors = { workspace = true, features = ["kafka", "file", "http", "websocket"] }
 aeon-observability = { path = "../aeon-observability" }
+aeon-wasm = { workspace = true }
 tempfile = "3"
 criterion = { workspace = true }
 rdkafka = { workspace = true }
@@ -64,6 +65,15 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tower = "0.5"
 axum = { workspace = true }
 serde = { workspace = true }
+aeon-processor-client = { workspace = true }
+aeon-crypto = { workspace = true }
+tokio-tungstenite = { workspace = true }
+ed25519-dalek = { workspace = true }
+base64 = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }
+futures-util = { workspace = true }
+reqwest = { workspace = true }
 
 [[bench]]
 name = "blackhole_bench"

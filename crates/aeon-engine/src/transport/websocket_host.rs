@@ -105,10 +105,11 @@ impl WebSocketProcessorHost {
     /// Handle a WebSocket upgrade — runs the AWPP handshake and manages
     /// the session lifecycle. Call this from the axum upgrade handler.
     pub async fn handle_upgrade(&self, socket: WebSocket) -> Result<(), AeonError> {
-        let shared = Arc::new(WsSharedSocket::new(socket));
+        let (shared, recv_rx) = WsSharedSocket::new(socket);
 
         let control = WsControlChannel {
             socket: shared.clone(),
+            recv_rx: Mutex::new(recv_rx),
         };
 
         // Run AWPP handshake with timeout
@@ -150,8 +151,11 @@ impl WebSocketProcessorHost {
             "T4 processor connected via WebSocket"
         );
 
+        // Extract recv_rx from control channel for the read loop
+        let mut recv_rx = control.recv_rx.into_inner();
+
         // Read loop — demultiplex text (control) and binary (data) frames
-        let result = ws_read_loop(&shared, &session).await;
+        let result = ws_read_loop(&mut recv_rx, &session).await;
 
         // Cleanup
         session.close();
@@ -289,51 +293,88 @@ impl ProcessorTransport for WebSocketProcessorHost {
 
 // ── Shared WebSocket ────────────────────────────────────────────────────
 
-/// Shared WebSocket — axum 0.8's `WebSocket` doesn't support split,
-/// so we wrap it in a Mutex for controlled send/recv.
+/// Channel-based shared WebSocket — avoids mutex contention between the
+/// read loop (which blocks on recv) and send callers (call_batch, heartbeat).
+///
+/// Architecture:
+/// - A single owner task runs the I/O loop: reads from the socket and
+///   processes `send_rx` commands in `tokio::select!`.
+/// - Callers enqueue sends via `send_tx` (non-blocking).
+/// - Received frames are forwarded through `recv_tx` for the read loop.
 struct WsSharedSocket {
-    inner: Mutex<WebSocket>,
+    send_tx: tokio::sync::mpsc::Sender<Message>,
 }
 
 impl WsSharedSocket {
-    fn new(socket: WebSocket) -> Self {
-        Self {
-            inner: Mutex::new(socket),
-        }
+    /// Create a new shared socket. Spawns a background I/O pump task.
+    /// Returns (shared_socket, recv_rx for the read loop).
+    fn new(
+        socket: WebSocket,
+    ) -> (
+        Arc<Self>,
+        tokio::sync::mpsc::Receiver<Result<Message, AeonError>>,
+    ) {
+        let (send_tx, mut send_rx) = tokio::sync::mpsc::channel::<Message>(256);
+        let (recv_tx, recv_rx) =
+            tokio::sync::mpsc::channel::<Result<Message, AeonError>>(256);
+
+        // I/O pump: owns the WebSocket, multiplexes send/recv without contention.
+        tokio::spawn(async move {
+            let mut socket = socket;
+            loop {
+                tokio::select! {
+                    // Outbound: dequeue a message to send.
+                    Some(msg) = send_rx.recv() => {
+                        if socket.send(msg).await.is_err() {
+                            break;
+                        }
+                    }
+                    // Inbound: read from the WebSocket.
+                    msg = socket.recv() => {
+                        match msg {
+                            Some(Ok(frame)) => {
+                                if recv_tx.send(Ok(frame)).await.is_err() {
+                                    break; // read loop dropped
+                                }
+                            }
+                            Some(Err(e)) => {
+                                let _ = recv_tx.send(Err(AeonError::connection(
+                                    format!("T4 WebSocket recv failed: {e}"),
+                                ))).await;
+                                break;
+                            }
+                            None => {
+                                break; // connection closed
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        (Arc::new(Self { send_tx }), recv_rx)
     }
 
     async fn send(&self, msg: Message) -> Result<(), AeonError> {
-        let mut ws = self.inner.lock().await;
-        ws.send(msg)
+        self.send_tx
+            .send(msg)
             .await
-            .map_err(|e| AeonError::connection(format!("T4 WebSocket send failed: {e}")))
-    }
-
-    async fn recv(&self) -> Option<Result<Message, AeonError>> {
-        let mut ws = self.inner.lock().await;
-        match ws.recv().await {
-            Some(Ok(msg)) => Some(Ok(msg)),
-            Some(Err(e)) => Some(Err(AeonError::connection(format!(
-                "T4 WebSocket recv failed: {e}"
-            )))),
-            None => None,
-        }
+            .map_err(|_| AeonError::connection("T4 WebSocket send channel closed"))
     }
 }
 
 // ── WebSocket Read Loop ─────────────────────────────────────────────────
 
-/// Demultiplex incoming WebSocket frames.
+/// Demultiplex incoming WebSocket frames from the recv channel.
 ///
 /// - **Text frames**: AWPP control messages (heartbeat, drain, error).
 /// - **Binary frames**: Batch response data with routing header.
-async fn ws_read_loop(socket: &WsSharedSocket, session: &AwppSession) -> Result<(), AeonError> {
-    loop {
-        let msg = match socket.recv().await {
-            Some(Ok(msg)) => msg,
-            Some(Err(e)) => return Err(e),
-            None => return Ok(()), // connection closed
-        };
+async fn ws_read_loop(
+    recv_rx: &mut tokio::sync::mpsc::Receiver<Result<Message, AeonError>>,
+    session: &AwppSession,
+) -> Result<(), AeonError> {
+    while let Some(result) = recv_rx.recv().await {
+        let msg = result?;
 
         match msg {
             Message::Text(text) => {
@@ -373,6 +414,8 @@ async fn ws_read_loop(socket: &WsSharedSocket, session: &AwppSession) -> Result<
             }
         }
     }
+
+    Ok(())
 }
 
 /// Parse and handle a binary data frame (batch response).
@@ -428,9 +471,11 @@ pub fn parse_ws_routing_header(data: &[u8]) -> Result<(&str, u16, usize), AeonEr
 
 // ── Control Channel (WebSocket) ─────────────────────────────────────────
 
-/// Control channel over WebSocket text frames.
+/// Control channel over WebSocket — uses the send channel for outgoing
+/// and the recv channel for incoming during handshake.
 struct WsControlChannel {
     socket: Arc<WsSharedSocket>,
+    recv_rx: Mutex<tokio::sync::mpsc::Receiver<Result<Message, AeonError>>>,
 }
 
 impl ControlChannel for WsControlChannel {
@@ -447,8 +492,9 @@ impl ControlChannel for WsControlChannel {
         &self,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, AeonError>> + Send + '_>> {
         Box::pin(async move {
+            let mut rx = self.recv_rx.lock().await;
             loop {
-                match self.socket.recv().await {
+                match rx.recv().await {
                     Some(Ok(Message::Text(text))) => {
                         return Ok(text.as_bytes().to_vec());
                     }
