@@ -84,17 +84,12 @@ async fn d3_rust_network_wt_t3() {
         let url = url.clone();
         let pipeline_name = pipeline_name.to_string();
         tokio::spawn(async move {
-            // NOTE: the SDK's `ProcessEvent.id` is a `String`, but `uuid::Uuid`
-            // serializes as raw 16 bytes in msgpack (non-human-readable format).
-            // That means msgpack on this data stream fails to decode events —
-            // matching the existing convention in A10/C8/F6, this test uses
-            // `json` (where `Uuid` serializes as a string and round-trips
-            // cleanly). Switching the SDK envelope to `uuid::Uuid` is tracked
-            // as a follow-up.
+            // Default codec (msgpack) — `ProcessEvent.id` is now `uuid::Uuid`,
+            // so the engine's msgpack-encoded `WireEvent.id` (16-byte array)
+            // round-trips cleanly.
             let config = ProcessorConfig::new("rust-net-wt-proc", url)
                 .pipeline(pipeline_name)
-                .signing_key_from_seed(&seed)
-                .codec("json");
+                .signing_key_from_seed(&seed);
             aeon_processor_client::webtransport::run_webtransport_batch(config, passthrough_batch)
                 .await
         })
