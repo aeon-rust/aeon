@@ -856,7 +856,29 @@ Rolling binary upgrade: zero event loss during Aeon v1→v2 transition under loa
 
 ---
 
-## Current State (2026-04-06, comprehensive audit)
+## Current State (2026-04-09, connector audit closed + E2E re-sweep)
+
+### Latest updates (2026-04-09)
+
+- **Connector backpressure audit closed** — see `docs/CONNECTOR-AUDIT.md`
+  §7. Six fixes landed (§4.0 `outputs_sent` metric on flush, §4.1
+  WebSocket source drop removed, §4.2 MQTT sleep-poll removed, §4.3
+  MongoDB CDC resume token persistence, §4.4 RabbitMQ + Redis Streams
+  sink strategies, §5.3 T3/T4 `run_buffered_transport` + bounded
+  `BatchInflight`). Two gaps captured-but-deferred with clear post-Gate-2
+  rationale (§4.5 Postgres/MySQL streaming replication, §4.6
+  QUIC/WebTransport sink stream reuse).
+- **Gate 1 re-validated** post-§5.3 — steady-state P99 = 2.500ms at 10K
+  evt/s, CPU 21.8%, zero loss. Identical to pre-§5.3 baseline. Zero
+  regression. See `docs/GATE1-VALIDATION.md` "Re-validation run" row.
+- **Full E2E sweep executed** — 43/43 runnable tests pass across
+  Tiers A/B/C/E/F/H in ~130s wall time. Tier C (11 SDK × Kafka E2E,
+  the Gate 1 money path) is fully green. 1 test correctly ignored
+  (A5, needs wasi-sdk), 19 documented `todo!()` stubs remain (Tier D
+  T3 WT, Tier F F1–F5/F7 non-Rust SDK external messaging, Tier G CDC,
+  Tier H PHP adapter variants). Bonus: `redpanda_integration` 3/3,
+  `sustained_load` 2/2 (30s zero-loss). See `docs/E2E-TEST-PLAN.md`
+  Execution Log.
 
 ### Gate 1 — PASSED (Phases 0–7)
 
