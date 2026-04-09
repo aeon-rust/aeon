@@ -436,13 +436,259 @@ async fn f4_mqtt_java_t4() {
 }
 
 // ===========================================================================
-// F5: RabbitMQ -> RabbitMQ (PHP T4)
+// F5: RabbitMQ -> PHP T4 -> RabbitMQ
 // ===========================================================================
+//
+// Pre-populates a source queue via AMQP basic.publish, drains it through
+// RabbitMqSource → PHP T4 WebSocket processor → RabbitMqSink (OrderedBatch,
+// which exercises the §4.4 join_all publisher-confirm round-trip fix), and
+// verifies the sink queue ended up with exactly N messages with matching
+// payloads. Both queues are per-run suffixed to avoid collisions.
+//
+// RabbitMQ is expected on `amqp://guest:guest@localhost:30567/%2f` (K3s
+// NodePort from `infra/k8s-test-services.yaml`) or via `AEON_E2E_RABBITMQ_URL`
+// override. The test publishes/consumes via the default exchange with the
+// queue name as routing key, so no exchange declaration is needed.
+
+fn rabbitmq_url() -> String {
+    std::env::var("AEON_E2E_RABBITMQ_URL")
+        .unwrap_or_else(|_| "amqp://guest:guest@localhost:30567/%2f".to_string())
+}
+
+async fn require_rabbitmq() -> Option<lapin::Connection> {
+    let url = rabbitmq_url();
+    let conn_fut = lapin::Connection::connect(&url, lapin::ConnectionProperties::default());
+    match tokio::time::timeout(Duration::from_secs(2), conn_fut).await {
+        Ok(Ok(c)) => Some(c),
+        Ok(Err(e)) => {
+            eprintln!("SKIP F5: rabbitmq connect failed for {url}: {e}");
+            None
+        }
+        Err(_) => {
+            eprintln!("SKIP F5: rabbitmq connect timeout for {url}");
+            None
+        }
+    }
+}
 
 #[tokio::test]
-#[ignore = "requires RabbitMQ server (Docker) + PHP SDK + engine WebSocket host"]
 async fn f5_rabbitmq_php_t4() {
-    todo!("Implement with RabbitMqSource -> PHP T4 -> RabbitMqSink");
+    use aeon_connectors::rabbitmq::{
+        RabbitMqSink, RabbitMqSinkConfig, RabbitMqSource, RabbitMqSourceConfig,
+    };
+    use aeon_types::traits::{Sink, Source};
+    use aeon_types::DeliveryStrategy;
+    use lapin::options::{
+        BasicConsumeOptions, BasicPublishOptions, QueueDeclareOptions, QueueDeleteOptions,
+    };
+    use lapin::types::FieldTable;
+    use lapin::BasicProperties;
+
+    // --- 1. Preconditions ----------------------------------------------------
+    let Some(setup_conn) = require_rabbitmq().await else {
+        return;
+    };
+    if !e2e_ws_harness::runtime_available("php") {
+        eprintln!("SKIP F5: php not found");
+        return;
+    }
+
+    // --- 2. Fresh source + sink queues ---------------------------------------
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let source_queue = format!("aeon.e2e.f5.src.{suffix}");
+    let sink_queue = format!("aeon.e2e.f5.sink.{suffix}");
+
+    let setup_channel = setup_conn
+        .create_channel()
+        .await
+        .expect("setup channel create");
+
+    setup_channel
+        .queue_declare(
+            &source_queue,
+            QueueDeclareOptions {
+                durable: true,
+                ..Default::default()
+            },
+            FieldTable::default(),
+        )
+        .await
+        .expect("declare source queue");
+
+    setup_channel
+        .queue_declare(
+            &sink_queue,
+            QueueDeclareOptions {
+                durable: true,
+                ..Default::default()
+            },
+            FieldTable::default(),
+        )
+        .await
+        .expect("declare sink queue");
+
+    // --- 3. Pre-populate source queue via basic.publish ----------------------
+    let msg_count: usize = 100;
+    for i in 0..msg_count {
+        let payload = format!("f5-payload-{i:05}");
+        setup_channel
+            .basic_publish(
+                "",
+                &source_queue,
+                BasicPublishOptions::default(),
+                payload.as_bytes(),
+                BasicProperties::default().with_delivery_mode(2),
+            )
+            .await
+            .expect("basic_publish")
+            .await
+            .expect("publisher confirm");
+    }
+
+    // --- 4. Start WS harness + register PHP processor identity ---------------
+    let pipeline_name = "f5-pipeline";
+    let server = e2e_ws_harness::start_ws_test_server(pipeline_name).await;
+    let identity = e2e_ws_harness::register_test_identity(&server, "php-proc");
+    let seed_file = e2e_ws_harness::write_seed_file(&identity);
+    let port = server.port;
+    let seed_path = seed_file.to_string_lossy().to_string().replace('\\', "/");
+    let pub_key = identity.public_key.clone();
+
+    let script = e2e_ws_harness::php_passthrough_script(
+        port,
+        &seed_path,
+        &pub_key,
+        pipeline_name,
+        "php-proc",
+    );
+    let script_path = std::env::temp_dir().join(format!("aeon_e2e_f5_php_{suffix}.php"));
+    std::fs::write(&script_path, &script).unwrap();
+
+    let mut child = std::process::Command::new("php")
+        .arg(&script_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn php");
+
+    let connected = e2e_ws_harness::wait_for_connection(&server, Duration::from_secs(10)).await;
+    assert!(connected, "F5: PHP processor failed to connect");
+
+    // --- 5. Aeon RabbitMQ source + sink --------------------------------------
+    let source_config = RabbitMqSourceConfig::new(rabbitmq_url(), &source_queue)
+        .with_prefetch_count(256)
+        .with_poll_timeout(Duration::from_millis(500))
+        .with_declare_queue(false)
+        .with_source_name("f5-rabbitmq-source");
+    let mut source = RabbitMqSource::new(source_config)
+        .await
+        .expect("RabbitMqSource::new");
+
+    // OrderedBatch exercises the §4.4 join_all publisher-confirm round-trip
+    // fix (batch boundary awaits all PublisherConfirm futures concurrently).
+    let sink_config = RabbitMqSinkConfig::direct_to_queue(rabbitmq_url(), &sink_queue)
+        .with_strategy(DeliveryStrategy::OrderedBatch);
+    let mut sink = RabbitMqSink::new(sink_config).await.expect("RabbitMqSink::new");
+
+    // --- 6. Drain loop: RabbitMQ -> PHP T4 -> RabbitMQ -----------------------
+    let mut total_received: usize = 0;
+    let mut total_outputs: usize = 0;
+    let mut empty_polls = 0;
+    loop {
+        let events = source.next_batch().await.unwrap();
+        if events.is_empty() {
+            empty_polls += 1;
+            if empty_polls >= 3 {
+                break;
+            }
+            continue;
+        }
+        empty_polls = 0;
+        total_received += events.len();
+        let outputs = server.ws_host.call_batch(events).await.unwrap();
+        total_outputs += outputs.len();
+        sink.write_batch(outputs).await.unwrap();
+        if total_received >= msg_count {
+            break;
+        }
+    }
+    sink.flush().await.unwrap();
+
+    // --- 7. Verification -----------------------------------------------------
+    assert_eq!(
+        total_received, msg_count,
+        "F5 C1: source received {total_received}, expected {msg_count}"
+    );
+    assert_eq!(
+        total_outputs, msg_count,
+        "F5 C1: processor produced {total_outputs}, expected {msg_count}"
+    );
+
+    // Drain the sink queue via a fresh consumer on the setup channel and
+    // verify every payload round-tripped in order.
+    let verify_channel = setup_conn
+        .create_channel()
+        .await
+        .expect("verify channel create");
+    let mut consumer = verify_channel
+        .basic_consume(
+            &sink_queue,
+            "f5-verifier",
+            BasicConsumeOptions::default(),
+            FieldTable::default(),
+        )
+        .await
+        .expect("basic_consume sink queue");
+
+    use futures_util::StreamExt;
+    use lapin::options::BasicAckOptions;
+    let mut collected: Vec<String> = Vec::with_capacity(msg_count);
+    let verify_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while collected.len() < msg_count {
+        let remaining = verify_deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, consumer.next()).await {
+            Ok(Some(Ok(delivery))) => {
+                let payload = String::from_utf8(delivery.data.clone()).expect("utf8 payload");
+                collected.push(payload);
+                let _ = delivery.ack(BasicAckOptions::default()).await;
+            }
+            Ok(Some(Err(_))) | Ok(None) | Err(_) => break,
+        }
+    }
+
+    assert_eq!(
+        collected.len(),
+        msg_count,
+        "F5 C1: sink queue drained {} messages, expected {msg_count}",
+        collected.len()
+    );
+    for (i, payload) in collected.iter().enumerate() {
+        assert_eq!(
+            payload,
+            &format!("f5-payload-{i:05}"),
+            "F5 C2: payload mismatch at index {i}"
+        );
+    }
+
+    // --- 8. Cleanup ----------------------------------------------------------
+    let _ = setup_channel
+        .queue_delete(&source_queue, QueueDeleteOptions::default())
+        .await;
+    let _ = setup_channel
+        .queue_delete(&sink_queue, QueueDeleteOptions::default())
+        .await;
+
+    drop(server);
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_file(&script_path);
+    let _ = std::fs::remove_file(&seed_file);
 }
 
 // ===========================================================================

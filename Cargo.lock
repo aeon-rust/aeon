@@ -145,6 +145,7 @@ dependencies = [
  "ed25519-dalek",
  "futures-util",
  "hex",
+ "lapin",
  "libloading",
  "rand 0.8.5",
  "rdkafka",

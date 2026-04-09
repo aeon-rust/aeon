@@ -52,7 +52,7 @@ rustls = { workspace = true, optional = true }
 # T4 WebSocket uses axum (via rest-api feature) — no extra deps needed
 
 [dev-dependencies]
-aeon-connectors = { workspace = true, features = ["kafka", "file", "http", "websocket", "redis-streams", "nats"] }
+aeon-connectors = { workspace = true, features = ["kafka", "file", "http", "websocket", "redis-streams", "nats", "rabbitmq"] }
 aeon-observability = { path = "../aeon-observability" }
 aeon-wasm = { workspace = true }
 tempfile = "3"
@@ -76,6 +76,7 @@ futures-util = { workspace = true }
 reqwest = { workspace = true }
 redis = { workspace = true }
 async-nats = { workspace = true }
+lapin = { workspace = true }
 
 [[bench]]
 name = "blackhole_bench"
