@@ -1768,3 +1768,102 @@ Worker::runAll();
 "#
     )
 }
+
+/// Generate a Swoole / OpenSwoole AWPP T4 processor script.
+/// Uses `Swoole\Coroutine\Http\Client::upgrade()` to establish the WS
+/// connection, then `push()` / `recv()` in a coroutine loop.
+/// Requires PHP 8.1+ with either the `swoole` or `openswoole` extension loaded.
+pub fn php_swoole_passthrough_script(
+    port: u16,
+    seed_path: &str,
+    _pub_key: &str,
+    pipeline_name: &str,
+    processor_name: &str,
+) -> String {
+    let seed_path_fixed = seed_path.replace('\\', "/");
+    format!(
+        r#"<?php
+// H1: Swoole / OpenSwoole coroutine WebSocket client — AWPP T4 processor
+if (!extension_loaded('swoole') && !extension_loaded('openswoole')) {{
+    fwrite(STDERR, "swoole/openswoole extension not loaded\n");
+    exit(2);
+}}
+
+$seed = file_get_contents('{seed_path_fixed}');
+$kp = sodium_crypto_sign_seed_keypair($seed);
+$sk = sodium_crypto_sign_secretkey($kp);
+$pk = sodium_crypto_sign_publickey($kp);
+$pubKeyStr = "ed25519:" . base64_encode($pk);
+
+\Swoole\Coroutine\run(function () use ($sk, $pubKeyStr) {{
+    $cli = new \Swoole\Coroutine\Http\Client('127.0.0.1', {port});
+    $cli->set(['timeout' => 30, 'websocket_mask' => true]);
+    if (!$cli->upgrade('/api/v1/processors/connect')) {{
+        fwrite(STDERR, "swoole upgrade failed: " . $cli->errMsg . "\n");
+        exit(1);
+    }}
+    $batchSigning = true;
+    while (true) {{
+        $frame = $cli->recv(30);
+        if ($frame === false || $frame === '' || $frame === null) break;
+        if (!is_object($frame)) break;
+        $data = $frame->data;
+        $opcode = $frame->opcode ?? 1;
+        // OPCODE_CLOSE = 8
+        if ($opcode === 8) break;
+        if ($opcode === 1) {{
+            // Text control frame
+            $ctrl = json_decode($data, true);
+            $type = $ctrl['type'] ?? '';
+            if ($type === 'challenge') {{
+                $nonce = hex2bin($ctrl['nonce']);
+                $sig = sodium_crypto_sign_detached($nonce, $sk);
+                $register = json_encode([
+                    'type' => 'register', 'protocol' => 'awpp/1', 'transport' => 'websocket',
+                    'name' => '{processor_name}', 'version' => '1.0.0',
+                    'public_key' => $pubKeyStr, 'challenge_signature' => bin2hex($sig),
+                    'capabilities' => ['batch'], 'transport_codec' => 'json',
+                    'requested_pipelines' => ['{pipeline_name}'], 'binding' => 'dedicated',
+                ]);
+                $cli->push($register, 1); // WEBSOCKET_OPCODE_TEXT
+            }} elseif ($type === 'accepted') {{
+                $batchSigning = $ctrl['batch_signing'] ?? true;
+            }} elseif ($type === 'drain') {{
+                break;
+            }}
+            continue;
+        }}
+        if ($opcode !== 2) continue; // Not binary
+        // AWPP data frame
+        $nameLen = unpack('V', substr($data, 0, 4))[1];
+        $pipeline = substr($data, 4, $nameLen);
+        $partition = unpack('v', substr($data, 4 + $nameLen, 2))[1];
+        $bd = substr($data, 4 + $nameLen + 2);
+        $batchId = unpack('P', substr($bd, 0, 8))[1];
+        $eventCount = unpack('V', substr($bd, 8, 4))[1];
+        $off = 12;
+        $payloads = [];
+        for ($i = 0; $i < $eventCount; $i++) {{
+            $eLen = unpack('V', substr($bd, $off, 4))[1]; $off += 4;
+            $ev = json_decode(substr($bd, $off, $eLen), true); $off += $eLen;
+            $payloads[] = $ev['payload'] ?? [];
+        }}
+        $body = pack('P', $batchId) . pack('V', count($payloads));
+        foreach ($payloads as $p) {{
+            $body .= pack('V', 1);
+            $out = json_encode(['destination' => 'output', 'payload' => $p, 'headers' => []], JSON_UNESCAPED_SLASHES);
+            $body .= pack('V', strlen($out)) . $out;
+        }}
+        $crc = pack('V', crc32($body));
+        $bwc = $body . $crc;
+        $sigBytes = $batchSigning ? sodium_crypto_sign_detached($bwc, $sk) : str_repeat("\0", 64);
+        $nameB = $pipeline;
+        $hdr = pack('V', strlen($nameB)) . $nameB . pack('v', $partition);
+        $out = $hdr . $bwc . $sigBytes;
+        $cli->push($out, 2); // WEBSOCKET_OPCODE_BINARY
+    }}
+    $cli->close();
+}});
+"#
+    )
+}
