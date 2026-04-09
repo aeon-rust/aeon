@@ -426,13 +426,301 @@ async fn f3_redis_nodejs_t4() {
 }
 
 // ===========================================================================
-// F4: MQTT -> MQTT (Java T4)
+// F4: MQTT -> Java T4 -> MQTT
 // ===========================================================================
+//
+// Subscribes to the source topic via MqttSource, subscribes to the sink
+// topic via a verifier MqttSource, publishes N messages onto the source
+// topic via a helper MqttSink, drains through the Java T4 WebSocket
+// processor into the real MqttSink, and verifies the verifier drained
+// exactly N matching payloads. Unlike F1/F3/F5, MQTT is not a queue — the
+// subscribers must exist before any message is published, which is why
+// the source/verifier are created before the publish step.
+//
+// Exercises the §4.2 MQTT source push-buffer path (TCP-window-driven
+// backpressure, reader-task suspension on send) end-to-end with a
+// non-Rust SDK for the first time. The MQTT sink is the "infeasible to
+// differentiate" case from §4.4 — rumqttc hides per-publish PUBACK
+// matching, so OrderedBatch == UnorderedBatch in practice, and this test
+// just validates that the existing write_batch loop survives a round-trip
+// against a real broker.
+//
+// Mosquitto is expected on `localhost:30188` (K3s NodePort from
+// `infra/k8s-test-services.yaml`) or via `AEON_E2E_MQTT_HOST` /
+// `AEON_E2E_MQTT_PORT` overrides.
+
+fn mqtt_host() -> String {
+    std::env::var("AEON_E2E_MQTT_HOST").unwrap_or_else(|_| "localhost".to_string())
+}
+
+fn mqtt_port() -> u16 {
+    std::env::var("AEON_E2E_MQTT_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30188)
+}
+
+async fn require_mqtt() -> bool {
+    let host = mqtt_host();
+    let port = mqtt_port();
+    let addr = format!("{host}:{port}");
+    match tokio::time::timeout(Duration::from_secs(2), tokio::net::TcpStream::connect(&addr)).await
+    {
+        Ok(Ok(_)) => true,
+        Ok(Err(e)) => {
+            eprintln!("SKIP F4: mqtt tcp connect failed for {addr}: {e}");
+            false
+        }
+        Err(_) => {
+            eprintln!("SKIP F4: mqtt tcp connect timeout for {addr}");
+            false
+        }
+    }
+}
+
+/// Resolve a Java 15+ `java` + `javac` pair. Checks `JAVA_HOME/bin` first
+/// (Windows CI often has Oracle stub + Microsoft JDK side-by-side, where
+/// `java` in PATH is the old Oracle 8 stub but `JAVA_HOME` points at a
+/// modern JDK), then falls back to plain `java`/`javac` in PATH.
+fn resolve_modern_java() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    fn probe(java: &std::path::Path) -> bool {
+        let Ok(out) = std::process::Command::new(java).arg("--version").output() else {
+            return false;
+        };
+        if !out.status.success() {
+            return false;
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        let version = text
+            .split_whitespace()
+            .nth(1)
+            .and_then(|v| v.split('.').next())
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(0);
+        version >= 15
+    }
+
+    let (java_exe, javac_exe) = if cfg!(windows) {
+        ("java.exe", "javac.exe")
+    } else {
+        ("java", "javac")
+    };
+
+    if let Ok(home) = std::env::var("JAVA_HOME") {
+        let bin = std::path::Path::new(&home).join("bin");
+        let java = bin.join(java_exe);
+        let javac = bin.join(javac_exe);
+        if java.exists() && javac.exists() && probe(&java) {
+            return Some((java, javac));
+        }
+    }
+
+    let path_java = std::path::PathBuf::from("java");
+    let path_javac = std::path::PathBuf::from("javac");
+    if probe(&path_java) {
+        return Some((path_java, path_javac));
+    }
+    None
+}
 
 #[tokio::test]
-#[ignore = "requires Mosquitto MQTT broker (Docker) + Java SDK + engine WebSocket host"]
 async fn f4_mqtt_java_t4() {
-    todo!("Implement with MqttSource -> Java T4 -> MqttSink");
+    use aeon_connectors::mqtt::{MqttSink, MqttSinkConfig, MqttSource, MqttSourceConfig};
+    use aeon_types::traits::{Sink, Source};
+    use aeon_types::Output;
+    use bytes::Bytes;
+    use std::sync::Arc as StdArc;
+
+    // --- 1. Preconditions ----------------------------------------------------
+    if !require_mqtt().await {
+        return;
+    }
+    let Some((java_bin, javac_bin)) = resolve_modern_java() else {
+        eprintln!("SKIP F4: java 15+ not found (checked JAVA_HOME + PATH)");
+        return;
+    };
+
+    // --- 2. Fresh source + sink topics ---------------------------------------
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let source_topic = format!("aeon/e2e/f4/src/{suffix}");
+    let sink_topic = format!("aeon/e2e/f4/sink/{suffix}");
+
+    let host = mqtt_host();
+    let port = mqtt_port();
+    let msg_count: usize = 100;
+
+    // --- 3. Create Aeon MQTT source + sink + verifier BEFORE publishing ------
+    // MQTT topics are ephemeral — subscribers must exist before any message
+    // is published or it is silently dropped (even with QoS 1, the broker
+    // does not buffer for clients that have never subscribed with a
+    // persistent session). Create every subscriber first, then publish.
+    let source_config = MqttSourceConfig::new(&host, port, &source_topic)
+        .with_client_id(format!("aeon-f4-src-{suffix}"))
+        .with_poll_timeout(Duration::from_millis(500))
+        .with_source_name("f4-mqtt-source");
+    let mut source = MqttSource::new(source_config).await.expect("MqttSource::new");
+
+    let verifier_config = MqttSourceConfig::new(&host, port, &sink_topic)
+        .with_client_id(format!("aeon-f4-verify-{suffix}"))
+        .with_poll_timeout(Duration::from_millis(500))
+        .with_source_name("f4-mqtt-verifier");
+    let mut verifier = MqttSource::new(verifier_config)
+        .await
+        .expect("MqttSource::new (verifier)");
+
+    let sink_config = MqttSinkConfig::new(&host, port, &sink_topic)
+        .with_client_id(format!("aeon-f4-sink-{suffix}"));
+    let mut sink = MqttSink::new(sink_config).await.expect("MqttSink::new");
+
+    // Small settle so that all three SUBSCRIBE / CONNACK round-trips finish
+    // before we start publishing.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // --- 4. Start WS harness + register Java processor identity --------------
+    let pipeline_name = "f4-pipeline";
+    let server = e2e_ws_harness::start_ws_test_server(pipeline_name).await;
+    let identity = e2e_ws_harness::register_test_identity(&server, "java-proc");
+    let seed_file = e2e_ws_harness::write_seed_file(&identity);
+    let seed_path = seed_file.to_string_lossy().to_string();
+    let pub_key = identity.public_key.clone();
+
+    let java_dir = e2e_ws_harness::java_passthrough_project(
+        server.port,
+        &seed_path,
+        &pub_key,
+        pipeline_name,
+        "java-proc",
+    );
+    let java_src = java_dir.join("AeonProcessor.java");
+
+    let compile = std::process::Command::new(&javac_bin)
+        .arg(&java_src)
+        .output()
+        .expect("javac");
+    if !compile.status.success() {
+        eprintln!(
+            "SKIP F4: javac failed: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let _ = std::fs::remove_dir_all(&java_dir);
+        drop(server);
+        return;
+    }
+
+    let mut child = std::process::Command::new(&java_bin)
+        .args(["-cp", &java_dir.to_string_lossy(), "AeonProcessor"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn java");
+
+    let connected = e2e_ws_harness::wait_for_connection(&server, Duration::from_secs(15)).await;
+    assert!(connected, "F4: Java processor failed to connect");
+
+    // --- 5. Publish N messages onto the source topic via a helper sink -------
+    let mut publisher_sink = MqttSink::new(
+        MqttSinkConfig::new(&host, port, &source_topic)
+            .with_client_id(format!("aeon-f4-pub-{suffix}")),
+    )
+    .await
+    .expect("MqttSink::new (publisher)");
+
+    let dest: StdArc<str> = StdArc::from("source");
+    let mut payloads: Vec<Output> = Vec::with_capacity(msg_count);
+    for i in 0..msg_count {
+        let payload = format!("f4-payload-{i:05}");
+        payloads.push(Output::new(StdArc::clone(&dest), Bytes::from(payload)));
+    }
+    publisher_sink
+        .write_batch(payloads)
+        .await
+        .expect("publish seed");
+
+    // --- 6. Drain loop: MQTT -> Java T4 -> MQTT ------------------------------
+    let mut total_received: usize = 0;
+    let mut total_outputs: usize = 0;
+    let mut empty_polls = 0;
+    let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if tokio::time::Instant::now() >= drain_deadline {
+            break;
+        }
+        let events = source.next_batch().await.unwrap();
+        if events.is_empty() {
+            empty_polls += 1;
+            if total_received >= msg_count && empty_polls >= 3 {
+                break;
+            }
+            continue;
+        }
+        empty_polls = 0;
+        total_received += events.len();
+        let outputs = server.ws_host.call_batch(events).await.unwrap();
+        total_outputs += outputs.len();
+        sink.write_batch(outputs).await.unwrap();
+        if total_received >= msg_count {
+            break;
+        }
+    }
+    sink.flush().await.unwrap();
+
+    // --- 7. Verification -----------------------------------------------------
+    assert_eq!(
+        total_received, msg_count,
+        "F4 C1: source received {total_received}, expected {msg_count}"
+    );
+    assert_eq!(
+        total_outputs, msg_count,
+        "F4 C1: processor produced {total_outputs}, expected {msg_count}"
+    );
+
+    // Drain the verifier subscribed to the sink topic.
+    let mut collected: Vec<String> = Vec::with_capacity(msg_count);
+    let verify_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while collected.len() < msg_count {
+        if tokio::time::Instant::now() >= verify_deadline {
+            break;
+        }
+        let events = verifier.next_batch().await.unwrap();
+        if events.is_empty() {
+            continue;
+        }
+        for event in events {
+            let payload = std::str::from_utf8(event.payload.as_ref())
+                .expect("utf8 payload")
+                .to_string();
+            collected.push(payload);
+            if collected.len() >= msg_count {
+                break;
+            }
+        }
+    }
+
+    assert_eq!(
+        collected.len(),
+        msg_count,
+        "F4 C1: verifier drained {} from sink topic, expected {msg_count}",
+        collected.len()
+    );
+    // MQTT preserves per-topic ordering from a single publisher with QoS 1,
+    // so the verifier should see the payloads in send order.
+    for (i, payload) in collected.iter().enumerate() {
+        assert_eq!(
+            payload,
+            &format!("f4-payload-{i:05}"),
+            "F4 C2: payload mismatch at index {i}"
+        );
+    }
+
+    // --- 8. Cleanup ----------------------------------------------------------
+    drop(server);
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&java_dir);
+    let _ = std::fs::remove_file(&seed_file);
 }
 
 // ===========================================================================
