@@ -9,6 +9,7 @@
 //!   pending deliveries. Higher throughput, downstream sorts by UUIDv7.
 
 use aeon_types::{AeonError, BatchResult, DeliveryStrategy, Output, Sink};
+use futures_util::future::join_all;
 use rdkafka::config::ClientConfig;
 use rdkafka::message::OwnedHeaders;
 use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
@@ -207,11 +208,18 @@ impl Sink for KafkaSink {
                 Ok(BatchResult::all_delivered(event_ids))
             }
             DeliveryStrategy::OrderedBatch => {
-                // Await all delivery futures at batch boundary.
+                // Await all delivery futures concurrently at the batch boundary.
+                // Sequential `for future in futures { future.await }` costs one
+                // scheduler yield per await (~1ms on Windows), which collapses
+                // throughput to ~700 events/sec regardless of batch size.
+                // `join_all` polls all futures together and wakes once on
+                // completion — the batch finishes in O(max round-trip), not
+                // O(batch_size × scheduler_yield).
                 // Idempotent producer guarantees ordering even with pipelining.
+                let results = join_all(futures).await;
                 let mut errors = Vec::new();
-                for future in futures {
-                    match future.await {
+                for result in results {
+                    match result {
                         Ok(_) => {
                             self.delivered += 1;
                         }

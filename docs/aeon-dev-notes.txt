@@ -19780,5 +19780,76 @@ claude's response:
 
 Committed as cc383fe. Ready for you to push when you're ready.
 
+==========================
+ let us have aeon-dev-notes committed to github.
 
+============================
+ claude's response:
+ 
+ did you remove gitignore for aeon-dev-notes?
+
+● No, aeon-dev-notes.txt was never in .gitignore — it's been tracked by git since it was first added. Let me verify:
+It's been tracked across 5 commits. It will be pushed to GitHub along with everything else when you push.
+
+================
+  thank you
+  =================
+  
+  claude's response:
+
+● You're welcome! Here's a quick recap of what we accomplished this session:
+
+  1. Fixed C2 Wasm+Kafka bug — Root cause: bump allocator grew unbounded, overflowing 256KB Wasm memory with accumulated Kafka topic messages. Fixed in WAT
+  alloc() + partition assignment.
+  2. Added 3 Wasm stress tests (300/300/5000 events) — all pass.
+  3. Cleaned up clippy warnings across test code.
+  4. Updated .gitignore — .claude/ now shareable (only settings.local.json ignored).
+  5. Updated .env.example — added cluster, benchmark, logging vars.
+  6. Updated README.md — 4-tier processors, 8 SDK languages, honest status, "Built with Claude" section.
+  7. Updated 11 docs with implementation status notes.
+
+  Final state: 820 tests passing (776 Rust + 24 Python + 20 Go), 0 failures, clippy clean. Three commits ready to push:
+  - f41669b — C2 fix
+  - cc383fe — documentation overhaul
+  - 4cf34db — dev notes update
+  
+  
+===================
+what next?
+===================
+ Looking at the state of the project, here are the logical next steps in priority order:
+
+  1. Gate 1 Validation Run (most aligned with Phase 0 focus)
+  - Actually measure against the targets: per-event overhead <100ns, headroom ratio ≥5x, zero event loss, Aeon CPU <50%
+  - Run the blackhole bench + E2E delivery bench + Redpanda bench back-to-back
+  - Document results and compare to targets in ROADMAP
+  - This is the point of Phase 0 — everything else is infrastructure for this
+
+  2. D3 WebTransport E2E Test (completes Tier D Rust path)
+  - Generate TLS certs in the test harness (~1h)
+  - Wire up WebTransport host + Rust processor-client (~1-2h)
+  - Only D3 is testable now; D1/D2/D4/D5 require per-SDK WT support
+
+  3. Pre-publish prep (if you're thinking about going public soon)
+  - Reserve aeon-* crate names on crates.io (need to create account, publish stub)
+  - Reserve aeonrust org on Docker Hub
+  - Add description, license, repository metadata to all Cargo.toml files
+  - Dry-run cargo publish --dry-run per crate
+
+  4. GitHub repo setup (when ready for external contributors)
+  - Issue/PR templates
+  - CONTRIBUTING.md
+  - GitHub Actions CI workflow (test + clippy + fmt)
+  - Branch protection rules
+
+  5. Tier F E2E tests (post-Gate 2, but infra is ready)
+  - NATS, Redis, RabbitMQ, Mosquitto already running on K3s
+  - F1-F5 are stubs; implementing them is straightforward but lower priority
+
+  My recommendation: Gate 1 validation run — it's the actual goal of the current phase and everything else is either deferred or prep work. Want me to run
+  the benchmarks and document results?
+  ===================
+  proceed
+  =====================
+  
 
