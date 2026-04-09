@@ -156,23 +156,187 @@ async fn h2_php_revolt_reactphp() {
 }
 
 // ===========================================================================
-// H3: RevoltPHP + AMPHP
+// H3: AMPHP v3 (amphp/websocket-client)
 // ===========================================================================
 
 #[tokio::test]
-#[ignore = "requires PHP 8.2+ with AMPHP Composer packages"]
 async fn h3_php_revolt_amphp() {
-    todo!("Implement with engine WS host + PHP RevoltPHP/AMPHP adapter");
+    if !php_available() {
+        return;
+    }
+    if !e2e_ws_harness::composer_available() {
+        eprintln!("SKIP H3: composer not available");
+        return;
+    }
+
+    let project_dir = match e2e_ws_harness::setup_composer_project(
+        "h3-amphp",
+        &["amphp/websocket-client:^2.0"],
+    ) {
+        Some(d) => d,
+        None => {
+            eprintln!("SKIP H3: composer install failed");
+            return;
+        }
+    };
+    let autoload = project_dir.join("vendor").join("autoload.php");
+    if !autoload.exists() {
+        eprintln!("SKIP H3: vendor/autoload.php missing after composer install");
+        return;
+    }
+
+    let pipeline_name = "h3-pipeline";
+    let server = e2e_ws_harness::start_ws_test_server(pipeline_name).await;
+    let identity = e2e_ws_harness::register_test_identity(&server, "php-amphp");
+    let seed_file = e2e_ws_harness::write_seed_file(&identity);
+    let seed_path = seed_file.to_string_lossy().to_string();
+    let pub_key = identity.public_key.clone();
+
+    let script = e2e_ws_harness::php_amphp_passthrough_script(
+        server.port,
+        &seed_path,
+        &pub_key,
+        pipeline_name,
+        "php-amphp",
+        &autoload.to_string_lossy(),
+    );
+    let script_path = std::env::temp_dir().join("aeon_e2e_h3_amphp.php");
+    std::fs::write(&script_path, &script).expect("write h3 script");
+
+    let mut child = std::process::Command::new("php")
+        .arg(&script_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn php (amphp)");
+
+    let connected = e2e_ws_harness::wait_for_connection(&server, Duration::from_secs(15)).await;
+    if !connected {
+        let _ = child.kill();
+        let out = child.wait_with_output().ok();
+        let stderr = out
+            .as_ref()
+            .map(|o| String::from_utf8_lossy(&o.stderr).into_owned())
+            .unwrap_or_default();
+        drop(server);
+        let _ = std::fs::remove_file(&script_path);
+        let _ = std::fs::remove_file(&seed_file);
+        panic!("H3: AMPHP processor failed to connect. stderr: {stderr}");
+    }
+
+    let events = make_test_events(MSG_COUNT);
+    let outputs = e2e_ws_harness::drive_events_through_transport(&server.ws_host, events, 64)
+        .await
+        .unwrap();
+
+    assert_eq!(outputs.len(), MSG_COUNT, "H3 C1: event count mismatch");
+    for (i, output) in outputs.iter().enumerate() {
+        let expected = format!("h-payload-{i:05}");
+        assert_eq!(
+            output.payload.as_ref(),
+            expected.as_bytes(),
+            "H3 C2: payload mismatch at {i}"
+        );
+    }
+
+    drop(server);
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_file(&script_path);
+    let _ = std::fs::remove_file(&seed_file);
 }
 
 // ===========================================================================
-// H4: Workerman
+// H4: Workerman (AsyncTcpConnection with ws:// scheme)
 // ===========================================================================
 
 #[tokio::test]
-#[ignore = "requires PHP 8.2+ with Workerman Composer package"]
 async fn h4_php_workerman() {
-    todo!("Implement with engine WS host + PHP Workerman adapter");
+    if !php_available() {
+        return;
+    }
+    if !e2e_ws_harness::composer_available() {
+        eprintln!("SKIP H4: composer not available");
+        return;
+    }
+
+    let project_dir = match e2e_ws_harness::setup_composer_project(
+        "h4-workerman",
+        &["workerman/workerman:^5.0"],
+    ) {
+        Some(d) => d,
+        None => {
+            eprintln!("SKIP H4: composer install failed");
+            return;
+        }
+    };
+    let autoload = project_dir.join("vendor").join("autoload.php");
+    if !autoload.exists() {
+        eprintln!("SKIP H4: vendor/autoload.php missing after composer install");
+        return;
+    }
+
+    let pipeline_name = "h4-pipeline";
+    let server = e2e_ws_harness::start_ws_test_server(pipeline_name).await;
+    let identity = e2e_ws_harness::register_test_identity(&server, "php-workerman");
+    let seed_file = e2e_ws_harness::write_seed_file(&identity);
+    let seed_path = seed_file.to_string_lossy().to_string();
+    let pub_key = identity.public_key.clone();
+
+    let script = e2e_ws_harness::php_workerman_passthrough_script(
+        server.port,
+        &seed_path,
+        &pub_key,
+        pipeline_name,
+        "php-workerman",
+        &autoload.to_string_lossy(),
+    );
+    let script_path = std::env::temp_dir().join("aeon_e2e_h4_workerman.php");
+    std::fs::write(&script_path, &script).expect("write h4 script");
+
+    // Workerman requires `start` as argv[1]
+    let mut child = std::process::Command::new("php")
+        .arg(&script_path)
+        .arg("start")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn php (workerman)");
+
+    let connected = e2e_ws_harness::wait_for_connection(&server, Duration::from_secs(15)).await;
+    if !connected {
+        let _ = child.kill();
+        let out = child.wait_with_output().ok();
+        let stderr = out
+            .as_ref()
+            .map(|o| String::from_utf8_lossy(&o.stderr).into_owned())
+            .unwrap_or_default();
+        drop(server);
+        let _ = std::fs::remove_file(&script_path);
+        let _ = std::fs::remove_file(&seed_file);
+        panic!("H4: Workerman processor failed to connect. stderr: {stderr}");
+    }
+
+    let events = make_test_events(MSG_COUNT);
+    let outputs = e2e_ws_harness::drive_events_through_transport(&server.ws_host, events, 64)
+        .await
+        .unwrap();
+
+    assert_eq!(outputs.len(), MSG_COUNT, "H4 C1: event count mismatch");
+    for (i, output) in outputs.iter().enumerate() {
+        let expected = format!("h-payload-{i:05}");
+        assert_eq!(
+            output.payload.as_ref(),
+            expected.as_bytes(),
+            "H4 C2: payload mismatch at {i}"
+        );
+    }
+
+    drop(server);
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_file(&script_path);
+    let _ = std::fs::remove_file(&seed_file);
 }
 
 // ===========================================================================

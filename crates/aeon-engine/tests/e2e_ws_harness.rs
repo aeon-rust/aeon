@@ -1567,3 +1567,204 @@ $loop->run();
 "#
     )
 }
+
+/// Generate an AMPHP v3 (`amphp/websocket-client:^2`) AWPP T4 processor script.
+/// Requires a Composer project with `amphp/websocket-client` installed.
+/// `vendor_autoload` must be the absolute path to `vendor/autoload.php`.
+pub fn php_amphp_passthrough_script(
+    port: u16,
+    seed_path: &str,
+    _pub_key: &str,
+    pipeline_name: &str,
+    processor_name: &str,
+    vendor_autoload: &str,
+) -> String {
+    let seed_path_fixed = seed_path.replace('\\', "/");
+    let autoload_fixed = vendor_autoload.replace('\\', "/");
+    format!(
+        r#"<?php
+// H3: AMPHP v3 + amphp/websocket-client — AWPP T4 processor
+require '{autoload_fixed}';
+
+use Amp\Websocket\Client\WebsocketHandshake;
+use function Amp\Websocket\Client\connect;
+
+$seed = file_get_contents('{seed_path_fixed}');
+$kp = sodium_crypto_sign_seed_keypair($seed);
+$sk = sodium_crypto_sign_secretkey($kp);
+$pk = sodium_crypto_sign_publickey($kp);
+$pubKeyStr = "ed25519:" . base64_encode($pk);
+
+$handshake = new WebsocketHandshake('ws://127.0.0.1:{port}/api/v1/processors/connect');
+$conn = connect($handshake);
+$batchSigning = true;
+
+try {{
+    while ($message = $conn->receive()) {{
+        $data = $message->buffer();
+        if ($message->isBinary()) {{
+            // AWPP data frame
+            $nameLen = unpack('V', substr($data, 0, 4))[1];
+            $pipeline = substr($data, 4, $nameLen);
+            $partition = unpack('v', substr($data, 4 + $nameLen, 2))[1];
+            $bd = substr($data, 4 + $nameLen + 2);
+            $batchId = unpack('P', substr($bd, 0, 8))[1];
+            $eventCount = unpack('V', substr($bd, 8, 4))[1];
+            $off = 12;
+            $payloads = [];
+            for ($i = 0; $i < $eventCount; $i++) {{
+                $eLen = unpack('V', substr($bd, $off, 4))[1]; $off += 4;
+                $ev = json_decode(substr($bd, $off, $eLen), true); $off += $eLen;
+                $payloads[] = $ev['payload'] ?? [];
+            }}
+            $body = pack('P', $batchId) . pack('V', count($payloads));
+            foreach ($payloads as $p) {{
+                $body .= pack('V', 1);
+                $out = json_encode(['destination' => 'output', 'payload' => $p, 'headers' => []], JSON_UNESCAPED_SLASHES);
+                $body .= pack('V', strlen($out)) . $out;
+            }}
+            $crc = pack('V', crc32($body));
+            $bwc = $body . $crc;
+            $sigBytes = $batchSigning ? sodium_crypto_sign_detached($bwc, $sk) : str_repeat("\0", 64);
+            $nameB = $pipeline;
+            $hdr = pack('V', strlen($nameB)) . $nameB . pack('v', $partition);
+            $frame = $hdr . $bwc . $sigBytes;
+            $conn->sendBinary($frame);
+        }} else {{
+            $ctrl = json_decode($data, true);
+            $type = $ctrl['type'] ?? '';
+            if ($type === 'challenge') {{
+                $nonce = hex2bin($ctrl['nonce']);
+                $sig = sodium_crypto_sign_detached($nonce, $sk);
+                $register = json_encode([
+                    'type' => 'register', 'protocol' => 'awpp/1', 'transport' => 'websocket',
+                    'name' => '{processor_name}', 'version' => '1.0.0',
+                    'public_key' => $pubKeyStr, 'challenge_signature' => bin2hex($sig),
+                    'capabilities' => ['batch'], 'transport_codec' => 'json',
+                    'requested_pipelines' => ['{pipeline_name}'], 'binding' => 'dedicated',
+                ]);
+                $conn->sendText($register);
+            }} elseif ($type === 'accepted') {{
+                $batchSigning = $ctrl['batch_signing'] ?? true;
+            }} elseif ($type === 'drain') {{
+                $conn->close();
+                break;
+            }}
+        }}
+    }}
+}} catch (\Throwable $e) {{
+    fwrite(STDERR, "amphp error: " . $e->getMessage() . "\n");
+    exit(1);
+}}
+"#
+    )
+}
+
+/// Generate a Workerman (`workerman/workerman:^5.0`) AWPP T4 processor script.
+/// Uses `AsyncTcpConnection` with the native `ws://` protocol. Requires PHP
+/// 8.1+ and a Composer project with workerman/workerman installed. Must be
+/// invoked as `php <script> start` on all platforms (Workerman argv contract).
+pub fn php_workerman_passthrough_script(
+    port: u16,
+    seed_path: &str,
+    _pub_key: &str,
+    pipeline_name: &str,
+    processor_name: &str,
+    vendor_autoload: &str,
+) -> String {
+    let seed_path_fixed = seed_path.replace('\\', "/");
+    let autoload_fixed = vendor_autoload.replace('\\', "/");
+    format!(
+        r#"<?php
+// H4: Workerman AsyncTcpConnection (ws://) — AWPP T4 processor
+require '{autoload_fixed}';
+
+use Workerman\Worker;
+use Workerman\Connection\AsyncTcpConnection;
+use Workerman\Protocols\Websocket;
+
+$GLOBALS['h4_seed'] = file_get_contents('{seed_path_fixed}');
+$GLOBALS['h4_kp'] = sodium_crypto_sign_seed_keypair($GLOBALS['h4_seed']);
+$GLOBALS['h4_sk'] = sodium_crypto_sign_secretkey($GLOBALS['h4_kp']);
+$GLOBALS['h4_pk'] = sodium_crypto_sign_publickey($GLOBALS['h4_kp']);
+$GLOBALS['h4_pub'] = "ed25519:" . base64_encode($GLOBALS['h4_pk']);
+$GLOBALS['h4_batch_signing'] = true;
+
+$worker = new Worker();
+$worker->count = 1;
+$worker->onWorkerStart = function () {{
+    $conn = new AsyncTcpConnection('ws://127.0.0.1:{port}/api/v1/processors/connect');
+    // Default to text frames; we flip websocketType just before sending binary.
+    $conn->websocketType = Websocket::BINARY_TYPE_BLOB;
+    $conn->onMessage = function ($conn, $data) {{
+        $sk = $GLOBALS['h4_sk'];
+        $pubKeyStr = $GLOBALS['h4_pub'];
+        // Workerman hands us the decoded frame body regardless of opcode.
+        // Control frames are JSON starting with '{{'; data frames are binary AWPP.
+        if (strlen($data) > 0 && $data[0] === '{{') {{
+            $ctrl = json_decode($data, true);
+            $type = $ctrl['type'] ?? '';
+            if ($type === 'challenge') {{
+                $nonce = hex2bin($ctrl['nonce']);
+                $sig = sodium_crypto_sign_detached($nonce, $sk);
+                $register = json_encode([
+                    'type' => 'register', 'protocol' => 'awpp/1', 'transport' => 'websocket',
+                    'name' => '{processor_name}', 'version' => '1.0.0',
+                    'public_key' => $pubKeyStr, 'challenge_signature' => bin2hex($sig),
+                    'capabilities' => ['batch'], 'transport_codec' => 'json',
+                    'requested_pipelines' => ['{pipeline_name}'], 'binding' => 'dedicated',
+                ]);
+                $conn->websocketType = Websocket::BINARY_TYPE_BLOB;
+                $conn->send($register);
+            }} elseif ($type === 'accepted') {{
+                $GLOBALS['h4_batch_signing'] = $ctrl['batch_signing'] ?? true;
+            }} elseif ($type === 'drain') {{
+                $conn->close();
+                Worker::stopAll();
+            }}
+            return;
+        }}
+        // AWPP data frame
+        $batchSigning = $GLOBALS['h4_batch_signing'];
+        $nameLen = unpack('V', substr($data, 0, 4))[1];
+        $pipeline = substr($data, 4, $nameLen);
+        $partition = unpack('v', substr($data, 4 + $nameLen, 2))[1];
+        $bd = substr($data, 4 + $nameLen + 2);
+        $batchId = unpack('P', substr($bd, 0, 8))[1];
+        $eventCount = unpack('V', substr($bd, 8, 4))[1];
+        $off = 12;
+        $payloads = [];
+        for ($i = 0; $i < $eventCount; $i++) {{
+            $eLen = unpack('V', substr($bd, $off, 4))[1]; $off += 4;
+            $ev = json_decode(substr($bd, $off, $eLen), true); $off += $eLen;
+            $payloads[] = $ev['payload'] ?? [];
+        }}
+        $body = pack('P', $batchId) . pack('V', count($payloads));
+        foreach ($payloads as $p) {{
+            $body .= pack('V', 1);
+            $out = json_encode(['destination' => 'output', 'payload' => $p, 'headers' => []], JSON_UNESCAPED_SLASHES);
+            $body .= pack('V', strlen($out)) . $out;
+        }}
+        $crc = pack('V', crc32($body));
+        $bwc = $body . $crc;
+        $sigBytes = $batchSigning ? sodium_crypto_sign_detached($bwc, $sk) : str_repeat("\0", 64);
+        $nameB = $pipeline;
+        $hdr = pack('V', strlen($nameB)) . $nameB . pack('v', $partition);
+        $frame = $hdr . $bwc . $sigBytes;
+        $conn->websocketType = Websocket::BINARY_TYPE_ARRAYBUFFER;
+        $conn->send($frame);
+    }};
+    $conn->onClose = function ($conn) {{
+        Worker::stopAll();
+    }};
+    $conn->onError = function ($conn, $code, $msg) {{
+        fwrite(STDERR, "workerman error [$code]: $msg\n");
+        Worker::stopAll();
+    }};
+    $conn->connect();
+}};
+
+Worker::runAll();
+"#
+    )
+}
