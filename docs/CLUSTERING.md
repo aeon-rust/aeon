@@ -2,6 +2,12 @@
 
 > Comprehensive guide to configuring and operating Aeon clusters, from single-node
 > development setups through multi-node production deployments.
+>
+> **Implementation status**: Single-node Raft is implemented and tested. Multi-node
+> cluster validation (3+ nodes, partition transfer, leader failover) is deferred to
+> post-Gate 2 as it requires multi-node infrastructure. The architecture, traits, and
+> QUIC transport code exist but have not been validated in a multi-node deployment.
+> See `docs/ROADMAP.md` for the Gate 2 deferred tasks.
 
 ---
 

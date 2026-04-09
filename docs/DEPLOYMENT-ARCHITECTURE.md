@@ -3,6 +3,11 @@
 > Infrastructure topology options, from single-machine development to
 > multi-server production. Covers Redpanda segregation, network latency
 > trade-offs, and capacity planning.
+>
+> **Current deployment**: Topology 1 (single machine) is actively tested with
+> Redpanda on Docker/Rancher Desktop. Performance numbers are from benchmark
+> runs on this topology. Multi-server topologies (2-4) are designed for
+> production but not yet validated.
 
 ---
 

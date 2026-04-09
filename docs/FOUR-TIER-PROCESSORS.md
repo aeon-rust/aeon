@@ -1,9 +1,16 @@
 # Four-Tier Processor Runtime Architecture — Evaluation & Design Document
 
-> **Status**: Draft — Pre-implementation evaluation  
-> **Date**: 2026-04-05  
+> **Status**: Partially implemented  
+> **Date**: 2026-04-05 (design), 2026-04-09 (status update)  
 > **Scope**: Phase 12b — Universal processor development model  
 > **Goal**: Enable processor development in 26+ programming languages via four transport tiers
+>
+> **What's implemented**: T1 Native (Rust, C/C++, .NET NativeAOT via C-ABI loading),
+> T2 Wasm (Wasmtime host, fuel metering, state isolation), T4 WebSocket host (AWPP
+> protocol, ED25519 identity, JSON/MsgPack codecs) with SDKs in Python, Go, Node.js,
+> C#/.NET, Java, PHP, C/C++, and Rust. 43 E2E tests passing across 8 tiers.
+> **Not yet implemented**: T3 WebTransport host (code exists, needs TLS test harness),
+> child process isolation tier, auto-scaling, RBAC per-processor.
 
 ---
 

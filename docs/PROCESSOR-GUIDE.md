@@ -1,15 +1,20 @@
 # Processor Development Guide
 
-This guide covers how to build event processors for Aeon in three runtime modes:
+This guide covers how to build event processors for Aeon using **T1 (Native)** and
+**T2 (Wasm)** in-process runtimes. For T3 (WebTransport) and T4 (WebSocket) network
+processors — which support Python, Go, Node.js, Java, PHP, C#, and more — see
+[FOUR-TIER-PROCESSORS.md](FOUR-TIER-PROCESSORS.md) and the SDKs in `sdks/`.
 
-| Runtime | Latency | Throughput | Best For |
-|---------|---------|------------|----------|
-| **Rust-native** | ~240ns | ~4.2M/sec | Maximum performance, trusted code |
-| **Rust-Wasm (SDK)** | ~1.2us | ~820K/sec | Sandboxed Rust, minimal boilerplate |
-| **Rust-Wasm (raw)** | ~1.2us | ~820K/sec | Sandboxed Rust, full ABI control |
-| **AssemblyScript-Wasm** | ~1.1us | ~940K/sec | TypeScript developers, rapid prototyping |
+| Runtime | Tier | Latency | Throughput | Best For |
+|---------|------|---------|------------|----------|
+| **Rust-native** | T1 | ~240ns | ~4.2M/sec | Maximum performance, trusted code |
+| **C/C++ native** | T1 | ~240ns | ~4.2M/sec | C-ABI, cross-language native |
+| **.NET NativeAOT** | T1 | ~240ns | ~4.2M/sec | C# teams, AOT-compiled to native |
+| **Rust-Wasm (SDK)** | T2 | ~1.2us | ~820K/sec | Sandboxed Rust, minimal boilerplate |
+| **Rust-Wasm (raw)** | T2 | ~1.2us | ~820K/sec | Sandboxed Rust, full ABI control |
+| **AssemblyScript-Wasm** | T2 | ~1.1us | ~940K/sec | TypeScript developers, rapid prototyping |
 
-All four produce the same result. Choose based on your team's language preference and whether you need Wasm sandboxing (fuel limits, memory isolation, namespace separation). For Rust-Wasm, the SDK (Option 2) is recommended over raw ABI (Option 3) unless you need low-level control.
+All produce the same result. Choose based on your team's language preference and whether you need Wasm sandboxing (fuel limits, memory isolation, namespace separation). For Rust-Wasm, the SDK (Option 2) is recommended over raw ABI (Option 3) unless you need low-level control.
 
 ---
 

@@ -75,7 +75,9 @@ venv/
 Thumbs.db
 
 # ── Claude Code ───────────────────────────────────────────────────────
-.claude/
+# Project-level settings (.claude/settings.json, CLAUDE.md) are shared.
+# Local settings contain machine-specific paths and auto-approved permissions.
+.claude/settings.local.json
 
 # ── Logs & temp files ─────────────────────────────────────────────────
 *.log

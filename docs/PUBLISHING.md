@@ -3,6 +3,11 @@
 > How to publish Aeon to crates.io, Docker Hub, and GitHub Releases.
 > Covers crate ordering, metadata requirements, Docker image strategy,
 > pre-built binaries, and CI/CD automation.
+>
+> **Status**: Pre-publish. All crates compile and test (820 tests passing).
+> Publishing pipeline is designed and documented but has not been executed yet.
+> Crate names (`aeon-*`) and Docker Hub org (`aeonrust`) should be reserved
+> before first public release.
 
 ---
 
@@ -63,7 +68,7 @@ Developer running Aeon locally:
 All publishable crates share the `aeon-` prefix for discoverability. They all
 live in the same crates.io registry (there is only one public Cargo registry).
 
-#### Published as Libraries (11 crates)
+#### Published as Libraries (12 crates)
 
 | Crate | Description | Internal Deps | Key Users |
 |-------|-------------|---------------|-----------|
@@ -77,6 +82,7 @@ live in the same crates.io registry (there is only one public Cargo registry).
 | `aeon-observability` | OTLP, logging, metrics | `aeon-types` | All production deployments |
 | `aeon-connectors` | 22 source/sink implementations | `aeon-types` | Pipeline builders |
 | `aeon-cluster` | Raft consensus + QUIC | `aeon-types` | Multi-node clusters |
+| `aeon-processor-client` | T3/T4 network processor SDK | `aeon-types` | Rust T3/T4 processor authors |
 | `aeon-engine` | Pipeline orchestrator | `aeon-types`, `aeon-native-sdk` (opt) | Pipeline operators |
 
 #### Published as Binary (1 crate)
@@ -104,6 +110,7 @@ Tier 1 (no internal deps — publish first):
 
 Tier 2 (depends on aeon-types only):
   ├── aeon-native-sdk
+  ├── aeon-processor-client
   ├── aeon-crypto
   ├── aeon-io
   ├── aeon-state

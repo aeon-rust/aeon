@@ -6,6 +6,12 @@
 > and cluster-aware deployment. Referenced from `docs/ROADMAP.md` (Phases 12–14).
 >
 > Related: `docs/INSTALLATION.md` (ports, multi-version operation, directory layout)
+>
+> **Implementation status**: Wasm hot-swap and native `.so`/`.dll` loading are
+> implemented and tested (including C-ABI and .NET NativeAOT on Windows). The REST
+> API processor registry endpoints exist. Upgrade strategies (drain-swap, blue-green,
+> canary) are designed but not yet integrated into the pipeline lifecycle. Child
+> process isolation is designed but not implemented.
 
 ---
 

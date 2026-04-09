@@ -16,12 +16,12 @@ Source (Kafka, HTTP, NATS, MQTT, CDC, ...)
             -> Sink (Kafka, Redis, File, WebSocket, ...)
 ```
 
-**Processors can be written in any language that compiles to WebAssembly** -- Rust, AssemblyScript/TypeScript, Go, C/C++, and more. Native Rust processors are also supported for maximum performance.
+**Processors can be written in any language** across four tiers: T1 Native (Rust, C/C++, .NET), T2 Wasm (Rust, AssemblyScript), T3 WebTransport, and T4 WebSocket (Python, Go, Node.js, Java, PHP, C#, Rust). SDKs available for 8 languages.
 
 ## Key Features
 
 - **22 connectors** across 16 connector types (Kafka, HTTP, WebSocket, Redis Streams, NATS, MQTT, RabbitMQ, PostgreSQL CDC, MySQL CDC, MongoDB CDC, QUIC, WebTransport, File, Memory, Blackhole, Stdout)
-- **3 processor runtimes**: Rust-native (4.2M events/sec), Rust-Wasm (820K/sec), AssemblyScript-Wasm (940K/sec)
+- **4 processor tiers**: T1 Native (Rust/C/.NET — 4.2M events/sec), T2 Wasm (820K/sec), T3 WebTransport, T4 WebSocket — with SDKs in 8 languages
 - **3 delivery strategies**: PerEvent (strictest ordering), OrderedBatch (ordered + high throughput), UnorderedBatch (maximum throughput)
 - **3 upgrade strategies**: Drain-swap (<100ms pause), blue-green (zero-downtime), canary (gradual rollout)
 - **Vendor-neutral observability**: OpenTelemetry OTLP export to SigNoz, Grafana, Jaeger, Elastic APM, Datadog, or any OTLP-compatible backend
@@ -164,13 +164,16 @@ aeon top
 
 ### 7. Develop a Processor
 
-See [docs/PROCESSOR-GUIDE.md](docs/PROCESSOR-GUIDE.md) for the complete guide covering:
-- **Rust-native** processors (fastest, direct trait implementation)
-- **Rust-Wasm (SDK)** processors (sandboxed, `aeon_processor!` macro — recommended for Wasm)
-- **Rust-Wasm (raw)** processors (sandboxed, full ABI control)
-- **AssemblyScript-Wasm** processors (TypeScript-like, compiles to Wasm)
+Aeon supports **4 processor tiers** — choose based on your performance and language needs:
 
-The Wasm wire format is documented in [docs/WIRE-FORMAT.md](docs/WIRE-FORMAT.md).
+| Tier | Transport | Languages | Latency |
+|------|-----------|-----------|---------|
+| **T1 Native** | In-process (C-ABI) | Rust, C/C++, .NET NativeAOT | ~240ns |
+| **T2 Wasm** | In-process (Wasmtime) | Rust, AssemblyScript | ~1.1us |
+| **T3 WebTransport** | QUIC/UDP | Any with WT client | ~5-15us |
+| **T4 WebSocket** | TCP/WS | Python, Go, Node.js, Java, PHP, C#, Rust | ~30-80us |
+
+See [docs/PROCESSOR-GUIDE.md](docs/PROCESSOR-GUIDE.md) for the Rust processor guide, [docs/FOUR-TIER-PROCESSORS.md](docs/FOUR-TIER-PROCESSORS.md) for the four-tier architecture, and [docs/WIRE-FORMAT.md](docs/WIRE-FORMAT.md) for the Wasm ABI specification.
 
 ## Connectors
 
@@ -218,9 +221,19 @@ crates/
   aeon-cluster/        # Raft consensus + QUIC transport
   aeon-crypto/         # Encryption, signing, Merkle trees
   aeon-observability/  # OpenTelemetry OTLP, Prometheus, structured logging
-  aeon-native-sdk/     # Native processor SDK (export_processor! macro)
+  aeon-native-sdk/     # Native processor SDK (export_processor! macro, C-ABI)
   aeon-wasm-sdk/       # Wasm processor SDK (aeon_processor! macro, no_std)
+  aeon-processor-client/ # T3/T4 network processor SDK (WebSocket, WebTransport)
   aeon-cli/            # CLI binary (new, build, validate, deploy, apply, top)
+
+sdks/
+  python/              # Python T4 processor SDK (WebSocket + AWPP)
+  go/                  # Go T4 processor SDK (WebSocket + AWPP)
+  nodejs/              # Node.js T4 processor SDK (WebSocket + AWPP)
+  dotnet/              # C#/.NET T4 SDK + NativeAOT T1 processor
+  java/                # Java T4 processor SDK (WebSocket + AWPP)
+  php/                 # PHP T4 processor SDK (6 deployment models)
+  c/                   # C/C++ T1 native processor SDK (C-ABI)
 
 samples/
   e2e-pipeline/              # Runnable binaries: aeon-pipeline + aeon-producer
@@ -229,7 +242,6 @@ samples/
     rust-wasm/               # Rust -> wasm32-unknown-unknown processor
     rust-wasm-sdk/           # Rust-Wasm using aeon-wasm-sdk convenience macros
     assemblyscript-wasm/     # AssemblyScript -> Wasm processor
-    typescript-wasm/         # TypeScript -> Wasm (Component Model, future)
 
 docs/
   ARCHITECTURE.md      # Full product specification
@@ -307,9 +319,31 @@ See [docs/SECURITY.md](docs/SECURITY.md) for the full security model.
 
 ## Current Status
 
-**All phases complete** (Phases 0-15c). The core pipeline, 22 connectors, state management, fault tolerance, delivery architecture, observability, Wasm runtime, cluster/QUIC, crypto, REST API, CLI, and production readiness are all implemented and benchmarked.
+**Phase 0 — Foundation** is the current focus: achieving Gate 1 performance targets
+(per-event overhead <100ns, headroom ratio >=5x, Aeon never the bottleneck).
 
-**601 tests passing** across the workspace. Clippy clean, rustfmt clean.
+**What's implemented and tested:**
+- Core pipeline engine with SPSC ring buffers and backpressure
+- T1 Native processors (Rust, C/C++, .NET NativeAOT) with C-ABI loading
+- T2 Wasm processors (Wasmtime, fuel metering, memory sandboxing)
+- T4 WebSocket processor host with AWPP protocol
+- Kafka/Redpanda source and sink (batch polling, manual partition assign)
+- Memory, File, Blackhole, Stdout, HTTP, WebSocket connectors
+- 3 delivery strategies (PerEvent, OrderedBatch, UnorderedBatch)
+- Checkpoint WAL and state store (L1 DashMap + L2 mmap + L3 redb)
+- REST API with Bearer token auth and OWASP-compliant security
+- SDKs: Python, Go, Node.js, C#/.NET, Java, PHP, C/C++, Rust
+- OpenTelemetry OTLP observability (traces, metrics, logs)
+
+**Designed, code exists, not yet production-validated:**
+- T3 WebTransport processor host (implemented, needs TLS test harness)
+- NATS, Redis Streams, MQTT, RabbitMQ connectors (implemented, E2E tests pending)
+- PostgreSQL/MySQL/MongoDB CDC connectors (stubs, post-Gate 2)
+- QUIC/WebTransport source and sink connectors
+- Multi-node Raft cluster (openraft + quinn, single-node tested)
+- Processor upgrade strategies (drain-swap, blue-green, canary)
+
+**820 tests passing** (776 Rust + 24 Python + 20 Go), 0 failures. Clippy clean, rustfmt clean.
 
 See [docs/ROADMAP.md](docs/ROADMAP.md) for full phase details.
 
@@ -331,7 +365,13 @@ See [docs/ROADMAP.md](docs/ROADMAP.md) for full phase details.
 | [SECURITY.md](docs/SECURITY.md) | Security model, OWASP compliance |
 | [CLUSTERING.md](docs/CLUSTERING.md) | Single-node, multi-node, Raft consensus |
 | [DEPLOYMENT-ARCHITECTURE.md](docs/DEPLOYMENT-ARCHITECTURE.md) | Topology options, Redpanda segregation, network latency |
+| [FOUR-TIER-PROCESSORS.md](docs/FOUR-TIER-PROCESSORS.md) | Four-tier processor architecture (T1-T4) |
 | [PUBLISHING.md](docs/PUBLISHING.md) | crates.io, Docker Hub, GitHub Releases, CI/CD |
+| [E2E-TEST-PLAN.md](docs/E2E-TEST-PLAN.md) | End-to-end test matrix (8 tiers, 63 tests) |
+
+## Built With
+
+Aeon is developed using [Claude](https://claude.ai) (Anthropic) as an AI coding partner via [Claude Code](https://claude.ai/claude-code). The `.claude/` directory and `CLAUDE.md` contain the project instructions and coding guidelines that shape how Claude assists with development.
 
 ## License
 

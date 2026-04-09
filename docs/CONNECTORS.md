@@ -1,6 +1,12 @@
 # Aeon Connectors Reference
 
 > Comprehensive guide to all Source and Sink connectors in the `aeon-connectors` crate.
+>
+> **Implementation status**: Kafka/Redpanda, Memory, Blackhole, Stdout, File, HTTP,
+> and WebSocket connectors are implemented and E2E tested. NATS, Redis Streams, MQTT,
+> and RabbitMQ connectors are implemented with infrastructure deployed on K3s for
+> testing (E2E tests pending). QUIC and WebTransport source/sink connectors exist as
+> code. CDC connectors (PostgreSQL, MySQL, MongoDB) are stubs for post-Gate 2.
 
 ---
 

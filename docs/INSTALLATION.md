@@ -6,6 +6,11 @@
 >
 > Related: `docs/PROCESSOR-DEPLOYMENT.md` (processor registry, pipeline lifecycle,
 > upgrade strategies, REST API, K8s patterns)
+>
+> **Status**: Port assignments and manifest schema are finalized. Single binary and
+> Docker installation methods are designed; `cargo install aeon-cli` and Docker Hub
+> images are not yet published (see `docs/PUBLISHING.md`). Currently, Aeon runs from
+> source via `cargo run` or `cargo build --release`.
 
 ---
 

@@ -19660,7 +19660,86 @@ The agent's analysis about input/output collision is incorrect — $ptr + $len u
 
 ● Let me add a test with metadata to see if that's the trigger, and also modify C2 to catch which event fails.
 
-  
-  
+ Committed. Now let me push to remote:
+
+
+Understood, I won't push. The commit is saved locally (f41669b). You can push when ready with git push origin master.
+
+  Summary of what was done:
+
+  - C2 bug fixed — Root cause: WAT bump allocator grew ~106 bytes/event without reclaiming. With accumulated messages in the Kafka topic from prior runs, it
+   exceeded 256KB Wasm memory. Fix: reset bump to heap base (65536) in alloc(), safe because host consumes previous event+output before next allocation.
+  Also fixed C2 partition assignment to vec![0].
+  - 3 Wasm stress tests added — 300 events (no metadata), 300 events (with metadata), 5000 events (stress). All pass.
+  - Clippy warnings fixed — 3 minor issues in test code.
+  - 776 Rust tests passing, 0 failures, 30 ignored.
+  - E2E status: 43 passed, 0 failed, 20 ignored.
+===================================================  
+   I will do it myself later to remote github repository. can we check and ensure gitignore is there correctly?
+
+=========================================================
+claude's response:
+
+ Looks solid. Let me verify nothing is being tracked that shouldn't be:
+
+
+All source code only — no build artifacts tracked. The .gitignore is comprehensive and correct:
+
+  ┌──────────────────────────────────────┬───────────────────────────────────────────────────────┬──────────────────────────────────────────────────────┐
+  │               Category               │                        Covered                        │                        Notes                         │
+  ├──────────────────────────────────────┼───────────────────────────────────────────────────────┼──────────────────────────────────────────────────────┤
+  │ Rust (/target/, .pdb)                │ Yes                                                   │ Both root and sub-crate targets                      │
+  ├──────────────────────────────────────┼───────────────────────────────────────────────────────┼──────────────────────────────────────────────────────┤
+  │ Binaries (.dll, .so, .dylib, .wasm)  │ Yes                                                   │ .wasm exception for pre-built benchmark bins         │
+  ├──────────────────────────────────────┼───────────────────────────────────────────────────────┼──────────────────────────────────────────────────────┤
+  │ Node (node_modules/,                 │ Yes                                                   │                                                      │
+  │ package-lock.json)                   │                                                       │                                                      │
+  ├──────────────────────────────────────┼───────────────────────────────────────────────────────┼──────────────────────────────────────────────────────┤
+  │ C/C++ (.obj, .o, .a, .lib, .exe)     │ Yes                                                   │ Build scripts explicitly unignored                   │
+  ├──────────────────────────────────────┼───────────────────────────────────────────────────────┼──────────────────────────────────────────────────────┤
+  │ .NET (bin/Debug, bin/Release, obj/)  │ Yes                                                   │                                                      │
+  ├──────────────────────────────────────┼───────────────────────────────────────────────────────┼──────────────────────────────────────────────────────┤
+  │ Java (*.class, build/)               │ Yes                                                   │                                                      │
+  ├──────────────────────────────────────┼───────────────────────────────────────────────────────┼──────────────────────────────────────────────────────┤
+  │ PHP (vendor/, .phpunit.*)            │ Yes                                                   │ composer.lock tracked (correct for reproducible      │
+  │                                      │                                                       │ installs)                                            │
+  ├──────────────────────────────────────┼───────────────────────────────────────────────────────┼──────────────────────────────────────────────────────┤
+  │ Python (__pycache__/, .venv/)        │ Yes                                                   │                                                      │
+  ├──────────────────────────────────────┼───────────────────────────────────────────────────────┼──────────────────────────────────────────────────────┤
+  │ Secrets (.env, *.pem, *.key, *.crt)  │ Yes                                                   │                                                      │
+  ├──────────────────────────────────────┼───────────────────────────────────────────────────────┼──────────────────────────────────────────────────────┤
+  │ IDE (.idea/, .vscode/)               │ Yes                                                   │                                                      │
+  ├──────────────────────────────────────┼───────────────────────────────────────────────────────┼──────────────────────────────────────────────────────┤
+  │ Claude Code (.claude/)               │ Yes                                                   │                                                      │
+  ├──────────────────────────────────────┼───────────────────────────────────────────────────────┼──────────────────────────────────────────────────────┤
+  │ OS files (Thumbs.db, .DS_Store)      │ Yes                                                   │                                                      │
+  ├──────────────────────────────────────┼───────────────────────────────────────────────────────┼──────────────────────────────────────────────────────┤
+  │ Go (sdks/go/build/)                  │ Missing — but Go doesn't produce build/ by default,   │                                                      │
+  │                                      │ so fine                                               │                                                      │
+  └──────────────────────────────────────┴───────────────────────────────────────────────────────┴──────────────────────────────────────────────────────┘
+
+  No issues found. The gitignore is clean and complete for the project's tech stack.
+==================================
+
+ since, I would mention in readme later that, Aeon is developed using claude models, I think, .claude/ may be shared on github!!! thinking... Then, I
+would suggest to add .env.example, to mark any environment variables, as a reference, however they implement, either as .env file or environment variables
+injected throuygh CI/CD pipeline. Also, I would request to update publishing markdown document, installation document, document with cluster related
+details and all documentation overall, to reflect current situation.
+
+=========================================
+claude's response:
+
+Good thinking on all three. Let me first understand what's in .claude/ and what docs exist.
+
+
+ Good findings. Let me plan the approach:
+
+  1. .claude/: Remove blanket ignore, but keep settings.local.json ignored (machine-specific paths). The CLAUDE.md at root is already tracked.
+  2. .env.example: Already exists — needs cluster/benchmark vars added.
+  3. Docs: Need to read and update each to reflect current state (Phase 0, test counts, SDK status, etc.)
+
+  Let me start by reading the key docs to understand what needs updating.
+
+
 
 
