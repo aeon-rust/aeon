@@ -169,8 +169,7 @@ fn main() {
     let metrics = rt.block_on(async {
         let mut source = make_source(1024);
         let processor = PassthroughProcessor::new(Arc::from(SINK_TOPIC));
-        let sink_config =
-            KafkaSinkConfig::new(brokers(), SINK_TOPIC).with_config("linger.ms", "0"); // minimize delivery latency
+        let sink_config = KafkaSinkConfig::new(brokers(), SINK_TOPIC).with_config("linger.ms", "0"); // minimize delivery latency
         let mut sink = aeon_connectors::kafka::KafkaSink::new(sink_config).expect("sink");
         let metrics = PipelineMetrics::new();
         let shutdown = AtomicBool::new(false);
@@ -203,8 +202,7 @@ fn main() {
     let metrics = rt.block_on(async {
         let source = make_source(1024);
         let processor = PassthroughProcessor::new(Arc::from(SINK_TOPIC));
-        let sink_config =
-            KafkaSinkConfig::new(brokers(), SINK_TOPIC).with_config("linger.ms", "0");
+        let sink_config = KafkaSinkConfig::new(brokers(), SINK_TOPIC).with_config("linger.ms", "0");
         let sink = aeon_connectors::kafka::KafkaSink::new(sink_config).expect("sink");
 
         let config = PipelineConfig {

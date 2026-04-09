@@ -41,7 +41,10 @@ fn php_available() -> bool {
         return false;
     }
     let check = std::process::Command::new("php")
-        .args(["-r", "if (!function_exists('sodium_crypto_sign_seed_keypair')) exit(1);"])
+        .args([
+            "-r",
+            "if (!function_exists('sodium_crypto_sign_seed_keypair')) exit(1);",
+        ])
         .output();
     if check.map(|o| !o.status.success()).unwrap_or(true) {
         eprintln!("SKIP: PHP sodium extension not available");
@@ -118,7 +121,11 @@ async fn h6_php_native_cli() {
     let pub_key = identity.public_key.clone();
 
     let script = e2e_ws_harness::php_passthrough_script(
-        server.port, &seed_path, &pub_key, pipeline_name, "php-native",
+        server.port,
+        &seed_path,
+        &pub_key,
+        pipeline_name,
+        "php-native",
     );
     let script_path = std::env::temp_dir().join("aeon_e2e_h6_php.php");
     std::fs::write(&script_path, &script).expect("write php script");
@@ -130,20 +137,22 @@ async fn h6_php_native_cli() {
         .spawn()
         .expect("spawn php");
 
-    let connected = e2e_ws_harness::wait_for_connection(
-        &server, Duration::from_secs(10),
-    ).await;
+    let connected = e2e_ws_harness::wait_for_connection(&server, Duration::from_secs(10)).await;
     assert!(connected, "H6: PHP native CLI processor failed to connect");
 
     let events = make_test_events(MSG_COUNT);
-    let outputs = e2e_ws_harness::drive_events_through_transport(
-        &server.ws_host, events, 64,
-    ).await.unwrap();
+    let outputs = e2e_ws_harness::drive_events_through_transport(&server.ws_host, events, 64)
+        .await
+        .unwrap();
 
     assert_eq!(outputs.len(), MSG_COUNT, "H6 C1: event count mismatch");
     for (i, output) in outputs.iter().enumerate() {
         let expected = format!("h-payload-{i:05}");
-        assert_eq!(output.payload.as_ref(), expected.as_bytes(), "H6 C2: payload mismatch at {i}");
+        assert_eq!(
+            output.payload.as_ref(),
+            expected.as_bytes(),
+            "H6 C2: payload mismatch at {i}"
+        );
     }
 
     drop(server);

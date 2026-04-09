@@ -114,16 +114,11 @@ impl RedisSink {
 /// Build a pipeline of XADDs for a set of outputs. Shared by OrderedBatch and
 /// UnorderedBatch strategies — the only difference between those two is whether
 /// the pipeline is awaited inline or on a background task.
-fn build_pipeline(
-    stream_key: &str,
-    max_len: usize,
-    outputs: &[Output],
-) -> redis::Pipeline {
+fn build_pipeline(stream_key: &str, max_len: usize, outputs: &[Output]) -> redis::Pipeline {
     let mut pipe = redis::pipe();
     for output in outputs {
         let payload_str = String::from_utf8_lossy(output.payload.as_ref()).into_owned();
-        let mut fields: Vec<(String, String)> =
-            Vec::with_capacity(1 + output.headers.len());
+        let mut fields: Vec<(String, String)> = Vec::with_capacity(1 + output.headers.len());
         fields.push(("data".to_string(), payload_str));
         for (k, v) in &output.headers {
             fields.push((k.to_string(), v.to_string()));
@@ -191,11 +186,7 @@ impl Sink for RedisSink {
             DeliveryStrategy::OrderedBatch => {
                 // Single pipelined round-trip. Redis is single-threaded and
                 // executes pipelined commands in order, so ordering is preserved.
-                let pipe = build_pipeline(
-                    &self.config.stream_key,
-                    self.config.max_len,
-                    &outputs,
-                );
+                let pipe = build_pipeline(&self.config.stream_key, self.config.max_len, &outputs);
                 let _: Vec<String> = pipe.query_async(&mut self.conn).await.map_err(|e| {
                     AeonError::connection(format!("redis XADD pipeline failed: {e}"))
                 })?;
@@ -209,11 +200,7 @@ impl Sink for RedisSink {
                 // internally multiplexes concurrent commands onto the same
                 // TCP connection, so spawning many concurrent tasks is safe.
                 // `flush()` awaits all stashed tasks and credits their outputs.
-                let pipe = build_pipeline(
-                    &self.config.stream_key,
-                    self.config.max_len,
-                    &outputs,
-                );
+                let pipe = build_pipeline(&self.config.stream_key, self.config.max_len, &outputs);
                 let mut conn = self.conn.clone();
                 let handle = tokio::spawn(async move {
                     let _: Vec<String> = pipe.query_async(&mut conn).await.map_err(|e| {
@@ -234,9 +221,9 @@ impl Sink for RedisSink {
         }
         let tasks = std::mem::take(&mut self.pending_tasks);
         for handle in tasks {
-            handle
-                .await
-                .map_err(|e| AeonError::connection(format!("redis sink task join failed: {e}")))??;
+            handle.await.map_err(|e| {
+                AeonError::connection(format!("redis sink task join failed: {e}"))
+            })??;
         }
         self.delivered += self.pending;
         self.pending = 0;

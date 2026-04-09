@@ -66,7 +66,11 @@ async fn b1_file_rust_native_t1() {
     // Criterion 2: Payload integrity — read output file and compare
     let output_content = std::fs::read_to_string(&output_path).unwrap();
     let output_lines: Vec<&str> = output_content.lines().collect();
-    assert_eq!(output_lines.len(), msg_count, "C1: all lines written to output file");
+    assert_eq!(
+        output_lines.len(),
+        msg_count,
+        "C1: all lines written to output file"
+    );
 
     for (i, line) in output_lines.iter().enumerate() {
         assert_eq!(
@@ -121,16 +125,25 @@ async fn b1_file_rust_native_t1_large() {
 #[tokio::test]
 async fn b2_file_c_native_t1() {
     let dll_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent().unwrap().parent().unwrap()
-        .join("sdks").join("c").join("build").join("passthrough_processor.dll");
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("sdks")
+        .join("c")
+        .join("build")
+        .join("passthrough_processor.dll");
 
     if !dll_path.exists() {
-        eprintln!("SKIP B2: C passthrough DLL not found at {}", dll_path.display());
+        eprintln!(
+            "SKIP B2: C passthrough DLL not found at {}",
+            dll_path.display()
+        );
         return;
     }
 
-    let processor = aeon_engine::NativeProcessor::load(&dll_path, b"")
-        .expect("load C passthrough processor");
+    let processor =
+        aeon_engine::NativeProcessor::load(&dll_path, b"").expect("load C passthrough processor");
 
     let input_dir = tempfile::tempdir().unwrap();
     let input_path = input_dir.path().join("input.txt");
@@ -157,14 +170,26 @@ async fn b2_file_c_native_t1() {
         .await
         .unwrap();
 
-    assert_eq!(metrics.events_received.load(Ordering::Relaxed), msg_count as u64, "C1: events received");
-    assert_eq!(metrics.outputs_sent.load(Ordering::Relaxed), msg_count as u64, "C1: outputs sent");
+    assert_eq!(
+        metrics.events_received.load(Ordering::Relaxed),
+        msg_count as u64,
+        "C1: events received"
+    );
+    assert_eq!(
+        metrics.outputs_sent.load(Ordering::Relaxed),
+        msg_count as u64,
+        "C1: outputs sent"
+    );
 
     let output_content = std::fs::read_to_string(&output_path).unwrap();
     let output_lines: Vec<&str> = output_content.lines().collect();
     assert_eq!(output_lines.len(), msg_count, "C1: all lines in output");
     for (i, line) in output_lines.iter().enumerate() {
-        assert_eq!(*line, format!("payload-{i:05}"), "C2: payload mismatch at {i}");
+        assert_eq!(
+            *line,
+            format!("payload-{i:05}"),
+            "C2: payload mismatch at {i}"
+        );
     }
 }
 
@@ -208,7 +233,13 @@ async fn b3_file_python_ws_t4() {
     let pub_key = identity.public_key.clone();
 
     // Reuse the same inline Python script pattern as A8
-    let script = crate::e2e_ws_harness::python_passthrough_script(port, &seed_path, &pub_key, pipeline_name, "python-proc");
+    let script = crate::e2e_ws_harness::python_passthrough_script(
+        port,
+        &seed_path,
+        &pub_key,
+        pipeline_name,
+        "python-proc",
+    );
     let script_path = std::env::temp_dir().join("aeon_e2e_b3_python.py");
     std::fs::write(&script_path, &script).expect("write python script");
 
@@ -219,9 +250,8 @@ async fn b3_file_python_ws_t4() {
         .spawn()
         .expect("spawn python");
 
-    let connected = e2e_ws_harness::wait_for_connection(
-        &server, std::time::Duration::from_secs(10),
-    ).await;
+    let connected =
+        e2e_ws_harness::wait_for_connection(&server, std::time::Duration::from_secs(10)).await;
     assert!(connected, "B3: Python processor failed to connect");
 
     // Read events from file source, drive through WS, collect outputs
@@ -253,7 +283,11 @@ async fn b3_file_python_ws_t4() {
     let output_lines: Vec<&str> = output_content.lines().collect();
     assert_eq!(output_lines.len(), msg_count, "B3 C1: event count mismatch");
     for (i, line) in output_lines.iter().enumerate() {
-        assert_eq!(*line, format!("b3-payload-{i:05}"), "B3 C2: payload mismatch at {i}");
+        assert_eq!(
+            *line,
+            format!("b3-payload-{i:05}"),
+            "B3 C2: payload mismatch at {i}"
+        );
     }
 
     drop(server);
@@ -275,7 +309,10 @@ async fn b4_file_nodejs_ws_t4() {
         return;
     }
     let check = std::process::Command::new("node")
-        .args(["-e", "const v=parseInt(process.versions.node);if(v<22){process.exit(1)}"])
+        .args([
+            "-e",
+            "const v=parseInt(process.versions.node);if(v<22){process.exit(1)}",
+        ])
         .output();
     if check.map(|o| !o.status.success()).unwrap_or(true) {
         eprintln!("SKIP B4: Node.js 22+ required");
@@ -300,7 +337,13 @@ async fn b4_file_nodejs_ws_t4() {
     let seed_path = seed_file.to_string_lossy().to_string().replace('\\', "/");
     let pub_key = identity.public_key.clone();
 
-    let script = crate::e2e_ws_harness::nodejs_passthrough_script(port, &seed_path, &pub_key, pipeline_name, "nodejs-proc");
+    let script = crate::e2e_ws_harness::nodejs_passthrough_script(
+        port,
+        &seed_path,
+        &pub_key,
+        pipeline_name,
+        "nodejs-proc",
+    );
     let script_path = std::env::temp_dir().join("aeon_e2e_b4_nodejs.js");
     std::fs::write(&script_path, &script).expect("write nodejs script");
 
@@ -311,9 +354,8 @@ async fn b4_file_nodejs_ws_t4() {
         .spawn()
         .expect("spawn node");
 
-    let connected = e2e_ws_harness::wait_for_connection(
-        &server, std::time::Duration::from_secs(10),
-    ).await;
+    let connected =
+        e2e_ws_harness::wait_for_connection(&server, std::time::Duration::from_secs(10)).await;
     assert!(connected, "B4: Node.js processor failed to connect");
 
     let source_config = FileSourceConfig::new(&input_path)
@@ -342,7 +384,11 @@ async fn b4_file_nodejs_ws_t4() {
     let output_lines: Vec<&str> = output_content.lines().collect();
     assert_eq!(output_lines.len(), msg_count, "B4 C1: event count mismatch");
     for (i, line) in output_lines.iter().enumerate() {
-        assert_eq!(*line, format!("b4-payload-{i:05}"), "B4 C2: payload mismatch at {i}");
+        assert_eq!(
+            *line,
+            format!("b4-payload-{i:05}"),
+            "B4 C2: payload mismatch at {i}"
+        );
     }
 
     drop(server);

@@ -24,8 +24,8 @@
 //! Requires: Redpanda at localhost:19092.
 //! Run: cargo bench -p aeon-engine --bench gate1_steady_state
 
-use aeon_connectors::kafka::{KafkaSinkConfig, KafkaSource, KafkaSourceConfig};
 use aeon_connectors::BlackholeSink;
+use aeon_connectors::kafka::{KafkaSinkConfig, KafkaSource, KafkaSourceConfig};
 use aeon_engine::{PassthroughProcessor, PipelineConfig, PipelineMetrics, run_buffered};
 use aeon_observability::LatencyHistogram;
 use aeon_types::{AeonError, DeliveryStrategy, Event, Output, Processor};
@@ -33,8 +33,8 @@ use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
 use rdkafka::client::DefaultClientContext;
 use rdkafka::config::ClientConfig;
 use rdkafka::producer::{BaseProducer, BaseRecord, Producer};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Processor wrapper that records end-to-end latency (source read → process time).
@@ -444,13 +444,9 @@ fn main() {
     println!("  Events produced:   {total_produced}");
     println!("  Events received:   {received}");
     println!("  Outputs sent:      {sent}");
-    println!(
-        "  Effective rate:    {effective_rate:.0} events/sec (target {target_rate})"
-    );
+    println!("  Effective rate:    {effective_rate:.0} events/sec (target {target_rate})");
 
-    println!(
-        "\n  Latency Histogram ({count} observations in measurement window):"
-    );
+    println!("\n  Latency Histogram ({count} observations in measurement window):");
     println!("    Mean:  {mean:.1}µs ({:.3}ms)", mean / 1000.0);
     println!("    P50:   {p50}µs ({:.3}ms)", p50 as f64 / 1000.0);
     println!("    P95:   {p95}µs ({:.3}ms)", p95 as f64 / 1000.0);
@@ -489,7 +485,11 @@ fn main() {
     );
     println!(
         "║  Rate Sustained: {total_produced}/{target_rate}  {}                    ║",
-        if rate_achieved { "✅ PASS" } else { "⚠ PARTIAL" }
+        if rate_achieved {
+            "✅ PASS"
+        } else {
+            "⚠ PARTIAL"
+        }
     );
     println!("╠══════════════════════════════════════════════════════════╣");
 

@@ -12,11 +12,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aeon_engine::identity_store::ProcessorIdentityStore;
+use aeon_engine::pipeline_manager::PipelineManager;
+use aeon_engine::registry::ProcessorRegistry;
 use aeon_engine::rest_api::{AppState, api_router};
 use aeon_engine::transport::session::PipelineResolver;
 use aeon_engine::transport::websocket_host::{WebSocketHostConfig, WebSocketProcessorHost};
-use aeon_engine::pipeline_manager::PipelineManager;
-use aeon_engine::registry::ProcessorRegistry;
 use aeon_types::awpp::PipelineAssignment;
 use aeon_types::error::AeonError;
 use aeon_types::event::{Event, Output};
@@ -288,7 +288,10 @@ pub async fn run_sdk_t4_test(
     // Build args with connection info
     let port = server.port;
     let env_vars = vec![
-        ("AEON_WS_URL", format!("ws://127.0.0.1:{port}/api/v1/processors/connect")),
+        (
+            "AEON_WS_URL",
+            format!("ws://127.0.0.1:{port}/api/v1/processors/connect"),
+        ),
         ("AEON_PIPELINE", pipeline_name.to_string()),
         ("AEON_PROCESSOR_NAME", processor_name.to_string()),
         ("AEON_KEY_FILE", seed_file.to_string_lossy().to_string()),
@@ -304,13 +307,13 @@ pub async fn run_sdk_t4_test(
     if !connected {
         // Read stderr for diagnostics
         let _ = child.kill();
-        let output = child.wait_with_output().unwrap_or_else(|_| {
-            std::process::Output {
+        let output = child
+            .wait_with_output()
+            .unwrap_or_else(|_| std::process::Output {
                 status: std::process::ExitStatus::default(),
                 stdout: vec![],
                 stderr: b"(could not read output)".to_vec(),
-            }
-        });
+            });
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!(
             "{test_name}: SDK process failed to connect within 10s.\nstderr: {stderr}"
@@ -356,7 +359,8 @@ pub fn python_passthrough_script(
     pipeline_name: &str,
     processor_name: &str,
 ) -> String {
-    format!(r#"
+    format!(
+        r#"
 import asyncio, json, struct, zlib, base64, sys, traceback
 from nacl.signing import SigningKey
 
@@ -428,7 +432,8 @@ async def main():
                 print(f"ERROR: {{e}}", file=sys.stderr); traceback.print_exc(file=sys.stderr); break
 
 asyncio.run(main())
-"#)
+"#
+    )
 }
 
 /// Generate inline Node.js passthrough processor script.
@@ -440,7 +445,8 @@ pub fn nodejs_passthrough_script(
     pipeline_name: &str,
     processor_name: &str,
 ) -> String {
-    format!(r#"
+    format!(
+        r#"
 const fs = require('fs');
 const crypto = require('crypto');
 const zlib = require('zlib');
@@ -506,7 +512,8 @@ ws.onmessage = (evt) => {{
 }};
 ws.onerror = (e) => {{ console.error('WS error:', e.message); process.exit(1); }};
 ws.onclose = () => {{ process.exit(0); }};
-"#)
+"#
+    )
 }
 
 /// Generate a Go passthrough processor project in a temp directory.
@@ -525,19 +532,25 @@ pub fn go_passthrough_project(
 
     // Find the absolute path to sdks/go
     let sdk_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent().unwrap().parent().unwrap()
-        .join("sdks").join("go");
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("sdks")
+        .join("go");
     let sdk_path_str = sdk_path.to_string_lossy().replace('\\', "/");
 
     // go.mod
-    let go_mod = format!(r#"module aeon-e2e-go-test
+    let go_mod = format!(
+        r#"module aeon-e2e-go-test
 
 go 1.21
 
 require github.com/aeon-rust/aeon/sdks/go v0.0.0
 
 replace github.com/aeon-rust/aeon/sdks/go => {sdk_path_str}
-"#);
+"#
+    );
     std::fs::write(tmp_dir.join("go.mod"), &go_mod).expect("write go.mod");
 
     // Fix: seed_path on Windows may have backslashes
@@ -547,7 +560,8 @@ replace github.com/aeon-rust/aeon/sdks/go => {sdk_path_str}
     // The SDK signs []byte(nonce) (hex string) but engine expects signing hex-decoded bytes.
     // So we use the SDK directly but patch the signing by using a custom main that does
     // the handshake correctly.
-    let main_go = format!(r#"package main
+    let main_go = format!(
+        r#"package main
 
 import (
 	"context"
@@ -701,7 +715,8 @@ func main() {{
 		conn.WriteMessage(websocket.BinaryMessage, frame)
 	}}
 }}
-"#);
+"#
+    );
 
     std::fs::write(tmp_dir.join("main.go"), &main_go).expect("write main.go");
 
@@ -709,11 +724,21 @@ func main() {{
     let output = std::process::Command::new("go")
         .args(["mod", "tidy"])
         .current_dir(&tmp_dir)
-        .env("PATH", format!("{};{}", "C:\\Program Files\\Go\\bin", std::env::var("PATH").unwrap_or_default()))
+        .env(
+            "PATH",
+            format!(
+                "{};{}",
+                "C:\\Program Files\\Go\\bin",
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
         .output()
         .expect("go mod tidy");
     if !output.status.success() {
-        eprintln!("go mod tidy stderr: {}", String::from_utf8_lossy(&output.stderr));
+        eprintln!(
+            "go mod tidy stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     tmp_dir
@@ -741,7 +766,11 @@ pub fn dotnet_passthrough_project(
         .current_dir(&tmp_dir)
         .output()
         .expect("dotnet new console");
-    assert!(output.status.success(), "dotnet new console failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "dotnet new console failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     // Add NuGet packages for ED25519 and CRC32
     let output = std::process::Command::new("dotnet")
@@ -749,16 +778,25 @@ pub fn dotnet_passthrough_project(
         .current_dir(&tmp_dir)
         .output()
         .expect("dotnet add package NSec");
-    assert!(output.status.success(), "dotnet add NSec failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "dotnet add NSec failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let output = std::process::Command::new("dotnet")
         .args(["add", "package", "System.IO.Hashing"])
         .current_dir(&tmp_dir)
         .output()
         .expect("dotnet add package Hashing");
-    assert!(output.status.success(), "dotnet add Hashing failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "dotnet add Hashing failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
-    let program_cs = format!(r#"
+    let program_cs = format!(
+        r#"
 using System;
 using System.Buffers.Binary;
 using System.IO;
@@ -872,7 +910,8 @@ static async Task ProcessFrame(byte[] raw, bool batchSigning, SignatureAlgorithm
     frame.Write(sigBytes);
     await ws.SendAsync(frame.ToArray(), WebSocketMessageType.Binary, true, default);
 }}
-"#);
+"#
+    );
 
     std::fs::write(tmp_dir.join("Program.cs"), &program_cs).expect("write Program.cs");
 
@@ -883,7 +922,10 @@ static async Task ProcessFrame(byte[] raw, bool batchSigning, SignatureAlgorithm
         .output()
         .expect("dotnet restore");
     if !output.status.success() {
-        eprintln!("dotnet restore stderr: {}", String::from_utf8_lossy(&output.stderr));
+        eprintln!(
+            "dotnet restore stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     tmp_dir
@@ -908,7 +950,8 @@ pub fn java_passthrough_project(
     // Java 17 has EdDSA support via java.security and built-in WebSocket via java.net.http
     // But java.net.http.WebSocket is complex. Use a simpler approach with raw socket + HTTP upgrade.
     // Actually, Java 15+ has EdDSA, Java 11+ has HttpClient with WebSocket.
-    let java_src = format!(r#"
+    let java_src = format!(
+        r#"
 import java.io.*;
 import java.net.*;
 import java.net.http.*;
@@ -1163,7 +1206,8 @@ public class AeonProcessor implements WebSocket.Listener {{
         proc.done.get();
     }}
 }}
-"#);
+"#
+    );
 
     std::fs::write(tmp_dir.join("AeonProcessor.java"), &java_src).expect("write Java source");
     tmp_dir
@@ -1180,7 +1224,8 @@ pub fn php_passthrough_script(
     processor_name: &str,
 ) -> String {
     let seed_path_fixed = seed_path.replace('\\', "/");
-    format!(r#"<?php
+    format!(
+        r#"<?php
 // Minimal AWPP T4 WebSocket processor in pure PHP (sodium + stream_socket_client)
 $seed = file_get_contents('{seed_path_fixed}');
 $kp = sodium_crypto_sign_seed_keypair($seed);
@@ -1310,5 +1355,6 @@ while (true) {{
     ws_send($ws, 2, $frame);
 }}
 fclose($ws);
-"#)
+"#
+    )
 }

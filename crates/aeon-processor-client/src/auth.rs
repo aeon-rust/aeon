@@ -56,11 +56,8 @@ mod tests {
 
         assert!(formatted.starts_with("ed25519:"));
         let b64 = &formatted["ed25519:".len()..];
-        let decoded = base64::Engine::decode(
-            &base64::engine::general_purpose::STANDARD,
-            b64,
-        )
-        .unwrap();
+        let decoded =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64).unwrap();
         assert_eq!(decoded.len(), 32);
         assert_eq!(decoded, pk.as_bytes());
     }

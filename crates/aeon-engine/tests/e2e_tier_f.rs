@@ -87,9 +87,7 @@ async fn f6_websocket_rust_net_t4() {
     let msg_count = 100;
 
     // === 1. Create WS server that SENDS events (for WebSocketSource) ===
-    let source_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap();
+    let source_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let source_addr = source_listener.local_addr().unwrap();
 
     let source_server_handle = tokio::spawn(async move {
@@ -108,9 +106,7 @@ async fn f6_websocket_rust_net_t4() {
     });
 
     // === 2. Create WS server that RECEIVES outputs (for WebSocketSink) ===
-    let sink_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap();
+    let sink_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let sink_addr = sink_listener.local_addr().unwrap();
 
     let sink_collected = Arc::new(tokio::sync::Mutex::new(Vec::<Vec<u8>>::new()));

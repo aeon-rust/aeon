@@ -5,13 +5,13 @@
 //! Requires: Redpanda at localhost:19092 with topic aeon-bench-source pre-populated.
 //! Run: cargo bench -p aeon-engine --bench kafka_source_isolation
 
-use aeon_connectors::kafka::{KafkaSource, KafkaSourceConfig};
 use aeon_connectors::BlackholeSink;
+use aeon_connectors::kafka::{KafkaSource, KafkaSourceConfig};
 use aeon_engine::{PassthroughProcessor, PipelineConfig, PipelineMetrics, run, run_buffered};
 use rdkafka::config::ClientConfig;
 use rdkafka::producer::{BaseProducer, BaseRecord, Producer};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 fn brokers() -> String {

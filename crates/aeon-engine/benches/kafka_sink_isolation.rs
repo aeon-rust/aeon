@@ -81,9 +81,7 @@ fn main() {
 
         let t = Instant::now();
         for chunk in outputs.chunks(batch_size) {
-            sink.write_batch(chunk.to_vec())
-                .await
-                .expect("write_batch");
+            sink.write_batch(chunk.to_vec()).await.expect("write_batch");
         }
         sink.flush().await.expect("flush");
         let elapsed = t.elapsed();
@@ -104,9 +102,7 @@ fn main() {
 
         let t = Instant::now();
         for chunk in outputs.chunks(batch_size) {
-            sink.write_batch(chunk.to_vec())
-                .await
-                .expect("write_batch");
+            sink.write_batch(chunk.to_vec()).await.expect("write_batch");
         }
         sink.flush().await.expect("flush");
         let elapsed = t.elapsed();
@@ -127,9 +123,7 @@ fn main() {
 
         let t = Instant::now();
         for chunk in outputs.chunks(batch_size) {
-            sink.write_batch(chunk.to_vec())
-                .await
-                .expect("write_batch");
+            sink.write_batch(chunk.to_vec()).await.expect("write_batch");
         }
         sink.flush().await.expect("flush");
         let elapsed = t.elapsed();
@@ -178,9 +172,7 @@ fn main() {
             producer.poll(Duration::ZERO);
         }
     }
-    producer
-        .flush(Duration::from_secs(30))
-        .expect("flush");
+    producer.flush(Duration::from_secs(30)).expect("flush");
     let elapsed = t.elapsed();
     println!(
         "  {event_count} events in {elapsed:.2?} → {:.0} events/sec ({:.0}ns/event)",

@@ -15,8 +15,8 @@ use aeon_observability::LatencyHistogram;
 use aeon_types::{AeonError, Event, Output, Processor};
 use rdkafka::config::ClientConfig;
 use rdkafka::producer::{BaseProducer, BaseRecord, Producer};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use sysinfo::{Pid, System};
 
@@ -200,8 +200,7 @@ fn main() {
         let source = make_source(1024);
         let base_processor = PassthroughProcessor::new(Arc::from(SINK_TOPIC));
         let processor = LatencyMeasuringProcessor::new(base_processor, Arc::clone(&hist));
-        let sink_config =
-            KafkaSinkConfig::new(brokers(), SINK_TOPIC).with_config("linger.ms", "0");
+        let sink_config = KafkaSinkConfig::new(brokers(), SINK_TOPIC).with_config("linger.ms", "0");
         let sink = aeon_connectors::kafka::KafkaSink::new(sink_config).expect("sink");
 
         // Buffered pipeline with SPSC ring buffers — source/processor/sink run concurrently.
@@ -274,9 +273,7 @@ fn main() {
     let avg_cpu_pct_of_system = avg_cpu_total / num_cpus as f64;
 
     println!("\n  CPU Usage ({num_samples} samples over {elapsed:.1?}):");
-    println!(
-        "    Raw total:  {avg_cpu_total:.1}% (sum across {num_cpus} logical cores)"
-    );
+    println!("    Raw total:  {avg_cpu_total:.1}% (sum across {num_cpus} logical cores)");
     println!("    Per-system: {avg_cpu_pct_of_system:.1}% (of total system capacity)");
 
     // ── Gate 1 Verdict ──
@@ -303,9 +300,7 @@ fn main() {
         "║  Zero Loss:    {sent}/{received}             {}       ║",
         if loss_pass { "✅ PASS" } else { "❌ FAIL" }
     );
-    println!(
-        "║  Throughput:   {throughput:.0} events/sec                    ║"
-    );
+    println!("║  Throughput:   {throughput:.0} events/sec                    ║");
     println!("╠══════════════════════════════════════════════════════════╣");
 
     if p99_pass && cpu_pass && loss_pass {
