@@ -1358,3 +1358,212 @@ fclose($ws);
 "#
     )
 }
+
+// ── Composer helpers for PHP async adapter tests ───────────────────────
+
+/// Resolve a Composer invocation usable for `<prefix> install|require ...`.
+/// Tries, in order:
+/// 1. `AEON_COMPOSER` env var (path to composer.phar, invoked via `php`)
+/// 2. `composer` / `composer.bat` on PATH
+/// 3. `$HOME/.local/bin/composer` or `%USERPROFILE%\.local\bin\composer` (phar)
+pub fn composer_command() -> Option<Vec<String>> {
+    // 1. Explicit override via env var
+    if let Ok(path) = std::env::var("AEON_COMPOSER") {
+        if std::path::Path::new(&path).exists() {
+            return Some(vec!["php".to_string(), path]);
+        }
+    }
+    // 2. Native `composer` on PATH
+    let native = if cfg!(windows) {
+        "composer.bat"
+    } else {
+        "composer"
+    };
+    let probe = std::process::Command::new(native)
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if probe {
+        return Some(vec![native.to_string()]);
+    }
+    // 3. User-local phar install
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok()?;
+    let phar = std::path::Path::new(&home).join(".local").join("bin").join("composer");
+    if phar.exists() {
+        return Some(vec!["php".to_string(), phar.to_string_lossy().to_string()]);
+    }
+    None
+}
+
+/// Returns true if Composer can be invoked in some form on this machine.
+pub fn composer_available() -> bool {
+    composer_command().is_some()
+}
+
+/// Create (or reuse) a Composer project with the given packages.
+/// `project_name` is used as a stable subdirectory under the temp dir so
+/// repeated test runs can skip the download step once vendor/ is in place.
+/// Each package is `name:constraint`, e.g. `react/event-loop:^1.5`.
+/// Returns the project directory (containing `vendor/autoload.php`) or None
+/// if Composer is unavailable or the install failed.
+pub fn setup_composer_project(project_name: &str, packages: &[&str]) -> Option<std::path::PathBuf> {
+    let prefix = composer_command()?;
+    let dir = std::env::temp_dir().join(format!("aeon-e2e-{project_name}"));
+    let autoload = dir.join("vendor").join("autoload.php");
+    if autoload.exists() {
+        return Some(dir);
+    }
+    let _ = std::fs::create_dir_all(&dir);
+
+    // Write a minimal composer.json
+    let deps: Vec<String> = packages
+        .iter()
+        .map(|p| {
+            let mut parts = p.splitn(2, ':');
+            let name = parts.next().unwrap_or("");
+            let constraint = parts.next().unwrap_or("*");
+            format!("    \"{name}\": \"{constraint}\"")
+        })
+        .collect();
+    let composer_json = format!(
+        "{{\n  \"require\": {{\n{}\n  }},\n  \"config\": {{ \"preferred-install\": \"dist\" }}\n}}\n",
+        deps.join(",\n")
+    );
+    if std::fs::write(dir.join("composer.json"), composer_json).is_err() {
+        return None;
+    }
+
+    let mut cmd = std::process::Command::new(&prefix[0]);
+    for arg in &prefix[1..] {
+        cmd.arg(arg);
+    }
+    cmd.arg("install")
+        .arg("--no-interaction")
+        .arg("--no-progress")
+        .arg("--quiet")
+        .current_dir(&dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    let output = cmd.output().ok()?;
+    if !output.status.success() {
+        eprintln!(
+            "composer install failed for {project_name}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return None;
+    }
+    if !autoload.exists() {
+        return None;
+    }
+    Some(dir)
+}
+
+/// Generate a ReactPHP + Ratchet/Pawl AWPP T4 processor script.
+/// Requires a Composer project with `react/event-loop` + `ratchet/pawl`.
+/// `vendor_autoload` must be the absolute path to `vendor/autoload.php`.
+pub fn php_reactphp_passthrough_script(
+    port: u16,
+    seed_path: &str,
+    _pub_key: &str,
+    pipeline_name: &str,
+    processor_name: &str,
+    vendor_autoload: &str,
+) -> String {
+    let seed_path_fixed = seed_path.replace('\\', "/");
+    let autoload_fixed = vendor_autoload.replace('\\', "/");
+    format!(
+        r#"<?php
+// H2: ReactPHP event loop + Ratchet/Pawl WebSocket client — AWPP T4 processor
+require '{autoload_fixed}';
+
+use Ratchet\Client\Connector;
+use React\EventLoop\Loop;
+use Ratchet\RFC6455\Messaging\Frame;
+use Ratchet\RFC6455\Messaging\MessageInterface;
+
+$seed = file_get_contents('{seed_path_fixed}');
+$kp = sodium_crypto_sign_seed_keypair($seed);
+$sk = sodium_crypto_sign_secretkey($kp);
+$pk = sodium_crypto_sign_publickey($kp);
+$pubKeyStr = "ed25519:" . base64_encode($pk);
+
+$loop = Loop::get();
+$connector = new Connector($loop);
+$batchSigning = true;
+
+$connector('ws://127.0.0.1:{port}/api/v1/processors/connect', [], [])->then(
+    function ($conn) use ($sk, $pubKeyStr, &$batchSigning, $loop) {{
+        $conn->on('message', function (MessageInterface $msg) use ($conn, $sk, $pubKeyStr, &$batchSigning, $loop) {{
+            $data = (string)$msg;
+            if ($msg->isBinary()) {{
+                // Parse AWPP data frame
+                $nameLen = unpack('V', substr($data, 0, 4))[1];
+                $pipeline = substr($data, 4, $nameLen);
+                $partition = unpack('v', substr($data, 4 + $nameLen, 2))[1];
+                $bd = substr($data, 4 + $nameLen + 2);
+                $batchId = unpack('P', substr($bd, 0, 8))[1];
+                $eventCount = unpack('V', substr($bd, 8, 4))[1];
+                $off = 12;
+                $payloads = [];
+                for ($i = 0; $i < $eventCount; $i++) {{
+                    $eLen = unpack('V', substr($bd, $off, 4))[1]; $off += 4;
+                    $ev = json_decode(substr($bd, $off, $eLen), true); $off += $eLen;
+                    $payloads[] = $ev['payload'] ?? [];
+                }}
+                // Build passthrough response
+                $body = pack('P', $batchId) . pack('V', count($payloads));
+                foreach ($payloads as $p) {{
+                    $body .= pack('V', 1);
+                    $out = json_encode(['destination' => 'output', 'payload' => $p, 'headers' => []], JSON_UNESCAPED_SLASHES);
+                    $body .= pack('V', strlen($out)) . $out;
+                }}
+                $crc = pack('V', crc32($body));
+                $bwc = $body . $crc;
+                $sigBytes = $batchSigning ? sodium_crypto_sign_detached($bwc, $sk) : str_repeat("\0", 64);
+                $nameB = $pipeline;
+                $hdr = pack('V', strlen($nameB)) . $nameB . pack('v', $partition);
+                $frame = $hdr . $bwc . $sigBytes;
+                $conn->send(new Frame($frame, true, Frame::OP_BINARY));
+            }} else {{
+                // Text control frame
+                $ctrl = json_decode($data, true);
+                $type = $ctrl['type'] ?? '';
+                if ($type === 'challenge') {{
+                    $nonce = hex2bin($ctrl['nonce']);
+                    $sig = sodium_crypto_sign_detached($nonce, $sk);
+                    $register = json_encode([
+                        'type' => 'register', 'protocol' => 'awpp/1', 'transport' => 'websocket',
+                        'name' => '{processor_name}', 'version' => '1.0.0',
+                        'public_key' => $pubKeyStr, 'challenge_signature' => bin2hex($sig),
+                        'capabilities' => ['batch'], 'transport_codec' => 'json',
+                        'requested_pipelines' => ['{pipeline_name}'], 'binding' => 'dedicated',
+                    ]);
+                    $conn->send($register);
+                }} elseif ($type === 'accepted') {{
+                    $batchSigning = $ctrl['batch_signing'] ?? true;
+                }} elseif ($type === 'drain') {{
+                    $conn->close();
+                    $loop->stop();
+                }}
+            }}
+        }});
+        $conn->on('close', function ($code = null, $reason = null) use ($loop) {{
+            $loop->stop();
+        }});
+    }},
+    function ($e) use ($loop) {{
+        fwrite(STDERR, "pawl connect failed: " . $e->getMessage() . "\n");
+        $loop->stop();
+        exit(1);
+    }}
+);
+
+$loop->run();
+"#
+    )
+}

@@ -176,7 +176,7 @@ All use Memory -> PHP -> Memory, validating each adapter E2E.
 | # | Adapter | Status |
 |---|---------|--------|
 | H1 | Swoole / OpenSwoole (Laravel Octane) | ❌ |
-| H2 | RevoltPHP + ReactPHP (Ratchet) | ❌ |
+| H2 | RevoltPHP + ReactPHP (Ratchet) | ✅ |
 | H3 | RevoltPHP + AMPHP | ❌ |
 | H4 | Workerman | ❌ |
 | H5 | FrankenPHP / RoadRunner | ❌ |
@@ -231,8 +231,8 @@ Python / Node.js / .NET / Java / PHP / Go runtimes available.
 | E (Cross-connector, Python T4) | 9 | **9** | 0 | 0 | 24s |
 | F (External messaging) | 7 | **5** (F1, F3, F4, F5, F6) | 0 | **1** | ~5s |
 | G (CDC database sources) | 3 | 0 | 0 | **3** | — |
-| H (PHP adapter variants) | 6 | **1** (H6) | 0 | **5** | <1s |
-| **Total** | **63** | **47** | **1** | **14** | **~134s** |
+| H (PHP adapter variants) | 6 | **2** (H2, H6) | 0 | **4** | ~8s |
+| **Total** | **63** | **48** | **1** | **13** | **~142s** |
 
 **Bonus coverage (not in the plan, run in the same sweep):**
 - `redpanda_integration`: 3/3 passed in 17s (source, sink, E2E passthrough).
@@ -249,7 +249,7 @@ aspirational marks.
 
 ### Implementation debt captured
 
-14 stub tests remain. They fall into three natural groups:
+13 stub tests remain. They fall into three natural groups:
 
 1. **T3 WebTransport end-to-end (5)** — Tier D, all 5 SDKs need TLS cert
    provisioning + engine WebTransport host wiring. T3 *transport* is
@@ -266,10 +266,12 @@ aspirational marks.
    non-runtime-available tests skip gracefully when the SDK
    toolchain is absent — they become active the moment Go / Java /
    etc. is installed.
-3. **CDC + PHP adapters + C Wasm (8)** — Tier G1–G3 (Postgres/MySQL/
-   MongoDB CDC), Tier H1–H5 (Swoole/ReactPHP/AMPHP/Workerman/FrankenPHP),
+3. **CDC + PHP adapters + C Wasm (7)** — Tier G1–G3 (Postgres/MySQL/
+   MongoDB CDC), Tier H1/H3/H4/H5 (Swoole/AMPHP/Workerman/FrankenPHP),
    Tier A5 (C via wasi-sdk). All gated on optional runtime or toolchain
-   installation.
+   installation. H2 (ReactPHP + Ratchet/Pawl) landed as the first async
+   PHP adapter — the Composer helper in `e2e_ws_harness.rs` unblocks the
+   remaining H3/H4 tests on any box with a working PHP + Composer.
 
-None of these are Gate 1 blockers. All 47 runnable tests pass — the
+None of these are Gate 1 blockers. All 48 runnable tests pass — the
 entire Gate 1 money path (Tier C: 11 SDK × Kafka E2E) is green.

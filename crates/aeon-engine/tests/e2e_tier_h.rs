@@ -64,13 +64,95 @@ async fn h1_php_swoole() {
 }
 
 // ===========================================================================
-// H2: RevoltPHP + ReactPHP (Ratchet)
+// H2: ReactPHP event loop + Ratchet/Pawl WebSocket client
 // ===========================================================================
 
 #[tokio::test]
-#[ignore = "requires PHP 8.2+ with ReactPHP/Ratchet Composer packages"]
 async fn h2_php_revolt_reactphp() {
-    todo!("Implement with engine WS host + PHP RevoltPHP/Ratchet adapter");
+    if !php_available() {
+        return;
+    }
+    if !e2e_ws_harness::composer_available() {
+        eprintln!("SKIP H2: composer not available");
+        return;
+    }
+
+    // Install react/event-loop + ratchet/pawl into a cached project dir.
+    let project_dir = match e2e_ws_harness::setup_composer_project(
+        "h2-reactphp",
+        &["react/event-loop:^1.5", "ratchet/pawl:^0.4"],
+    ) {
+        Some(d) => d,
+        None => {
+            eprintln!("SKIP H2: composer install failed");
+            return;
+        }
+    };
+    let autoload = project_dir.join("vendor").join("autoload.php");
+    if !autoload.exists() {
+        eprintln!("SKIP H2: vendor/autoload.php missing after composer install");
+        return;
+    }
+
+    let pipeline_name = "h2-pipeline";
+    let server = e2e_ws_harness::start_ws_test_server(pipeline_name).await;
+    let identity = e2e_ws_harness::register_test_identity(&server, "php-reactphp");
+    let seed_file = e2e_ws_harness::write_seed_file(&identity);
+    let seed_path = seed_file.to_string_lossy().to_string();
+    let pub_key = identity.public_key.clone();
+
+    let script = e2e_ws_harness::php_reactphp_passthrough_script(
+        server.port,
+        &seed_path,
+        &pub_key,
+        pipeline_name,
+        "php-reactphp",
+        &autoload.to_string_lossy(),
+    );
+    let script_path = std::env::temp_dir().join("aeon_e2e_h2_reactphp.php");
+    std::fs::write(&script_path, &script).expect("write h2 script");
+
+    let mut child = std::process::Command::new("php")
+        .arg(&script_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn php (reactphp)");
+
+    let connected = e2e_ws_harness::wait_for_connection(&server, Duration::from_secs(15)).await;
+    if !connected {
+        let _ = child.kill();
+        let out = child.wait_with_output().ok();
+        let stderr = out
+            .as_ref()
+            .map(|o| String::from_utf8_lossy(&o.stderr).into_owned())
+            .unwrap_or_default();
+        drop(server);
+        let _ = std::fs::remove_file(&script_path);
+        let _ = std::fs::remove_file(&seed_file);
+        panic!("H2: ReactPHP processor failed to connect. stderr: {stderr}");
+    }
+
+    let events = make_test_events(MSG_COUNT);
+    let outputs = e2e_ws_harness::drive_events_through_transport(&server.ws_host, events, 64)
+        .await
+        .unwrap();
+
+    assert_eq!(outputs.len(), MSG_COUNT, "H2 C1: event count mismatch");
+    for (i, output) in outputs.iter().enumerate() {
+        let expected = format!("h-payload-{i:05}");
+        assert_eq!(
+            output.payload.as_ref(),
+            expected.as_bytes(),
+            "H2 C2: payload mismatch at {i}"
+        );
+    }
+
+    drop(server);
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_file(&script_path);
+    let _ = std::fs::remove_file(&seed_file);
 }
 
 // ===========================================================================
