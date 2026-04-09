@@ -856,7 +856,56 @@ Rolling binary upgrade: zero event loss during Aeon v1→v2 transition under loa
 
 ---
 
-## Current State (2026-04-09, connector audit closed + E2E re-sweep)
+## Current State (2026-04-10, Tier D D3 landed + msgpack SDK envelope fix)
+
+### Latest updates (2026-04-10)
+
+- **Tier D D3 (Rust Network T3 WebTransport) landed** — first full T3
+  WebTransport E2E acceptance proof: Memory source → engine
+  `WebTransportProcessorHost` → `aeon-processor-client` WT client →
+  Memory sink, 200 events through a partition-pinned data stream,
+  C1/C2/C3 criteria + graceful shutdown all verified. Requires
+  `--features webtransport-host`; the test harness binds a
+  `wtransport::Identity::self_signed(["localhost"])` cert on
+  `127.0.0.1:0` and the client trusts it via the
+  `aeon-processor-client` `webtransport-insecure` feature. See
+  `crates/aeon-engine/tests/e2e_wt_harness.rs` (new) and
+  `crates/aeon-engine/tests/e2e_tier_d.rs` D3. Commits: `263daf2`
+  (test + harness), `9a8e8e6` (docs flip).
+- **Processor client WT protocol rewrite** — `aeon-processor-client`'s
+  `run_webtransport*` was opening stream-per-batch while the engine's
+  `WebTransportProcessorHost` expected long-lived bi streams, causing
+  both sides to `accept_bi()` and deadlock. Rewrote the client to
+  match the server: `open_bi()` one bi stream per (pipeline,
+  partition) from the `Accepted` message, write the routing header
+  `[4B name_len LE][name][2B partition LE]`, then loop reading
+  length-prefixed batch requests and writing length-prefixed batch
+  responses — same `wire::decode_batch_request` /
+  `wire::encode_batch_response` helpers already used by the WS
+  client. Added `SharedProcessFn = Arc<dyn Fn + Send + Sync>` so the
+  closure can be cloned into per-stream tasks. Commit: `f8cf41f`.
+- **Also exposed** `WebTransportProcessorHost::local_addr()` for tests
+  binding to port `0` — captured from `endpoint.local_addr()` before
+  the endpoint moves into the accept loop.
+- **SDK envelope msgpack fix** — `aeon_processor_client::ProcessEvent.id`
+  was `String`, but the engine encodes `WireEvent.id: uuid::Uuid` via
+  `rmp_serde`, and `Uuid`'s serde impl branches on
+  `is_human_readable()` — 16-byte array in msgpack, string in JSON.
+  That meant the msgpack default codec was effectively broken for the
+  Rust processor-client SDK and every Rust-processor-client E2E test
+  (A10 / C8 / D3 / F6) was pinned to `.codec("json")` as a workaround.
+  Flipped `ProcessEvent.id` to `uuid::Uuid` and dropped all four json
+  pins. All four now run with the default `msgpack` codec (A10 2.16s,
+  C8 5.96s, D3 3.15s, F6 0.55s), which is the codec real production
+  processors will use. `cargo test -p aeon-processor-client
+  --all-features` green (17 unit + 1 doctest). Clippy clean. Commits:
+  `a019378` (fix), `e9a71d5` (docs).
+- **Tier D status**: 1/5 runnable (D3 ✅). D1 (Python), D2 (Go), D4
+  (Node.js), D5 (Java) remain `todo!()` stubs, each blocked on a
+  per-language WebTransport client in their respective SDKs — not
+  TLS provisioning or engine host wiring. See
+  `docs/E2E-TEST-PLAN.md` execution log for the updated Tier D row
+  and the totals (53 passed / 1 ignored / 8 stubs, ~145s).
 
 ### Latest updates (2026-04-09)
 
