@@ -50,9 +50,9 @@ decoupled (`UnorderedBatch`, flushed at interval).
 | Kafka | Pull | Bounded (offsets) | rdkafka prefetch | Implicit (offsets) | **Yes** | Production-grade |
 | HTTP Polling | Pull | Controlled interval | — | N/A | No | OK |
 | HTTP Webhook | Push | Unbounded | PushBuffer | **HTTP 503** | No | OK — best Phase 3 |
-| WebSocket | Push | Unbounded | PushBuffer | **drops msgs** | No | **BUG** — see §4.1 |
+| WebSocket | Push | Unbounded | PushBuffer | TCP window (blocking send) | No | OK (fixed §4.1) |
 | NATS JetStream | Pull | Bounded (consumer grp) | — | Implicit (ack) | Implicit | OK |
-| MQTT | Push | Unbounded | PushBuffer | Sleep-poll backoff | No | OK but see §4.2 |
+| MQTT | Push | Unbounded | PushBuffer | TCP window (blocking send) | No | OK (fixed §4.2) |
 | RabbitMQ | Push | Unbounded | PushBuffer | **nack + requeue** | No | OK — best-in-class |
 | Redis Streams | Pull | Bounded (pending) | — | Implicit (XACK) | Yes | OK |
 | Postgres CDC | Pull | Bounded (LSN) | — | Implicit | Yes | OK (polling, see §4.5) |
@@ -158,23 +158,30 @@ and backpressure reaches the peer via TCP window.
 **Test**: unit test that produces 2x channel capacity + 2x spill threshold events
 and asserts zero loss.
 
-### 4.2 — MQTT source sleeps instead of using protocol backoff
+### 4.2 — MQTT source sleep-then-continue — FIXED
 
-**Severity**: Low — the sleep-poll approach *does* backpressure, but is coarse.
-**Location**: `crates/aeon-connectors/src/mqtt/source.rs:132-136`.
+**Severity** was: Low — the sleep-poll approach *did* backpressure, but
+coarsely (100ms fixed sleep, no signal coupling to actual drain rate).
+**Location**: `crates/aeon-connectors/src/mqtt/source.rs::mqtt_reader`.
 
-**Current**: when overloaded, sleeps the event loop poll for 100ms. The broker
-will eventually pile up retained messages or, for QoS 1/2, stop delivering until
-we ack.
+**Previous behavior**: when `tx.is_overloaded()`, sleep 100ms and continue.
+This added 100ms latency spikes under pressure and was a fixed constant
+regardless of actual drain rate.
 
-**Better**: same as WebSocket — remove the `is_overloaded()` branch and let
-`tx.send(event).await` block. Not polling the `EventLoop` naturally pauses
-delivery because rumqttc's `EventLoop::poll` is where MQTT packet reception
-happens.
+**Fix (landed this pass)**: removed the `is_overloaded()` sleep branch
+entirely. `tx.send(event).await` already blocks when the push buffer is
+full, which suspends the reader task, which stops `EventLoop::poll()`,
+which stops draining rumqttc's internal receiver, which stops reading
+from the TCP socket. The OS receive window fills and the broker slows its
+delivery (QoS 0) or stops delivering pending messages until we catch up
+and ack (QoS 1/2). Same TCP-flow-control mechanism as the WebSocket source
+fix in §4.1.
 
-**Deferred** until the WebSocket fix is proven, because the MQTT fix is the
-same mechanism in a different connector and we want to validate the approach
-once before repeating it.
+**Regression test**: the existing
+`push_buffer::tests::test_push_buffer_zero_loss_under_backpressure` guards
+the invariant for all push sources that use `PushBufferTx::send` — MQTT,
+WebSocket, QUIC, WebTransport streams, HTTP Webhook, MongoDB CDC, and
+RabbitMQ all share the same blocking-send contract.
 
 ### 4.3 — MongoDB CDC has no resume token persistence
 
@@ -367,7 +374,18 @@ with file:line references for follow-up phases.
      path was trying to achieve, by not draining the tungstenite `read` loop.
    - Regression test: `push_buffer::tests::test_push_buffer_zero_loss_under_backpressure`.
 
-3. **§4.4 — RabbitMQ, Redis Streams sink strategies** — **DONE**.
+3. **§4.2 — MQTT source sleep-poll backoff** (mqtt/source.rs) — **DONE**.
+   - Removed the `is_overloaded()` + 100ms sleep branch from `mqtt_reader`.
+     Same mechanism as §4.1: blocking `tx.send(event).await` suspends
+     `EventLoop::poll()`, which stops draining the TCP socket, which tells
+     the broker to slow down (or stop, for QoS 1/2) via the OS receive
+     window.
+   - Regression coverage is the shared
+     `test_push_buffer_zero_loss_under_backpressure` — MQTT, WebSocket,
+     and every other push source rely on the same `PushBufferTx::send`
+     contract.
+
+4. **§4.4 — RabbitMQ, Redis Streams sink strategies** — **DONE**.
    - `rabbitmq/sink.rs`: all three strategies implemented via
      `pending_confirms: Vec<PublisherConfirm>` stashing and `join_all` at
      the batch boundary / flush boundary.
@@ -378,11 +396,10 @@ with file:line references for follow-up phases.
    - MQTT is documented as infeasible at the current rumqttc API level
      (see §4.4 body).
 
-Other gaps (§4.2 MQTT source backoff, §4.3 MongoDB CDC resume token,
-§4.5 Postgres/MySQL CDC streaming replication, §4.6 QUIC/WebTransport sink
-stream reuse, §5.3 T3/T4 pipeline adapter + BatchInflight bound) remain
-deferred as follow-up work with clear file:line references for the next
-phase.
+Other gaps (§4.3 MongoDB CDC resume token, §4.5 Postgres/MySQL CDC
+streaming replication, §4.6 QUIC/WebTransport sink stream reuse, §5.3
+T3/T4 pipeline adapter + BatchInflight bound) remain deferred as follow-up
+work with clear file:line references for the next phase.
 
 ---
 
@@ -390,9 +407,12 @@ phase.
 
 **Source side**: Pull-based connectors (Kafka, NATS JetStream, Redis Streams,
 CDCs) already propagate natural upstream backpressure via protocol offsets.
-Push-based connectors all use the shared three-phase `PushBuffer` and most
-of them do the right thing at Phase 3. WebSocket is the one outlier that
-drops instead of applying TCP flow control (fixable in this pass).
+Push-based connectors all use the shared three-phase `PushBuffer` and
+after this pass they all converge on the same correct pattern: blocking
+`PushBufferTx::send(event).await` cascades into protocol-native flow
+control (TCP window for WebSocket/MQTT/QUIC/WebTransport, HTTP 503 for
+Webhook, AMQP nack+requeue for RabbitMQ). No push source silently drops
+or sleeps any more.
 
 **Sink side**: File, Kafka, NATS, **RabbitMQ**, and **Redis Streams** are all
 fully strategy-aware and production-grade after this pass. MQTT cannot add

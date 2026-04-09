@@ -2,7 +2,15 @@
 //!
 //! Push-source: a background task reads from the MQTT EventLoop and pushes
 //! events into a PushBuffer. `next_batch()` drains the buffer.
-//! Phase 3 backpressure: when overloaded, pause the event loop polling.
+//!
+//! **Backpressure**: `PushBufferTx::send(event).await` blocks when the
+//! channel is full. Because the reader task is the only thing calling
+//! `EventLoop::poll()`, suspending on `tx.send` also suspends the poll loop
+//! — rumqttc stops reading from the broker's TCP socket, the OS receive
+//! window fills, and the broker naturally slows its delivery to us (or,
+//! for QoS 1/2, stops delivering until we catch up and ack). No messages
+//! are dropped. This is the same TCP-window-driven backpressure the
+//! WebSocket source relies on.
 
 use crate::push_buffer::{PushBufferConfig, PushBufferRx, push_buffer};
 use aeon_types::{AeonError, Event, PartitionId, Source};
@@ -129,12 +137,6 @@ async fn mqtt_reader(
     source_name: Arc<str>,
 ) {
     loop {
-        // Phase 3: if overloaded, back off before polling
-        if tx.is_overloaded() {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            continue;
-        }
-
         match eventloop.poll().await {
             Ok(rumqttc::Event::Incoming(rumqttc::Packet::Publish(publish))) => {
                 let payload = Bytes::from(publish.payload.to_vec());
@@ -150,6 +152,13 @@ async fn mqtt_reader(
                     .metadata
                     .push((Arc::from("mqtt.topic"), Arc::from(publish.topic.as_str())));
 
+                // tx.send blocks when the push buffer is full. Suspending
+                // the reader task stops `eventloop.poll()`, which stops
+                // draining rumqttc's internal receiver, which stops reading
+                // from the TCP socket — the OS receive window fills and the
+                // broker naturally slows delivery (for QoS 1/2, it stops
+                // delivering until we catch up and ack). Messages are never
+                // dropped.
                 if tx.send(event).await.is_err() {
                     break; // Buffer closed
                 }
