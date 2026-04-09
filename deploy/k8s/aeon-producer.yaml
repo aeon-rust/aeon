@@ -1,0 +1,45 @@
+# Aeon Producer — generates load for benchmarking
+# Runs as a Job: produces N events, then exits.
+#
+# Usage:
+#   kubectl apply -f deploy/k8s/aeon-producer.yaml
+#   kubectl -n aeon logs -f job/aeon-producer
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: aeon-producer
+  namespace: aeon
+  labels:
+    app: aeon-producer
+spec:
+  backoffLimit: 2
+  template:
+    metadata:
+      labels:
+        app: aeon-producer
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: producer
+          image: aeon:latest
+          imagePullPolicy: Never
+          command: ["aeon-producer"]
+          args:
+            - "--topic"
+            - "aeon-bench-source"
+            - "--brokers"
+            - "redpanda:9092"
+            - "--count"
+            - "1000000"
+            - "--rate"
+            - "0"
+            - "--payload-size"
+            - "128"
+          resources:
+            requests:
+              cpu: "500m"
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 256Mi

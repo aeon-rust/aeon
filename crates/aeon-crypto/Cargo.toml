@@ -1,0 +1,44 @@
+[package]
+name = "aeon-crypto"
+description = "Encryption, signing, and Merkle tree operations for Aeon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["auto-tls"]
+fips = []       # When enabled, restricts to FIPS 140-3 approved algorithms only
+auto-tls = ["rcgen", "hostname"]  # Enable auto-generated self-signed certificates
+
+[dependencies]
+aeon-types = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }
+
+# Cryptographic primitives
+sha2 = "0.10"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
+
+# Symmetric encryption (EtM: AES-256-CTR + HMAC-SHA-512)
+aes = "0.8"
+ctr = "0.9"
+hmac = "0.12"
+
+# Key safety
+zeroize = { version = "1", features = ["derive"] }
+
+# TLS/mTLS certificate management
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+rcgen = { workspace = true, optional = true }
+hostname = { version = "0.4", optional = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+rcgen = { workspace = true }
+
+[[bench]]
+name = "crypto_bench"
+harness = false

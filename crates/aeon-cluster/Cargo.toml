@@ -1,0 +1,44 @@
+[package]
+name = "aeon-cluster"
+description = "Raft consensus, PoH, and QUIC transport for Aeon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+cluster = [
+    "dep:openraft",
+    "dep:quinn",
+    "dep:rustls",
+    "dep:rustls-pemfile",
+    "dep:tokio",
+    "dep:dashmap",
+]
+encryption-at-rest = ["dep:aeon-crypto", "cluster"]
+
+[dependencies]
+aeon-types = { workspace = true }
+aeon-crypto = { workspace = true, optional = true }
+serde = { workspace = true }
+bincode = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+# Feature-gated cluster dependencies
+openraft = { workspace = true, optional = true }
+quinn = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+rustls-pemfile = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+dashmap = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+rcgen = { workspace = true }
+
+[[bench]]
+name = "cluster_bench"
+harness = false
+required-features = ["cluster"]

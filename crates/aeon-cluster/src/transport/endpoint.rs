@@ -1,0 +1,194 @@
+//! QUIC endpoint management with connection pooling.
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use aeon_types::AeonError;
+use dashmap::DashMap;
+use quinn::{ClientConfig, Connection, Endpoint, ServerConfig};
+
+use crate::types::{NodeAddress, NodeId};
+
+/// QUIC endpoint wrapping quinn::Endpoint with connection pooling.
+pub struct QuicEndpoint {
+    endpoint: Endpoint,
+    client_config: ClientConfig,
+    /// Pool of established connections by node ID.
+    connections: Arc<DashMap<NodeId, Connection>>,
+}
+
+impl QuicEndpoint {
+    /// Create a QUIC endpoint bound to the given address.
+    pub fn bind(
+        bind_addr: SocketAddr,
+        server_config: ServerConfig,
+        client_config: ClientConfig,
+    ) -> Result<Self, AeonError> {
+        let endpoint =
+            Endpoint::server(server_config, bind_addr).map_err(|e| AeonError::Connection {
+                message: format!("failed to bind QUIC endpoint on {bind_addr}: {e}"),
+                source: None,
+                retryable: false,
+            })?;
+
+        Ok(Self {
+            endpoint,
+            client_config,
+            connections: Arc::new(DashMap::new()),
+        })
+    }
+
+    /// Connect to a remote node, reusing existing connections.
+    pub async fn connect(
+        &self,
+        node_id: NodeId,
+        addr: &NodeAddress,
+    ) -> Result<Connection, AeonError> {
+        // Check pool first
+        if let Some(conn) = self.connections.get(&node_id) {
+            if conn.close_reason().is_none() {
+                return Ok(conn.clone());
+            }
+            // Connection is closed, remove it
+            drop(conn);
+            self.connections.remove(&node_id);
+        }
+
+        // Resolve hostname to socket address
+        let socket_addr = tokio::net::lookup_host(addr.to_string())
+            .await
+            .map_err(|e| AeonError::Connection {
+                message: format!("failed to resolve {addr}: {e}"),
+                source: None,
+                retryable: true,
+            })?
+            .next()
+            .ok_or_else(|| AeonError::Connection {
+                message: format!("no addresses found for {addr}"),
+                source: None,
+                retryable: false,
+            })?;
+
+        let connecting = self
+            .endpoint
+            .connect_with(self.client_config.clone(), socket_addr, &addr.host)
+            .map_err(|e| AeonError::Connection {
+                message: format!("failed to initiate QUIC connection to {addr}: {e}"),
+                source: None,
+                retryable: true,
+            })?;
+
+        let connection = connecting.await.map_err(|e| AeonError::Connection {
+            message: format!("QUIC handshake failed with {addr}: {e}"),
+            source: None,
+            retryable: true,
+        })?;
+
+        self.connections.insert(node_id, connection.clone());
+        tracing::debug!(node_id, %addr, "QUIC connection established");
+
+        Ok(connection)
+    }
+
+    /// Accept an incoming connection.
+    pub async fn accept(&self) -> Option<quinn::Incoming> {
+        self.endpoint.accept().await
+    }
+
+    /// Remove a connection from the pool.
+    pub fn disconnect(&self, node_id: NodeId) {
+        if let Some((_, conn)) = self.connections.remove(&node_id) {
+            conn.close(0u32.into(), b"disconnect");
+        }
+    }
+
+    /// Check if a node has an active connection.
+    pub fn is_connected(&self, node_id: NodeId) -> bool {
+        self.connections
+            .get(&node_id)
+            .is_some_and(|c| c.close_reason().is_none())
+    }
+
+    /// Get the local address this endpoint is bound to.
+    pub fn local_addr(&self) -> Result<SocketAddr, AeonError> {
+        self.endpoint
+            .local_addr()
+            .map_err(|e| AeonError::Connection {
+                message: format!("failed to get local address: {e}"),
+                source: None,
+                retryable: false,
+            })
+    }
+
+    /// Close the endpoint.
+    pub fn close(&self) {
+        self.endpoint.close(0u32.into(), b"shutdown");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::tls::dev_quic_configs;
+
+    #[tokio::test]
+    async fn endpoint_bind_and_local_addr() {
+        let (server_cfg, client_cfg) = dev_quic_configs();
+        let endpoint =
+            QuicEndpoint::bind("127.0.0.1:0".parse().unwrap(), server_cfg, client_cfg).unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        assert_eq!(addr.ip(), std::net::Ipv4Addr::LOCALHOST);
+        assert_ne!(addr.port(), 0); // OS assigned a port
+        endpoint.close();
+    }
+
+    #[tokio::test]
+    async fn endpoint_connect_and_pool() {
+        // Use the same cert for both endpoints so client trusts server
+        let (server_cfg, client_cfg) = dev_quic_configs();
+
+        // Start a "server" endpoint
+        let server = QuicEndpoint::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            server_cfg.clone(),
+            client_cfg.clone(),
+        )
+        .unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        // Spawn server accept loop (must accept connections for handshake to complete)
+        let server_handle = tokio::spawn(async move {
+            if let Some(incoming) = server.accept().await {
+                let _conn = incoming.await.ok();
+            }
+            server
+        });
+
+        // Start a "client" endpoint using same certs
+        let client =
+            QuicEndpoint::bind("127.0.0.1:0".parse().unwrap(), server_cfg, client_cfg).unwrap();
+
+        // Use "localhost" as host to match cert SAN
+        let target = NodeAddress::new("localhost", server_addr.port());
+
+        // Connect
+        let conn = client.connect(1, &target).await.unwrap();
+        assert!(client.is_connected(1));
+
+        // Second connect should reuse
+        let conn2 = client.connect(1, &target).await.unwrap();
+        assert_eq!(
+            conn.stable_id(),
+            conn2.stable_id(),
+            "should reuse existing connection"
+        );
+
+        // Disconnect
+        client.disconnect(1);
+        assert!(!client.is_connected(1));
+
+        client.close();
+        let server = server_handle.await.unwrap();
+        server.close();
+    }
+}

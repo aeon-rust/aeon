@@ -1,0 +1,29 @@
+[package]
+name = "aeon-e2e-pipeline"
+description = "Runnable example: Redpanda → WasmProcessor → Redpanda"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "aeon-pipeline"
+path = "src/pipeline.rs"
+
+[[bin]]
+name = "aeon-producer"
+path = "src/producer.rs"
+
+[dependencies]
+aeon-types = { workspace = true }
+aeon-engine = { workspace = true }
+aeon-connectors = { workspace = true, features = ["kafka", "memory", "blackhole"] }
+aeon-wasm = { path = "../../crates/aeon-wasm" }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+rdkafka = { workspace = true }
+uuid = { workspace = true }
+bytes = { workspace = true }
+smallvec = { workspace = true }

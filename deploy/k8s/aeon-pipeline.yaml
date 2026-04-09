@@ -1,0 +1,201 @@
+# Aeon Pipeline Deployments — one per test configuration
+# Image: aeon:latest (built locally with `docker build -t aeon:latest .`)
+#
+# Configurations:
+#   1. native-processor — PassthroughProcessor, no Wasm overhead
+#   2. rust-wasm-processor — Rust-compiled Wasm processor
+#   3. as-wasm-processor — AssemblyScript-compiled Wasm processor
+#
+# Usage:
+#   kubectl apply -f deploy/k8s/aeon-pipeline.yaml
+#   kubectl -n aeon scale deployment/aeon-native --replicas=3  # multi-node
+---
+# ─── ConfigMap for shared pipeline settings ──────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: aeon-pipeline-config
+  namespace: aeon
+data:
+  BROKERS: "redpanda:9092"
+  SOURCE_TOPIC: "aeon-bench-source"
+  SINK_TOPIC: "aeon-bench-sink"
+  BATCH_SIZE: "1024"
+  BUFFER_CAPACITY: "8192"
+  PARTITIONS: "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15"
+  RUST_LOG: "info"
+
+---
+# ─── 1. Native Processor (Passthrough) ──────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aeon-native
+  namespace: aeon
+  labels:
+    app: aeon-pipeline
+    processor: native
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: aeon-pipeline
+      processor: native
+  template:
+    metadata:
+      labels:
+        app: aeon-pipeline
+        processor: native
+    spec:
+      containers:
+        - name: pipeline
+          image: aeon:latest
+          imagePullPolicy: Never  # Use local image (Rancher Desktop)
+          command: ["aeon-pipeline"]
+          args:
+            - "--source"
+            - "redpanda"
+            - "--processor"
+            - "native"
+            - "--sink"
+            - "redpanda"
+            - "--brokers"
+            - "$(BROKERS)"
+            - "--source-topic"
+            - "$(SOURCE_TOPIC)"
+            - "--sink-topic"
+            - "$(SINK_TOPIC)"
+            - "--batch-size"
+            - "$(BATCH_SIZE)"
+            - "--buffer-capacity"
+            - "$(BUFFER_CAPACITY)"
+            - "--partitions"
+            - "$(PARTITIONS)"
+          envFrom:
+            - configMapRef:
+                name: aeon-pipeline-config
+          resources:
+            requests:
+              cpu: "500m"
+              memory: 256Mi
+            limits:
+              cpu: "2"
+              memory: 512Mi
+
+---
+# ─── 2. Rust-Wasm Processor ─────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aeon-rust-wasm
+  namespace: aeon
+  labels:
+    app: aeon-pipeline
+    processor: rust-wasm
+spec:
+  replicas: 0  # Scale up when ready to test
+  selector:
+    matchLabels:
+      app: aeon-pipeline
+      processor: rust-wasm
+  template:
+    metadata:
+      labels:
+        app: aeon-pipeline
+        processor: rust-wasm
+    spec:
+      containers:
+        - name: pipeline
+          image: aeon:latest
+          imagePullPolicy: Never
+          command: ["aeon-pipeline"]
+          args:
+            - "--source"
+            - "redpanda"
+            - "--processor"
+            - "wasm"
+            - "--wasm"
+            - "/app/processors/rust-processor.wasm"
+            - "--sink"
+            - "redpanda"
+            - "--brokers"
+            - "$(BROKERS)"
+            - "--source-topic"
+            - "$(SOURCE_TOPIC)"
+            - "--sink-topic"
+            - "$(SINK_TOPIC)"
+            - "--batch-size"
+            - "$(BATCH_SIZE)"
+            - "--buffer-capacity"
+            - "$(BUFFER_CAPACITY)"
+            - "--partitions"
+            - "$(PARTITIONS)"
+          envFrom:
+            - configMapRef:
+                name: aeon-pipeline-config
+          resources:
+            requests:
+              cpu: "500m"
+              memory: 256Mi
+            limits:
+              cpu: "2"
+              memory: 512Mi
+
+---
+# ─── 3. AssemblyScript-Wasm Processor ───────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aeon-as-wasm
+  namespace: aeon
+  labels:
+    app: aeon-pipeline
+    processor: as-wasm
+spec:
+  replicas: 0  # Scale up when ready to test
+  selector:
+    matchLabels:
+      app: aeon-pipeline
+      processor: as-wasm
+  template:
+    metadata:
+      labels:
+        app: aeon-pipeline
+        processor: as-wasm
+    spec:
+      containers:
+        - name: pipeline
+          image: aeon:latest
+          imagePullPolicy: Never
+          command: ["aeon-pipeline"]
+          args:
+            - "--source"
+            - "redpanda"
+            - "--processor"
+            - "wasm"
+            - "--wasm"
+            - "/app/processors/as-processor.wasm"
+            - "--sink"
+            - "redpanda"
+            - "--brokers"
+            - "$(BROKERS)"
+            - "--source-topic"
+            - "$(SOURCE_TOPIC)"
+            - "--sink-topic"
+            - "$(SINK_TOPIC)"
+            - "--batch-size"
+            - "$(BATCH_SIZE)"
+            - "--buffer-capacity"
+            - "$(BUFFER_CAPACITY)"
+            - "--partitions"
+            - "$(PARTITIONS)"
+          envFrom:
+            - configMapRef:
+                name: aeon-pipeline-config
+          resources:
+            requests:
+              cpu: "500m"
+              memory: 256Mi
+            limits:
+              cpu: "2"
+              memory: 512Mi

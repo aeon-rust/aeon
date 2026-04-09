@@ -1,0 +1,108 @@
+[package]
+name = "aeon-engine"
+description = "Pipeline orchestrator and SPSC wiring for Aeon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["native-loader", "rest-api", "processor-auth", "websocket-host"]
+native-loader = ["libloading", "aeon-native-sdk", "sha2", "hex"]
+rest-api = ["axum", "tower-http"]
+processor-auth = ["aeon-crypto", "rand", "sha2", "hex", "base64"]
+webtransport-host = ["wtransport", "rustls", "processor-auth"]
+websocket-host = ["processor-auth", "rest-api", "axum/ws"]
+
+[dependencies]
+aeon-types = { workspace = true }
+bytes = { workspace = true }
+rtrb = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+core_affinity = { workspace = true }
+dashmap = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }
+crc32fast = { workspace = true }
+serde_json = { workspace = true }
+
+# Native .so processor loading (feature-gated)
+libloading = { version = "0.8", optional = true }
+aeon-native-sdk = { workspace = true, optional = true }
+
+# Processor identity / challenge-response auth (feature-gated)
+aeon-crypto = { workspace = true, optional = true }
+rand = { version = "0.8", optional = true }
+
+# REST API (feature-gated)
+axum = { workspace = true, optional = true }
+tower-http = { workspace = true, optional = true }
+
+# Integrity verification for native processors (feature-gated)
+sha2 = { workspace = true, optional = true }
+hex = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
+
+# T3 WebTransport processor host (feature-gated)
+wtransport = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+
+# T4 WebSocket uses axum (via rest-api feature) — no extra deps needed
+
+[dev-dependencies]
+aeon-connectors = { workspace = true, features = ["kafka", "file", "http", "websocket"] }
+aeon-observability = { path = "../aeon-observability" }
+aeon-wasm = { workspace = true }
+tempfile = "3"
+criterion = { workspace = true }
+rdkafka = { workspace = true }
+uuid = { workspace = true }
+smallvec = { workspace = true }
+sysinfo = "0.33"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tower = "0.5"
+axum = { workspace = true }
+serde = { workspace = true }
+aeon-processor-client = { workspace = true }
+aeon-crypto = { workspace = true }
+tokio-tungstenite = { workspace = true }
+ed25519-dalek = { workspace = true }
+base64 = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }
+futures-util = { workspace = true }
+reqwest = { workspace = true }
+
+[[bench]]
+name = "blackhole_bench"
+harness = false
+
+[[bench]]
+name = "redpanda_bench"
+harness = false
+
+[[bench]]
+name = "pipeline_components_bench"
+harness = false
+
+[[bench]]
+name = "partition_scaling_bench"
+harness = false
+
+[[bench]]
+name = "multi_partition_blackhole_bench"
+harness = false
+
+[[bench]]
+name = "e2e_delivery_bench"
+harness = false
+
+[[bench]]
+name = "transport_bench"
+harness = false
+
+[[bench]]
+name = "gate1_validation"
+harness = false

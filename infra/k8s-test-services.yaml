@@ -1,0 +1,205 @@
+# Test infrastructure for E2E Tier F tests
+# Deploy: kubectl apply -f infra/k8s-test-services.yaml
+# Ports exposed on localhost via NodePort:
+#   NATS:      30422 (client), 30822 (monitoring)
+#   Redis:     30637
+#   RabbitMQ:  30567 (AMQP), 30156 (management UI)
+#   Mosquitto: 30188 (MQTT)
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: aeon-test
+---
+# ── NATS with JetStream ──────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nats
+  namespace: aeon-test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nats
+  template:
+    metadata:
+      labels:
+        app: nats
+    spec:
+      containers:
+      - name: nats
+        image: nats:2.10-alpine
+        args: ["--jetstream", "--store_dir=/data", "-m", "8222"]
+        ports:
+        - containerPort: 4222
+        - containerPort: 8222
+        resources:
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nats
+  namespace: aeon-test
+spec:
+  type: NodePort
+  selector:
+    app: nats
+  ports:
+  - name: client
+    port: 4222
+    targetPort: 4222
+    nodePort: 30422
+  - name: monitor
+    port: 8222
+    targetPort: 8222
+    nodePort: 30822
+---
+# ── Redis ─────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: aeon-test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        ports:
+        - containerPort: 6379
+        resources:
+          limits:
+            memory: "256Mi"
+            cpu: "250m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: aeon-test
+spec:
+  type: NodePort
+  selector:
+    app: redis
+  ports:
+  - name: client
+    port: 6379
+    targetPort: 6379
+    nodePort: 30637
+---
+# ── RabbitMQ ──────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rabbitmq
+  namespace: aeon-test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rabbitmq
+  template:
+    metadata:
+      labels:
+        app: rabbitmq
+    spec:
+      containers:
+      - name: rabbitmq
+        image: rabbitmq:3.13-management-alpine
+        ports:
+        - containerPort: 5672
+        - containerPort: 15672
+        resources:
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rabbitmq
+  namespace: aeon-test
+spec:
+  type: NodePort
+  selector:
+    app: rabbitmq
+  ports:
+  - name: amqp
+    port: 5672
+    targetPort: 5672
+    nodePort: 30567
+  - name: management
+    port: 15672
+    targetPort: 15672
+    nodePort: 30156
+---
+# ── Mosquitto (MQTT) ──────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mosquitto-config
+  namespace: aeon-test
+data:
+  mosquitto.conf: |
+    listener 1883
+    allow_anonymous true
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mosquitto
+  namespace: aeon-test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mosquitto
+  template:
+    metadata:
+      labels:
+        app: mosquitto
+    spec:
+      containers:
+      - name: mosquitto
+        image: eclipse-mosquitto:2
+        ports:
+        - containerPort: 1883
+        volumeMounts:
+        - name: config
+          mountPath: /mosquitto/config/mosquitto.conf
+          subPath: mosquitto.conf
+        resources:
+          limits:
+            memory: "128Mi"
+            cpu: "100m"
+      volumes:
+      - name: config
+        configMap:
+          name: mosquitto-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mosquitto
+  namespace: aeon-test
+spec:
+  type: NodePort
+  selector:
+    app: mosquitto
+  ports:
+  - name: mqtt
+    port: 1883
+    targetPort: 1883
+    nodePort: 30188

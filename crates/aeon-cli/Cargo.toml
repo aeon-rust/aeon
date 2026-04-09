@@ -1,0 +1,29 @@
+[package]
+name = "aeon-cli"
+description = "CLI binary entrypoint for Aeon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "aeon"
+path = "src/main.rs"
+
+[features]
+default = ["native-validate"]
+native-validate = ["aeon-engine/native-loader"]
+rest-api = ["aeon-engine/rest-api"]
+
+[dependencies]
+aeon-types = { workspace = true }
+aeon-engine = { workspace = true }
+aeon-crypto = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = "0.9"
+ureq = { version = "2", features = ["json"] }
+wasmtime = { workspace = true }
+rustls-pemfile = { workspace = true }

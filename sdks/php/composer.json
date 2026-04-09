@@ -1,0 +1,37 @@
+{
+    "name": "aeon/processor-sdk",
+    "description": "Aeon processor SDK for PHP — T4 WebSocket with 6 deployment model adapters",
+    "type": "library",
+    "license": "Apache-2.0",
+    "minimum-stability": "stable",
+    "require": {
+        "php": ">=8.1",
+        "paragonie/sodium_compat": "^1.21"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^10.0"
+    },
+    "suggest": {
+        "ext-msgpack": "For MsgPack codec (faster than JSON)",
+        "ext-openswoole": "For Swoole/OpenSwoole adapter",
+        "ext-swoole": "For Swoole adapter (or Laravel Octane with Swoole driver)",
+        "react/socket": "For RevoltPHP+ReactPHP adapter",
+        "ratchet/pawl": "For ReactPHP WebSocket client",
+        "amphp/websocket-client": "For RevoltPHP+AMPHP adapter",
+        "revolt/event-loop": "For RevoltPHP-based adapters",
+        "workerman/workerman": "For Workerman adapter"
+    },
+    "autoload": {
+        "psr-4": {
+            "Aeon\\ProcessorSdk\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Aeon\\ProcessorSdk\\Tests\\": "tests/"
+        }
+    },
+    "scripts": {
+        "test": "phpunit --colors=always"
+    }
+}

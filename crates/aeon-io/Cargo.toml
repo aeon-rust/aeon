@@ -1,0 +1,16 @@
+[package]
+name = "aeon-io"
+description = "Tokio I/O abstraction layer for Aeon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+aeon-types = { workspace = true }
+bytes = { workspace = true }
+
+[features]
+default = []
+io-uring = []

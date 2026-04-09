@@ -1,0 +1,93 @@
+# ── Rust / Cargo ──────────────────────────────────────────────────────
+/target/
+**/target/
+**/*.rs.bk
+*.pdb
+
+# Cargo.lock is committed for the workspace root (binary/application).
+# Sub-crate Cargo.lock files in samples/ are build artifacts.
+samples/**/Cargo.lock
+
+# ── Build artifacts ───────────────────────────────────────────────────
+*.so
+*.dll
+*.dylib
+*.wasm
+# Exception: pre-built wasm bins checked in for benchmarks
+!samples/processors/wasm-bins/*.wasm
+
+# ── Node / AssemblyScript ─────────────────────────────────────────────
+node_modules/
+package-lock.json
+
+# ── C / C++ ───────────────────────────────────────────────────────────
+*.obj
+*.o
+*.a
+*.lib
+*.exe
+!sdks/c/build.sh
+!sdks/c/build_msvc.bat
+
+# ── .NET ──────────────────────────────────────────────────────────────
+**/bin/Debug/
+**/bin/Release/
+**/obj/
+*.csproj.user
+*.nupkg
+
+# ── Java ──────────────────────────────────────────────────────────────
+*.class
+sdks/java/build/
+
+# ── PHP ───────────────────────────────────────────────────────────────
+vendor/
+composer.phar
+.phpunit.result.cache
+.phpunit.cache/
+
+# ── Python ────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+.venv/
+venv/
+
+# ── Environment & secrets ─────────────────────────────────────────────
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+
+# ── IDE / editor ──────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ── Claude Code ───────────────────────────────────────────────────────
+# Project-level settings (.claude/settings.json, CLAUDE.md) are shared.
+# Local settings contain machine-specific paths and auto-approved permissions.
+.claude/settings.local.json
+
+# ── Logs & temp files ─────────────────────────────────────────────────
+*.log
+*.tmp
+*.bak
+
+# ── Docker volumes & local data ───────────────────────────────────────
+data/
+checkpoints/
+
+# ── OS files ──────────────────────────────────────────────────────────
+desktop.ini
+ehthumbs.db

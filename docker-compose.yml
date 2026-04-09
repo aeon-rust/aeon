@@ -1,0 +1,334 @@
+# Aeon v3 — Local Development Infrastructure
+# Designed for Rancher Desktop on WSL2
+# Usage: docker compose up -d
+# Minimal: docker compose up -d redpanda redpanda-console
+
+services:
+  # ─── Redpanda (Kafka-compatible streaming) ────────────────────────────
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:${REDPANDA_VERSION:-v24.2.12}
+    container_name: aeon-redpanda
+    command:
+      - redpanda
+      - start
+      - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr internal://redpanda:9092,external://localhost:19092
+      - --pandaproxy-addr internal://0.0.0.0:8082,external://0.0.0.0:18082
+      - --advertise-pandaproxy-addr internal://redpanda:8082,external://localhost:18082
+      - --schema-registry-addr internal://0.0.0.0:8081,external://0.0.0.0:18081
+      - --rpc-addr redpanda:33145
+      - --advertise-rpc-addr redpanda:33145
+      - --mode dev-container
+      - --smp ${REDPANDA_SMP:-4}
+      - --memory ${REDPANDA_MEMORY:-4G}
+      - --default-log-level=${REDPANDA_LOG_LEVEL:-warn}
+    ports:
+      - "19092:19092"   # Kafka API (external listener for host access)
+      - "18082:18082"   # Pandaproxy (HTTP)
+      - "18081:18081"   # Schema Registry
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD", "rpk", "cluster", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - aeon-net
+
+  redpanda-console:
+    image: docker.redpanda.com/redpandadata/console:v2.7.2
+    container_name: aeon-redpanda-console
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+      KAFKA_SCHEMAREGISTRY_ENABLED: "true"
+      KAFKA_SCHEMAREGISTRY_URLS: http://redpanda:8081
+    networks:
+      - aeon-net
+
+  # Pre-create Redpanda topics for Scenario 1 testing
+  redpanda-init:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.2.12
+    container_name: aeon-redpanda-init
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    entrypoint: /bin/bash
+    command: >
+      -c "
+      rpk topic create aeon-source -p 16 --brokers redpanda:9092 || true;
+      rpk topic create aeon-sink -p 16 --brokers redpanda:9092 || true;
+      rpk topic create aeon-dlq -p 4 --brokers redpanda:9092 || true;
+      rpk topic create aeon-bench-source -p 16 --brokers redpanda:9092 || true;
+      rpk topic create aeon-bench-sink -p 16 --brokers redpanda:9092 || true;
+      rpk topic create aeon-scale-p4 -p 4 --brokers redpanda:9092 || true;
+      rpk topic create aeon-scale-p8 -p 8 --brokers redpanda:9092 || true;
+      rpk topic create aeon-scale-p16 -p 16 --brokers redpanda:9092 || true;
+      echo 'Topics created successfully'
+      "
+    networks:
+      - aeon-net
+
+  # ─── PostgreSQL 16 ────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: aeon-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-aeon}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-aeon}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./docker/postgres-init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    command: >
+      postgres
+      -c wal_level=logical
+      -c max_replication_slots=4
+      -c max_wal_senders=4
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aeon"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - aeon-net
+
+  # ─── MongoDB 7 ────────────────────────────────────────────────────────
+  mongodb:
+    image: mongo:7
+    container_name: aeon-mongodb
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb-data:/data/db
+    command: ["mongod", "--replSet", "rs0"]
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - aeon-net
+
+  # Initialize MongoDB replica set (required for Change Streams)
+  mongodb-init:
+    image: mongo:7
+    container_name: aeon-mongodb-init
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    entrypoint: mongosh
+    command: >
+      --host mongodb --eval "
+      try { rs.initiate({ _id: 'rs0', members: [{ _id: 0, host: 'mongodb:27017' }] }) }
+      catch(e) { if (e.codeName !== 'AlreadyInitialized') throw e; }
+      "
+    networks:
+      - aeon-net
+
+  # ─── MySQL 8 ──────────────────────────────────────────────────────────
+  mysql:
+    image: mysql:8.0
+    container_name: aeon-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?Set MYSQL_ROOT_PASSWORD in .env}
+      MYSQL_DATABASE: ${MYSQL_DB:-aeon}
+      MYSQL_USER: ${MYSQL_USER:-aeon}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?Set MYSQL_PASSWORD in .env}
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    command: >
+      --server-id=1
+      --log-bin=mysql-bin
+      --binlog-format=ROW
+      --binlog-row-image=FULL
+      --gtid-mode=ON
+      --enforce-gtid-consistency=ON
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - aeon-net
+
+  # ─── Redis 7 (Streams + Valkey compatible) ────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: aeon-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: ["redis-server", "--appendonly", "yes"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - aeon-net
+
+  # ─── RabbitMQ 3.13 (with management plugin) ──────────────────────────
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: aeon-rabbitmq
+    ports:
+      - "5672:5672"     # AMQP
+      - "15672:15672"   # Management UI
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-aeon}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?Set RABBITMQ_PASSWORD in .env}
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - aeon-net
+
+  # ─── NATS (with JetStream enabled) ────────────────────────────────────
+  nats:
+    image: nats:2.10-alpine
+    container_name: aeon-nats
+    ports:
+      - "4222:4222"     # Client
+      - "8222:8222"     # Monitoring
+    command: ["--jetstream", "--store_dir", "/data", "-m", "8222"]
+    volumes:
+      - nats-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8222/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - aeon-net
+
+  # ─── Mosquitto (MQTT broker) ──────────────────────────────────────────
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: aeon-mosquitto
+    ports:
+      - "1883:1883"     # MQTT
+      - "9001:9001"     # WebSocket (MQTT over WS)
+    volumes:
+      - mosquitto-data:/mosquitto/data
+      - ./docker/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mosquitto_sub -t '$$SYS/#' -C 1 -W 3 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    networks:
+      - aeon-net
+
+  # ─── OpenTelemetry Collector (vendor-neutral routing) ──────────────────
+  # Routes OTLP traces/logs/metrics to any combination of backends:
+  # SigNoz, Grafana (Tempo/Loki/Mimir), Jaeger, Elastic APM, OpenObserve, etc.
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.115.0
+    container_name: aeon-otel-collector
+    ports:
+      - "4317:4317"     # OTLP gRPC receiver
+      - "4318:4318"     # OTLP HTTP receiver
+      - "8889:8889"     # Prometheus metrics exporter
+    volumes:
+      - ./docker/otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml:ro
+    depends_on:
+      - jaeger
+      - loki
+      - prometheus
+    networks:
+      - aeon-net
+
+  # ─── Observability: Prometheus ────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.55.0
+    container_name: aeon-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./docker/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=7d
+      - --web.enable-lifecycle
+    networks:
+      - aeon-net
+
+  # ─── Observability: Grafana ───────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:11.3.0
+    container_name: aeon-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?Set GRAFANA_ADMIN_PASSWORD in .env}
+      GF_AUTH_ANONYMOUS_ENABLED: ${GRAFANA_ANONYMOUS_ENABLED:-false}
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
+      - loki
+    networks:
+      - aeon-net
+
+  # ─── Observability: Jaeger (all-in-one) ──────────────────────────────
+  jaeger:
+    image: jaegertracing/all-in-one:1.54
+    container_name: aeon-jaeger
+    ports:
+      - "16686:16686"   # Jaeger UI
+      - "4317:4317"     # OTLP gRPC
+      - "4318:4318"     # OTLP HTTP
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    networks:
+      - aeon-net
+
+  # ─── Observability: Loki ──────────────────────────────────────────────
+  loki:
+    image: grafana/loki:3.2.0
+    container_name: aeon-loki
+    ports:
+      - "3100:3100"
+    volumes:
+      - loki-data:/loki
+      - ./docker/loki-config.yaml:/etc/loki/config.yaml:ro
+    command: -config.file=/etc/loki/config.yaml
+    networks:
+      - aeon-net
+
+networks:
+  aeon-net:
+    name: aeon-net
+    driver: bridge
+
+volumes:
+  redpanda-data:
+  postgres-data:
+  mysql-data:
+  mongodb-data:
+  redis-data:
+  rabbitmq-data:
+  nats-data:
+  mosquitto-data:
+  prometheus-data:
+  grafana-data:
+  loki-data:

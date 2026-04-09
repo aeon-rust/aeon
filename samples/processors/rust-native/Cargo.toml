@@ -1,0 +1,18 @@
+[package]
+name = "aeon-sample-rust-native"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+aeon-types = { path = "../../../crates/aeon-types" }
+bytes = "1"
+
+[dev-dependencies]
+aeon-wasm = { path = "../../../crates/aeon-wasm" }
+criterion = { version = "0.5", features = ["html_reports"] }
+uuid = { version = "1", features = ["v7"] }
+
+[[bench]]
+name = "multi_runtime"
+harness = false

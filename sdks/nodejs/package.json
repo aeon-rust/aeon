@@ -1,0 +1,20 @@
+{
+  "name": "@aeon/processor-sdk",
+  "version": "0.1.0",
+  "description": "Aeon processor SDK for Node.js — T4 WebSocket + T3 WebTransport",
+  "main": "aeon.js",
+  "types": "aeon.d.ts",
+  "scripts": {
+    "test": "node --test test_aeon.js"
+  },
+  "keywords": ["aeon", "processor", "stream-processing", "websocket"],
+  "license": "Apache-2.0",
+  "dependencies": {
+    "ws": "^8.18.0",
+    "msgpackr": "^1.11.0",
+    "@noble/ed25519": "^2.2.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

@@ -1,0 +1,60 @@
+# Aeon — systemd service unit
+# Install: sudo cp aeon.service /etc/systemd/system/
+#          sudo systemctl daemon-reload
+#          sudo systemctl enable --now aeon
+#
+# Logs: journalctl -u aeon -f
+# Config: /etc/aeon/aeon.yaml
+
+[Unit]
+Description=Aeon Real-Time Data Processing Engine
+Documentation=https://github.com/your-org/aeon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=aeon
+Group=aeon
+
+ExecStart=/usr/local/bin/aeon
+WorkingDirectory=/var/lib/aeon
+
+# Environment
+Environment=RUST_LOG=info
+Environment=AEON_API_ADDR=0.0.0.0:4471
+EnvironmentFile=-/etc/aeon/env
+
+# Restart policy
+Restart=on-failure
+RestartSec=5s
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=4096
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+MemoryDenyWriteExecute=false  # Wasm JIT needs writable+executable memory
+
+# Writable directories
+ReadWritePaths=/var/lib/aeon
+ReadWritePaths=/var/log/aeon
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=aeon
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,14 @@
+[package]
+name = "aeon-wasm-sdk"
+description = "SDK for building Wasm Aeon processors with idiomatic Rust — replaces manual wire format, allocator, and ABI boilerplate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# No external dependencies — this crate is no_std and self-contained
+# for wasm32-unknown-unknown targets.
+
+[features]
+default = []

@@ -1,0 +1,114 @@
+# Aeon — Production Docker Compose
+# Deploys Aeon + Redpanda for single-node production use.
+#
+# Usage:
+#   docker compose -f docker/docker-compose.prod.yml up -d
+#
+# Build first:
+#   docker build -t aeon:latest -f docker/Dockerfile .
+
+services:
+  # ── Redpanda (Kafka-compatible) ──────────────────────────────────────
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.2.12
+    container_name: aeon-redpanda
+    command:
+      - redpanda
+      - start
+      - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr internal://redpanda:9092,external://localhost:19092
+      - --schema-registry-addr internal://0.0.0.0:8081,external://0.0.0.0:18081
+      - --rpc-addr redpanda:33145
+      - --advertise-rpc-addr redpanda:33145
+      - --smp 2
+      - --memory 2G
+      - --default-log-level=warn
+    ports:
+      - "19092:19092"
+      - "18081:18081"
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD", "rpk", "cluster", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - aeon-net
+
+  # ── Topic initialization ─────────────────────────────────────────────
+  init-topics:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.2.12
+    container_name: aeon-init-topics
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    entrypoint: /bin/bash
+    command: >
+      -c "
+      rpk topic create aeon-source -p 16 --brokers redpanda:9092 &&
+      rpk topic create aeon-sink -p 16 --brokers redpanda:9092 &&
+      rpk topic create aeon-dlq -p 4 --brokers redpanda:9092 &&
+      echo 'Topics created successfully'
+      "
+    networks:
+      - aeon-net
+
+  # ── Aeon Engine ──────────────────────────────────────────────────────
+  aeon:
+    image: aeon:latest
+    container_name: aeon-engine
+    depends_on:
+      init-topics:
+        condition: service_completed_successfully
+    ports:
+      - "4470:4470"   # QUIC cluster
+      - "4471:4471"   # REST API
+      - "4472:4472"   # Metrics
+    environment:
+      RUST_LOG: info
+      AEON_LOG_FORMAT: json
+      AEON_API_ADDR: "0.0.0.0:4471"
+      AEON_API_TOKEN: ${AEON_API_TOKEN:?Set AEON_API_TOKEN for production}
+      AEON_CHECKPOINT_DIR: /app/data/checkpoints
+      AEON_BROKERS: "redpanda:9092"
+      # OTLP export — routes traces/logs/metrics to OTel Collector
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
+      OTEL_SERVICE_NAME: ${OTEL_SERVICE_NAME:-aeon}
+    volumes:
+      - aeon-artifacts:/app/artifacts
+      - aeon-data:/app/data
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/aeon", "--help"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    networks:
+      - aeon-net
+    restart: unless-stopped
+
+  # ── Redpanda Console (optional, for debugging) ──────────────────────
+  console:
+    image: docker.redpanda.com/redpandadata/console:v2.7.2
+    container_name: aeon-console
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+    networks:
+      - aeon-net
+    profiles:
+      - debug
+
+networks:
+  aeon-net:
+    name: aeon-net
+    driver: bridge
+
+volumes:
+  redpanda-data:
+  aeon-artifacts:
+  aeon-data:

@@ -1,0 +1,31 @@
+# Aeon Processor Development Environment
+#
+# Pre-configured with Rust, wasm32 target, Node.js, and AssemblyScript
+# for building all processor runtime types.
+#
+# Usage:
+#   docker build -f docker/Dockerfile.dev -t aeon-dev .
+#   docker run -it --rm -v $(pwd):/workspace aeon-dev
+
+FROM rust:1.85-bookworm
+
+# Install wasm32 target for Wasm processors
+RUN rustup target add wasm32-unknown-unknown
+
+# Install Node.js 20 LTS for AssemblyScript/TypeScript processors
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y nodejs \
+    && npm install -g assemblyscript@0.27
+
+# Install useful tools
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    cmake \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+# Pre-warm cargo registry (speeds up first build)
+RUN cargo install cargo-watch 2>/dev/null || true
+
+ENTRYPOINT ["/bin/bash"]

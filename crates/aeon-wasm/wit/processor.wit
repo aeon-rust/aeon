@@ -1,0 +1,89 @@
+/// Aeon Processor WIT Contract
+///
+/// Guest processors implement the `processor` world, which requires
+/// exporting the `process` interface. The host provides state, logging,
+/// metrics, and time imports.
+
+package aeon:processor@0.1.0;
+
+/// An event flowing through the pipeline.
+record event {
+    /// Event ID as 16 bytes (UUIDv7).
+    id: list<u8>,
+    /// Unix epoch nanoseconds.
+    timestamp: s64,
+    /// Source identifier.
+    source: string,
+    /// Partition number.
+    partition: u16,
+    /// Key-value metadata headers.
+    metadata: list<tuple<string, string>>,
+    /// Event payload bytes.
+    payload: list<u8>,
+}
+
+/// An output emitted by the processor.
+record output {
+    /// Destination sink/topic name.
+    destination: string,
+    /// Optional partition key.
+    key: option<list<u8>>,
+    /// Output payload bytes.
+    payload: list<u8>,
+    /// Key-value headers.
+    headers: list<tuple<string, string>>,
+}
+
+/// Host-provided state operations (backed by multi-tier state store).
+interface state {
+    /// Get a value by key. Returns none if not found.
+    get: func(key: list<u8>) -> option<list<u8>>;
+    /// Put a key-value pair.
+    put: func(key: list<u8>, value: list<u8>);
+    /// Delete a key.
+    delete: func(key: list<u8>);
+}
+
+/// Host-provided logging.
+interface log {
+    /// Log at info level.
+    info: func(message: string);
+    /// Log at warn level.
+    warn: func(message: string);
+    /// Log at error level.
+    error: func(message: string);
+    /// Log at debug level.
+    debug: func(message: string);
+}
+
+/// Host-provided metrics.
+interface metrics {
+    /// Increment a counter by delta.
+    counter-inc: func(name: string, delta: u64);
+    /// Set a gauge value.
+    gauge-set: func(name: string, value: f64);
+}
+
+/// Host-provided time.
+interface clock {
+    /// Current time in milliseconds since epoch.
+    now-ms: func() -> s64;
+}
+
+/// The processor interface that guests must implement.
+interface process {
+    /// Process a single event, returning zero or more outputs.
+    process: func(evt: event) -> list<output>;
+}
+
+/// The processor world — what guest modules must implement.
+world processor {
+    /// Host imports available to the guest.
+    import state;
+    import log;
+    import metrics;
+    import clock;
+
+    /// Guest must export the process interface.
+    export process;
+}

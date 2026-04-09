@@ -1,0 +1,15 @@
+[package]
+name = "aeon-native-sdk"
+description = "SDK for building native .so/.dll Aeon processors with C-ABI exports"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+aeon-types = { workspace = true }
+bytes = { workspace = true }
+smallvec = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]

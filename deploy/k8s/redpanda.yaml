@@ -1,0 +1,147 @@
+# Redpanda single-node for Rancher Desktop load testing
+# For production, use the Redpanda Helm chart instead.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redpanda
+  namespace: aeon
+  labels:
+    app: redpanda
+spec:
+  type: ClusterIP
+  ports:
+    - name: kafka
+      port: 9092
+      targetPort: 9092
+    - name: admin
+      port: 9644
+      targetPort: 9644
+    - name: schema-registry
+      port: 8081
+      targetPort: 8081
+  selector:
+    app: redpanda
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redpanda-external
+  namespace: aeon
+  labels:
+    app: redpanda
+spec:
+  type: NodePort
+  ports:
+    - name: kafka
+      port: 19092
+      targetPort: 19092
+      nodePort: 31092
+  selector:
+    app: redpanda
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redpanda
+  namespace: aeon
+  labels:
+    app: redpanda
+spec:
+  serviceName: redpanda
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redpanda
+  template:
+    metadata:
+      labels:
+        app: redpanda
+    spec:
+      containers:
+        - name: redpanda
+          image: docker.redpanda.com/redpandadata/redpanda:v24.2.12
+          command:
+            - redpanda
+            - start
+            - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092
+            - --advertise-kafka-addr internal://redpanda:9092,external://localhost:31092
+            - --pandaproxy-addr 0.0.0.0:8082
+            - --advertise-pandaproxy-addr redpanda:8082
+            - --schema-registry-addr 0.0.0.0:8081
+            - --advertise-schema-registry-addr redpanda:8081
+            - --rpc-addr 0.0.0.0:33145
+            - --advertise-rpc-addr redpanda:33145
+            - --mode dev-container
+            - --smp 2
+            - --memory 1G
+            - --default-log-level=warn
+          ports:
+            - containerPort: 9092
+              name: kafka
+            - containerPort: 19092
+              name: kafka-ext
+            - containerPort: 8081
+              name: schema
+            - containerPort: 9644
+              name: admin
+          resources:
+            requests:
+              cpu: "1"
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          readinessProbe:
+            exec:
+              command: ["rpk", "cluster", "health"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/redpanda/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 5Gi
+
+---
+# Init job: create topics
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: redpanda-init
+  namespace: aeon
+  labels:
+    app: redpanda-init
+spec:
+  backoffLimit: 5
+  template:
+    spec:
+      restartPolicy: OnFailure
+      initContainers:
+        - name: wait-redpanda
+          image: docker.redpanda.com/redpandadata/redpanda:v24.2.12
+          command: ["bash", "-c"]
+          args:
+            - |
+              until rpk cluster health --brokers redpanda:9092 2>/dev/null; do
+                echo "Waiting for Redpanda..."
+                sleep 3
+              done
+      containers:
+        - name: create-topics
+          image: docker.redpanda.com/redpandadata/redpanda:v24.2.12
+          command: ["bash", "-c"]
+          args:
+            - |
+              rpk topic create aeon-bench-source -p 16 --brokers redpanda:9092 && \
+              rpk topic create aeon-bench-sink -p 16 --brokers redpanda:9092 && \
+              rpk topic create aeon-dlq -p 4 --brokers redpanda:9092 && \
+              echo "Topics created successfully"

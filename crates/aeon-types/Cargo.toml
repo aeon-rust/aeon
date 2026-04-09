@@ -1,0 +1,35 @@
+[package]
+name = "aeon-types"
+description = "Core types, traits, and error definitions for Aeon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bytes = { workspace = true }
+smallvec = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+rtrb = { workspace = true }
+serde = { workspace = true }
+serde_bytes = { workspace = true }
+serde_json = { workspace = true }
+rmp-serde = { workspace = true }
+memchr = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[[bench]]
+name = "uuid_bench"
+harness = false
+
+[[bench]]
+name = "event_bench"
+harness = false
+
+[[bench]]
+name = "scanner_bench"
+harness = false

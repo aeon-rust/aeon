@@ -1,0 +1,135 @@
+[workspace]
+resolver = "2"
+exclude = [
+    "samples/processors/rust-wasm",
+    "samples/processors/rust-wasm-sdk",
+]
+members = [
+    "crates/aeon-types",
+    "crates/aeon-io",
+    "crates/aeon-state",
+    "crates/aeon-wasm",
+    "crates/aeon-connectors",
+    "crates/aeon-engine",
+    "crates/aeon-cluster",
+    "crates/aeon-crypto",
+    "crates/aeon-observability",
+    "crates/aeon-native-sdk",
+    "crates/aeon-wasm-sdk",
+    "crates/aeon-processor-client",
+    "crates/aeon-cli",
+    "samples/processors/rust-native",
+    "samples/e2e-pipeline",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.85"
+repository = "https://github.com/aeon-rust/aeon"
+homepage = "https://github.com/aeon-rust/aeon"
+
+[workspace.dependencies]
+# Core
+bytes = "1"
+smallvec = "1"
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+thiserror = "2"
+anyhow = "1"
+
+# Async
+tokio = { version = "1", features = ["full"] }
+
+# Hot-path
+rtrb = "0.3"
+memchr = "2"
+core_affinity = "0.8"
+
+# State
+dashmap = "6"
+memmap2 = "0.9"
+redb = "2"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
+bincode = "1"
+rmp-serde = "1"
+crc32fast = "1"
+
+# Kafka / Redpanda
+rdkafka = { version = "0.36", features = ["cmake-build"] }
+
+# Wasm runtime
+wasmtime = "29"
+
+# Cluster / Consensus
+openraft = { version = "0.9", features = ["serde", "storage-v2"] }
+quinn = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2"
+rcgen = "0.14"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# HTTP / REST
+axum = "0.8"
+tower-http = { version = "0.6", features = ["trace", "cors", "limit", "set-header"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+
+# Crypto (integrity verification)
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+
+# Streaming connectors
+futures-util = "0.3"
+tokio-tungstenite = "0.26"
+redis = { version = "0.27", features = ["tokio-comp", "streams"] }
+async-nats = "0.38"
+rumqttc = "0.24"
+lapin = "2"
+
+# Advanced connectors (Phase 11b)
+wtransport = "0.6"
+tokio-postgres = { version = "0.7", features = ["runtime"] }
+mysql_async = "0.34"
+mongodb = "3"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-opentelemetry = "0.28"
+opentelemetry = "0.27"
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.27", features = ["tonic", "logs"] }
+
+# Testing
+criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3"
+
+# Workspace internal (version required for crates.io publishing)
+aeon-types = { path = "crates/aeon-types", version = "0.1.0" }
+aeon-io = { path = "crates/aeon-io", version = "0.1.0" }
+aeon-state = { path = "crates/aeon-state", version = "0.1.0" }
+aeon-engine = { path = "crates/aeon-engine", version = "0.1.0" }
+aeon-connectors = { path = "crates/aeon-connectors", version = "0.1.0" }
+aeon-native-sdk = { path = "crates/aeon-native-sdk", version = "0.1.0" }
+aeon-crypto = { path = "crates/aeon-crypto", version = "0.1.0" }
+aeon-observability = { path = "crates/aeon-observability", version = "0.1.0" }
+aeon-processor-client = { path = "crates/aeon-processor-client", version = "0.1.0" }
+aeon-wasm = { path = "crates/aeon-wasm", version = "0.1.0" }
+rand = "0.8"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+
+[profile.bench]
+inherits = "release"
+debug = true

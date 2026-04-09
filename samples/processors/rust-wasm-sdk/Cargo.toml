@@ -1,0 +1,16 @@
+[package]
+name = "rust-wasm-sdk-sample"
+description = "Sample Aeon Wasm processor using the aeon-wasm-sdk (compare with rust-wasm for raw ABI)"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+aeon-wasm-sdk = { path = "../../../crates/aeon-wasm-sdk" }
+
+[profile.release]
+opt-level = "s"
+lto = true

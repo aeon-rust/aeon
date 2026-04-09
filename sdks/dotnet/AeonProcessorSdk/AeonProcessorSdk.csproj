@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>Aeon.ProcessorSdk</RootNamespace>
+    <AssemblyName>AeonProcessorSdk</AssemblyName>
+    <Version>0.1.0</Version>
+    <Description>Aeon processor SDK for .NET — T1 NativeAOT + T3 WebTransport + T4 WebSocket</Description>
+    <PackageId>Aeon.ProcessorSdk</PackageId>
+    <Authors>aeon-rust</Authors>
+    <License>Apache-2.0</License>
+    <PublishAot>true</PublishAot>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="MessagePack" Version="2.5.*" />
+    <PackageReference Include="NSec.Cryptography" Version="24.4.*" />
+  </ItemGroup>
+
+</Project>
