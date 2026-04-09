@@ -57,7 +57,7 @@ decoupled (`UnorderedBatch`, flushed at interval).
 | Redis Streams | Pull | Bounded (pending) | — | Implicit (XACK) | Yes | OK |
 | Postgres CDC | Pull | Bounded (LSN) | — | Implicit | Yes | OK (polling, see §4.5) |
 | MySQL CDC | Pull | Bounded (binlog pos) | — | Implicit | Yes | OK (polling, see §4.5) |
-| MongoDB CDC | Push | Unbounded | PushBuffer | Blocking send only | No (stub) | See §4.3 |
+| MongoDB CDC | Push | Unbounded | PushBuffer | Blocking send only | File-based (at-least-once) | OK (fixed §4.3) |
 | QUIC | Push | Unbounded | PushBuffer | Zero-length frame | No | OK |
 | WebTransport (streams) | Push | Unbounded | PushBuffer | Zero-length frame | No | OK |
 | WebTransport (datagrams) | Push | Lossy | PushBuffer | **intentional drop** | No | OK (opt-in `accept_loss`) |
@@ -183,19 +183,51 @@ the invariant for all push sources that use `PushBufferTx::send` — MQTT,
 WebSocket, QUIC, WebTransport streams, HTTP Webhook, MongoDB CDC, and
 RabbitMQ all share the same blocking-send contract.
 
-### 4.3 — MongoDB CDC has no resume token persistence
+### 4.3 — MongoDB CDC resume token persistence
 
-**Severity**: Correctness gap — after a crash, the connector restarts the
-change stream from the beginning instead of resuming at the last processed
-document.
-**Location**: `crates/aeon-connectors/src/mongodb_cdc/source.rs` (no
-`source_offset` field used; no token persisted).
+**FIXED in this pass.**
 
-**Fix**: store `ChangeStream::resume_token()` in `Event.source_offset` (as
-bytes or a string reference via metadata). Expose it through the delivery
-ledger checkpoint so the connector can seek to it on restart.
+**Before**: the connector opened a change stream with no `resume_after`
+and discarded the per-event `ResumeToken`. After a crash or clean restart
+the stream resumed at "now", silently skipping every change that occurred
+while the process was down.
 
-**Deferred** — MongoDB CDC is post-Scenario 1 per `CLAUDE.md`.
+**After**: `crates/aeon-connectors/src/mongodb_cdc/source.rs`
+
+- `MongoDbCdcSourceConfig` gains two fields:
+  - `resume_token_path: Option<PathBuf>` — file path for the persisted
+    token. If `None`, behavior is unchanged (stream starts from "now").
+  - `resume_token_flush_every_n: usize` — flush cadence (default 100).
+- On `MongoDbCdcSource::new`, if the file exists and parses, the token is
+  passed to `ChangeStreamOptions::resume_after` before calling `watch()`.
+  Unparseable / missing files log a warning and fall through to "start
+  from now" (never fail startup).
+- The reader task captures `change_event.id.clone()` as the latest token,
+  bumps an unflushed counter after every `tx.send`, and atomically writes
+  the latest token to disk (write-to-temp + rename) every N events.
+- On reader shutdown (stream close or buffer closed), a final flush
+  ensures a clean stop never loses the latest observed token.
+- Persistence format: JSON via serde (`ResumeToken` derives
+  `Serialize`/`Deserialize`). A token is ~100 bytes on disk.
+
+**Delivery semantics**: at-least-once. The token is flushed after the
+event is handed to the push buffer, not after sinks ack it, so a crash
+between "buffered" and "delivered" will re-process the affected window.
+Exactly-once would require threading the token through the pipeline
+delivery-ledger checkpoint; since `CheckpointRecord.source_offsets` is
+`HashMap<u16, i64>`, that means either a WAL format bump (v1 → v2 with
+a parallel `source_tokens: HashMap<u16, Vec<u8>>`) or a sidecar store.
+Deferred — at-least-once with file-based resume is a safe, standard
+starting point for CDC workloads and closes the correctness gap.
+
+**Regression tests** (`mongodb_cdc::source::tests`, 6 tests):
+- `load_missing_file_returns_none` — nonexistent path is not an error
+- `load_empty_file_returns_none` — zero-byte file is not an error
+- `save_then_load_round_trips_token` — write + read + equality
+- `save_overwrites_existing_token_atomically` — overwrite leaves no
+  stale `.token.tmp` sibling
+- `save_creates_missing_parent_dirs` — nested paths auto-create dirs
+- `load_corrupt_file_returns_err` — invalid JSON surfaces `AeonError`
 
 ### 4.4 — MQTT, RabbitMQ, Redis sink strategies
 
@@ -446,10 +478,24 @@ with file:line references for follow-up phases.
      `pipeline::tests::buffered_transport_pipeline_large_volume`,
      `pipeline::tests::buffered_transport_pipeline_propagates_transport_error`.
 
-Other gaps (§4.3 MongoDB CDC resume token, §4.5 Postgres/MySQL CDC
-streaming replication, §4.6 QUIC/WebTransport sink stream reuse) remain
-deferred as follow-up work with clear file:line references for the next
-phase.
+6. **§4.3 — MongoDB CDC resume token persistence** — **DONE**.
+   - `MongoDbCdcSourceConfig` gains `resume_token_path` + cadence knob.
+   - On startup the source loads the token (if present) and passes it
+     to `ChangeStreamOptions::resume_after` so the stream resumes from
+     the last observed event instead of silently skipping to "now".
+   - During streaming the reader atomically flushes the latest token
+     every N events via write-to-temp + rename, with a final flush on
+     reader shutdown.
+   - Delivery semantics are at-least-once (token flushes after buffer
+     send, not after sink ack). Exactly-once would require a WAL
+     format bump (see §4.3 body).
+   - Regression tests: 6 unit tests in `mongodb_cdc::source::tests`
+     covering load/save round-trip, missing/empty/corrupt files, atomic
+     overwrite, and parent-dir auto-creation.
+
+Other gaps (§4.5 Postgres/MySQL CDC streaming replication, §4.6
+QUIC/WebTransport sink stream reuse) remain deferred as follow-up work
+with clear file:line references for the next phase.
 
 ---
 
