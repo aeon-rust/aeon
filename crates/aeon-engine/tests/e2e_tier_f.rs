@@ -18,13 +18,202 @@ use std::time::Duration;
 mod e2e_ws_harness;
 
 // ===========================================================================
-// F1: NATS -> NATS (Python T4)
+// F1: NATS JetStream -> Python T4 -> NATS JetStream
 // ===========================================================================
+//
+// Creates two JetStream streams (source + sink), publishes N messages into
+// the source stream, and drains them through NatsSource → Python T4
+// WebSocket processor → NatsSink (OrderedBatch, which awaits all PublishAck
+// futures at the batch boundary). Verifies the sink stream ended up with
+// exactly N persisted messages.
+//
+// NATS is expected on `nats://localhost:30422` (K3s NodePort from
+// `infra/k8s-test-services.yaml`) or via `AEON_E2E_NATS_URL` override.
+
+fn nats_url() -> String {
+    std::env::var("AEON_E2E_NATS_URL").unwrap_or_else(|_| "nats://localhost:30422".to_string())
+}
+
+async fn require_nats() -> Option<async_nats::jetstream::Context> {
+    let url = nats_url();
+    let client_fut = async_nats::connect(&url);
+    let client = match tokio::time::timeout(Duration::from_secs(2), client_fut).await {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => {
+            eprintln!("SKIP F1: nats connect failed for {url}: {e}");
+            return None;
+        }
+        Err(_) => {
+            eprintln!("SKIP F1: nats connect timeout for {url}");
+            return None;
+        }
+    };
+    Some(async_nats::jetstream::new(client))
+}
 
 #[tokio::test]
-#[ignore = "requires NATS server (Docker) + Python SDK + engine WebSocket host"]
 async fn f1_nats_python_t4() {
-    todo!("Implement with NatsSource -> Python T4 -> NatsSink");
+    use aeon_connectors::nats::{NatsSink, NatsSinkConfig, NatsSource, NatsSourceConfig};
+    use aeon_types::traits::{Sink, Source};
+    use aeon_types::DeliveryStrategy;
+
+    // --- 1. Preconditions ----------------------------------------------------
+    let Some(js) = require_nats().await else {
+        return;
+    };
+    if !e2e_ws_harness::runtime_available("python") {
+        eprintln!("SKIP F1: python not found");
+        return;
+    }
+
+    // --- 2. Fresh source + sink JetStream streams ----------------------------
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let src_stream_name = format!("aeon_e2e_f1_src_{suffix}");
+    let sink_stream_name = format!("aeon_e2e_f1_sink_{suffix}");
+    let src_subject = format!("aeon.e2e.f1.src.{suffix}");
+    let sink_subject = format!("aeon.e2e.f1.sink.{suffix}");
+    let consumer_name = format!("f1_consumer_{suffix}");
+
+    // Clean any stale streams from previous runs with the same names
+    // (stream names are nano-suffixed so this is almost always a no-op).
+    let _ = js.delete_stream(&src_stream_name).await;
+    let _ = js.delete_stream(&sink_stream_name).await;
+
+    js.create_stream(async_nats::jetstream::stream::Config {
+        name: src_stream_name.clone(),
+        subjects: vec![src_subject.clone()],
+        ..Default::default()
+    })
+    .await
+    .expect("create src stream");
+
+    js.create_stream(async_nats::jetstream::stream::Config {
+        name: sink_stream_name.clone(),
+        subjects: vec![sink_subject.clone()],
+        ..Default::default()
+    })
+    .await
+    .expect("create sink stream");
+
+    // --- 3. Pre-populate source stream via JS publish ------------------------
+    let msg_count: usize = 100;
+    for i in 0..msg_count {
+        let payload = format!("f1-payload-{i:05}");
+        let ack = js
+            .publish(src_subject.clone(), payload.into_bytes().into())
+            .await
+            .expect("js publish");
+        ack.await.expect("js publish ack");
+    }
+
+    // --- 4. Start WS harness + register Python processor identity ------------
+    let pipeline_name = "f1-pipeline";
+    let server = e2e_ws_harness::start_ws_test_server(pipeline_name).await;
+    let identity = e2e_ws_harness::register_test_identity(&server, "python-proc");
+    let seed_file = e2e_ws_harness::write_seed_file(&identity);
+    let port = server.port;
+    let seed_path = seed_file.to_string_lossy().to_string().replace('\\', "/");
+    let pub_key = identity.public_key.clone();
+
+    let script = e2e_ws_harness::python_passthrough_script(
+        port,
+        &seed_path,
+        &pub_key,
+        pipeline_name,
+        "python-proc",
+    );
+    let script_path = std::env::temp_dir().join(format!("aeon_e2e_f1_python_{suffix}.py"));
+    std::fs::write(&script_path, &script).unwrap();
+
+    let mut child = std::process::Command::new("python")
+        .arg(&script_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn python");
+
+    let connected = e2e_ws_harness::wait_for_connection(&server, Duration::from_secs(10)).await;
+    assert!(connected, "F1: Python processor failed to connect");
+
+    // --- 5. Aeon NATS source + sink ------------------------------------------
+    let source_config = NatsSourceConfig::new(nats_url(), &src_stream_name, &src_subject)
+        .with_consumer(&consumer_name)
+        .with_batch_size(64)
+        .with_fetch_timeout(Duration::from_millis(500))
+        .with_source_name("f1-nats-source");
+    let mut source = NatsSource::new(source_config).await.expect("NatsSource::new");
+
+    // OrderedBatch exercises the §4.0 metric-credit-on-flush path for NATS's
+    // JetStream ack futures (publish then await-all-acks at batch boundary).
+    let sink_config = NatsSinkConfig::new(nats_url(), &sink_subject)
+        .with_strategy(DeliveryStrategy::OrderedBatch);
+    let mut sink = NatsSink::new(sink_config).await.expect("NatsSink::new");
+
+    // --- 6. Drain loop: NATS -> Python T4 -> NATS ----------------------------
+    let mut total_received: usize = 0;
+    let mut total_outputs: usize = 0;
+    let mut empty_polls = 0;
+    loop {
+        let events = source.next_batch().await.unwrap();
+        if events.is_empty() {
+            empty_polls += 1;
+            if empty_polls >= 3 {
+                break;
+            }
+            continue;
+        }
+        empty_polls = 0;
+        total_received += events.len();
+        let outputs = server.ws_host.call_batch(events).await.unwrap();
+        total_outputs += outputs.len();
+        sink.write_batch(outputs).await.unwrap();
+        if total_received >= msg_count {
+            break;
+        }
+    }
+    sink.flush().await.unwrap();
+
+    // --- 7. Verification -----------------------------------------------------
+    assert_eq!(
+        total_received, msg_count,
+        "F1 C1: source received {total_received}, expected {msg_count}"
+    );
+    assert_eq!(
+        total_outputs, msg_count,
+        "F1 C1: processor produced {total_outputs}, expected {msg_count}"
+    );
+
+    // Give the sink stream a moment to settle on the server.
+    let mut sink_messages = 0u64;
+    for _ in 0..20 {
+        let mut sink_stream = js
+            .get_stream(&sink_stream_name)
+            .await
+            .expect("get sink stream");
+        let info = sink_stream.info().await.expect("stream info");
+        sink_messages = info.state.messages;
+        if sink_messages as usize >= msg_count {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        sink_messages as usize, msg_count,
+        "F1 C1: sink stream has {sink_messages}, expected {msg_count}"
+    );
+
+    // --- 8. Cleanup ----------------------------------------------------------
+    let _ = js.delete_stream(&src_stream_name).await;
+    let _ = js.delete_stream(&sink_stream_name).await;
+
+    drop(server);
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_file(&script_path);
+    let _ = std::fs::remove_file(&seed_file);
 }
 
 // ===========================================================================
