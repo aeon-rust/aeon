@@ -19455,3 +19455,212 @@ All tests confirmed:
 what next?
 ======================================================
 claude's response:
+
+ Actionable items, ranked by effort/impact:
+
+  ┌─────┬────────────────────────────────┬────────┬──────────────────────────────────────┐
+  │  #  │              Task              │ Effort │                Impact                │
+  ├─────┼────────────────────────────────┼────────┼──────────────────────────────────────┤
+  │ 1   │ Fix C2 Wasm off-by-one         │ ~1h    │ Zero failures (42/0/20)              │
+  ├─────┼────────────────────────────────┼────────┼──────────────────────────────────────┤
+  │ 2   │ Implement D3 (Rust WT test)    │ ~2h    │ Validate WT host with TLS cert gen   │
+  ├─────┼────────────────────────────────┼────────┼──────────────────────────────────────┤
+  │ 3   │ Implement Tier F tests (F1-F5) │ ~3h    │ NATS/Redis/RabbitMQ/MQTT now running │
+  ├─────┼────────────────────────────────┼────────┼──────────────────────────────────────┤
+  │ 4   │ Push to remote                 │ 1 min  │ Backup all work                      │
+  └─────┴────────────────────────────────┴────────┴──────────────────────────────────────┘
+
+  Your call — fix the Wasm bug, start on WebTransport, wire up the new Docker services, or push?
+
+=========================================================================
+continue with the list of the tasks
+==========================================================================
+claude's response:
+
+The Wasm process function crashes. Let me check the Wasm processor and the WAT file:
+
+  Searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+● The WAT has (memory 4) = 4 pages = 256KB. Let me check the WasmProcessor to understand how it calls process:
+
+  Searched for 1 pattern, read 2 files (ctrl+o to expand)
+
+● Let me first check if the Wasm issue is Kafka-specific or general:
+
+● Bash(cd "D:/my-opensource/aeon" && cargo test -p aeon-engine --test e2e_tier_a a2_rust_wasm_t2 -- --nocapture 2>&1 | tail -10)
+  ⎿      Finished `test` profile [unoptimized + debuginfo] target(s) in 0.78s
+          Running tests\e2e_tier_a.rs (target\debug\deps\e2e_tier_a-607297f7783ff9d8.exe)
+     … +5 lines (ctrl+o to expand)
+
+● A2 passes with Memory connector. The issue is Kafka-specific. Kafka events likely have more metadata or different field sizes. The WAT bump allocator
+  never reclaims memory — with 200+ Kafka events, it runs out of the 4-page (256KB) memory.
+
+  Let me check:
+
+● Bash(cd "D:/my-opensource/aeon" && cargo test -p aeon-engine --test e2e_tier_c c2_kafka_rust_wasm -- --nocapture 2>&1 | grep -E "error|panic|range|slice"
+      | head -5)
+  ⎿  thread 'c2_kafka_rust_wasm_t2' (39556) panicked at crates\aeon-engine\tests\e2e_tier_c.rs:155:10:
+     called `Result::unwrap()` on an `Err` value: Processor { message: "call 'process' failed: error while executing at wasm backtrace:\n    0:  0x194
+     - <unknown>!<wasm function 2>", source: None }
+     error: test failed, to rerun pass `-p aeon-engine --test e2e_tier_c`
+  ⎿  (timeout 2m)
+
+● The crash is inside the Wasm guest at function 2 (the process function). The issue is the bump allocator running out of memory — with 200 Kafka events and
+   a never-reset bump allocator, it eventually writes past the 256KB boundary.
+
+  Two fixes:
+  1. Increase WAT memory to handle more events
+  2. Reset bump allocator on each process call (since host does alloc/dealloc externally)
+
+  The cleanest fix is to reset the bump pointer at the start of each process call, since the host already allocates for the input and the output pointer is
+  read immediately after return:
+
+  Read 1 file (ctrl+o to expand)
+
+● The host flow: alloc → write_memory → process → read_memory → dealloc. But dealloc is a no-op in the WAT. So memory grows monotonically.
+
+  The WAT bump allocator starts at 65536, and alloc is called by the host, then $bump_alloc is called inside process. After one event cycle, neither is
+  freed. After ~200 events, we exhaust 256KB.
+
+  The simplest and cleanest fix: make the WAT's alloc reset the bump pointer to a known base before allocation, effectively making each call work from a
+  fresh allocation region. But this would break if the host expects multiple allocations to coexist.
+
+  Actually, looking at the host code — it calls alloc, writes event, calls process (which internally allocates output), then reads result. The input and
+  output are both needed simultaneously. But after read_memory returns, both can be freed.
+
+  The correct fix is in the WAT — increase memory and/or reset bump between process calls. Let me just increase memory pages and add a reset at the start of
+   process:
+
+
+==============================
+ let us discuss, document detailed approach, before proceeding?
+
+===============================
+claude's response:
+
+ Good call. Let me analyze the bug properly first.
+
+  What we know:
+  1. A2 (Wasm + Memory) passes — 1,000 events, no issue
+  2. C2 (Wasm + Kafka) fails — 200 events, crash inside Wasm process function
+  3. The crash is at wasm function 2 (the process export), not host-side memory
+  4. The bump allocator fix didn't help — so it's not a memory exhaustion issue
+
+  What's different between A2 and C2:
+  - Kafka events have different metadata (rdkafka headers vs test-generated)
+  - Kafka source may produce events with source_offset set
+  - Kafka event payloads come from produce_test_messages which uses FutureRecord — the payload encoding may differ
+  - The wire format serialization of Kafka-sourced events may produce different byte patterns
+
+  What I need to investigate:
+  1. What exact data does serialize_event produce for a Kafka-sourced event vs a Memory-sourced event?
+  2. Is the WAT i32.load hitting an unaligned or out-of-bounds address?
+  3. Are Kafka events larger, causing the initial alloc to place data near a page boundary?
+
+  Proposed approach:
+  1. Add a focused unit test that serializes a Kafka-like event and runs it through the Wasm processor directly (no Kafka needed)
+  2. Compare wire format sizes between Memory and Kafka events
+  3. Identify the exact byte offset where the crash occurs
+  4. Fix the root cause
+
+  Should I write this up in docs/aeon-dev-notes.txt and proceed, or do you want to discuss the approach further?
+
+
+====================================
+I have documented in the dev notes. let's add a reference in roadmap? and then proceed
+=====================================
+claude's response:
+
+ Good, the dev notes have the full context. Now let me add a reference in the ROADMAP and proceed with the investigation.
+
+
+Now proceeding with the investigation. Step 1 — add a focused unit test to reproduce with Kafka-like events:
+
+  Read 1 file (ctrl+o to expand)
+
+● Now let me understand what Kafka events look like — check the C2 test and produce_test_messages:
+
+  Searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+● Now let me check what KafkaSource produces — specifically the metadata it attaches:
+
+Now I see the key difference: Kafka events have no headers set by produce_test_messages (FutureRecord doesn't set headers), so metadata count is 0 — same
+  as Memory events. But the source_name is different — it's "c2-source" (9 bytes) vs "e2e-test" (8 bytes).
+
+  The real issue might be simpler. The WAT uses i32.load which is a 4-byte aligned load on Wasm. If the source string length changes the offset by 1 byte,
+  subsequent i32.load operations hit unaligned addresses.
+
+  Let me check: after skipping UUID(16) + timestamp(8) + source_len(4) + source_bytes + partition(2), the next i32.load for meta_count is at offset 30 +
+  source_len. For "e2e-test" (8 bytes): offset 38, not 4-byte aligned (38 % 4 = 2). For "c2-source" (9 bytes): offset 39, also not aligned.
+
+  Wait — Wasm i32.load on linear memory doesn't require alignment (it just traps on OOB, not alignment). So that's not it.
+
+  Let me think more carefully. The actual crash might be an OOB memory access. Let me calculate the exact allocation scenario:
+
+
+ Interesting — A2 uses 140KB of bump space and passes, while C2 only needs 21KB and fails. So it's not memory exhaustion. The crash must be a logic bug in
+  the WAT parser when encountering Kafka event data.
+
+  The difference: Memory events have 1 metadata entry (test-key/val-N), Kafka events have 0 metadata. But the WAT loop should handle 0 correctly —
+  meta_count=0 means the loop body never executes.
+
+  Wait — let me re-examine. Could it be about the source string length causing a misalignment of i32.load? Wasm doesn't trap on unaligned loads by
+  default... unless the WAT uses i32.load align=4 explicitly. Let me check — the WAT just uses i32.load which defaults to natural alignment on Wasm, and
+  unaligned loads are valid in Wasm but may trap in some engines.
+
+  Actually no — in Wasm, i32.load with the default align=2 (log2 of 4) is fine even for unaligned addresses. It never traps on alignment.
+
+  The crash must be an OOB access. Let me look at the specific issue: with "c2-source" (9 bytes), the source field takes 4+9=13 bytes. After
+  UUID(16)+ts(8)+src(13)+partition(2) = 39. The i32.load at offset 39 reads bytes 39-42 for meta_count. Then meta_count=0, skip loop. Then i32.load at
+  offset 43 reads payload_len.
+
+  But wait — does the host alloc actually allocate at the right address? The bump starts at 65536. Host calls alloc(59), gets ptr=65536. Then host writes 59
+   bytes at 65536. Then WAT's process(65536, 59) runs.
+
+  Inside process: $pos = ptr + 24 = 65560. Read source_len at 65560: i32.load(65560) = 9. $pos = 65560 + 4 + 9 = 65573. Skip partition(2): $pos = 65575.
+  Read meta_count at 65575: i32.load(65575) = 0. $pos = 65579. Read payload_len at 65579: i32.load(65579) reads bytes 65579-65582.
+
+  Event data ends at 65536 + 59 = 65595. payload_len read at 65579 = 4 bytes, then payload at 65583 for 12 bytes = 65595. This all fits.
+
+  But then $bump_alloc is called. The bump was at 65536 (with my fix: reset to ptr+len = 65595). Output allocation: 4 + 23 + 12 = 39 bytes. $bump_alloc(39)
+  returns 65595, sets bump to 65634. Then writes output at 65595.
+
+  This should all work. Let me check if my WAT fix was actually applied — I got an error saying the tool use was rejected:
+
+  Read 1 file (ctrl+o to expand)
+
+● The bump reset fix is there. So the crash is something else. Let me actually run C2 with more verbose output to see exactly which event causes the crash:
+
+The agent's analysis about input/output collision is incorrect — $ptr + $len uses the current event's parameters, so output is always placed after the
+  current input. Let me look more carefully at the actual host-side code.
+
+  Searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+● Let me check the C2 test and the Kafka source to understand what's different.
+
+  Searched for 6 patterns, read 3 files (ctrl+o to expand)
+
+● The reproduction test passes with 300 events. The events are shaped identically to what Kafka would produce (no headers on produce_test_messages). Let me
+  just try running C2 directly — the bump reset may have already fixed it but wasn't re-tested properly.
+
+
+================
+  test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 248 filtered out; finished in 0.00s
+  ========================
+  claude's response:
+  
+ C2 still fails at 0x18b. The reproduction test passes, so something about the actual Kafka events differs. Let me check the Kafka source event
+  construction more carefully.
+
+  Read 1 file (ctrl+o to expand)
+
+● Let me add a more targeted reproduction test — one that exactly mimics Kafka event characteristics including realistic timestamps.
+
+  Read 1 file (ctrl+o to expand)
+
+● Let me add a test with metadata to see if that's the trigger, and also modify C2 to catch which event fails.
+
+  
+  
+
+

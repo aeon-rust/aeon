@@ -3,6 +3,9 @@
 
     (func (export "alloc") (param $size i32) (result i32)
         (local $ptr i32)
+        ;; Reset bump to heap base — by the time host calls alloc again,
+        ;; the previous event and output have already been read.
+        (global.set $bump (i32.const 65536))
         (local.set $ptr (global.get $bump))
         (global.set $bump (i32.add (global.get $bump) (local.get $size)))
         (local.get $ptr)
@@ -21,6 +24,11 @@
         (local $out_ptr i32)
         (local $write_pos i32)
         (local $result_content_len i32)
+
+        ;; Reset bump allocator — host reads output immediately after return,
+        ;; so previous allocations are no longer needed. Place output after
+        ;; the input event to avoid overwriting it during this call.
+        (global.set $bump (i32.add (local.get $ptr) (local.get $len)))
 
         ;; Skip UUID (16) + timestamp (8) = 24 bytes
         (local.set $pos (i32.add (local.get $ptr) (i32.const 24)))

@@ -155,7 +155,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_webhook_source_receives_events() {
-        let config = HttpWebhookSourceConfig::new("127.0.0.1:0".parse().unwrap())
+        let _config = HttpWebhookSourceConfig::new("127.0.0.1:0".parse().unwrap())
             .with_poll_timeout(Duration::from_millis(200));
 
         // We need to get the actual port, so we bind manually

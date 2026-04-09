@@ -25,19 +25,17 @@ async fn require_redpanda() -> bool {
 
     match result {
         Ok(producer) => {
-            // Try a metadata request to verify connectivity
-            match tokio::time::timeout(
+            // Try a metadata request to verify connectivity.
+            // Even if send fails (e.g. auth), the producer was created — Redpanda is there.
+            let _ = tokio::time::timeout(
                 Duration::from_secs(5),
                 producer.send(
                     FutureRecord::<(), [u8]>::to("__consumer_offsets").payload(&[]),
                     Duration::from_secs(1),
                 ),
             )
-            .await
-            {
-                // Even if send fails (e.g. auth), the producer was created — Redpanda is there
-                _ => true,
-            }
+            .await;
+            true
         }
         Err(_) => {
             eprintln!("SKIP: Redpanda not available at {BROKERS}");

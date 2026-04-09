@@ -712,8 +712,8 @@ mod tests {
             .unwrap();
 
         let outputs = sink.outputs();
-        for i in 0..5 {
-            assert_eq!(outputs[i].payload.as_ref(), format!("event-{i}").as_bytes());
+        for (i, output) in outputs.iter().enumerate().take(5) {
+            assert_eq!(output.payload.as_ref(), format!("event-{i}").as_bytes());
         }
     }
 

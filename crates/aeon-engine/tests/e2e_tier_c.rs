@@ -137,7 +137,7 @@ async fn c2_kafka_rust_wasm_t2() {
     produce_test_messages(source_topic, msg_count).await;
 
     let source_config = KafkaSourceConfig::new(BROKERS, source_topic)
-        .with_partitions((0..16).collect())
+        .with_partitions(vec![0])
         .with_batch_max(64)
         .with_poll_timeout(Duration::from_secs(2))
         .with_source_name("c2-source")

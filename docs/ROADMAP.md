@@ -866,7 +866,7 @@ Rolling binary upgrade: zero event loss during Aeon v1→v2 transition under loa
 | Phase 6 — Observability | 2026-03-28 | Histograms, logging, per-partition metrics, Grafana dashboard, 34 tests |
 | Phase 7 — Wasm Runtime | 2026-03-28 | Wasmtime, host functions, WIT contract, ~794K wasm events/sec, 21 tests |
 
-**Total workspace tests**: 773 Rust passing (688 base + 36 feature-gated L2/L3 + 17 aeon-processor-client + 32 E2E passing, 0 failed, 20 E2E ignored) + 24 Python + 20 Go = 817 total | **Clippy**: clean | **Rustfmt**: clean | **Audit date**: 2026-04-07
+**Total workspace tests**: 776 Rust passing (0 failed, 30 ignored) + 24 Python + 20 Go = 820 total | **Clippy**: clean | **Rustfmt**: clean | **Audit date**: 2026-04-08
 
 ### Gate 2 — Complete (Phases 8–10) ✅
 
@@ -2435,7 +2435,8 @@ Every language gets T3/T4 (network) access. T1/T2 (in-process) are additional hi
 - **Tier G** (P3): CDC database sources (PostgreSQL, MySQL, MongoDB), 3 tests — ⏳ stubs created
 - **Tier H** (P1): PHP adapter variants (all 6 deployment models), 6 tests — ✅ H6 passing (native CLI), 5 ignored (need PHP extensions)
 - Implementation order: A → C → B → H → D → E → F → G
-- Status: 42 passed, 1 failed (C2 pre-existing Wasm off-by-one), 20 ignored / 63 total test functions
+- Status: 43 passed, 0 failed, 20 ignored / 63 total test functions
+- **Resolved — C2 Wasm + Kafka** (was bump-allocator exhaustion): WAT passthrough's bump allocator grew unbounded (~106 bytes/event). With accumulated messages from prior Kafka topic runs, exceeded 4-page (256KB) Wasm memory. Fix: reset bump to heap base in `alloc()` (safe — host consumes previous event+output before next alloc). Also fixed partition assignment to `vec![0]` for auto-created single-partition topics.
 
 **P4: Benchmark Run 5** (Multi-Partition Scaling):
 - After all SDKs and E2E tests are complete

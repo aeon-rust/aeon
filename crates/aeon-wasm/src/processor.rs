@@ -368,11 +368,12 @@ mod tests {
         // - Creates a serialized output list with one output containing the payload
         let wat = r#"
             (module
-                ;; Bump allocator — grows only, never frees
+                ;; Bump allocator — resets on each alloc (host consumes before next call)
                 (global $bump (mut i32) (i32.const 65536))
 
                 (func (export "alloc") (param $size i32) (result i32)
                     (local $ptr i32)
+                    (global.set $bump (i32.const 65536))
                     (local.set $ptr (global.get $bump))
                     (global.set $bump (i32.add (global.get $bump) (local.get $size)))
                     (local.get $ptr)
@@ -524,6 +525,7 @@ mod tests {
 
                 (func (export "alloc") (param $size i32) (result i32)
                     (local $ptr i32)
+                    (global.set $bump (i32.const 65536))
                     (local.set $ptr (global.get $bump))
                     (global.set $bump (i32.add (global.get $bump) (local.get $size)))
                     (local.get $ptr)
@@ -572,5 +574,86 @@ mod tests {
         // This filter/drop processor returns 0 outputs per event
         let outputs = processor.process_batch(events).unwrap();
         assert!(outputs.is_empty());
+    }
+
+    /// Reproduce C2 bug: 200+ events through passthrough WAT (Kafka-like, no metadata).
+    #[test]
+    fn wasm_passthrough_many_events_no_metadata() {
+        let wat = include_str!("../../aeon-engine/tests/e2e_wasm_passthrough.wat");
+        let module = WasmModule::from_wat(wat).unwrap();
+        let processor = WasmProcessor::new(Arc::new(module)).unwrap();
+
+        for i in 0..300 {
+            let event = Event::new(
+                uuid::Uuid::now_v7(),
+                i * 1_000_000,
+                Arc::from("c2-source"),
+                PartitionId::new((i % 4) as u16),
+                Bytes::from(format!("test-event-{i}")),
+            );
+
+            let outputs = processor
+                .process(event)
+                .unwrap_or_else(|e| panic!("process failed at event {i}: {e}"));
+            assert_eq!(outputs.len(), 1, "event {i}: expected 1 output");
+            assert_eq!(
+                outputs[0].payload.as_ref(),
+                format!("test-event-{i}").as_bytes(),
+                "event {i}: payload mismatch"
+            );
+        }
+    }
+
+    /// Stress test: 5000 events to verify bump allocator reset prevents OOM.
+    #[test]
+    fn wasm_passthrough_stress_5000_events() {
+        let wat = include_str!("../../aeon-engine/tests/e2e_wasm_passthrough.wat");
+        let module = WasmModule::from_wat(wat).unwrap();
+        let processor = WasmProcessor::new(Arc::new(module)).unwrap();
+
+        for i in 0..5000 {
+            let event = Event::new(
+                uuid::Uuid::now_v7(),
+                1712534400000_i64 * 1_000_000,
+                Arc::from("stress-source"),
+                PartitionId::new(0),
+                Bytes::from(format!("stress-payload-{i}")),
+            );
+
+            processor
+                .process(event)
+                .unwrap_or_else(|e| panic!("process failed at event {i}: {e}"));
+        }
+    }
+
+    /// Reproduce C2 bug variant: events WITH metadata (like Kafka headers).
+    #[test]
+    fn wasm_passthrough_many_events_with_metadata() {
+        let wat = include_str!("../../aeon-engine/tests/e2e_wasm_passthrough.wat");
+        let module = WasmModule::from_wat(wat).unwrap();
+        let processor = WasmProcessor::new(Arc::new(module)).unwrap();
+
+        for i in 0..300 {
+            let mut event = Event::new(
+                uuid::Uuid::now_v7(),
+                1712534400000_i64 * 1_000_000, // realistic Kafka timestamp (ns)
+                Arc::from("c2-source"),
+                PartitionId::new(0),
+                Bytes::from(format!("test-event-{i}")),
+            );
+            // Add metadata like Kafka headers would
+            event.metadata.push((Arc::from("kafka-key"), Arc::from("kafka-value")));
+            event.metadata.push((Arc::from("x-trace-id"), Arc::from("abc123def456")));
+
+            let outputs = processor
+                .process(event)
+                .unwrap_or_else(|e| panic!("process failed at event {i}: {e}"));
+            assert_eq!(outputs.len(), 1, "event {i}: expected 1 output");
+            assert_eq!(
+                outputs[0].payload.as_ref(),
+                format!("test-event-{i}").as_bytes(),
+                "event {i}: payload mismatch"
+            );
+        }
     }
 }
