@@ -501,27 +501,105 @@ with clear file:line references for the next phase.
 
 ## 7. Verdict
 
-**Source side**: Pull-based connectors (Kafka, NATS JetStream, Redis Streams,
-CDCs) already propagate natural upstream backpressure via protocol offsets.
-Push-based connectors all use the shared three-phase `PushBuffer` and
-after this pass they all converge on the same correct pattern: blocking
-`PushBufferTx::send(event).await` cascades into protocol-native flow
-control (TCP window for WebSocket/MQTT/QUIC/WebTransport, HTTP 503 for
-Webhook, AMQP nack+requeue for RabbitMQ). No push source silently drops
-or sleeps any more.
+**Audit pass status: CLOSED (2026-04-09).**
 
-**Sink side**: File, Kafka, NATS, **RabbitMQ**, and **Redis Streams** are all
-fully strategy-aware and production-grade after this pass. MQTT cannot add
-strategy differentiation without reworking the sink to observe PUBACK /
-PUBCOMP out of the rumqttc `EventLoop` — captured as a finding in §4.4 and
-deferred (MQTT is post-Gate 2).
+Six fixes landed this pass; two gaps remain captured-but-deferred with
+clear file:line references and post-Gate-2 rationale. Gate 1 was
+re-validated after the largest structural change (§5.3) with zero
+regression at the 10K evt/s steady-state baseline (see
+`docs/GATE1-VALIDATION.md` "Re-validation run" entry).
 
-**Processor side**: T1/T2 run via `run_buffered` with sync `Processor`.
-T3/T4 now run via `run_buffered_transport` with async `ProcessorTransport`,
-and their per-session `BatchInflight` is bounded by a Semaphore so a slow
-remote processor exerts real backpressure on the pipeline instead of
-growing the pending map without limit. All four tiers propagate
-backpressure end-to-end.
+### Fixes landed
 
-**Pipeline orchestrator**: the single correctness bug is the `outputs_sent`
-metric not being credited for `UnorderedBatch`. Fixed in this pass.
+1. **§4.0 — `outputs_sent` metric credited on flush** (`pipeline.rs`)
+   The single correctness bug in the Scenario-1 hot path. The sink task
+   now drains a `pending_ids: Vec<Uuid>` into the `outputs_sent` counter
+   and delivery ledger at every flush site via the shared
+   `credit_pending_on_flush` helper. `gate1_steady_state` now asserts
+   `events_received == outputs_sent == total_produced`.
+
+2. **§4.1 — WebSocket source no longer drops on overload**
+   (`websocket/source.rs`). The `is_overloaded()` drop branch is gone;
+   blocking `PushBufferTx::send(event).await` stops the tungstenite
+   read loop, which closes the TCP receive window on the peer.
+
+3. **§4.2 — MQTT source no longer sleep-polls** (`mqtt/source.rs`).
+   Same mechanism as §4.1: blocking send suspends `EventLoop::poll()`,
+   which stops draining the rumqttc receiver, which closes the broker
+   socket's window.
+
+4. **§4.3 — MongoDB CDC resume token persistence**
+   (`mongodb_cdc/source.rs`). File-backed `resume_after` at
+   configurable flush cadence, atomic write-to-temp + rename, graceful
+   fallthrough on missing/corrupt files, 6 unit tests. Delivery
+   semantics: at-least-once (exactly-once requires a WAL format bump —
+   documented in §4.3 body).
+
+5. **§4.4 — RabbitMQ and Redis Streams sink strategies**
+   (`rabbitmq/sink.rs`, `redis_streams/sink.rs`). All three delivery
+   strategies now implemented. MQTT sink is documented as infeasible
+   at the current rumqttc API level — captured as a finding, not a
+   deferral (the per-publish await is semantically already what
+   `UnorderedBatch` would be, and real differentiation would require
+   a sink redesign around PUBACK/PUBCOMP demultiplexing).
+
+6. **§5.3 — T3/T4 `run_buffered_transport` + bounded `BatchInflight`**
+   (`pipeline.rs`, `transport/session.rs`). New pipeline entry point
+   accepts `T: ProcessorTransport + ?Sized`, sharing the sink task body
+   with `run_buffered` via the extracted `run_sink_task` helper.
+   `BatchInflight` is now paired with a `tokio::sync::Semaphore`
+   (default capacity 1024, configurable via `max_inflight_batches`) so
+   a slow remote processor suspends the processor task instead of
+   growing the pending DashMap without limit. Gate 1 re-validation
+   after this change: steady-state P99 = 2.500ms at 10K evt/s, CPU
+   21.8%, zero loss — identical to the pre-§5.3 baseline.
+
+### Deferred (post-Gate 2)
+
+- **§4.5 — Postgres/MySQL CDC streaming replication.**
+  `postgres_cdc/source.rs:150` still uses `pg_logical_slot_get_changes`
+  polling; `mysql_cdc/source.rs:150` still uses `SHOW BINLOG EVENTS`.
+  Correct and OK for low-rate CDC, but won't scale. The upgrade path is
+  a Debezium-class rework (Postgres `START_REPLICATION` protocol or a
+  MySQL binlog client library). Deferred — CDCs are post-Gate 2 and the
+  current polling implementation is not a correctness gap, only a
+  throughput ceiling.
+
+- **§4.6 — QUIC/WebTransport sinks open a new stream per batch.**
+  `quic/sink.rs:82` and `webtransport/sink.rs:65` pay stream-setup
+  overhead on every write. The fix is a long-lived bidi stream with
+  length-prefixed framing and ack frames — the pattern already used by
+  `WebTransportProcessorHost`. Deferred — these are T3/T4 *sink*
+  concerns, and the T3/T4 processor *transport* path (which is what
+  Scenario 1 actually needs) is already production-grade after §5.3.
+
+### Summary by layer
+
+- **Source side.** Pull-based connectors (Kafka, NATS JetStream, Redis
+  Streams, CDCs) propagate natural upstream backpressure via protocol
+  offsets. Push-based connectors all share the three-phase `PushBuffer`
+  primitive; after §4.1 / §4.2 / §4.3 they converge on one correct
+  pattern — blocking `PushBufferTx::send(event).await` cascades into
+  protocol-native flow control (TCP window for
+  WebSocket/MQTT/QUIC/WebTransport, HTTP 503 for Webhook, AMQP
+  nack+requeue for RabbitMQ, change-stream backpressure for MongoDB
+  CDC). No push source silently drops or sleep-polls any more, and
+  MongoDB CDC now persists resume tokens for at-least-once recovery
+  across restarts.
+
+- **Sink side.** File, Kafka, NATS, RabbitMQ, and Redis Streams are
+  fully strategy-aware and production-grade. MQTT is correct by
+  construction (see §4.4). QUIC/WebTransport sinks are functional
+  with the stream-reuse optimization deferred as §4.6.
+
+- **Processor side.** T1 native and T2 Wasm run via `run_buffered`
+  with the sync `Processor` trait. T3 WebTransport and T4 WebSocket
+  run via `run_buffered_transport` with the async `ProcessorTransport`
+  trait; their per-session `BatchInflight` is bounded by a Semaphore so
+  a slow remote processor exerts real backpressure on the pipeline
+  instead of growing the pending map without limit. All four tiers
+  propagate backpressure end-to-end.
+
+- **Pipeline orchestrator.** The `outputs_sent` metric bug is fixed
+  (§4.0). The Scenario-1 hot path has no known correctness gaps. Gate
+  1 re-validation confirms zero regression from the §5.3 refactor.
