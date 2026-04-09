@@ -289,11 +289,12 @@ None of these are Gate 1 blockers. All 53 runnable tests pass — the
 entire Gate 1 money path (Tier C: 11 SDK × Kafka E2E) is green, and
 D3 now proves the T3 WebTransport host end-to-end with a real client.
 
-### Known follow-up: SDK envelope Uuid serialization (msgpack)
+### Resolved: SDK envelope Uuid serialization (msgpack)
 
-D3 currently uses the `json` codec (matching A10/C8/F6). The `msgpack`
-path trips because `WireEvent.id: uuid::Uuid` serializes as a 16-byte
-array in msgpack while `ProcessEvent.id: String` expects a string —
-the same SDK envelope bug also affects WS tests, which is why they
-too pin to `json`. Fix is to switch the SDK envelope `id` field to
-`uuid::Uuid` so msgpack round-trips cleanly; tracked as a follow-up.
+For a brief window A10 / C8 / D3 / F6 all pinned to `.codec("json")`
+because `aeon_processor_client::ProcessEvent.id` was a `String` while
+the engine's `WireEvent.id` is a `uuid::Uuid` — msgpack serializes
+`Uuid` as a 16-byte array and decode blew up with
+`invalid value: byte array, expected a string`. Fixed by flipping
+`ProcessEvent.id` to `uuid::Uuid`; all four tests now run with the
+default `msgpack` codec, matching production processors.
