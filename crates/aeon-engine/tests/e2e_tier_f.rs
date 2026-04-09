@@ -217,13 +217,214 @@ async fn f1_nats_python_t4() {
 }
 
 // ===========================================================================
-// F2: NATS -> Kafka (Go T4)
+// F2: NATS -> Go T4 -> Kafka
 // ===========================================================================
+//
+// Cross-connector topology: publish N messages into a NATS JetStream
+// stream, drain through NatsSource → Go T4 WebSocket processor → KafkaSink
+// into a fresh Redpanda topic, then drain the Kafka topic back with a
+// StreamConsumer to verify payload integrity and ordering.
+//
+// Unlike F1/F3/F5 this test does not exercise a specific audit fix — it
+// validates that the source and sink belong to different messaging
+// systems without either stepping on the other's ownership of the event
+// envelope (metadata propagation, delivery strategies, shutdown). Skips
+// gracefully if NATS, Redpanda, or Go are unavailable.
+
+const F2_BROKERS: &str = "localhost:19092";
+
+async fn require_redpanda_for_f2() -> bool {
+    match tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::net::TcpStream::connect("127.0.0.1:19092"),
+    )
+    .await
+    {
+        Ok(Ok(_)) => true,
+        _ => {
+            eprintln!("SKIP F2: Redpanda not available at {F2_BROKERS}");
+            false
+        }
+    }
+}
 
 #[tokio::test]
-#[ignore = "requires NATS server + Redpanda (Docker) + Go SDK + engine WebSocket host"]
 async fn f2_nats_kafka_go_t4() {
-    todo!("Implement with NatsSource -> Go T4 -> KafkaSink");
+    use aeon_connectors::kafka::{KafkaSink, KafkaSinkConfig};
+    use aeon_connectors::nats::{NatsSource, NatsSourceConfig};
+    use aeon_types::traits::{Sink, Source};
+    use rdkafka::Message as _;
+    use rdkafka::config::ClientConfig;
+    use rdkafka::consumer::{Consumer, StreamConsumer};
+
+    // --- 1. Preconditions ----------------------------------------------------
+    let Some(js) = require_nats().await else {
+        return;
+    };
+    if !require_redpanda_for_f2().await {
+        return;
+    }
+    if !e2e_ws_harness::runtime_available("go") {
+        eprintln!("SKIP F2: go not found");
+        return;
+    }
+
+    // --- 2. Fresh NATS source stream + Kafka sink topic ---------------------
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let src_stream_name = format!("aeon_e2e_f2_src_{suffix}");
+    let src_subject = format!("aeon.e2e.f2.src.{suffix}");
+    let consumer_name = format!("f2_consumer_{suffix}");
+    let kafka_sink_topic = format!("aeon-e2e-f2-sink-{suffix}");
+
+    let _ = js.delete_stream(&src_stream_name).await;
+    js.create_stream(async_nats::jetstream::stream::Config {
+        name: src_stream_name.clone(),
+        subjects: vec![src_subject.clone()],
+        ..Default::default()
+    })
+    .await
+    .expect("create src stream");
+
+    // --- 3. Pre-populate source stream ---------------------------------------
+    let msg_count: usize = 100;
+    for i in 0..msg_count {
+        let payload = format!("f2-payload-{i:05}");
+        let ack = js
+            .publish(src_subject.clone(), payload.into_bytes().into())
+            .await
+            .expect("js publish");
+        ack.await.expect("js publish ack");
+    }
+
+    // --- 4. Start WS harness + spawn Go processor ----------------------------
+    let pipeline_name = "f2-pipeline";
+    let server = e2e_ws_harness::start_ws_test_server(pipeline_name).await;
+    let identity = e2e_ws_harness::register_test_identity(&server, "go-proc");
+    let seed_file = e2e_ws_harness::write_seed_file(&identity);
+    let seed_path = seed_file.to_string_lossy().to_string();
+    let pub_key = identity.public_key.clone();
+
+    let go_dir = e2e_ws_harness::go_passthrough_project(
+        server.port,
+        &seed_path,
+        &pub_key,
+        pipeline_name,
+        "go-proc",
+    );
+
+    let mut child = std::process::Command::new("go")
+        .args(["run", "."])
+        .current_dir(&go_dir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn go");
+
+    let connected = e2e_ws_harness::wait_for_connection(&server, Duration::from_secs(30)).await;
+    assert!(connected, "F2: Go processor failed to connect");
+
+    // --- 5. Aeon NATS source + Kafka sink ------------------------------------
+    let source_config = NatsSourceConfig::new(nats_url(), &src_stream_name, &src_subject)
+        .with_consumer(&consumer_name)
+        .with_batch_size(64)
+        .with_fetch_timeout(Duration::from_millis(500))
+        .with_source_name("f2-nats-source");
+    let mut source = NatsSource::new(source_config).await.expect("NatsSource::new");
+
+    let sink_config = KafkaSinkConfig::new(F2_BROKERS, &kafka_sink_topic);
+    let mut sink = KafkaSink::new(sink_config).expect("KafkaSink::new");
+
+    // --- 6. Drain loop: NATS -> Go T4 -> Kafka -------------------------------
+    let mut total_received: usize = 0;
+    let mut total_outputs: usize = 0;
+    let mut empty_polls = 0;
+    loop {
+        let events = source.next_batch().await.unwrap();
+        if events.is_empty() {
+            empty_polls += 1;
+            if empty_polls >= 3 {
+                break;
+            }
+            continue;
+        }
+        empty_polls = 0;
+        total_received += events.len();
+        let outputs = server.ws_host.call_batch(events).await.unwrap();
+        total_outputs += outputs.len();
+        sink.write_batch(outputs).await.unwrap();
+        if total_received >= msg_count {
+            break;
+        }
+    }
+    sink.flush().await.unwrap();
+
+    // --- 7. Verification: source/processor counts + Kafka payload drain -----
+    assert_eq!(
+        total_received, msg_count,
+        "F2 C1: source received {total_received}, expected {msg_count}"
+    );
+    assert_eq!(
+        total_outputs, msg_count,
+        "F2 C1: processor produced {total_outputs}, expected {msg_count}"
+    );
+
+    let verify_group = format!("f2-verify-{suffix}");
+    let verifier: StreamConsumer = ClientConfig::new()
+        .set("bootstrap.servers", F2_BROKERS)
+        .set("group.id", &verify_group)
+        .set("auto.offset.reset", "earliest")
+        .set("enable.auto.commit", "false")
+        .create()
+        .expect("verifier consumer create");
+    verifier
+        .subscribe(&[kafka_sink_topic.as_str()])
+        .expect("subscribe sink topic");
+
+    let mut collected: Vec<String> = Vec::with_capacity(msg_count);
+    let verify_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while collected.len() < msg_count {
+        let remaining = verify_deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, verifier.recv()).await {
+            Ok(Ok(msg)) => {
+                let payload = msg
+                    .payload()
+                    .map(|b| String::from_utf8_lossy(b).into_owned())
+                    .unwrap_or_default();
+                collected.push(payload);
+            }
+            Ok(Err(_)) | Err(_) => break,
+        }
+    }
+
+    assert_eq!(
+        collected.len(),
+        msg_count,
+        "F2 C1: kafka sink drained {} messages, expected {msg_count}",
+        collected.len()
+    );
+    // Single-partition default topic + single producer preserves order.
+    for (i, payload) in collected.iter().enumerate() {
+        assert_eq!(
+            payload,
+            &format!("f2-payload-{i:05}"),
+            "F2 C2: payload mismatch at index {i}"
+        );
+    }
+
+    // --- 8. Cleanup ----------------------------------------------------------
+    let _ = js.delete_stream(&src_stream_name).await;
+
+    drop(server);
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&go_dir);
+    let _ = std::fs::remove_file(&seed_file);
 }
 
 // ===========================================================================
