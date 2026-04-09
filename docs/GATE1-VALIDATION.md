@@ -145,10 +145,22 @@ Winning configuration for Redpanda sink:
 | 1,000 evt/s | BlackholeSink (Aeon isolation) | 0.61ms | ≤1ms | ≤1ms | ≤5ms | 20.5% | 0 | PASS |
 | 1,000 evt/s | KafkaSink UnorderedBatch | 0.52ms | ≤1ms | ≤1ms | ≤2.5ms | 19.6% | 0 | PASS |
 | 10,000 evt/s | KafkaSink UnorderedBatch | 0.58ms | ≤1ms | ≤2.5ms | ≤2.5ms | 21.8% | 0 | PASS |
+| **10,000 evt/s (re-val 2026-04-09 post-§5.3)** | KafkaSink UnorderedBatch | **0.556ms** | **1.000ms** | **1.000ms** | **2.500ms** | **21.8%** | **0** | **PASS** |
 
 **Steady-state P99 is 2.5ms — 4x better than the 10ms target.** Aeon's intrinsic pipeline
 contribution (source-read → processor-call latency, which is what the histogram records) is
 sub-millisecond at both tested rates.
+
+**Re-validation run (2026-04-09, post-§5.3 T3/T4 wiring)**: after landing
+`run_buffered_transport` and the bounded-semaphore `BatchInflight` refactor
+(commit `65751a5`), plus the shared `run_sink_task` extraction in
+`pipeline.rs`, the steady-state P99 at 10K evt/s is identical to the
+original baseline. Zero regression. Config reproduced via:
+`AEON_BENCH_TARGET_RATE=10000 AEON_BENCH_LINGER_MS=5 AEON_BENCH_DRAIN_MS=0`
+`AEON_BENCH_PARTITIONS=8 cargo bench -p aeon-engine --bench gate1_steady_state`.
+Validation of the `gate1_validation` (catch-up saturation) bench in the
+same run: 100K/100K zero loss, 19.9% CPU, 28,975 events/sec throughput
+(vs baseline 30,598 — within single-run Windows/WSL2 measurement noise).
 
 **Key learning — OrderedBatch vs UnorderedBatch trade-off**:
 - **OrderedBatch** awaits all delivery futures at each `write_batch` call via `join_all`. Per-
