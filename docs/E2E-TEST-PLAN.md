@@ -153,7 +153,7 @@ Each tests a different messaging connector with a different SDK.
 
 | # | Source -> Sink | Processor | Infra | Status |
 |---|---------------|-----------|-------|--------|
-| F1 | NATS -> NATS | Python T4 | NATS | ❌ |
+| F1 | NATS -> NATS | Python T4 | NATS | ✅ |
 | F2 | NATS -> Kafka | Go T4 | NATS + Redpanda | ❌ |
 | F3 | Redis -> Redis | Node.js T4 | Redis | ✅ |
 | F4 | MQTT -> MQTT | Java T4 | Mosquitto | ❌ |
@@ -229,10 +229,10 @@ Python / Node.js / .NET / Java / PHP / Go runtimes available.
 | C (Kafka/Redpanda E2E, all SDKs) | 11 | **11** | 0 | 0 | 79s |
 | D (T3 WebTransport variants) | 5 | 0 | 0 | **5** | — |
 | E (Cross-connector, Python T4) | 9 | **9** | 0 | 0 | 24s |
-| F (External messaging) | 7 | **2** (F3, F6) | 0 | **5** | ~1s |
+| F (External messaging) | 7 | **3** (F1, F3, F6) | 0 | **4** | ~3s |
 | G (CDC database sources) | 3 | 0 | 0 | **3** | — |
 | H (PHP adapter variants) | 6 | **1** (H6) | 0 | **5** | <1s |
-| **Total** | **63** | **44** | **1** | **18** | **~130s** |
+| **Total** | **63** | **45** | **1** | **17** | **~132s** |
 
 **Bonus coverage (not in the plan, run in the same sweep):**
 - `redpanda_integration`: 3/3 passed in 17s (source, sink, E2E passthrough).
@@ -249,22 +249,24 @@ aspirational marks.
 
 ### Implementation debt captured
 
-19 stub tests remain. They fall into three natural groups:
+18 stub tests remain. They fall into three natural groups:
 
 1. **T3 WebTransport end-to-end (5)** — Tier D, all 5 SDKs need TLS cert
    provisioning + engine WebTransport host wiring. T3 *transport* is
    production-grade after §5.3 (see `docs/CONNECTOR-AUDIT.md`); these
    tests are the SDK-level acceptance proof.
-2. **External messaging with non-Rust SDKs (5)** — Tier F1, F2, F4, F5
-   (NATS, MQTT, RabbitMQ with Python/Go/Java/PHP) + F7 (QUIC loopback
-   with Go T3). F3 Redis→Node.js landed this sweep and exercises the
-   §4.4 pipelined-XADD round-trip fix end-to-end. The remaining
-   connectors already pass their own Rust-level integration tests;
-   these validate the full SDK round-trip.
+2. **External messaging with non-Rust SDKs (4)** — Tier F2, F4, F5
+   (NATS→Kafka→Go, MQTT→Java, RabbitMQ→PHP) + F7 (QUIC loopback with
+   Go T3). F1 NATS→Python and F3 Redis→Node.js both landed this
+   sweep; F1 exercises the §4.0 metric-credit-on-flush path against
+   JetStream's publish+ack-future pattern, F3 exercises the §4.4
+   pipelined-XADD round-trip fix. The remaining connectors already
+   pass their own Rust-level integration tests; these validate the
+   full SDK round-trip.
 3. **CDC + PHP adapters + C Wasm (8)** — Tier G1–G3 (Postgres/MySQL/
    MongoDB CDC), Tier H1–H5 (Swoole/ReactPHP/AMPHP/Workerman/FrankenPHP),
    Tier A5 (C via wasi-sdk). All gated on optional runtime or toolchain
    installation.
 
-None of these are Gate 1 blockers. All 43 runnable tests pass — the
+None of these are Gate 1 blockers. All 45 runnable tests pass — the
 entire Gate 1 money path (Tier C: 11 SDK × Kafka E2E) is green.
