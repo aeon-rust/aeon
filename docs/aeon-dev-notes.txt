@@ -19780,5 +19780,19 @@ claude's response:
 
 Committed as cc383fe. Ready for you to push when you're ready.
 
+==========================
+ let us have aeon-dev-notes committed to github.
+
+============================
+ claude's response:
+ 
+ did you remove gitignore for aeon-dev-notes?
+
+● No, aeon-dev-notes.txt was never in .gitignore — it's been tracked by git since it was first added. Let me verify:
+It's been tracked across 5 commits. It will be pushed to GitHub along with everything else when you push.
+
+================
+ 
+===================
 
 
