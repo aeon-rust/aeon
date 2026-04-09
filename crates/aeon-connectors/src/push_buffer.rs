@@ -211,6 +211,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_push_buffer_zero_loss_under_backpressure() {
+        // Validates the contract push-source connectors (WebSocket, MQTT,
+        // RabbitMQ, MongoDB CDC, …) rely on: when the consumer is slow,
+        // PushBufferTx::send blocks the producer but never drops events.
+        // The WebSocket source used to drop events on `is_overloaded()`;
+        // this test guards the invariant that the blocking-send path
+        // delivers every event exactly once.
+        let config = PushBufferConfig {
+            channel_capacity: 16,
+            batch_size: 32,
+            drain_timeout: Duration::from_millis(1),
+            spill_threshold: 8,
+        };
+        let (tx, mut rx) = push_buffer(config);
+
+        const TOTAL: usize = 5_000;
+        let producer = tokio::spawn(async move {
+            for i in 0..TOTAL {
+                tx.send(test_event(&format!("evt-{i}")))
+                    .await
+                    .expect("blocking send must succeed");
+            }
+        });
+
+        let mut received = 0usize;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while received < TOTAL && tokio::time::Instant::now() < deadline {
+            let batch = rx
+                .next_batch(Duration::from_millis(50))
+                .await
+                .expect("drain");
+            received += batch.len();
+        }
+        producer.await.unwrap();
+
+        assert_eq!(
+            received, TOTAL,
+            "push buffer must deliver every event under backpressure"
+        );
+    }
+
+    #[tokio::test]
     async fn test_push_buffer_overload_signal() {
         let config = PushBufferConfig {
             channel_capacity: 4,

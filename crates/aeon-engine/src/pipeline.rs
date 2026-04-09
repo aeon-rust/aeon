@@ -518,6 +518,11 @@ where
         }
         let mut last_flush = Instant::now();
         let mut pending_count: u64 = 0;
+        // IDs of outputs that write_batch returned as `pending` but have not yet
+        // been flushed. Accumulated across write_batch calls; drained on flush.
+        // Used for both the outputs_sent metric and the delivery ledger so that
+        // UnorderedBatch sinks correctly credit acks at flush boundaries.
+        let mut pending_ids: Vec<uuid::Uuid> = Vec::new();
         let mut delivered_since_checkpoint: u64 = 0;
         let mut failed_since_checkpoint: u64 = 0;
         let mut ckpt_writer = checkpoint_writer;
@@ -593,6 +598,14 @@ where
                             acked_since_last_flush += delivered_count;
                             events_since_last_flush += total_count;
 
+                            // Accumulate pending IDs for flush-time crediting.
+                            // Non-blocking strategies (UnorderedBatch) return
+                            // BatchResult::all_pending; delivered is empty here and
+                            // only resolved when sink.flush() completes.
+                            if !batch_result.pending.is_empty() {
+                                pending_ids.extend(batch_result.pending.iter().copied());
+                            }
+
                             // Apply BatchFailurePolicy if there are partial failures.
                             if batch_result.has_failures() {
                                 let original = outputs_for_retry.as_deref().unwrap_or(&[]);
@@ -637,6 +650,17 @@ where
                                 tuner.report(events_since_last_flush, acked_since_last_flush);
                             }
                             sink.flush().await?;
+                            // Credit pending outputs as delivered now that the
+                            // flush has resolved their acks. Mark them in the
+                            // ledger so checkpoints reflect the actual delivered
+                            // set for UnorderedBatch-style sinks.
+                            credit_pending_on_flush(
+                                &mut pending_ids,
+                                &metrics_sink,
+                                &sink_ledger,
+                                &mut delivered_since_checkpoint,
+                                &mut acked_since_last_flush,
+                            );
                             write_checkpoint(
                                 &mut ckpt_writer,
                                 &sink_ledger,
@@ -666,6 +690,13 @@ where
                                 tuner.report(events_since_last_flush, acked_since_last_flush);
                             }
                             sink.flush().await?;
+                            credit_pending_on_flush(
+                                &mut pending_ids,
+                                &metrics_sink,
+                                &sink_ledger,
+                                &mut delivered_since_checkpoint,
+                                &mut acked_since_last_flush,
+                            );
                             write_checkpoint(
                                 &mut ckpt_writer,
                                 &sink_ledger,
@@ -686,6 +717,13 @@ where
 
         // Final flush + checkpoint
         sink.flush().await?;
+        credit_pending_on_flush(
+            &mut pending_ids,
+            &metrics_sink,
+            &sink_ledger,
+            &mut delivered_since_checkpoint,
+            &mut acked_since_last_flush,
+        );
         if delivered_since_checkpoint > 0 || failed_since_checkpoint > 0 {
             write_checkpoint(
                 &mut ckpt_writer,
@@ -829,6 +867,35 @@ where
         Some(e) => Err(e),
         None => Ok(()),
     }
+}
+
+/// Credit outputs that were returned as `pending` by `write_batch` but are
+/// now delivered thanks to a successful `sink.flush()`. Drains `pending_ids`
+/// into the `outputs_sent` metric, the delivery ledger (if configured), and
+/// the checkpoint-window counters.
+///
+/// Called from every code path that invokes `sink.flush()` in non-blocking
+/// delivery mode (interval flush, idle flush, final flush). For blocking
+/// strategies (`PerEvent`, `OrderedBatch`) the vec is always empty so this
+/// is a no-op on the fast path.
+fn credit_pending_on_flush(
+    pending_ids: &mut Vec<uuid::Uuid>,
+    metrics: &Arc<PipelineMetrics>,
+    ledger: &Option<Arc<DeliveryLedger>>,
+    delivered_since_checkpoint: &mut u64,
+    acked_since_last_flush: &mut u64,
+) {
+    if pending_ids.is_empty() {
+        return;
+    }
+    let count = pending_ids.len() as u64;
+    if let Some(l) = ledger {
+        l.mark_batch_acked(pending_ids);
+    }
+    metrics.outputs_sent.fetch_add(count, Ordering::Relaxed);
+    *delivered_since_checkpoint += count;
+    *acked_since_last_flush += count;
+    pending_ids.clear();
 }
 
 /// Write a checkpoint record with ledger-populated offsets and pending IDs.
@@ -1218,6 +1285,97 @@ mod tests {
 
         assert_eq!(metrics.events_received.load(Ordering::Relaxed), 50_000);
         assert_eq!(metrics.outputs_sent.load(Ordering::Relaxed), 50_000);
+    }
+
+    /// Test sink that returns `BatchResult::all_pending` from `write_batch` and
+    /// only "delivers" pending outputs when `flush` is called. Models the
+    /// UnorderedBatch contract of real sinks (Kafka, NATS, RabbitMQ) without
+    /// requiring an external broker. Used to validate that the sink task
+    /// credits `outputs_sent` at flush time via `credit_pending_on_flush`.
+    struct DeferredSink {
+        pending: Vec<Output>,
+        delivered: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl DeferredSink {
+        fn new(delivered: Arc<std::sync::atomic::AtomicU64>) -> Self {
+            Self {
+                pending: Vec::new(),
+                delivered,
+            }
+        }
+    }
+
+    impl Sink for DeferredSink {
+        async fn write_batch(
+            &mut self,
+            outputs: Vec<Output>,
+        ) -> Result<aeon_types::BatchResult, AeonError> {
+            let ids: Vec<uuid::Uuid> = outputs
+                .iter()
+                .map(|o| o.source_event_id.unwrap_or(uuid::Uuid::nil()))
+                .collect();
+            self.pending.extend(outputs);
+            Ok(aeon_types::BatchResult::all_pending(ids))
+        }
+
+        async fn flush(&mut self) -> Result<(), AeonError> {
+            let drained = self.pending.len() as u64;
+            self.pending.clear();
+            self.delivered
+                .fetch_add(drained, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn buffered_pipeline_unordered_credits_metric_at_flush() {
+        // Regression guard for the pipeline metric bug: with DeliveryStrategy::
+        // UnorderedBatch, a sink that returns BatchResult::all_pending must
+        // still see its outputs credited to `outputs_sent` once flush completes.
+        // Prior to the fix, the sink task only added `batch_result.delivered
+        // .len()` to the counter, which is always 0 for all_pending sinks, so
+        // outputs_sent stayed at 0 even though every event was eventually
+        // delivered on flush.
+        let events = make_events(5_000);
+        let source = MemorySource::new(events, 128);
+        let processor = PassthroughProcessor::new(Arc::from("output"));
+        let delivered_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let sink = DeferredSink::new(Arc::clone(&delivered_count));
+        let config = PipelineConfig {
+            delivery: DeliveryConfig {
+                strategy: DeliveryStrategy::UnorderedBatch,
+                flush: crate::delivery::FlushStrategy {
+                    interval: std::time::Duration::from_millis(20),
+                    max_pending: 1_000,
+                    adaptive: false,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let metrics = Arc::new(PipelineMetrics::new());
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        run_buffered(
+            source,
+            processor,
+            sink,
+            config,
+            Arc::clone(&metrics),
+            shutdown,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Sink actually delivered all events on flush(es).
+        assert_eq!(delivered_count.load(std::sync::atomic::Ordering::Relaxed), 5_000);
+        // The metric must also agree.
+        assert_eq!(metrics.events_received.load(Ordering::Relaxed), 5_000);
+        assert_eq!(metrics.events_processed.load(Ordering::Relaxed), 5_000);
+        assert_eq!(metrics.outputs_sent.load(Ordering::Relaxed), 5_000);
     }
 
     fn make_events_with_ids(count: usize) -> Vec<Event> {

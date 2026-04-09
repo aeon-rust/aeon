@@ -468,11 +468,11 @@ fn main() {
     let p99_ms = p99 as f64 / 1000.0;
     let p99_pass = p99_ms < 10.0;
     let cpu_pass = avg_cpu_pct_of_system < 50.0;
-    // UnorderedBatch's `outputs_sent` metric isn't incremented until flush completes,
-    // so use events_received vs produced as the zero-loss check — a mismatch would
-    // indicate source-side drops, and the pipeline's final flush (in run_buffered's
-    // sink task cleanup) guarantees delivery before return.
-    let loss_pass = received >= total_produced;
+    // Zero-loss check: every produced event must be both received by the source
+    // AND credited as delivered by the sink. `outputs_sent` is now incremented
+    // at flush time for UnorderedBatch (via pipeline's credit_pending_on_flush),
+    // so we can assert both sides match.
+    let loss_pass = received >= total_produced && sent >= total_produced;
     let rate_achieved = effective_rate >= (target_rate as f64 * 0.95);
 
     println!(
@@ -484,7 +484,7 @@ fn main() {
         if cpu_pass { "✅ PASS" } else { "❌ FAIL" }
     );
     println!(
-        "║  Zero Loss:      {received}/{total_produced}  {}               ║",
+        "║  Zero Loss:      rx {received}/{total_produced} · tx {sent}/{total_produced}  {}  ║",
         if loss_pass { "✅ PASS" } else { "❌ FAIL" }
     );
     println!(

@@ -161,11 +161,14 @@ sub-millisecond at both tested rates.
   is limited by librdkafka's internal batching, which is very efficient. Good for low-latency
   streaming and mid-to-low rates.
 
-**Metric bug noted (not fixed in this pass)**: `PipelineMetrics.outputs_sent` isn't
-incremented for `UnorderedBatch` because `batch_result.delivered` is empty until `flush()`
-completes, and the sink task only adds `delivered.len()` to the counter. The bench uses
-`events_received == events_produced` for the zero-loss check instead. Fix for the metric
-is a separate item.
+**Metric bug fixed in follow-up**: `PipelineMetrics.outputs_sent` was not being
+incremented for `UnorderedBatch` because `batch_result.delivered` is empty until
+`flush()` completes, and the sink task only added `delivered.len()` to the counter.
+Fixed in `pipeline.rs` via a `credit_pending_on_flush` helper that drains a
+`pending_ids: Vec<Uuid>` into the metric and delivery ledger at every flush site
+(interval, idle, final). The `gate1_steady_state` bench now validates both
+`events_received` and `outputs_sent` against `total_produced`. Regression test:
+`pipeline::tests::buffered_pipeline_unordered_credits_metric_at_flush`.
 
 ---
 
