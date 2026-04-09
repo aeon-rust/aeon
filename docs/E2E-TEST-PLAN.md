@@ -210,3 +210,59 @@ Each E2E test must verify:
 3. **Metadata propagation**: headers/metadata pass through correctly
 4. **Ordering**: within a partition, events arrive in order
 5. **Graceful shutdown**: processor disconnects cleanly, no orphaned batches
+
+---
+
+## Execution Log
+
+### 2026-04-09 — Full E2E sweep (post-audit close)
+
+Executed after the connector audit pass closed and Gate 1 was re-validated.
+Infrastructure up: Redpanda (`aeon-redpanda`, Docker), Redis / NATS /
+RabbitMQ / Mosquitto (K3s `aeon-test` namespace). Rust toolchain +
+Python / Node.js / .NET / Java / PHP / Go runtimes available.
+
+| Tier | Runnable cases | Passed | Ignored | Stubs (`todo!()`) | Wall time |
+|---|---:|---:|---:|---:|---:|
+| A (Memory round-trip, all SDKs) | 17 | **16** | 1 (A5, wasi-sdk) | 0 | 21s |
+| B (File round-trip) | 5 | **5** | 0 | 0 | 2s |
+| C (Kafka/Redpanda E2E, all SDKs) | 11 | **11** | 0 | 0 | 79s |
+| D (T3 WebTransport variants) | 5 | 0 | 0 | **5** | — |
+| E (Cross-connector, Python T4) | 9 | **9** | 0 | 0 | 24s |
+| F (External messaging) | 7 | **1** (F6) | 0 | **6** | <1s |
+| G (CDC database sources) | 3 | 0 | 0 | **3** | — |
+| H (PHP adapter variants) | 6 | **1** (H6) | 0 | **5** | <1s |
+| **Total** | **63** | **43** | **1** | **19** | **~130s** |
+
+**Bonus coverage (not in the plan, run in the same sweep):**
+- `redpanda_integration`: 3/3 passed in 17s (source, sink, E2E passthrough).
+- `sustained_load`: 2/2 passed in 60s (`sustained_30s_zero_event_loss` +
+  `sustained_30s_buffered_zero_event_loss` — 30s steady-state runs with
+  zero loss assertions).
+
+### Status column audit
+
+Every ✅ in the tier tables above was **actually executed and passed**.
+Every ❌ is a real `todo!()` stub with the exact deferral reason captured
+in the test's `#[ignore]` message. The status column is accurate — no
+aspirational marks.
+
+### Implementation debt captured
+
+19 stub tests remain. They fall into three natural groups:
+
+1. **T3 WebTransport end-to-end (5)** — Tier D, all 5 SDKs need TLS cert
+   provisioning + engine WebTransport host wiring. T3 *transport* is
+   production-grade after §5.3 (see `docs/CONNECTOR-AUDIT.md`); these
+   tests are the SDK-level acceptance proof.
+2. **External messaging with non-Rust SDKs (6)** — Tier F1–F5 (NATS,
+   Redis, MQTT, RabbitMQ with Python/Go/Node.js/Java/PHP) + F7 (QUIC
+   loopback with Go T3). The connectors already pass their own
+   Rust-level integration tests; these validate the full SDK round-trip.
+3. **CDC + PHP adapters + C Wasm (8)** — Tier G1–G3 (Postgres/MySQL/
+   MongoDB CDC), Tier H1–H5 (Swoole/ReactPHP/AMPHP/Workerman/FrankenPHP),
+   Tier A5 (C via wasi-sdk). All gated on optional runtime or toolchain
+   installation.
+
+None of these are Gate 1 blockers. All 43 runnable tests pass — the
+entire Gate 1 money path (Tier C: 11 SDK × Kafka E2E) is green.
