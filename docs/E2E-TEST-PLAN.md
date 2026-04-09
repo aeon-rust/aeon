@@ -127,7 +127,7 @@ Memory Source -> Processor (T3) -> Memory Sink. Validates QUIC/WebTransport tran
 |---|-----------|------|--------|
 | D1 | Python | Memory -> Python_WT -> Memory | ❌ |
 | D2 | Go | Memory -> Go_WT -> Memory | ❌ |
-| D3 | Rust Network | Memory -> RustNet_WT -> Memory | ❌ |
+| D3 | Rust Network | Memory -> RustNet_WT -> Memory | ✅ |
 | D4 | Node.js | Memory -> NodeJS_WT -> Memory | ❌ |
 | D5 | Java | Memory -> Java_WT -> Memory | ❌ |
 
@@ -227,12 +227,12 @@ Python / Node.js / .NET / Java / PHP / Go runtimes available.
 | A (Memory round-trip, all SDKs) | 17 | **16** | 1 (A5, wasi-sdk) | 0 | 21s |
 | B (File round-trip) | 5 | **5** | 0 | 0 | 2s |
 | C (Kafka/Redpanda E2E, all SDKs) | 11 | **11** | 0 | 0 | 79s |
-| D (T3 WebTransport variants) | 5 | 0 | 0 | **5** | — |
+| D (T3 WebTransport variants) | 5 | **1** (D3) | 0 | **4** | ~3s |
 | E (Cross-connector, Python T4) | 9 | **9** | 0 | 0 | 24s |
 | F (External messaging) | 7 | **5** (F1, F3, F4, F5, F6) | 0 | **1** | ~5s |
 | G (CDC database sources) | 3 | 0 | 0 | **3** | — |
 | H (PHP adapter variants) | 6 | **6** (H1–H6)† | 0 | 0 | ~8s |
-| **Total** | **63** | **52** | **1** | **9** | **~142s** |
+| **Total** | **63** | **53** | **1** | **8** | **~145s** |
 
 † H1 (Swoole) and H5 (FrankenPHP) self-skip when their runtime is absent,
 matching the A12 (Java) / C7 (Go) convention. Both are real, compiled
@@ -253,15 +253,22 @@ aspirational marks.
 
 ### Implementation debt captured
 
-9 stub tests remain. They fall into three natural groups:
+8 stub tests remain. They fall into three natural groups:
 
-1. **T3 WebTransport end-to-end (5)** — Tier D, all 5 SDKs need TLS cert
-   provisioning + engine WebTransport host wiring. T3 *transport* is
-   production-grade after §5.3 (see `docs/CONNECTOR-AUDIT.md`); these
-   tests are the SDK-level acceptance proof.
+1. **T3 WebTransport end-to-end (4)** — Tier D1/D2/D4/D5, blocked on
+   per-language WebTransport clients in the Python/Go/Node.js/Java
+   SDKs. D3 (Rust Network) landed this sweep and is the first full
+   T3 round-trip proof: in-process Rust WT processor client,
+   self-signed localhost cert via `wtransport::Identity::self_signed`,
+   200 events through a partition-pinned data stream, C1/C2/C3 +
+   graceful shutdown verified. T3 *transport* was already
+   production-grade after §5.3 (see `docs/CONNECTOR-AUDIT.md`); D3
+   is the first SDK-level acceptance proof. D3 requires
+   `--features webtransport-host` and uses the `aeon-processor-client`
+   `webtransport-insecure` feature to trust the self-signed cert.
 2. **QUIC loopback (1)** — Tier F7 (QUIC loopback with Go T3) is the
-   last Tier F stub. It shares the same TLS-cert + WebTransport-host
-   blocker as Tier D. All other Tier F tests landed this sweep: F1
+   last Tier F stub. It shares the same Go-SDK WT-client blocker as
+   Tier D2. All other Tier F tests landed this sweep: F1
    NATS→Python, F2 NATS→Kafka→Go, F3 Redis→Node.js, F4 MQTT→Java,
    F5 RabbitMQ→PHP. Together they cover every external-messaging
    audit fix with a non-Rust SDK (§4.0 flush-credit, §4.4
@@ -278,5 +285,15 @@ aspirational marks.
    H5 (FrankenPHP `php-cli` SAPI), H6 (native CLI). H1 and H5 self-skip
    when their runtime is absent — no `todo!()` stubs remain in Tier H.
 
-None of these are Gate 1 blockers. All 52 runnable tests pass — the
-entire Gate 1 money path (Tier C: 11 SDK × Kafka E2E) is green.
+None of these are Gate 1 blockers. All 53 runnable tests pass — the
+entire Gate 1 money path (Tier C: 11 SDK × Kafka E2E) is green, and
+D3 now proves the T3 WebTransport host end-to-end with a real client.
+
+### Known follow-up: SDK envelope Uuid serialization (msgpack)
+
+D3 currently uses the `json` codec (matching A10/C8/F6). The `msgpack`
+path trips because `WireEvent.id: uuid::Uuid` serializes as a 16-byte
+array in msgpack while `ProcessEvent.id: String` expects a string —
+the same SDK envelope bug also affects WS tests, which is why they
+too pin to `json`. Fix is to switch the SDK envelope `id` field to
+`uuid::Uuid` so msgpack round-trips cleanly; tracked as a follow-up.
