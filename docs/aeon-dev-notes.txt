@@ -19741,5 +19741,44 @@ Good thinking on all three. Let me first understand what's in .claude/ and what 
   Let me start by reading the key docs to understand what needs updating.
 
 
+All done. Here's the summary of changes across 12 files:
+
+  .gitignore — Changed from blanket .claude/ ignore to only .claude/settings.local.json (machine-specific). Project-level Claude Code settings are now
+  shareable.
+
+  .env.example — Added 15 missing environment variables:
+  - Cluster: AEON_CLUSTER_NODE_ID, AEON_CLUSTER_BIND, AEON_HTTP_BIND, AEON_INSTANCE_DATA_DIR, AEON_INSTANCE_LOG_DIR
+  - Logging: RUST_LOG
+  - Benchmarking: AEON_BENCH_* (10 vars for brokers, partitions, payload, batch, Wasm paths)
+  - Added note about CI/CD injection as alternative to .env file
+
+  README.md — Major updates:
+  - Processor description: 3 runtimes → 4 tiers (T1-T4) with 8 language SDKs
+  - Added sdks/ and aeon-processor-client to workspace structure
+  - "Current Status" rewritten: honest split between "implemented and tested" vs "designed, not production-validated"
+  - Test count: 601 → 820 (776 Rust + 24 Python + 20 Go)
+  - Added "Built With" section mentioning Claude Code
+  - Added FOUR-TIER-PROCESSORS.md and E2E-TEST-PLAN.md to doc table
+
+  11 docs updated with implementation status notes:
+  - PUBLISHING.md: Added aeon-processor-client (12 crates now), pre-publish status
+  - CLUSTERING.md: Single-node tested, multi-node deferred to post-Gate 2
+  - INSTALLATION.md: Currently runs from source, not yet published
+  - CONNECTORS.md: 7 connectors E2E tested, 4 implemented + infra ready, 3 CDC stubs
+  - FOUR-TIER-PROCESSORS.md: Updated from "Draft" to "Partially implemented" with specifics
+  - PROCESSOR-DEPLOYMENT.md: Wasm/native loading implemented, upgrades designed not integrated
+  - PROCESSOR-GUIDE.md: Added C/C++ and .NET NativeAOT T1 rows, T3/T4 SDK cross-reference
+  - DEPLOYMENT-ARCHITECTURE.md: Topology 1 tested, multi-server designed not validated
+
+  Would you like me to commit these changes?
+
+✻ Churned for 8m 24s
+===============================================
+proceed
+==================================================
+claude's response:
+
+Committed as cc383fe. Ready for you to push when you're ready.
+
 
 
