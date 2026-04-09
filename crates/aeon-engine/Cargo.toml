@@ -114,3 +114,7 @@ harness = false
 [[bench]]
 name = "kafka_sink_isolation"
 harness = false
+
+[[bench]]
+name = "gate1_steady_state"
+harness = false
