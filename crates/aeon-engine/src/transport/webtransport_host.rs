@@ -53,6 +53,11 @@ pub struct WebTransportHostConfig {
     pub pipeline_name: String,
     /// Pipeline codec override (if set, overrides processor preference).
     pub pipeline_codec: Option<TransportCodec>,
+    /// Maximum number of concurrently in-flight batches per session.
+    /// Bounds the per-session pending DashMap so a slow processor cannot
+    /// cause unbounded memory growth. `call_batch` suspends on the session
+    /// semaphore when this limit is reached.
+    pub max_inflight_batches: usize,
 }
 
 impl WebTransportHostConfig {
@@ -74,6 +79,7 @@ impl WebTransportHostConfig {
             processor_version: String::new(),
             pipeline_name: String::new(),
             pipeline_codec: None,
+            max_inflight_batches: crate::transport::session::DEFAULT_MAX_INFLIGHT_BATCHES,
         }
     }
 }
@@ -204,8 +210,11 @@ impl ProcessorTransport for WebTransportProcessorHost {
                     ))
                 })?;
 
-            // Allocate batch_id and get response receiver
-            let (batch_id, rx) = session.batch_inflight.start_batch();
+            // Allocate batch_id and get response receiver. If the session's
+            // inflight capacity is saturated, `start_batch` suspends until
+            // an earlier batch completes — this is the session-level
+            // backpressure that bounds the pending map.
+            let (batch_id, rx) = session.batch_inflight.start_batch().await;
 
             // Encode batch request
             let wire = crate::batch_wire::encode_batch_request(batch_id, &events, session.codec)?;
@@ -340,6 +349,7 @@ async fn handle_wt_session(
         heartbeat_interval: config.heartbeat_interval,
         batch_signing: true,
         pipeline_codec: config.pipeline_codec,
+        max_inflight_batches: config.max_inflight_batches,
     };
 
     let awpp = tokio::time::timeout(

@@ -296,8 +296,8 @@ already handled better by the processor host implementations.
 |---|---|---|---|---|---|
 | T1 Native | dylib (libloading) | Sync call in processor task | Yes, via SPSC | `run_buffered()` via `Processor` trait | Complete |
 | T2 Wasm | Wasmtime in-process | Sync call in processor task | Yes, via SPSC | `run_buffered()` via `Processor` trait | Complete |
-| T3 WebTransport | QUIC, out-of-process | Async `call_batch` via `ProcessorTransport` | Partial — see §5.3 | **Not wired** into `run_buffered` | Host implemented, adapter missing |
-| T4 WebSocket | WS, out-of-process | Async `call_batch` via `ProcessorTransport` | Partial — see §5.3 | **Not wired** into `run_buffered` | Host implemented, adapter missing |
+| T3 WebTransport | QUIC, out-of-process | Async `call_batch` via `ProcessorTransport` | OK (fixed §5.3) | `run_buffered_transport` + bounded `BatchInflight` | Production-grade |
+| T4 WebSocket | WS, out-of-process | Async `call_batch` via `ProcessorTransport` | OK (fixed §5.3) | `run_buffered_transport` + bounded `BatchInflight` | Production-grade |
 
 ### 5.1 T1 Native — OK
 
@@ -314,41 +314,72 @@ but returns a hard error on exhaustion, which terminates the pipeline. That
 is a *feature* for now (forces operators to tune fuel limits); future work
 could add cooperative yield.
 
-### 5.3 T3/T4 — Host implemented but not wired to `run_buffered`
+### 5.3 T3/T4 — FIXED: `run_buffered_transport` + bounded `BatchInflight`
 
 `crates/aeon-engine/src/transport/webtransport_host.rs` and
 `.../websocket_host.rs` both implement `aeon-types::ProcessorTransport` —
-an *async* trait — not the sync `Processor` trait. The engine's
-`run_buffered` signature is `P: Processor + Send + Sync + 'static`, so
-neither host can be used with the buffered pipeline today.
+an *async* trait — not the sync `Processor` trait. Before this pass the
+engine's `run_buffered` signature (`P: Processor + Send + Sync + 'static`)
+could not accept them, and `BatchInflight` was an unbounded `DashMap` of
+pending oneshots that could grow without limit if a remote processor
+stalled.
 
-The T3/T4 hosts track in-flight batches in a `BatchInflight` struct
-(`transport/session.rs`) keyed by `batch_id`, with a `DashMap` of pending
-`oneshot` receivers. **This structure has no capacity bound.** If a remote
-processor stalls, the map grows unboundedly until the 30s per-batch timeout
-fires and drops the batch.
+**What landed**:
 
-**Fixes needed**:
+1. **`run_buffered_transport<S, T, K>`** (`crates/aeon-engine/src/pipeline.rs`)
+   — new public entry point accepting
+   `T: ProcessorTransport + Send + Sync + 'static + ?Sized` (so an
+   `Arc<dyn ProcessorTransport>` works). Structurally identical to
+   `run_buffered`: same source/processor/sink SPSC layout, same delivery
+   pipeline, same failure policy, same checkpoint behavior. The processor
+   task body is the single difference — it calls
+   `transport.call_batch(events).await` instead of the synchronous
+   `processor.process_batch(events)`. Sink task body is shared with
+   `run_buffered` via the extracted `run_sink_task` helper.
 
-1. **Wire a `ProcessorTransport` → `Processor` adapter** so T3/T4 processor
-   hosts can be used with `run_buffered`. The adapter would `block_on` the
-   async call, but that defeats async backpressure. Better: add a
-   `run_buffered_async` pipeline variant that takes an async processor and
-   runs it with `await` inside the processor task. This preserves the yield
-   semantics and lets the SPSC fullness propagate backpressure naturally
-   through the async call.
+2. **Bounded `BatchInflight`** (`crates/aeon-engine/src/transport/session.rs`)
+   — the pending DashMap is now paired with a `tokio::sync::Semaphore`
+   holding `max_inflight_batches` permits (default 1024). `start_batch` is
+   now `async`: it awaits `Semaphore::acquire_owned().await` before
+   allocating a `batch_id`, stores the `OwnedSemaphorePermit` alongside the
+   oneshot sender in the DashMap, and releases the permit automatically
+   when the entry is removed by `complete_batch` / `cancel_all`. A slow
+   remote processor can no longer grow the pending map without bound —
+   instead it exerts backpressure on the pipeline's processor task, which
+   suspends, stops draining the source ring, and cascades the slowdown
+   upstream to the broker the same way any other blocking sink would.
 
-2. **Bound `BatchInflight`** with a `tokio::sync::Semaphore`. Configurable
-   `max_inflight_batches` on the host config; `call_batch` acquires a permit
-   before sending a frame, releases on response/timeout. This gives explicit
-   protocol-level backpressure at the transport boundary.
+3. **`max_inflight_batches` config knob** threaded through
+   `HandshakeConfig`, `WebTransportHostConfig`, and `WebSocketHostConfig`.
+   Defaults to `transport::session::DEFAULT_MAX_INFLIGHT_BATCHES = 1024`.
 
-3. **Per-batch timeout + retry policy** — move retry decisions from the
-   transport layer into the pipeline via `BatchFailurePolicy`, so a single
-   policy controls retries regardless of tier.
+Backpressure path end-to-end: transport saturation → `Semaphore::acquire`
+suspends inside `call_batch` → processor task suspends → source→processor
+ring fills → source task yields → push-source `PushBufferTx::send` blocks
+→ TCP receive window closes → broker stops delivering. Zero loss.
 
-All three are **post-Gate 1** because T3/T4 aren't on the Gate 1 critical
-path.
+Regression coverage:
+- `transport::session::tests::batch_inflight_bounded_by_capacity` — proves
+  a third `start_batch` blocks when capacity is 2 and unblocks exactly when
+  `complete_batch` drops the first permit.
+- `transport::session::tests::batch_inflight_permit_released_on_cancel_all`
+  — proves `cancel_all` releases all permits.
+- `pipeline::tests::buffered_transport_pipeline_passthrough` — 1k events
+  through `run_buffered_transport` with `InProcessTransport` wrapping a
+  sync `Processor`, verifying it is behaviorally equivalent to
+  `run_buffered` (same metrics, same output count).
+- `pipeline::tests::buffered_transport_pipeline_large_volume` — 50k events
+  through a small ring buffer (256 capacity) to exercise the backpressure
+  path.
+- `pipeline::tests::buffered_transport_pipeline_propagates_transport_error`
+  — inline-defined `FailingTransport` verifies that transport errors are
+  surfaced cleanly instead of hanging the pipeline.
+
+Item #3 (per-batch timeout + retry policy migration from transport to
+pipeline `BatchFailurePolicy`) remains deferred — the current per-batch
+`batch_timeout` on the host configs is still honored by the hosts
+themselves, and `run_buffered_transport` already applies the pipeline's
+existing `BatchFailurePolicy` via the shared sink task.
 
 ---
 
@@ -396,10 +427,29 @@ with file:line references for follow-up phases.
    - MQTT is documented as infeasible at the current rumqttc API level
      (see §4.4 body).
 
+5. **§5.3 — T3/T4 pipeline wiring + bounded `BatchInflight`** — **DONE**.
+   - New `run_buffered_transport<S, T, K>` in `pipeline.rs` accepts
+     `T: ProcessorTransport + ?Sized`, sharing the source and sink task
+     bodies with `run_buffered` via the extracted `run_sink_task` helper.
+     The processor task calls `transport.call_batch(events).await` so
+     transport backpressure suspends the pipeline naturally.
+   - `BatchInflight` is now bounded by a `tokio::sync::Semaphore` with
+     default capacity 1024, configurable via `max_inflight_batches` on
+     `HandshakeConfig` / `WebTransportHostConfig` / `WebSocketHostConfig`.
+     `start_batch` is now `async` and awaits a permit; `complete_batch`
+     and `cancel_all` release permits by dropping them with the DashMap
+     entry.
+   - Regression tests:
+     `transport::session::tests::batch_inflight_bounded_by_capacity`,
+     `transport::session::tests::batch_inflight_permit_released_on_cancel_all`,
+     `pipeline::tests::buffered_transport_pipeline_passthrough`,
+     `pipeline::tests::buffered_transport_pipeline_large_volume`,
+     `pipeline::tests::buffered_transport_pipeline_propagates_transport_error`.
+
 Other gaps (§4.3 MongoDB CDC resume token, §4.5 Postgres/MySQL CDC
-streaming replication, §4.6 QUIC/WebTransport sink stream reuse, §5.3
-T3/T4 pipeline adapter + BatchInflight bound) remain deferred as follow-up
-work with clear file:line references for the next phase.
+streaming replication, §4.6 QUIC/WebTransport sink stream reuse) remain
+deferred as follow-up work with clear file:line references for the next
+phase.
 
 ---
 
@@ -420,10 +470,12 @@ strategy differentiation without reworking the sink to observe PUBACK /
 PUBCOMP out of the rumqttc `EventLoop` — captured as a finding in §4.4 and
 deferred (MQTT is post-Gate 2).
 
-**Processor side**: T1/T2 are wired correctly and propagate backpressure
-end-to-end. T3/T4 hosts are implemented but not yet integrated with the
-pipeline runner, and their `BatchInflight` queue is unbounded. Both issues
-are post-Gate 1.
+**Processor side**: T1/T2 run via `run_buffered` with sync `Processor`.
+T3/T4 now run via `run_buffered_transport` with async `ProcessorTransport`,
+and their per-session `BatchInflight` is bounded by a Semaphore so a slow
+remote processor exerts real backpressure on the pipeline instead of
+growing the pending map without limit. All four tiers propagate
+backpressure end-to-end.
 
 **Pipeline orchestrator**: the single correctness bug is the `outputs_sent`
 metric not being credited for `UnorderedBatch`. Fixed in this pass.

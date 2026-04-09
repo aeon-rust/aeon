@@ -91,6 +91,7 @@ pub async fn start_ws_test_server(pipeline_name: &str) -> WsTestServer {
         processor_version: "1.0.0".into(),
         pipeline_name: pipeline_name.to_string(),
         pipeline_codec: None,
+        max_inflight_batches: aeon_engine::transport::session::DEFAULT_MAX_INFLIGHT_BATCHES,
     };
 
     let ws_host = Arc::new(WebSocketProcessorHost::new(ws_config));

@@ -48,6 +48,11 @@ pub struct WebSocketHostConfig {
     pub pipeline_name: String,
     /// Pipeline codec override (if set, overrides processor preference).
     pub pipeline_codec: Option<TransportCodec>,
+    /// Maximum number of concurrently in-flight batches per session.
+    /// Bounds the per-session pending DashMap so a slow processor cannot
+    /// cause unbounded memory growth. `call_batch` suspends on the session
+    /// semaphore when this limit is reached.
+    pub max_inflight_batches: usize,
 }
 
 impl WebSocketHostConfig {
@@ -67,6 +72,7 @@ impl WebSocketHostConfig {
             processor_version: String::new(),
             pipeline_name: String::new(),
             pipeline_codec: None,
+            max_inflight_batches: crate::transport::session::DEFAULT_MAX_INFLIGHT_BATCHES,
         }
     }
 }
@@ -118,6 +124,7 @@ impl WebSocketProcessorHost {
             heartbeat_interval: self.config.heartbeat_interval,
             batch_signing: true,
             pipeline_codec: self.config.pipeline_codec,
+            max_inflight_batches: self.config.max_inflight_batches,
         };
 
         let awpp = tokio::time::timeout(
@@ -230,8 +237,11 @@ impl ProcessorTransport for WebSocketProcessorHost {
                     AeonError::connection(format!("T4 socket for session {session_id} not found"))
                 })?;
 
-            // Allocate batch_id and get response receiver
-            let (batch_id, rx) = session.batch_inflight.start_batch();
+            // Allocate batch_id and get response receiver. If the session's
+            // inflight capacity is saturated, `start_batch` suspends until
+            // an earlier batch completes — this is the session-level
+            // backpressure that bounds the pending map.
+            let (batch_id, rx) = session.batch_inflight.start_batch().await;
 
             // Encode batch request, then wrap in data frame with routing header
             let wire = crate::batch_wire::encode_batch_request(batch_id, &events, session.codec)?;
@@ -315,8 +325,7 @@ impl WsSharedSocket {
         tokio::sync::mpsc::Receiver<Result<Message, AeonError>>,
     ) {
         let (send_tx, mut send_rx) = tokio::sync::mpsc::channel::<Message>(256);
-        let (recv_tx, recv_rx) =
-            tokio::sync::mpsc::channel::<Result<Message, AeonError>>(256);
+        let (recv_tx, recv_rx) = tokio::sync::mpsc::channel::<Result<Message, AeonError>>(256);
 
         // I/O pump: owns the WebSocket, multiplexes send/recv without contention.
         tokio::spawn(async move {
