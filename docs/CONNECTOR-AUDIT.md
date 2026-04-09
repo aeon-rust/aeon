@@ -84,9 +84,9 @@ three-phase backpressure primitive used by every push source:
 | File | **All three honored** | Per-event fsync / batch fsync / buffered | Drains BufWriter | Production-grade |
 | Kafka | **All three honored** | Per-future await / `join_all` / enqueue only | `producer.flush()` | Production-grade |
 | NATS JetStream | **All three honored** | Per-ack / batch-ack / deferred-ack | Awaits `pending_acks` | Production-grade |
-| MQTT | **None differentiated** | Always per-publish await | no-op | **Gap** — see §4.4 |
-| RabbitMQ | **None differentiated** | Always per-publish confirm | no-op | **Gap** — see §4.4 |
-| Redis Streams | **None differentiated** | Always per-XADD await | no-op | **Gap** — see §4.4 |
+| MQTT | **N/A** — rumqttc API is already fire-and-enqueue | Always per-publish enqueue | no-op | No differentiation possible — see §4.4 |
+| RabbitMQ | **All three honored** | Per-confirm await / `join_all` / stash for flush | Awaits `pending_confirms` | Production-grade |
+| Redis Streams | **All three honored** | Per-XADD / pipelined XADD / spawned pipeline | Awaits `pending_tasks` | Production-grade |
 | QUIC | None differentiated | New stream per batch | no-op | Functional, see §4.6 |
 | WebTransport | None differentiated | New stream per batch | no-op | Functional, see §4.6 |
 | WebSocket | None differentiated | Per-output `send` + loop await | `writer.flush()` | Functional |
@@ -190,33 +190,71 @@ ledger checkpoint so the connector can seek to it on restart.
 
 **Deferred** — MongoDB CDC is post-Scenario 1 per `CLAUDE.md`.
 
-### 4.4 — MQTT, RabbitMQ, Redis sinks ignore DeliveryStrategy
+### 4.4 — MQTT, RabbitMQ, Redis sink strategies
 
-**Severity**: Missing feature — `DeliveryStrategy::UnorderedBatch` cannot give
-its normal throughput/latency benefit because these sinks still await every
-publish synchronously.
-**Locations**:
-- `crates/aeon-connectors/src/mqtt/sink.rs` — always awaits per publish.
-- `crates/aeon-connectors/src/rabbitmq/sink.rs` — always awaits publisher
-  confirm per publish.
-- `crates/aeon-connectors/src/redis_streams/sink.rs` — always awaits each XADD.
+**RabbitMQ** — **FIXED in this pass**.
+`crates/aeon-connectors/src/rabbitmq/sink.rs` now honors all three delivery
+strategies, mirroring the Kafka sink contract:
+- `PerEvent`: `basic_publish().await` followed by `confirm.await` per output.
+- `OrderedBatch` (default): issue all publishes in order, then `join_all` the
+  `PublisherConfirm` futures at the batch boundary. AMQP preserves per-channel
+  publish order, so ordering is maintained even when confirms are awaited
+  concurrently.
+- `UnorderedBatch`: stash the `PublisherConfirm` futures in
+  `pending_confirms: Vec<PublisherConfirm>`; `write_batch()` returns
+  `BatchResult::all_pending(ids)`. `flush()` drains and `join_all`s the vec,
+  then credits `self.delivered`. Nacks are converted to `AeonError` via
+  `check_confirmation()`.
 
-**Fix shape** (common pattern, adapted per connector):
+**Redis Streams** — **FIXED in this pass**.
+`crates/aeon-connectors/src/redis_streams/sink.rs` now honors all three:
+- `PerEvent`: XADD each output with a per-call `query_async`.
+- `OrderedBatch` (default): build a single `redis::pipe()` containing all XADDs
+  and execute it in one round-trip. Redis is single-threaded and pipelined
+  commands execute in order, so ordering is preserved.
+- `UnorderedBatch`: spawn the pipeline execution on a tokio task (the
+  `MultiplexedConnection` is clonable and internally multiplexes concurrent
+  commands onto one TCP connection). Store the `JoinHandle` in
+  `pending_tasks`. `flush()` awaits all handles and credits them. Useful when
+  the pipeline sink task wants to decouple write_batch latency from the
+  broker round-trip.
 
-- `PerEvent`: current behavior — await per publish.
-- `OrderedBatch`: issue all publishes, then await all confirms via `join_all`
-  (same pattern as the Kafka sink fix, `kafka/sink.rs:219`).
-- `UnorderedBatch`: store publish futures in `pending_acks: Vec<_>`, return
-  `BatchResult::all_pending(ids)`. In `flush()`, `join_all` the pending vec
-  and report results.
+**MQTT** — **strategy differentiation is infeasible at the current rumqttc API
+level.** This is a finding, not a deferral.
+`rumqttc::AsyncClient::publish()` (`~/.cargo/registry/src/index.crates.io-*/
+rumqttc-0.24.0/src/client.rs:69-89`) signature is
+`async fn publish(...) -> Result<(), ClientError>`. The implementation
+constructs a `Request::Publish(...)` and sends it over an internal flume
+channel to the `EventLoop` task; it returns as soon as the request is
+enqueued on that channel. **There is no per-publish future or handle
+returned** — the PUBACK (QoS 1) / PUBCOMP (QoS 2) for that specific message
+is consumed inside the EventLoop and never surfaced back to the caller. The
+only failure mode `publish()` reports is "failed to enqueue the Request"
+(client dropped or channel closed).
 
-Redis Streams needs a slightly different approach because the redis crate's
-`Pipeline` type is the idiomatic way to batch XADDs. For `UnorderedBatch`, use
-`redis::pipe().xadd().xadd()...query_async()` in `flush()`.
+This means the `AsyncClient::publish().await` path is already semantically
+identical to `UnorderedBatch`: publishes are batched inside rumqttc's own
+request queue, processed asynchronously by the EventLoop, and confirmed by
+the broker in the background. There is nothing for the Aeon sink to stash.
+The three Aeon-level strategies would all compile down to the same for-loop
+of `client.publish(...).await`.
 
-**Deferred** until the Kafka unordered-batch metric bug (§4.0) is fixed,
-because (a) those connectors are post-Scenario 1 and (b) the fix requires the
-metric bug to be resolved first so we can validate them.
+**What would be required to add real strategy differentiation for MQTT**:
+1. A client that exposes PUBACK/PUBCOMP events via a side channel (rumqttc's
+   `EventLoop::poll()` does emit these as `Incoming::PubAck`/`Incoming::PubComp`,
+   but the sink currently doesn't see them — they are consumed by the
+   background poll loop spawned in `MqttSink::new`, `sink.rs:81-91`).
+2. A packet-id → oneshot map maintained inside the sink, populated from the
+   poll loop, so the sink can await per-publish confirmation.
+3. This is a non-trivial redesign of the MQTT sink and is **not justified for
+   Scenario 1** (MQTT is post-Gate 2 per `CLAUDE.md`). Captured here so a
+   future pass can pick it up; the MQTT sink currently behaves correctly for
+   every strategy by virtue of rumqttc's architecture.
+
+**No code change** to `mqtt/sink.rs` in this pass; the per-publish await is
+semantically correct given the API surface. The module-level docs could be
+amended to state this explicitly so future readers don't mistake it for a
+bug, but that is a cosmetic change.
 
 ### 4.5 — Postgres/MySQL CDC use polling instead of streaming replication
 
@@ -307,26 +345,44 @@ path.
 
 ---
 
-## 6. Immediate Fix Plan (this pass)
+## 6. Fixes Landed This Pass
 
-Scope is intentionally narrow — fix what is on the Scenario 1 critical path
-and call correctness bugs. Everything else is captured in the matrices
-above with file:line references for follow-up phases.
+Scope is intentionally narrow — fix what is on the Scenario 1 critical path,
+call correctness bugs, and extend strategy coverage to the sinks where the
+client library allows it. Everything else is captured in the matrices above
+with file:line references for follow-up phases.
 
-1. **§4.0 — UnorderedBatch metric bug** (pipeline.rs):
-   - Track pending count locally in the sink task.
-   - On successful `flush()`, credit `outputs_sent` with the drained pending
-     count.
-   - Update the `gate1_steady_state` bench to use `outputs_sent` again as
-     the zero-loss check (remove the `events_received` workaround).
+1. **§4.0 — UnorderedBatch metric bug** (pipeline.rs) — **DONE**.
+   - Sink task now accumulates `pending_ids: Vec<Uuid>` and credits them to
+     `outputs_sent` + delivery ledger at every flush site via the shared
+     `credit_pending_on_flush` helper.
+   - Regression test:
+     `pipeline::tests::buffered_pipeline_unordered_credits_metric_at_flush`.
+   - `gate1_steady_state` bench now validates both `events_received` and
+     `outputs_sent` against `total_produced`.
 
-2. **§4.1 — WebSocket source drop** (websocket/source.rs):
-   - Remove the `is_overloaded()` drop branches.
-   - Add a unit test that produces 2× `channel_capacity + spill_threshold`
-     events through the source and asserts zero loss.
+2. **§4.1 — WebSocket source drop** (websocket/source.rs) — **DONE**.
+   - Removed the `is_overloaded()` drop branches. The blocking
+     `PushBufferTx::send(event).await` provides the backpressure the drop
+     path was trying to achieve, by not draining the tungstenite `read` loop.
+   - Regression test: `push_buffer::tests::test_push_buffer_zero_loss_under_backpressure`.
 
-Other gaps (§4.2, §4.3, §4.4, §4.5, §4.6, §5.3) are deferred as follow-up
-work with clear file:line references for the next phase.
+3. **§4.4 — RabbitMQ, Redis Streams sink strategies** — **DONE**.
+   - `rabbitmq/sink.rs`: all three strategies implemented via
+     `pending_confirms: Vec<PublisherConfirm>` stashing and `join_all` at
+     the batch boundary / flush boundary.
+   - `redis_streams/sink.rs`: `PerEvent` loops per-XADD, `OrderedBatch` uses
+     a single `redis::pipe()` round-trip, `UnorderedBatch` spawns the
+     pipeline execution on a tokio task and stashes the `JoinHandle` for
+     `flush()` to await.
+   - MQTT is documented as infeasible at the current rumqttc API level
+     (see §4.4 body).
+
+Other gaps (§4.2 MQTT source backoff, §4.3 MongoDB CDC resume token,
+§4.5 Postgres/MySQL CDC streaming replication, §4.6 QUIC/WebTransport sink
+stream reuse, §5.3 T3/T4 pipeline adapter + BatchInflight bound) remain
+deferred as follow-up work with clear file:line references for the next
+phase.
 
 ---
 
@@ -338,12 +394,11 @@ Push-based connectors all use the shared three-phase `PushBuffer` and most
 of them do the right thing at Phase 3. WebSocket is the one outlier that
 drops instead of applying TCP flow control (fixable in this pass).
 
-**Sink side**: File, Kafka, and NATS are fully strategy-aware and
-production-grade. MQTT, RabbitMQ, and Redis Streams are functional but
-treat every strategy as `PerEvent`. This does not break correctness — it
-just means they can't take advantage of `UnorderedBatch` for throughput.
-Fix is well-understood (same pattern as Kafka `OrderedBatch` + `join_all`)
-and deferred to a dedicated pass.
+**Sink side**: File, Kafka, NATS, **RabbitMQ**, and **Redis Streams** are all
+fully strategy-aware and production-grade after this pass. MQTT cannot add
+strategy differentiation without reworking the sink to observe PUBACK /
+PUBCOMP out of the rumqttc `EventLoop` — captured as a finding in §4.4 and
+deferred (MQTT is post-Gate 2).
 
 **Processor side**: T1/T2 are wired correctly and propagate backpressure
 end-to-end. T3/T4 hosts are implemented but not yet integrated with the

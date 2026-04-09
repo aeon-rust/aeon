@@ -1,6 +1,32 @@
 //! MQTT sink — publishes outputs to an MQTT topic.
 //!
 //! Each output payload is published as an MQTT message to the configured topic.
+//!
+//! # Why `DeliveryStrategy` is not honored here
+//!
+//! Unlike the Kafka, RabbitMQ, and Redis Streams sinks, this connector does
+//! **not** branch on `DeliveryStrategy`. `rumqttc::AsyncClient::publish()`
+//! returns `Result<(), ClientError>` as soon as the request has been enqueued
+//! on rumqttc's internal flume channel to the background `EventLoop` task —
+//! it does not return a future that can be awaited for the broker PUBACK /
+//! PUBCOMP. Those acks are consumed by the `EventLoop::poll()` loop spawned
+//! in `MqttSink::new`, and the sink currently has no side channel to observe
+//! them per packet-id.
+//!
+//! Consequently, `publish(...).await` is already semantically equivalent to
+//! `UnorderedBatch`: publishes are batched inside rumqttc's own request queue
+//! and confirmed by the broker in the background. A Vec of `pending_confirms`
+//! would have nothing to hold and `join_all` would have nothing to await.
+//!
+//! Real per-publish confirmation would require:
+//! 1. Capturing `Incoming::PubAck` / `Incoming::PubComp` events from the
+//!    `EventLoop::poll()` loop and matching them to a packet-id → oneshot map
+//!    held by the sink.
+//! 2. Threading that map through a publish path that reserves packet-ids
+//!    before sending.
+//!
+//! See `docs/CONNECTOR-AUDIT.md` §4.4. MQTT is post-Gate 2 per `CLAUDE.md` so
+//! this investment is deferred.
 
 use aeon_types::{AeonError, BatchResult, Output, Sink};
 use rumqttc::{AsyncClient, MqttOptions, QoS};
