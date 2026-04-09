@@ -6,6 +6,8 @@
 //! WebTransport provides lower latency than WebSocket due to QUIC's 0-RTT
 //! connection establishment and multiplexed streams.
 
+use std::sync::Arc;
+
 use aeon_types::AeonError;
 use wtransport::{ClientConfig, Endpoint};
 
@@ -13,13 +15,18 @@ use crate::auth;
 use crate::wire::{self, Accepted, Challenge, Heartbeat, Register};
 use crate::{BatchProcessFn, ProcessFn, ProcessorConfig, SessionInfo};
 
+/// Shared process function type used across spawned per-stream tasks.
+/// Must be `Send + Sync` because data-stream workers are spawned on the tokio runtime.
+type SharedProcessFn =
+    Arc<dyn Fn(Vec<crate::ProcessEvent>) -> Vec<Vec<crate::ProcessOutput>> + Send + Sync>;
+
 /// Run a processor over T3 WebTransport with per-event processing.
 pub async fn run_webtransport(
     config: ProcessorConfig,
     process_fn: ProcessFn,
 ) -> Result<(), AeonError> {
-    let wrapper: Box<dyn Fn(Vec<crate::ProcessEvent>) -> Vec<Vec<crate::ProcessOutput>> + Send> =
-        Box::new(move |events| events.into_iter().map(process_fn).collect());
+    let wrapper: SharedProcessFn =
+        Arc::new(move |events| events.into_iter().map(process_fn).collect());
     run_webtransport_inner(config, wrapper).await
 }
 
@@ -28,15 +35,14 @@ pub async fn run_webtransport_batch(
     config: ProcessorConfig,
     process_fn: BatchProcessFn,
 ) -> Result<(), AeonError> {
-    let wrapper: Box<dyn Fn(Vec<crate::ProcessEvent>) -> Vec<Vec<crate::ProcessOutput>> + Send> =
-        Box::new(process_fn);
+    let wrapper: SharedProcessFn = Arc::new(process_fn);
     run_webtransport_inner(config, wrapper).await
 }
 
 /// Internal WebTransport processing loop.
 async fn run_webtransport_inner(
     config: ProcessorConfig,
-    process_fn: Box<dyn Fn(Vec<crate::ProcessEvent>) -> Vec<Vec<crate::ProcessOutput>> + Send>,
+    process_fn: SharedProcessFn,
 ) -> Result<(), AeonError> {
     // Parse URL to extract host for WebTransport.
     let url = config.url.clone();
@@ -92,16 +98,20 @@ async fn run_webtransport_inner(
     let response_json = read_length_prefixed(&mut ctrl_recv).await?;
     let msg_type = wire::parse_control_type(&response_json)?;
 
-    let session = match msg_type.as_str() {
+    let (session, pipelines) = match msg_type.as_str() {
         "accepted" => {
             let accepted: Accepted = serde_json::from_str(&response_json)
                 .map_err(|e| AeonError::state(format!("Parse accepted: {e}")))?;
-            SessionInfo {
-                session_id: accepted.session_id,
-                codec: accepted.transport_codec,
-                heartbeat_interval_ms: accepted.heartbeat_interval_ms,
-                batch_signing: accepted.batch_signing,
-            }
+            let pipelines = accepted.pipelines.clone();
+            (
+                SessionInfo {
+                    session_id: accepted.session_id,
+                    codec: accepted.transport_codec,
+                    heartbeat_interval_ms: accepted.heartbeat_interval_ms,
+                    batch_signing: accepted.batch_signing,
+                },
+                pipelines,
+            )
         }
         "rejected" => {
             let rejected: wire::Rejected = serde_json::from_str(&response_json)
@@ -121,6 +131,7 @@ async fn run_webtransport_inner(
     tracing::info!(
         session_id = %session.session_id,
         codec = %session.codec,
+        pipeline_count = pipelines.len(),
         "Session accepted via WebTransport"
     );
 
@@ -141,73 +152,141 @@ async fn run_webtransport_inner(
         }
     });
 
-    // Processing loop: accept bidirectional data streams from server.
+    // Open one long-lived bidirectional data stream per (pipeline, partition)
+    // assignment. The client opens the stream, writes a routing header, then
+    // loops on length-prefixed batch frames (reads requests, writes responses).
+    // This matches the server's `handle_wt_session` → `accept_bi` + routing-header
+    // protocol in `aeon-engine/src/transport/webtransport_host.rs`.
     let codec = session.codec.clone();
     let batch_signing = session.batch_signing;
     let signing_key = config.signing_key.clone();
 
-    loop {
-        match connection.accept_bi().await {
-            Ok(stream) => {
-                let (mut send, mut recv) = stream;
-                let codec = codec.clone();
-                let signing_key = signing_key.clone();
+    let mut stream_tasks = tokio::task::JoinSet::new();
+    for assignment in &pipelines {
+        for &partition in &assignment.partitions {
+            let pipeline_name = assignment.name.clone();
+            let (mut send, recv) = connection
+                .open_bi()
+                .await
+                .map_err(|e| AeonError::state(format!("Open data stream: {e}")))?
+                .await
+                .map_err(|e| AeonError::state(format!("Await data stream: {e}")))?;
 
-                // Read batch request from data stream.
-                let mut data = Vec::new();
-                let mut buf = [0u8; 65536];
-                loop {
-                    match recv.read(&mut buf).await {
-                        Ok(Some(n)) => data.extend_from_slice(&buf[..n]),
-                        Ok(None) => break,
-                        Err(e) => {
-                            tracing::warn!(err = %e, "Data stream read error");
-                            break;
-                        }
-                    }
-                }
+            // Routing header: [4B name_len LE][name][2B partition LE]
+            let name_bytes = pipeline_name.as_bytes();
+            let mut header = Vec::with_capacity(4 + name_bytes.len() + 2);
+            header.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+            header.extend_from_slice(name_bytes);
+            header.extend_from_slice(&partition.to_le_bytes());
+            send.write_all(&header)
+                .await
+                .map_err(|e| AeonError::state(format!("Write routing header: {e}")))?;
 
-                if data.is_empty() {
-                    continue;
-                }
+            tracing::debug!(
+                pipeline = %pipeline_name,
+                partition,
+                "T3 data stream registered"
+            );
 
-                // Decode and process.
-                match wire::decode_batch_request(&data, &codec) {
-                    Ok((batch_id, events)) => {
-                        let outputs = process_fn(events);
-                        match wire::encode_batch_response(
-                            batch_id,
-                            &outputs,
-                            &codec,
-                            &signing_key,
-                            batch_signing,
-                        ) {
-                            Ok(response) => {
-                                if let Err(e) = send.write_all(&response).await {
-                                    tracing::warn!(err = %e, "Data stream write error");
-                                }
-                                let _ = send.finish().await;
-                            }
-                            Err(e) => {
-                                tracing::warn!(err = %e, "Failed to encode response");
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(err = %e, "Failed to decode batch request");
-                    }
+            let codec = codec.clone();
+            let signing_key = signing_key.clone();
+            let process_fn = process_fn.clone();
+            let label_pipeline = pipeline_name.clone();
+
+            stream_tasks.spawn(async move {
+                if let Err(e) = run_data_stream(
+                    send,
+                    recv,
+                    codec,
+                    batch_signing,
+                    signing_key,
+                    process_fn,
+                )
+                .await
+                {
+                    tracing::debug!(
+                        pipeline = %label_pipeline,
+                        partition,
+                        err = %e,
+                        "T3 data stream ended"
+                    );
                 }
-            }
-            Err(e) => {
-                tracing::info!(err = %e, "Connection closed or error accepting stream");
-                break;
-            }
+            });
         }
     }
 
+    if stream_tasks.is_empty() {
+        tracing::warn!(
+            "No pipeline assignments in Accepted — WebTransport processor has nothing to do"
+        );
+    } else {
+        // Wait for the first data stream task to finish (error / connection close),
+        // then tear down the remaining streams and the heartbeat.
+        let _ = stream_tasks.join_next().await;
+        tracing::info!("A T3 data stream ended, draining remaining streams");
+    }
+
+    stream_tasks.abort_all();
+    while stream_tasks.join_next().await.is_some() {}
     heartbeat_handle.abort();
     tracing::info!("WebTransport processor disconnected");
     Ok(())
+}
+
+/// Drive a single long-lived WebTransport data stream.
+///
+/// Reads length-prefixed batch requests from `recv`, runs `process_fn`, and
+/// writes length-prefixed batch responses on `send`. Matches the server-side
+/// `wt_data_stream_reader` + `call_batch` framing:
+/// `[4B len LE][batch_wire bytes]`, with the wire payload built/consumed by
+/// `wire::{decode_batch_request, encode_batch_response}`.
+async fn run_data_stream(
+    mut send: wtransport::SendStream,
+    mut recv: wtransport::RecvStream,
+    codec: String,
+    batch_signing: bool,
+    signing_key: ed25519_dalek::SigningKey,
+    process_fn: SharedProcessFn,
+) -> Result<(), AeonError> {
+    loop {
+        // Read 4-byte LE length prefix.
+        let mut len_buf = [0u8; 4];
+        recv.read_exact(&mut len_buf)
+            .await
+            .map_err(|e| AeonError::state(format!("Read frame length: {e}")))?;
+        let frame_len = u32::from_le_bytes(len_buf) as usize;
+        if frame_len > 16 * 1024 * 1024 {
+            return Err(AeonError::state(format!(
+                "Batch frame too large: {frame_len} bytes"
+            )));
+        }
+
+        // Read frame body.
+        let mut frame = vec![0u8; frame_len];
+        recv.read_exact(&mut frame)
+            .await
+            .map_err(|e| AeonError::state(format!("Read frame body: {e}")))?;
+
+        // Decode → process → encode.
+        let (batch_id, events) = wire::decode_batch_request(&frame, &codec)?;
+        let outputs = process_fn(events);
+        let response = wire::encode_batch_response(
+            batch_id,
+            &outputs,
+            &codec,
+            &signing_key,
+            batch_signing,
+        )?;
+
+        // Write length-prefixed response.
+        let resp_len = (response.len() as u32).to_le_bytes();
+        send.write_all(&resp_len)
+            .await
+            .map_err(|e| AeonError::state(format!("Write response length: {e}")))?;
+        send.write_all(&response)
+            .await
+            .map_err(|e| AeonError::state(format!("Write response body: {e}")))?;
+    }
 }
 
 /// Build the AWPP Register message for WebTransport.
