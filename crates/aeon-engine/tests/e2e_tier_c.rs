@@ -175,16 +175,25 @@ async fn c3_kafka_c_native_t1() {
     }
 
     let dll_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent().unwrap().parent().unwrap()
-        .join("sdks").join("c").join("build").join("passthrough_processor.dll");
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("sdks")
+        .join("c")
+        .join("build")
+        .join("passthrough_processor.dll");
 
     if !dll_path.exists() {
-        eprintln!("SKIP C3: C passthrough DLL not found at {}", dll_path.display());
+        eprintln!(
+            "SKIP C3: C passthrough DLL not found at {}",
+            dll_path.display()
+        );
         return;
     }
 
-    let processor = aeon_engine::NativeProcessor::load(&dll_path, b"")
-        .expect("load C passthrough processor");
+    let processor =
+        aeon_engine::NativeProcessor::load(&dll_path, b"").expect("load C passthrough processor");
 
     let source_topic = "aeon-e2e-c3-source";
     let sink_topic = "aeon-e2e-c3-sink";
@@ -213,7 +222,10 @@ async fn c3_kafka_c_native_t1() {
     let received = metrics.events_received.load(Ordering::Relaxed);
     let sent = metrics.outputs_sent.load(Ordering::Relaxed);
 
-    assert!(received >= msg_count as u64, "C3: expected >= {msg_count} received, got {received}");
+    assert!(
+        received >= msg_count as u64,
+        "C3: expected >= {msg_count} received, got {received}"
+    );
     assert_eq!(received, sent, "C3: received == sent");
 }
 
@@ -228,13 +240,25 @@ async fn c4_kafka_dotnet_native_aot_t1() {
     }
 
     let dll_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent().unwrap().parent().unwrap()
-        .join("sdks").join("dotnet").join("AeonPassthroughNative")
-        .join("bin").join("Release").join("net8.0").join("win-x64")
-        .join("publish").join("AeonPassthroughNative.dll");
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("sdks")
+        .join("dotnet")
+        .join("AeonPassthroughNative")
+        .join("bin")
+        .join("Release")
+        .join("net8.0")
+        .join("win-x64")
+        .join("publish")
+        .join("AeonPassthroughNative.dll");
 
     if !dll_path.exists() {
-        eprintln!("SKIP C4: .NET NativeAOT DLL not found at {}", dll_path.display());
+        eprintln!(
+            "SKIP C4: .NET NativeAOT DLL not found at {}",
+            dll_path.display()
+        );
         return;
     }
 
@@ -268,7 +292,10 @@ async fn c4_kafka_dotnet_native_aot_t1() {
     let received = metrics.events_received.load(Ordering::Relaxed);
     let sent = metrics.outputs_sent.load(Ordering::Relaxed);
 
-    assert!(received >= msg_count as u64, "C4: expected >= {msg_count} received, got {received}");
+    assert!(
+        received >= msg_count as u64,
+        "C4: expected >= {msg_count} received, got {received}"
+    );
     assert_eq!(received, sent, "C4: received == sent");
 }
 
@@ -278,9 +305,12 @@ async fn c4_kafka_dotnet_native_aot_t1() {
 
 #[tokio::test]
 async fn c5_kafka_dotnet_ws_t4() {
-    if !require_redpanda().await { return; }
+    if !require_redpanda().await {
+        return;
+    }
     if !e2e_ws_harness::runtime_available("dotnet") {
-        eprintln!("SKIP C5: dotnet not found"); return;
+        eprintln!("SKIP C5: dotnet not found");
+        return;
     }
     let source_topic = "aeon-e2e-c5-source";
     let msg_count = 200;
@@ -293,34 +323,47 @@ async fn c5_kafka_dotnet_ws_t4() {
     let seed_path = seed_file.to_string_lossy().to_string();
     let pub_key = identity.public_key.clone();
     let dotnet_dir = e2e_ws_harness::dotnet_passthrough_project(
-        server.port, &seed_path, &pub_key, pipeline_name, "dotnet-proc",
+        server.port,
+        &seed_path,
+        &pub_key,
+        pipeline_name,
+        "dotnet-proc",
     );
     let mut child = std::process::Command::new("dotnet")
         .args(["run", "--project", &dotnet_dir.to_string_lossy()])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .spawn().expect("spawn dotnet");
+        .spawn()
+        .expect("spawn dotnet");
     let connected = e2e_ws_harness::wait_for_connection(&server, Duration::from_secs(30)).await;
     assert!(connected, "C5: .NET processor failed to connect");
 
     let source_config = KafkaSourceConfig::new(BROKERS, source_topic)
-        .with_partitions(vec![0]).with_batch_max(64)
+        .with_partitions(vec![0])
+        .with_batch_max(64)
         .with_poll_timeout(Duration::from_secs(2))
-        .with_source_name("c5-source").with_max_empty_polls(5);
+        .with_source_name("c5-source")
+        .with_max_empty_polls(5);
     let mut source = KafkaSource::new(source_config).expect("source creation");
     let mut total_received = 0u64;
     let mut total_outputs = 0u64;
     loop {
         let events = source.next_batch().await.unwrap();
-        if events.is_empty() { break; }
+        if events.is_empty() {
+            break;
+        }
         total_received += events.len() as u64;
         let outputs = server.ws_host.call_batch(events).await.unwrap();
         total_outputs += outputs.len() as u64;
     }
-    assert!(total_received >= msg_count as u64, "C5: expected >= {msg_count} received, got {total_received}");
+    assert!(
+        total_received >= msg_count as u64,
+        "C5: expected >= {msg_count} received, got {total_received}"
+    );
     assert_eq!(total_received, total_outputs, "C5: received == outputs");
     drop(server);
-    let _ = child.kill(); let _ = child.wait();
+    let _ = child.kill();
+    let _ = child.wait();
     let _ = std::fs::remove_file(&seed_file);
     let _ = std::fs::remove_dir_all(&dotnet_dir);
 }
@@ -358,7 +401,13 @@ async fn c6_kafka_python_ws_t4() {
     let seed_path = seed_file.to_string_lossy().to_string();
     let pub_key = identity.public_key.clone();
 
-    let script = e2e_ws_harness::python_passthrough_script(port, &seed_path, &pub_key, pipeline_name, "python-proc");
+    let script = e2e_ws_harness::python_passthrough_script(
+        port,
+        &seed_path,
+        &pub_key,
+        pipeline_name,
+        "python-proc",
+    );
     let script_path = std::env::temp_dir().join("aeon_e2e_c6_python.py");
     std::fs::write(&script_path, &script).unwrap();
 
@@ -393,7 +442,10 @@ async fn c6_kafka_python_ws_t4() {
         total_outputs += outputs.len() as u64;
     }
 
-    assert!(total_received >= msg_count as u64, "C6: expected >= {msg_count} received, got {total_received}");
+    assert!(
+        total_received >= msg_count as u64,
+        "C6: expected >= {msg_count} received, got {total_received}"
+    );
     assert_eq!(total_received, total_outputs, "C6: received == outputs");
 
     drop(server);
@@ -429,7 +481,11 @@ async fn c7_kafka_go_ws_t4() {
     let pub_key = identity.public_key.clone();
 
     let go_dir = e2e_ws_harness::go_passthrough_project(
-        server.port, &seed_path, &pub_key, pipeline_name, "go-proc",
+        server.port,
+        &seed_path,
+        &pub_key,
+        pipeline_name,
+        "go-proc",
     );
 
     let mut child = std::process::Command::new("go")
@@ -440,9 +496,7 @@ async fn c7_kafka_go_ws_t4() {
         .spawn()
         .expect("spawn go");
 
-    let connected = e2e_ws_harness::wait_for_connection(
-        &server, Duration::from_secs(30),
-    ).await;
+    let connected = e2e_ws_harness::wait_for_connection(&server, Duration::from_secs(30)).await;
     assert!(connected, "C7: Go processor failed to connect");
 
     let source_config = KafkaSourceConfig::new(BROKERS, source_topic)
@@ -465,7 +519,10 @@ async fn c7_kafka_go_ws_t4() {
         total_outputs += outputs.len() as u64;
     }
 
-    assert!(total_received >= msg_count as u64, "C7: expected >= {msg_count} received, got {total_received}");
+    assert!(
+        total_received >= msg_count as u64,
+        "C7: expected >= {msg_count} received, got {total_received}"
+    );
     assert_eq!(total_received, total_outputs, "C7: received == outputs");
 
     drop(server);
@@ -485,7 +542,7 @@ async fn c8_kafka_rust_network_ws_t4() {
         return;
     }
 
-    use aeon_processor_client::{ProcessEvent, ProcessOutput, ProcessorConfig, ProcessorClient};
+    use aeon_processor_client::{ProcessEvent, ProcessOutput, ProcessorClient, ProcessorConfig};
 
     let source_topic = "aeon-e2e-c8-source";
     let msg_count = 200;
@@ -540,7 +597,10 @@ async fn c8_kafka_rust_network_ws_t4() {
         total_outputs += outputs.len() as u64;
     }
 
-    assert!(total_received >= msg_count as u64, "C8: expected >= {msg_count} received, got {total_received}");
+    assert!(
+        total_received >= msg_count as u64,
+        "C8: expected >= {msg_count} received, got {total_received}"
+    );
     assert_eq!(total_received, total_outputs, "C8: received == outputs");
 }
 
@@ -558,7 +618,10 @@ async fn c9_kafka_nodejs_ws_t4() {
         return;
     }
     let check = std::process::Command::new("node")
-        .args(["-e", "const v=parseInt(process.versions.node);if(v<22){process.exit(1)}"])
+        .args([
+            "-e",
+            "const v=parseInt(process.versions.node);if(v<22){process.exit(1)}",
+        ])
         .output();
     if check.map(|o| !o.status.success()).unwrap_or(true) {
         eprintln!("SKIP C9: Node.js 22+ required");
@@ -577,7 +640,13 @@ async fn c9_kafka_nodejs_ws_t4() {
     let seed_path = seed_file.to_string_lossy().to_string().replace('\\', "/");
     let pub_key = identity.public_key.clone();
 
-    let script = e2e_ws_harness::nodejs_passthrough_script(port, &seed_path, &pub_key, pipeline_name, "nodejs-proc");
+    let script = e2e_ws_harness::nodejs_passthrough_script(
+        port,
+        &seed_path,
+        &pub_key,
+        pipeline_name,
+        "nodejs-proc",
+    );
     let script_path = std::env::temp_dir().join("aeon_e2e_c9_nodejs.js");
     std::fs::write(&script_path, &script).unwrap();
 
@@ -611,7 +680,10 @@ async fn c9_kafka_nodejs_ws_t4() {
         total_outputs += outputs.len() as u64;
     }
 
-    assert!(total_received >= msg_count as u64, "C9: expected >= {msg_count} received, got {total_received}");
+    assert!(
+        total_received >= msg_count as u64,
+        "C9: expected >= {msg_count} received, got {total_received}"
+    );
     assert_eq!(total_received, total_outputs, "C9: received == outputs");
 
     drop(server);
@@ -627,18 +699,31 @@ async fn c9_kafka_nodejs_ws_t4() {
 
 #[tokio::test]
 async fn c10_kafka_java_ws_t4() {
-    if !require_redpanda().await { return; }
-    if !e2e_ws_harness::runtime_available("java") {
-        eprintln!("SKIP C10: java not found"); return;
+    if !require_redpanda().await {
+        return;
     }
-    let java_ver = std::process::Command::new("java").args(["--version"]).output();
-    let is_modern = java_ver.map(|o| {
-        String::from_utf8_lossy(&o.stdout).split_whitespace().nth(1)
-            .and_then(|v| v.split('.').next())
-            .and_then(|v| v.parse::<u32>().ok())
-            .map(|v| v >= 15).unwrap_or(false)
-    }).unwrap_or(false);
-    if !is_modern { eprintln!("SKIP C10: Java 15+ required"); return; }
+    if !e2e_ws_harness::runtime_available("java") {
+        eprintln!("SKIP C10: java not found");
+        return;
+    }
+    let java_ver = std::process::Command::new("java")
+        .args(["--version"])
+        .output();
+    let is_modern = java_ver
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .split_whitespace()
+                .nth(1)
+                .and_then(|v| v.split('.').next())
+                .and_then(|v| v.parse::<u32>().ok())
+                .map(|v| v >= 15)
+                .unwrap_or(false)
+        })
+        .unwrap_or(false);
+    if !is_modern {
+        eprintln!("SKIP C10: Java 15+ required");
+        return;
+    }
 
     let source_topic = "aeon-e2e-c10-source";
     let msg_count = 200;
@@ -651,39 +736,55 @@ async fn c10_kafka_java_ws_t4() {
     let seed_path = seed_file.to_string_lossy().to_string();
     let pub_key = identity.public_key.clone();
     let java_dir = e2e_ws_harness::java_passthrough_project(
-        server.port, &seed_path, &pub_key, pipeline_name, "java-proc",
+        server.port,
+        &seed_path,
+        &pub_key,
+        pipeline_name,
+        "java-proc",
     );
     let compile = std::process::Command::new("javac")
-        .arg(java_dir.join("AeonProcessor.java")).output().expect("javac");
+        .arg(java_dir.join("AeonProcessor.java"))
+        .output()
+        .expect("javac");
     if !compile.status.success() {
-        eprintln!("SKIP C10: javac failed"); return;
+        eprintln!("SKIP C10: javac failed");
+        return;
     }
     let mut child = std::process::Command::new("java")
         .args(["-cp", &java_dir.to_string_lossy(), "AeonProcessor"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .spawn().expect("spawn java");
+        .spawn()
+        .expect("spawn java");
     let connected = e2e_ws_harness::wait_for_connection(&server, Duration::from_secs(15)).await;
     assert!(connected, "C10: Java processor failed to connect");
 
     let source_config = KafkaSourceConfig::new(BROKERS, source_topic)
-        .with_partitions(vec![0]).with_batch_max(64)
+        .with_partitions(vec![0])
+        .with_batch_max(64)
         .with_poll_timeout(Duration::from_secs(2))
-        .with_source_name("c10-source").with_max_empty_polls(5);
+        .with_source_name("c10-source")
+        .with_max_empty_polls(5);
     let mut source = KafkaSource::new(source_config).expect("source creation");
     let mut total_received = 0u64;
     let mut total_outputs = 0u64;
     loop {
         let events = source.next_batch().await.unwrap();
-        if events.is_empty() { break; }
+        if events.is_empty() {
+            break;
+        }
         total_received += events.len() as u64;
         let outputs = server.ws_host.call_batch(events).await.unwrap();
         total_outputs += outputs.len() as u64;
     }
-    assert!(total_received >= msg_count as u64, "C10: expected >= {msg_count} received, got {total_received}");
+    assert!(
+        total_received >= msg_count as u64,
+        "C10: expected >= {msg_count} received, got {total_received}"
+    );
     assert_eq!(total_received, total_outputs, "C10: received == outputs");
     drop(server);
-    let _ = child.kill(); let _ = child.wait();
+    let _ = child.kill();
+    let _ = child.wait();
     let _ = std::fs::remove_file(&seed_file);
     let _ = std::fs::remove_dir_all(&java_dir);
 }
@@ -694,15 +795,22 @@ async fn c10_kafka_java_ws_t4() {
 
 #[tokio::test]
 async fn c11_kafka_php_ws_t4() {
-    if !require_redpanda().await { return; }
+    if !require_redpanda().await {
+        return;
+    }
     if !e2e_ws_harness::runtime_available("php") {
-        eprintln!("SKIP C11: php not found"); return;
+        eprintln!("SKIP C11: php not found");
+        return;
     }
     let check = std::process::Command::new("php")
-        .args(["-r", "if (!function_exists('sodium_crypto_sign_seed_keypair')) exit(1);"])
+        .args([
+            "-r",
+            "if (!function_exists('sodium_crypto_sign_seed_keypair')) exit(1);",
+        ])
         .output();
     if check.map(|o| !o.status.success()).unwrap_or(true) {
-        eprintln!("SKIP C11: PHP sodium extension not available"); return;
+        eprintln!("SKIP C11: PHP sodium extension not available");
+        return;
     }
 
     let source_topic = "aeon-e2e-c11-source";
@@ -717,7 +825,11 @@ async fn c11_kafka_php_ws_t4() {
     let pub_key = identity.public_key.clone();
 
     let script = e2e_ws_harness::php_passthrough_script(
-        server.port, &seed_path, &pub_key, pipeline_name, "php-proc",
+        server.port,
+        &seed_path,
+        &pub_key,
+        pipeline_name,
+        "php-proc",
     );
     let script_path = std::env::temp_dir().join("aeon_e2e_c11_php.php");
     std::fs::write(&script_path, &script).unwrap();
@@ -726,28 +838,37 @@ async fn c11_kafka_php_ws_t4() {
         .arg(&script_path)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .spawn().expect("spawn php");
+        .spawn()
+        .expect("spawn php");
     let connected = e2e_ws_harness::wait_for_connection(&server, Duration::from_secs(10)).await;
     assert!(connected, "C11: PHP processor failed to connect");
 
     let source_config = KafkaSourceConfig::new(BROKERS, source_topic)
-        .with_partitions(vec![0]).with_batch_max(64)
+        .with_partitions(vec![0])
+        .with_batch_max(64)
         .with_poll_timeout(Duration::from_secs(2))
-        .with_source_name("c11-source").with_max_empty_polls(5);
+        .with_source_name("c11-source")
+        .with_max_empty_polls(5);
     let mut source = KafkaSource::new(source_config).expect("source creation");
     let mut total_received = 0u64;
     let mut total_outputs = 0u64;
     loop {
         let events = source.next_batch().await.unwrap();
-        if events.is_empty() { break; }
+        if events.is_empty() {
+            break;
+        }
         total_received += events.len() as u64;
         let outputs = server.ws_host.call_batch(events).await.unwrap();
         total_outputs += outputs.len() as u64;
     }
-    assert!(total_received >= msg_count as u64, "C11: expected >= {msg_count} received, got {total_received}");
+    assert!(
+        total_received >= msg_count as u64,
+        "C11: expected >= {msg_count} received, got {total_received}"
+    );
     assert_eq!(total_received, total_outputs, "C11: received == outputs");
     drop(server);
-    let _ = child.kill(); let _ = child.wait();
+    let _ = child.kill();
+    let _ = child.wait();
     let _ = std::fs::remove_file(&script_path);
     let _ = std::fs::remove_file(&seed_file);
 }

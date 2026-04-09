@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicI64, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
-use tokio::sync::oneshot;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 
 use aeon_types::awpp::{
     AcceptedPayload, ControlMessage, DrainPayload, HeartbeatPayload, PipelineAssignment,
@@ -81,35 +81,84 @@ impl SessionState {
 
 // ── Batch In-Flight Tracking ────────────────────────────────────────────
 
+/// Default maximum number of concurrently in-flight batches per session.
+///
+/// Caps the DashMap pending table so a misbehaving or slow processor cannot
+/// cause unbounded memory growth on the host. Callers of `start_batch` await
+/// a semaphore permit when this limit is hit, exerting backpressure back
+/// through the pipeline processor task.
+pub const DEFAULT_MAX_INFLIGHT_BATCHES: usize = 1024;
+
+/// A pending batch slot: the oneshot responder plus the semaphore permit
+/// that reserves its capacity. The permit is dropped when the entry is
+/// removed from the map, releasing the slot for the next `start_batch`.
+type PendingSlot = (
+    oneshot::Sender<Result<Vec<Output>, AeonError>>,
+    OwnedSemaphorePermit,
+);
+
 /// Tracks in-flight batch requests awaiting responses.
 ///
-/// Maps `batch_id` → oneshot sender. When the response arrives, the
-/// transport calls `complete_batch` to resolve the waiting caller.
+/// Maps `batch_id` → (oneshot sender, semaphore permit). When the response
+/// arrives, the transport calls `complete_batch` to resolve the waiting caller
+/// and drop the permit (releasing a slot for the next batch).
+///
+/// The semaphore bounds the number of concurrently outstanding batches per
+/// session. Without it, a slow processor would cause the pending DashMap to
+/// grow without limit as new batches kept getting enqueued.
 pub struct BatchInflight {
     next_id: AtomicU64,
-    pending: DashMap<u64, oneshot::Sender<Result<Vec<Output>, AeonError>>>,
+    pending: DashMap<u64, PendingSlot>,
+    semaphore: Arc<Semaphore>,
 }
 
 impl BatchInflight {
+    /// Create a `BatchInflight` with the default max-inflight capacity.
     pub fn new() -> Self {
+        Self::with_capacity(DEFAULT_MAX_INFLIGHT_BATCHES)
+    }
+
+    /// Create a `BatchInflight` bounded to at most `max_inflight` concurrent batches.
+    pub fn with_capacity(max_inflight: usize) -> Self {
         Self {
             next_id: AtomicU64::new(1),
             pending: DashMap::new(),
+            semaphore: Arc::new(Semaphore::new(max_inflight.max(1))),
         }
     }
 
     /// Allocate a batch_id and return the receiver for the eventual response.
-    pub fn start_batch(&self) -> (u64, oneshot::Receiver<Result<Vec<Output>, AeonError>>) {
+    ///
+    /// Awaits a semaphore permit first — if the session already has
+    /// `max_inflight` batches outstanding, the caller suspends until an
+    /// earlier batch completes (or is cancelled). The permit is held inside
+    /// the pending map and released automatically when the batch completes
+    /// or is cancelled via `complete_batch` / `cancel_all`.
+    pub async fn start_batch(&self) -> (u64, oneshot::Receiver<Result<Vec<Output>, AeonError>>) {
+        // A closed semaphore is only possible during shutdown. If that
+        // happens we fall back to an immediately-cancelled receiver so the
+        // caller sees a clean error instead of panicking.
+        let permit = match Arc::clone(&self.semaphore).acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => {
+                let (tx, rx) = oneshot::channel();
+                let _ = tx.send(Err(AeonError::connection("session closed")));
+                return (0, rx);
+            }
+        };
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
-        self.pending.insert(id, tx);
+        self.pending.insert(id, (tx, permit));
         (id, rx)
     }
 
     /// Resolve a pending batch with the given result. Returns false if
     /// the batch_id was not found (already completed or timed out).
+    ///
+    /// Dropping the stored `OwnedSemaphorePermit` releases a slot so the
+    /// next `start_batch` caller can proceed.
     pub fn complete_batch(&self, batch_id: u64, result: Result<Vec<Output>, AeonError>) -> bool {
-        if let Some((_, tx)) = self.pending.remove(&batch_id) {
+        if let Some((_, (tx, _permit))) = self.pending.remove(&batch_id) {
             let _ = tx.send(result);
             true
         } else {
@@ -122,11 +171,17 @@ impl BatchInflight {
         self.pending.len() as u32
     }
 
+    /// Number of permits currently available — i.e., how many additional
+    /// batches can be started before `start_batch` begins to block.
+    pub fn available_permits(&self) -> usize {
+        self.semaphore.available_permits()
+    }
+
     /// Cancel all pending batches with a connection-closed error.
     pub fn cancel_all(&self) {
         let keys: Vec<u64> = self.pending.iter().map(|e| *e.key()).collect();
         for key in keys {
-            if let Some((_, tx)) = self.pending.remove(&key) {
+            if let Some((_, (tx, _permit))) = self.pending.remove(&key) {
                 let _ = tx.send(Err(AeonError::connection("session closed")));
             }
         }
@@ -249,6 +304,11 @@ pub struct HandshakeConfig {
     pub batch_signing: bool,
     /// Pipeline codec override — if set, this overrides the processor's preference.
     pub pipeline_codec: Option<TransportCodec>,
+    /// Maximum number of concurrently in-flight batches per session.
+    /// Bounds the pending DashMap so a slow processor cannot cause
+    /// unbounded memory growth. `start_batch` suspends on a semaphore
+    /// when this limit is hit.
+    pub max_inflight_batches: usize,
 }
 
 impl Default for HandshakeConfig {
@@ -258,6 +318,7 @@ impl Default for HandshakeConfig {
             heartbeat_interval: Duration::from_secs(10),
             batch_signing: true,
             pipeline_codec: None,
+            max_inflight_batches: DEFAULT_MAX_INFLIGHT_BATCHES,
         }
     }
 }
@@ -381,7 +442,7 @@ pub async fn handshake(
         last_heartbeat: Arc::new(AtomicI64::new(0)),
         state: Arc::new(AtomicU8::new(SessionState::Active as u8)),
         connected_at: Instant::now(),
-        batch_inflight: Arc::new(BatchInflight::new()),
+        batch_inflight: Arc::new(BatchInflight::with_capacity(config.max_inflight_batches)),
     })
 }
 
@@ -408,10 +469,10 @@ pub fn serialize_control_message(msg: &ControlMessage) -> Result<Vec<u8>, AeonEr
 mod tests {
     use super::*;
 
-    #[test]
-    fn batch_inflight_roundtrip() {
+    #[tokio::test]
+    async fn batch_inflight_roundtrip() {
         let inflight = BatchInflight::new();
-        let (id, mut rx) = inflight.start_batch();
+        let (id, mut rx) = inflight.start_batch().await;
         assert_eq!(id, 1);
         assert_eq!(inflight.pending_count(), 1);
 
@@ -429,11 +490,11 @@ mod tests {
         assert!(!inflight.complete_batch(999, Ok(vec![])));
     }
 
-    #[test]
-    fn batch_inflight_cancel_all() {
+    #[tokio::test]
+    async fn batch_inflight_cancel_all() {
         let inflight = BatchInflight::new();
-        let (_id1, mut rx1) = inflight.start_batch();
-        let (_id2, mut rx2) = inflight.start_batch();
+        let (_id1, mut rx1) = inflight.start_batch().await;
+        let (_id2, mut rx2) = inflight.start_batch().await;
         assert_eq!(inflight.pending_count(), 2);
 
         inflight.cancel_all();
@@ -445,14 +506,51 @@ mod tests {
         assert!(r2.is_err());
     }
 
-    #[test]
-    fn batch_inflight_ids_are_monotonic() {
+    #[tokio::test]
+    async fn batch_inflight_ids_are_monotonic() {
         let inflight = BatchInflight::new();
-        let (id1, _) = inflight.start_batch();
-        let (id2, _) = inflight.start_batch();
-        let (id3, _) = inflight.start_batch();
+        let (id1, _rx1) = inflight.start_batch().await;
+        let (id2, _rx2) = inflight.start_batch().await;
+        let (id3, _rx3) = inflight.start_batch().await;
         assert!(id1 < id2);
         assert!(id2 < id3);
+    }
+
+    #[tokio::test]
+    async fn batch_inflight_bounded_by_capacity() {
+        // Capacity of 2 — third start_batch should block until an earlier
+        // batch completes, at which point the permit is released.
+        let inflight = Arc::new(BatchInflight::with_capacity(2));
+        let (id1, _rx1) = inflight.start_batch().await;
+        let (_id2, _rx2) = inflight.start_batch().await;
+        assert_eq!(inflight.available_permits(), 0);
+
+        // Spawn a task that tries to start a third batch — it should block.
+        let inflight_clone = Arc::clone(&inflight);
+        let blocked = tokio::spawn(async move { inflight_clone.start_batch().await });
+
+        // Give it a moment to prove it is actually blocked.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!blocked.is_finished());
+
+        // Completing batch 1 releases a permit — the spawned task unblocks.
+        assert!(inflight.complete_batch(id1, Ok(vec![])));
+        let (id3, _rx3) = blocked.await.unwrap();
+        assert_ne!(id3, id1);
+        assert_eq!(inflight.pending_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn batch_inflight_permit_released_on_cancel_all() {
+        let inflight = Arc::new(BatchInflight::with_capacity(1));
+        let (_id1, _rx1) = inflight.start_batch().await;
+        assert_eq!(inflight.available_permits(), 0);
+
+        inflight.cancel_all();
+        assert_eq!(inflight.available_permits(), 1);
+
+        // Next start_batch should proceed immediately.
+        let (_id2, _rx2) = inflight.start_batch().await;
     }
 
     #[test]
@@ -512,8 +610,8 @@ mod tests {
         assert!(!session.is_healthy());
     }
 
-    #[test]
-    fn session_close_cancels_inflight() {
+    #[tokio::test]
+    async fn session_close_cancels_inflight() {
         let session = AwppSession {
             session_id: "test".into(),
             fingerprint: "fp".into(),
@@ -529,7 +627,7 @@ mod tests {
             batch_inflight: Arc::new(BatchInflight::new()),
         };
 
-        let (_id, mut rx) = session.batch_inflight.start_batch();
+        let (_id, mut rx) = session.batch_inflight.start_batch().await;
         assert_eq!(session.batch_inflight.pending_count(), 1);
 
         session.close();

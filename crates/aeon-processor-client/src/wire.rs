@@ -225,11 +225,7 @@ pub fn parse_data_frame(data: &[u8]) -> Result<(String, u16, &[u8]), AeonError> 
         .map_err(|e| AeonError::state(format!("Invalid pipeline name UTF-8: {e}")))?
         .to_string();
 
-    let partition = u16::from_le_bytes(
-        data[4 + name_len..4 + name_len + 2]
-            .try_into()
-            .unwrap(),
-    );
+    let partition = u16::from_le_bytes(data[4 + name_len..4 + name_len + 2].try_into().unwrap());
 
     let batch_data = &data[4 + name_len + 2..];
     Ok((name, partition, batch_data))
@@ -323,7 +319,8 @@ mod tests {
 
         // Verify CRC32.
         let crc_offset = encoded.len() - 68; // 64 sig + 4 CRC from end
-        let stored_crc = u32::from_le_bytes(encoded[crc_offset..crc_offset + 4].try_into().unwrap());
+        let stored_crc =
+            u32::from_le_bytes(encoded[crc_offset..crc_offset + 4].try_into().unwrap());
         let computed_crc = crc32fast::hash(&encoded[..crc_offset]);
         assert_eq!(stored_crc, computed_crc);
     }

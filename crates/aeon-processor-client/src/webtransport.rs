@@ -211,10 +211,7 @@ async fn run_webtransport_inner(
 }
 
 /// Build the AWPP Register message for WebTransport.
-fn build_register(
-    config: &ProcessorConfig,
-    challenge: &Challenge,
-) -> Result<Register, AeonError> {
+fn build_register(config: &ProcessorConfig, challenge: &Challenge) -> Result<Register, AeonError> {
     let pk = config.signing_key.verifying_key();
     let public_key = auth::format_public_key(&pk);
     let challenge_signature = auth::sign_challenge(&config.signing_key, &challenge.nonce)?;
@@ -239,9 +236,7 @@ fn build_register(
 /// Read a length-prefixed message from a QUIC stream.
 ///
 /// Format: `[4B len LE][message bytes]`
-async fn read_length_prefixed(
-    recv: &mut wtransport::RecvStream,
-) -> Result<String, AeonError> {
+async fn read_length_prefixed(recv: &mut wtransport::RecvStream) -> Result<String, AeonError> {
     let mut len_buf = [0u8; 4];
     recv.read_exact(&mut len_buf)
         .await
@@ -259,8 +254,7 @@ async fn read_length_prefixed(
         .await
         .map_err(|e| AeonError::state(format!("Read control message: {e}")))?;
 
-    String::from_utf8(buf)
-        .map_err(|e| AeonError::state(format!("Control message not UTF-8: {e}")))
+    String::from_utf8(buf).map_err(|e| AeonError::state(format!("Control message not UTF-8: {e}")))
 }
 
 /// Write a length-prefixed message to a QUIC stream.

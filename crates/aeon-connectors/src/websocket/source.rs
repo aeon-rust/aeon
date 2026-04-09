@@ -2,7 +2,14 @@
 //!
 //! Push-source: a background task reads from the WebSocket and pushes
 //! events into a PushBuffer. `next_batch()` drains the buffer.
-//! Phase 3 backpressure: when overloaded, the background reader pauses.
+//!
+//! **Backpressure**: `PushBufferTx::send` blocks (awaits) when the channel
+//! is full, which in turn suspends the `read.next()` loop below. Because
+//! the reader task is the only thing driving the tungstenite sink, not
+//! calling `read.next()` stops draining the underlying TCP socket, and
+//! the OS-level TCP window fills — propagating backpressure to the remote
+//! peer without needing an explicit protocol-level signal. Messages are
+//! never dropped.
 
 use crate::push_buffer::{PushBufferConfig, PushBufferRx, push_buffer};
 use aeon_types::{AeonError, Event, PartitionId, Source};
@@ -84,11 +91,6 @@ impl WebSocketSource {
             while let Some(msg_result) = read.next().await {
                 match msg_result {
                     Ok(Message::Text(text)) => {
-                        // Phase 3: if overloaded, skip (could also pause reading)
-                        if tx.is_overloaded() {
-                            tracing::warn!("websocket source overloaded, dropping message");
-                            continue;
-                        }
                         let event = Event::new(
                             uuid::Uuid::nil(),
                             0,
@@ -96,15 +98,14 @@ impl WebSocketSource {
                             PartitionId::new(0),
                             Bytes::from(text.as_bytes().to_vec()),
                         );
+                        // tx.send blocks when the push buffer is full; that
+                        // back-pressures the outer read.next() loop and
+                        // eventually the TCP socket.
                         if tx.send(event).await.is_err() {
                             break; // Buffer closed
                         }
                     }
                     Ok(Message::Binary(data)) => {
-                        if tx.is_overloaded() {
-                            tracing::warn!("websocket source overloaded, dropping message");
-                            continue;
-                        }
                         let event = Event::new(
                             uuid::Uuid::nil(),
                             0,

@@ -642,8 +642,12 @@ mod tests {
                 Bytes::from(format!("test-event-{i}")),
             );
             // Add metadata like Kafka headers would
-            event.metadata.push((Arc::from("kafka-key"), Arc::from("kafka-value")));
-            event.metadata.push((Arc::from("x-trace-id"), Arc::from("abc123def456")));
+            event
+                .metadata
+                .push((Arc::from("kafka-key"), Arc::from("kafka-value")));
+            event
+                .metadata
+                .push((Arc::from("x-trace-id"), Arc::from("abc123def456")));
 
             let outputs = processor
                 .process(event)

@@ -102,7 +102,7 @@ fn make_events(count: usize, psize: usize) -> Vec<Event> {
 /// Delete and recreate a topic to ensure a clean slate.
 async fn reset_topic(topic: &str, partitions: i32) {
     let admin: AdminClient<rdkafka::client::DefaultClientContext> = ClientConfig::new()
-        .set("bootstrap.servers", &brokers())
+        .set("bootstrap.servers", brokers())
         .create()
         .expect("admin client");
 
@@ -127,7 +127,7 @@ async fn reset_topic(topic: &str, partitions: i32) {
 /// Produce N messages to the source topic.
 fn produce_messages(topic: &str, count: usize, payload_size: usize) -> Duration {
     let producer: BaseProducer = ClientConfig::new()
-        .set("bootstrap.servers", &brokers())
+        .set("bootstrap.servers", brokers())
         .set("message.timeout.ms", "30000")
         .set("queue.buffering.max.messages", "1000000")
         .set("queue.buffering.max.kbytes", "1048576")
@@ -172,7 +172,7 @@ fn produce_messages(topic: &str, count: usize, payload_size: usize) -> Duration 
 
 fn make_source(topic: &str) -> KafkaSource {
     let nparts = num_partitions();
-    let config = KafkaSourceConfig::new(&brokers(), topic)
+    let config = KafkaSourceConfig::new(brokers(), topic)
         .with_partitions((0..nparts as i32).collect())
         .with_batch_max(batch_size())
         .with_poll_timeout(Duration::from_secs(2))
@@ -339,7 +339,7 @@ async fn bench_redpanda(strategy: DeliveryStrategy) -> BenchResult {
     let source = make_source(SOURCE_TOPIC);
     let processor = PassthroughProcessor::new(Arc::from(SINK_TOPIC));
 
-    let mut sink_config = KafkaSinkConfig::new(&brokers(), SINK_TOPIC).with_strategy(strategy);
+    let mut sink_config = KafkaSinkConfig::new(brokers(), SINK_TOPIC).with_strategy(strategy);
     // Optimize producer settings per strategy
     match strategy {
         DeliveryStrategy::PerEvent => {

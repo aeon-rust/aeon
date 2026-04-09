@@ -366,7 +366,7 @@ async fn handle_batch_failures<K: Sink>(
 pub async fn run_buffered<S, P, K>(
     mut source: S,
     processor: P,
-    mut sink: K,
+    sink: K,
     config: PipelineConfig,
     metrics: Arc<PipelineMetrics>,
     shutdown: Arc<AtomicBool>,
@@ -381,7 +381,7 @@ where
 
     let (mut src_prod, mut src_cons) =
         rtrb::RingBuffer::<Vec<Event>>::new(config.source_buffer_capacity);
-    let (mut sink_prod, mut sink_cons) =
+    let (mut sink_prod, sink_cons) =
         rtrb::RingBuffer::<Vec<Output>>::new(config.sink_buffer_capacity);
 
     let shutdown_src = Arc::clone(&shutdown);
@@ -470,19 +470,187 @@ where
     });
 
     let metrics_sink = Arc::clone(&metrics);
-    let delivery_strategy = config.delivery.strategy;
-    let flush_interval = config.delivery.flush.interval;
-    let max_pending = config.delivery.flush.max_pending;
-    let adaptive_flush = config.delivery.flush.adaptive;
-    let adaptive_min_divisor = config.delivery.flush.adaptive_min_divisor;
-    let adaptive_max_multiplier = config.delivery.flush.adaptive_max_multiplier;
-    let failure_policy = config.delivery.failure_policy;
-    let max_retries = config.delivery.max_retries;
-    let retry_backoff = config.delivery.retry_backoff;
+    let sink_ctx = build_sink_task_ctx(&config, core_assignment.map(|c| c.sink));
 
+    // Sink task: pop outputs, write to sink.
+    // PerEvent/OrderedBatch: write_batch blocks on delivery acks.
+    // UnorderedBatch: write_batch enqueues fast, flush() called at checkpoint intervals.
+    //
+    // Delivery ledger integration:
+    // - Track each output with source_event_id before write_batch
+    // - Mark acked on successful delivery
+    // - Populate checkpoint source_offsets from ledger
+    let sink_ledger = ledger;
+    let sink_handle = tokio::spawn(run_sink_task(
+        sink,
+        sink_cons,
+        metrics_sink,
+        sink_ledger,
+        sink_ctx,
+    ));
+
+    // Wait for all tasks
+    let (src_result, proc_result, sink_result) =
+        tokio::join!(source_handle, processor_handle, sink_handle);
+
+    // Propagate errors
+    src_result.map_err(|e| AeonError::processor(format!("source task panicked: {e}")))??;
+    proc_result.map_err(|e| AeonError::processor(format!("processor task panicked: {e}")))??;
+    sink_result.map_err(|e| AeonError::processor(format!("sink task panicked: {e}")))??;
+
+    Ok(())
+}
+
+/// Runs a buffered pipeline with an async `ProcessorTransport` in the
+/// processor stage. Used by T3/T4 out-of-process processor transports
+/// (WebTransport/WebSocket hosts and any other ProcessorTransport impl).
+///
+/// Structurally identical to `run_buffered` — same three-task layout with
+/// source→processor→sink SPSC ring buffers and the same delivery/failure
+/// pipeline in the sink task. The only difference is that the processor
+/// task body calls `transport.call_batch(events).await` instead of the
+/// synchronous `processor.process_batch(events)`.
+///
+/// Backpressure propagates identically:
+/// - If the transport is slow or saturated (its `BatchInflight` semaphore is
+///   held), `call_batch` suspends on the semaphore, which suspends the
+///   processor task, which stops draining the source→processor ring — the
+///   source task pauses, and ultimately the upstream broker sees TCP-window
+///   backpressure. No events are dropped.
+pub async fn run_buffered_transport<S, T, K>(
+    mut source: S,
+    transport: Arc<T>,
+    sink: K,
+    config: PipelineConfig,
+    metrics: Arc<PipelineMetrics>,
+    shutdown: Arc<AtomicBool>,
+    ledger: Option<Arc<DeliveryLedger>>,
+) -> Result<(), AeonError>
+where
+    S: Source + Send + 'static,
+    T: aeon_types::traits::ProcessorTransport + Send + Sync + 'static + ?Sized,
+    K: Sink + Send + 'static,
+{
+    let core_assignment = config.core_pinning.resolve();
+
+    let (mut src_prod, mut src_cons) =
+        rtrb::RingBuffer::<Vec<Event>>::new(config.source_buffer_capacity);
+    let (mut sink_prod, sink_cons) =
+        rtrb::RingBuffer::<Vec<Output>>::new(config.sink_buffer_capacity);
+
+    let shutdown_src = Arc::clone(&shutdown);
+    let metrics_src = Arc::clone(&metrics);
+
+    // Source task — identical to run_buffered.
+    let source_core = core_assignment.map(|c| c.source);
+    let source_handle = tokio::spawn(async move {
+        if let Some(core) = source_core {
+            pin_to_core(core);
+        }
+        while !shutdown_src.load(Ordering::Relaxed) {
+            let events = match source.next_batch().await {
+                Ok(events) => events,
+                Err(e) => return Err(e),
+            };
+            if events.is_empty() {
+                break;
+            }
+            metrics_src
+                .events_received
+                .fetch_add(events.len() as u64, Ordering::Relaxed);
+
+            let mut pending = Some(events);
+            while let Some(batch) = pending.take() {
+                match src_prod.push(batch) {
+                    Ok(()) => {}
+                    Err(rtrb::PushError::Full(returned)) => {
+                        pending = Some(returned);
+                        tokio::task::yield_now().await;
+                    }
+                }
+            }
+        }
+        drop(src_prod);
+        Ok::<(), AeonError>(())
+    });
+
+    let shutdown_proc = Arc::clone(&shutdown);
+    let metrics_proc = Arc::clone(&metrics);
+
+    // Processor task — the single difference from run_buffered. Calls
+    // `transport.call_batch(events).await` instead of the synchronous
+    // `processor.process_batch(events)`. Backpressure from a saturated
+    // transport (e.g. the session's BatchInflight semaphore is full) will
+    // suspend here and propagate backwards through the source ring buffer.
+    let proc_core = core_assignment.map(|c| c.processor);
+    let processor_handle = tokio::spawn(async move {
+        if let Some(core) = proc_core {
+            pin_to_core(core);
+        }
+        while !shutdown_proc.load(Ordering::Relaxed) {
+            match src_cons.pop() {
+                Ok(events) => {
+                    let count = events.len() as u64;
+                    let outputs = match transport.call_batch(events).await {
+                        Ok(outputs) => outputs,
+                        Err(e) => return Err(e),
+                    };
+                    metrics_proc
+                        .events_processed
+                        .fetch_add(count, Ordering::Relaxed);
+
+                    let mut pending = Some(outputs);
+                    while let Some(batch) = pending.take() {
+                        match sink_prod.push(batch) {
+                            Ok(()) => {}
+                            Err(rtrb::PushError::Full(returned)) => {
+                                pending = Some(returned);
+                                tokio::task::yield_now().await;
+                            }
+                        }
+                    }
+                }
+                Err(_) => {
+                    if src_cons.is_abandoned() {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+        drop(sink_prod);
+        Ok::<(), AeonError>(())
+    });
+
+    let metrics_sink = Arc::clone(&metrics);
+    let sink_ctx = build_sink_task_ctx(&config, core_assignment.map(|c| c.sink));
+    let sink_ledger = ledger;
+    let sink_handle = tokio::spawn(run_sink_task(
+        sink,
+        sink_cons,
+        metrics_sink,
+        sink_ledger,
+        sink_ctx,
+    ));
+
+    let (src_result, proc_result, sink_result) =
+        tokio::join!(source_handle, processor_handle, sink_handle);
+
+    src_result.map_err(|e| AeonError::processor(format!("source task panicked: {e}")))??;
+    proc_result.map_err(|e| AeonError::processor(format!("processor task panicked: {e}")))??;
+    sink_result.map_err(|e| AeonError::processor(format!("sink task panicked: {e}")))??;
+
+    Ok(())
+}
+
+/// Build a `SinkTaskCtx` from `PipelineConfig`, resolving the checkpoint
+/// WAL writer if configured. Shared between `run_buffered` and
+/// `run_buffered_transport` so the two call sites can spawn `run_sink_task`
+/// with identical setup.
+fn build_sink_task_ctx(config: &PipelineConfig, core: Option<usize>) -> SinkTaskCtx {
     // Initialize checkpoint writer if WAL backend is configured.
     let checkpoint_writer = if config.delivery.checkpoint.backend == CheckpointBackend::Wal {
-        let dir = config.delivery.checkpoint.dir.unwrap_or_else(|| {
+        let dir = config.delivery.checkpoint.dir.clone().unwrap_or_else(|| {
             std::env::var("AEON_CHECKPOINT_DIR")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|_| std::env::temp_dir().join("aeon-checkpoints"))
@@ -502,213 +670,19 @@ where
         None
     };
 
-    // Sink task: pop outputs, write to sink.
-    // PerEvent/OrderedBatch: write_batch blocks on delivery acks.
-    // UnorderedBatch: write_batch enqueues fast, flush() called at checkpoint intervals.
-    //
-    // Delivery ledger integration:
-    // - Track each output with source_event_id before write_batch
-    // - Mark acked on successful delivery
-    // - Populate checkpoint source_offsets from ledger
-    let sink_core = core_assignment.map(|c| c.sink);
-    let sink_ledger = ledger;
-    let sink_handle = tokio::spawn(async move {
-        if let Some(core) = sink_core {
-            pin_to_core(core);
-        }
-        let mut last_flush = Instant::now();
-        let mut pending_count: u64 = 0;
-        let mut delivered_since_checkpoint: u64 = 0;
-        let mut failed_since_checkpoint: u64 = 0;
-        let mut ckpt_writer = checkpoint_writer;
-
-        // Adaptive flush tuner: adjusts flush interval based on ack success rate.
-        // Only active when adaptive=true AND a delivery ledger is present.
-        let mut flush_tuner = if adaptive_flush && sink_ledger.is_some() {
-            Some(FlushTuner::new(
-                flush_interval,
-                flush_interval / adaptive_min_divisor,
-                flush_interval * adaptive_max_multiplier,
-            ))
-        } else {
-            None
-        };
-        // Counters for adaptive flush feedback
-        let mut acked_since_last_flush: u64 = 0;
-        let mut events_since_last_flush: u64 = 0;
-
-        loop {
-            match sink_cons.pop() {
-                Ok(outputs) => {
-                    let count = outputs.len() as u64;
-
-                    // Track outputs in delivery ledger (if enabled).
-                    // Collect event IDs for ack/fail after write_batch.
-                    let tracked_ids: Vec<uuid::Uuid> = if let Some(ref ledger) = sink_ledger {
-                        outputs
-                            .iter()
-                            .filter_map(|o| {
-                                if let Some(event_id) = o.source_event_id {
-                                    let partition =
-                                        o.source_partition.unwrap_or(PartitionId::new(0));
-                                    let offset = o.source_offset.unwrap_or(0);
-                                    ledger.track(event_id, partition, offset);
-                                    Some(event_id)
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect()
-                    } else {
-                        Vec::new()
-                    };
-
-                    // Clone outputs before write_batch if failure policy may need them for retry.
-                    // Only clone when RetryFailed is configured — avoid the cost otherwise.
-                    let outputs_for_retry = if failure_policy == BatchFailurePolicy::RetryFailed {
-                        Some(outputs.clone())
-                    } else {
-                        None
-                    };
-
-                    match sink.write_batch(outputs).await {
-                        Ok(batch_result) => {
-                            // Mark delivered outputs as acked in ledger.
-                            if let Some(ref ledger) = sink_ledger {
-                                if !batch_result.delivered.is_empty() {
-                                    ledger.mark_batch_acked(&batch_result.delivered);
-                                }
-                                // Failed outputs are marked in ledger.
-                                for (id, err) in &batch_result.failed {
-                                    ledger.mark_failed(id, format!("{err}"));
-                                }
-                                // Pending outputs remain tracked — acked at flush.
-                            }
-                            let delivered_count = batch_result.delivered.len() as u64;
-                            let total_count = count;
-                            metrics_sink
-                                .outputs_sent
-                                .fetch_add(delivered_count, Ordering::Relaxed);
-                            delivered_since_checkpoint += delivered_count;
-                            acked_since_last_flush += delivered_count;
-                            events_since_last_flush += total_count;
-
-                            // Apply BatchFailurePolicy if there are partial failures.
-                            if batch_result.has_failures() {
-                                let original = outputs_for_retry.as_deref().unwrap_or(&[]);
-                                handle_batch_failures(
-                                    &mut sink,
-                                    original,
-                                    &batch_result,
-                                    failure_policy,
-                                    max_retries,
-                                    retry_backoff,
-                                    &metrics_sink,
-                                    &sink_ledger,
-                                )
-                                .await?;
-                                failed_since_checkpoint += batch_result.failed.len() as u64;
-                            }
-                        }
-                        Err(e) => {
-                            // Mark all tracked outputs as failed
-                            if let Some(ref ledger) = sink_ledger {
-                                let reason = format!("{e}");
-                                for id in &tracked_ids {
-                                    ledger.mark_failed(id, reason.clone());
-                                }
-                            }
-                            return Err(e);
-                        }
-                    }
-
-                    // In Batched mode, track pending and flush at intervals
-                    if !delivery_strategy.is_blocking() {
-                        pending_count += count;
-                        let effective_interval = flush_tuner
-                            .as_ref()
-                            .map(|t| t.interval())
-                            .unwrap_or(flush_interval);
-                        let should_flush = last_flush.elapsed() >= effective_interval
-                            || pending_count >= max_pending as u64;
-                        if should_flush {
-                            // Report to adaptive tuner before flush
-                            if let Some(ref mut tuner) = flush_tuner {
-                                tuner.report(events_since_last_flush, acked_since_last_flush);
-                            }
-                            sink.flush().await?;
-                            write_checkpoint(
-                                &mut ckpt_writer,
-                                &sink_ledger,
-                                &metrics_sink,
-                                &mut delivered_since_checkpoint,
-                                &mut failed_since_checkpoint,
-                            );
-                            pending_count = 0;
-                            last_flush = Instant::now();
-                            acked_since_last_flush = 0;
-                            events_since_last_flush = 0;
-                        }
-                    }
-                }
-                Err(_) => {
-                    if sink_cons.is_abandoned() {
-                        break;
-                    }
-                    // In Batched mode, flush pending even while idle
-                    if !delivery_strategy.is_blocking() && pending_count > 0 {
-                        let effective_interval = flush_tuner
-                            .as_ref()
-                            .map(|t| t.interval())
-                            .unwrap_or(flush_interval);
-                        if last_flush.elapsed() >= effective_interval {
-                            if let Some(ref mut tuner) = flush_tuner {
-                                tuner.report(events_since_last_flush, acked_since_last_flush);
-                            }
-                            sink.flush().await?;
-                            write_checkpoint(
-                                &mut ckpt_writer,
-                                &sink_ledger,
-                                &metrics_sink,
-                                &mut delivered_since_checkpoint,
-                                &mut failed_since_checkpoint,
-                            );
-                            pending_count = 0;
-                            last_flush = Instant::now();
-                            acked_since_last_flush = 0;
-                            events_since_last_flush = 0;
-                        }
-                    }
-                    tokio::task::yield_now().await;
-                }
-            }
-        }
-
-        // Final flush + checkpoint
-        sink.flush().await?;
-        if delivered_since_checkpoint > 0 || failed_since_checkpoint > 0 {
-            write_checkpoint(
-                &mut ckpt_writer,
-                &sink_ledger,
-                &metrics_sink,
-                &mut delivered_since_checkpoint,
-                &mut failed_since_checkpoint,
-            );
-        }
-
-        Ok::<(), AeonError>(())
-    });
-
-    // Wait for all tasks
-    let (src_result, proc_result, sink_result) =
-        tokio::join!(source_handle, processor_handle, sink_handle);
-
-    // Propagate errors
-    src_result.map_err(|e| AeonError::processor(format!("source task panicked: {e}")))??;
-    proc_result.map_err(|e| AeonError::processor(format!("processor task panicked: {e}")))??;
-    sink_result.map_err(|e| AeonError::processor(format!("sink task panicked: {e}")))??;
-
-    Ok(())
+    SinkTaskCtx {
+        core,
+        delivery_strategy: config.delivery.strategy,
+        flush_interval: config.delivery.flush.interval,
+        max_pending: config.delivery.flush.max_pending,
+        adaptive_flush: config.delivery.flush.adaptive,
+        adaptive_min_divisor: config.delivery.flush.adaptive_min_divisor,
+        adaptive_max_multiplier: config.delivery.flush.adaptive_max_multiplier,
+        failure_policy: config.delivery.failure_policy,
+        max_retries: config.delivery.max_retries,
+        retry_backoff: config.delivery.retry_backoff,
+        checkpoint_writer,
+    }
 }
 
 /// Multi-partition pipeline configuration.
@@ -829,6 +803,304 @@ where
         Some(e) => Err(e),
         None => Ok(()),
     }
+}
+
+/// Bundle of sink-task parameters resolved from `PipelineConfig::delivery`.
+///
+/// Passed into `run_sink_task` so both `run_buffered` and
+/// `run_buffered_transport` can share the sink task body without needing
+/// a 15-argument helper signature.
+struct SinkTaskCtx {
+    core: Option<usize>,
+    delivery_strategy: aeon_types::DeliveryStrategy,
+    flush_interval: Duration,
+    max_pending: usize,
+    adaptive_flush: bool,
+    adaptive_min_divisor: u32,
+    adaptive_max_multiplier: u32,
+    failure_policy: BatchFailurePolicy,
+    max_retries: u32,
+    retry_backoff: Duration,
+    checkpoint_writer: Option<CheckpointWriter>,
+}
+
+/// Shared sink task body for `run_buffered` / `run_buffered_transport`.
+///
+/// Pops output batches from the processor→sink ring buffer, applies the
+/// configured `DeliveryStrategy`, handles partial failures via
+/// `BatchFailurePolicy`, maintains the delivery ledger, and periodically
+/// flushes + checkpoints. Exits cleanly when the ring producer is dropped.
+async fn run_sink_task<K: Sink + Send + 'static>(
+    mut sink: K,
+    mut sink_cons: rtrb::Consumer<Vec<Output>>,
+    metrics_sink: Arc<PipelineMetrics>,
+    sink_ledger: Option<Arc<DeliveryLedger>>,
+    ctx: SinkTaskCtx,
+) -> Result<(), AeonError> {
+    if let Some(core) = ctx.core {
+        pin_to_core(core);
+    }
+
+    let SinkTaskCtx {
+        core: _,
+        delivery_strategy,
+        flush_interval,
+        max_pending,
+        adaptive_flush,
+        adaptive_min_divisor,
+        adaptive_max_multiplier,
+        failure_policy,
+        max_retries,
+        retry_backoff,
+        mut checkpoint_writer,
+    } = ctx;
+
+    let mut last_flush = Instant::now();
+    let mut pending_count: u64 = 0;
+    // IDs of outputs that write_batch returned as `pending` but have not yet
+    // been flushed. Accumulated across write_batch calls; drained on flush.
+    // Used for both the outputs_sent metric and the delivery ledger so that
+    // UnorderedBatch sinks correctly credit acks at flush boundaries.
+    let mut pending_ids: Vec<uuid::Uuid> = Vec::new();
+    let mut delivered_since_checkpoint: u64 = 0;
+    let mut failed_since_checkpoint: u64 = 0;
+
+    // Adaptive flush tuner: adjusts flush interval based on ack success rate.
+    // Only active when adaptive=true AND a delivery ledger is present.
+    let mut flush_tuner = if adaptive_flush && sink_ledger.is_some() {
+        Some(FlushTuner::new(
+            flush_interval,
+            flush_interval / adaptive_min_divisor,
+            flush_interval * adaptive_max_multiplier,
+        ))
+    } else {
+        None
+    };
+    // Counters for adaptive flush feedback
+    let mut acked_since_last_flush: u64 = 0;
+    let mut events_since_last_flush: u64 = 0;
+
+    loop {
+        match sink_cons.pop() {
+            Ok(outputs) => {
+                let count = outputs.len() as u64;
+
+                // Track outputs in delivery ledger (if enabled).
+                // Collect event IDs for ack/fail after write_batch.
+                let tracked_ids: Vec<uuid::Uuid> = if let Some(ref ledger) = sink_ledger {
+                    outputs
+                        .iter()
+                        .filter_map(|o| {
+                            if let Some(event_id) = o.source_event_id {
+                                let partition = o.source_partition.unwrap_or(PartitionId::new(0));
+                                let offset = o.source_offset.unwrap_or(0);
+                                ledger.track(event_id, partition, offset);
+                                Some(event_id)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+
+                // Clone outputs before write_batch if failure policy may need them for retry.
+                // Only clone when RetryFailed is configured — avoid the cost otherwise.
+                let outputs_for_retry = if failure_policy == BatchFailurePolicy::RetryFailed {
+                    Some(outputs.clone())
+                } else {
+                    None
+                };
+
+                match sink.write_batch(outputs).await {
+                    Ok(batch_result) => {
+                        // Mark delivered outputs as acked in ledger.
+                        if let Some(ref ledger) = sink_ledger {
+                            if !batch_result.delivered.is_empty() {
+                                ledger.mark_batch_acked(&batch_result.delivered);
+                            }
+                            // Failed outputs are marked in ledger.
+                            for (id, err) in &batch_result.failed {
+                                ledger.mark_failed(id, format!("{err}"));
+                            }
+                            // Pending outputs remain tracked — acked at flush.
+                        }
+                        let delivered_count = batch_result.delivered.len() as u64;
+                        let total_count = count;
+                        metrics_sink
+                            .outputs_sent
+                            .fetch_add(delivered_count, Ordering::Relaxed);
+                        delivered_since_checkpoint += delivered_count;
+                        acked_since_last_flush += delivered_count;
+                        events_since_last_flush += total_count;
+
+                        // Accumulate pending IDs for flush-time crediting.
+                        // Non-blocking strategies (UnorderedBatch) return
+                        // BatchResult::all_pending; delivered is empty here and
+                        // only resolved when sink.flush() completes.
+                        if !batch_result.pending.is_empty() {
+                            pending_ids.extend(batch_result.pending.iter().copied());
+                        }
+
+                        // Apply BatchFailurePolicy if there are partial failures.
+                        if batch_result.has_failures() {
+                            let original = outputs_for_retry.as_deref().unwrap_or(&[]);
+                            handle_batch_failures(
+                                &mut sink,
+                                original,
+                                &batch_result,
+                                failure_policy,
+                                max_retries,
+                                retry_backoff,
+                                &metrics_sink,
+                                &sink_ledger,
+                            )
+                            .await?;
+                            failed_since_checkpoint += batch_result.failed.len() as u64;
+                        }
+                    }
+                    Err(e) => {
+                        // Mark all tracked outputs as failed
+                        if let Some(ref ledger) = sink_ledger {
+                            let reason = format!("{e}");
+                            for id in &tracked_ids {
+                                ledger.mark_failed(id, reason.clone());
+                            }
+                        }
+                        return Err(e);
+                    }
+                }
+
+                // In Batched mode, track pending and flush at intervals
+                if !delivery_strategy.is_blocking() {
+                    pending_count += count;
+                    let effective_interval = flush_tuner
+                        .as_ref()
+                        .map(|t| t.interval())
+                        .unwrap_or(flush_interval);
+                    let should_flush = last_flush.elapsed() >= effective_interval
+                        || pending_count >= max_pending as u64;
+                    if should_flush {
+                        // Report to adaptive tuner before flush
+                        if let Some(ref mut tuner) = flush_tuner {
+                            tuner.report(events_since_last_flush, acked_since_last_flush);
+                        }
+                        sink.flush().await?;
+                        // Credit pending outputs as delivered now that the
+                        // flush has resolved their acks. Mark them in the
+                        // ledger so checkpoints reflect the actual delivered
+                        // set for UnorderedBatch-style sinks.
+                        credit_pending_on_flush(
+                            &mut pending_ids,
+                            &metrics_sink,
+                            &sink_ledger,
+                            &mut delivered_since_checkpoint,
+                            &mut acked_since_last_flush,
+                        );
+                        write_checkpoint(
+                            &mut checkpoint_writer,
+                            &sink_ledger,
+                            &metrics_sink,
+                            &mut delivered_since_checkpoint,
+                            &mut failed_since_checkpoint,
+                        );
+                        pending_count = 0;
+                        last_flush = Instant::now();
+                        acked_since_last_flush = 0;
+                        events_since_last_flush = 0;
+                    }
+                }
+            }
+            Err(_) => {
+                if sink_cons.is_abandoned() {
+                    break;
+                }
+                // In Batched mode, flush pending even while idle
+                if !delivery_strategy.is_blocking() && pending_count > 0 {
+                    let effective_interval = flush_tuner
+                        .as_ref()
+                        .map(|t| t.interval())
+                        .unwrap_or(flush_interval);
+                    if last_flush.elapsed() >= effective_interval {
+                        if let Some(ref mut tuner) = flush_tuner {
+                            tuner.report(events_since_last_flush, acked_since_last_flush);
+                        }
+                        sink.flush().await?;
+                        credit_pending_on_flush(
+                            &mut pending_ids,
+                            &metrics_sink,
+                            &sink_ledger,
+                            &mut delivered_since_checkpoint,
+                            &mut acked_since_last_flush,
+                        );
+                        write_checkpoint(
+                            &mut checkpoint_writer,
+                            &sink_ledger,
+                            &metrics_sink,
+                            &mut delivered_since_checkpoint,
+                            &mut failed_since_checkpoint,
+                        );
+                        pending_count = 0;
+                        last_flush = Instant::now();
+                        acked_since_last_flush = 0;
+                        events_since_last_flush = 0;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        }
+    }
+
+    // Final flush + checkpoint
+    sink.flush().await?;
+    credit_pending_on_flush(
+        &mut pending_ids,
+        &metrics_sink,
+        &sink_ledger,
+        &mut delivered_since_checkpoint,
+        &mut acked_since_last_flush,
+    );
+    if delivered_since_checkpoint > 0 || failed_since_checkpoint > 0 {
+        write_checkpoint(
+            &mut checkpoint_writer,
+            &sink_ledger,
+            &metrics_sink,
+            &mut delivered_since_checkpoint,
+            &mut failed_since_checkpoint,
+        );
+    }
+
+    Ok(())
+}
+
+/// Credit outputs that were returned as `pending` by `write_batch` but are
+/// now delivered thanks to a successful `sink.flush()`. Drains `pending_ids`
+/// into the `outputs_sent` metric, the delivery ledger (if configured), and
+/// the checkpoint-window counters.
+///
+/// Called from every code path that invokes `sink.flush()` in non-blocking
+/// delivery mode (interval flush, idle flush, final flush). For blocking
+/// strategies (`PerEvent`, `OrderedBatch`) the vec is always empty so this
+/// is a no-op on the fast path.
+fn credit_pending_on_flush(
+    pending_ids: &mut Vec<uuid::Uuid>,
+    metrics: &Arc<PipelineMetrics>,
+    ledger: &Option<Arc<DeliveryLedger>>,
+    delivered_since_checkpoint: &mut u64,
+    acked_since_last_flush: &mut u64,
+) {
+    if pending_ids.is_empty() {
+        return;
+    }
+    let count = pending_ids.len() as u64;
+    if let Some(l) = ledger {
+        l.mark_batch_acked(pending_ids);
+    }
+    metrics.outputs_sent.fetch_add(count, Ordering::Relaxed);
+    *delivered_since_checkpoint += count;
+    *acked_since_last_flush += count;
+    pending_ids.clear();
 }
 
 /// Write a checkpoint record with ledger-populated offsets and pending IDs.
@@ -1062,6 +1334,169 @@ mod tests {
         assert_eq!(metrics.outputs_sent.load(Ordering::Relaxed), 1_000);
     }
 
+    // ── run_buffered_transport integration tests ────────────────────────
+    //
+    // These exercise the async `ProcessorTransport` path of the buffered
+    // pipeline. `InProcessTransport` wraps a sync `Processor` behind the
+    // `ProcessorTransport` trait, so the same processor impl that runs in
+    // `run_buffered` is reused here — which proves the two paths are
+    // behaviorally equivalent and share the sink task helper.
+
+    #[tokio::test]
+    async fn buffered_transport_pipeline_passthrough() {
+        use crate::transport::InProcessTransport;
+        use aeon_types::processor_transport::ProcessorTier;
+
+        let events = make_events(1_000);
+        let source = MemorySource::new(events, 64);
+        let processor = PassthroughProcessor::new(Arc::from("output"));
+        let transport = Arc::new(InProcessTransport::new(
+            processor,
+            "passthrough",
+            "1.0",
+            ProcessorTier::Native,
+        ));
+        let sink = BlackholeSink::new();
+        let config = PipelineConfig::default();
+        let metrics = Arc::new(PipelineMetrics::new());
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        run_buffered_transport(
+            source,
+            transport,
+            sink,
+            config,
+            Arc::clone(&metrics),
+            shutdown,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(metrics.events_received.load(Ordering::Relaxed), 1_000);
+        assert_eq!(metrics.events_processed.load(Ordering::Relaxed), 1_000);
+        assert_eq!(metrics.outputs_sent.load(Ordering::Relaxed), 1_000);
+    }
+
+    #[tokio::test]
+    async fn buffered_transport_pipeline_large_volume() {
+        use crate::transport::InProcessTransport;
+        use aeon_types::processor_transport::ProcessorTier;
+
+        let events = make_events(50_000);
+        let source = MemorySource::new(events, 512);
+        let processor = PassthroughProcessor::new(Arc::from("output"));
+        let transport = Arc::new(InProcessTransport::new(
+            processor,
+            "passthrough",
+            "1.0",
+            ProcessorTier::Native,
+        ));
+        let sink = BlackholeSink::new();
+        let config = PipelineConfig {
+            source_buffer_capacity: 256,
+            sink_buffer_capacity: 256,
+            max_batch_size: 512,
+            ..Default::default()
+        };
+        let metrics = Arc::new(PipelineMetrics::new());
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        run_buffered_transport(
+            source,
+            transport,
+            sink,
+            config,
+            Arc::clone(&metrics),
+            shutdown,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(metrics.events_received.load(Ordering::Relaxed), 50_000);
+        assert_eq!(metrics.outputs_sent.load(Ordering::Relaxed), 50_000);
+    }
+
+    #[tokio::test]
+    async fn buffered_transport_pipeline_propagates_transport_error() {
+        // A transport that always errors should cause run_buffered_transport
+        // to propagate the error cleanly instead of hanging or silently
+        // dropping events.
+        use aeon_types::traits::ProcessorTransport;
+
+        struct FailingTransport;
+        impl ProcessorTransport for FailingTransport {
+            fn call_batch(
+                &self,
+                _events: Vec<Event>,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<Vec<Output>, AeonError>> + Send + '_>,
+            > {
+                Box::pin(async { Err(AeonError::processor("transport forced failure")) })
+            }
+            fn health(
+                &self,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                aeon_types::processor_transport::ProcessorHealth,
+                                AeonError,
+                            >,
+                        > + Send
+                        + '_,
+                >,
+            > {
+                Box::pin(async {
+                    Ok(aeon_types::processor_transport::ProcessorHealth {
+                        healthy: false,
+                        latency_us: None,
+                        pending_batches: None,
+                        uptime_secs: None,
+                    })
+                })
+            }
+            fn drain(
+                &self,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<(), AeonError>> + Send + '_>,
+            > {
+                Box::pin(async { Ok(()) })
+            }
+            fn info(&self) -> aeon_types::processor_transport::ProcessorInfo {
+                aeon_types::processor_transport::ProcessorInfo {
+                    name: "failing".into(),
+                    version: "0.0".into(),
+                    tier: aeon_types::processor_transport::ProcessorTier::Native,
+                    capabilities: vec![],
+                }
+            }
+        }
+
+        let events = make_events(100);
+        let source = MemorySource::new(events, 16);
+        let transport = Arc::new(FailingTransport);
+        let sink = BlackholeSink::new();
+        let config = PipelineConfig::default();
+        let metrics = Arc::new(PipelineMetrics::new());
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let result = run_buffered_transport(
+            source,
+            transport,
+            sink,
+            config,
+            Arc::clone(&metrics),
+            shutdown,
+            None,
+        )
+        .await;
+
+        assert!(result.is_err(), "expected processor task to surface error");
+        assert_eq!(metrics.outputs_sent.load(Ordering::Relaxed), 0);
+    }
+
     #[test]
     fn core_pinning_disabled_resolves_to_none() {
         assert!(CorePinning::Disabled.resolve().is_none());
@@ -1218,6 +1653,100 @@ mod tests {
 
         assert_eq!(metrics.events_received.load(Ordering::Relaxed), 50_000);
         assert_eq!(metrics.outputs_sent.load(Ordering::Relaxed), 50_000);
+    }
+
+    /// Test sink that returns `BatchResult::all_pending` from `write_batch` and
+    /// only "delivers" pending outputs when `flush` is called. Models the
+    /// UnorderedBatch contract of real sinks (Kafka, NATS, RabbitMQ) without
+    /// requiring an external broker. Used to validate that the sink task
+    /// credits `outputs_sent` at flush time via `credit_pending_on_flush`.
+    struct DeferredSink {
+        pending: Vec<Output>,
+        delivered: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl DeferredSink {
+        fn new(delivered: Arc<std::sync::atomic::AtomicU64>) -> Self {
+            Self {
+                pending: Vec::new(),
+                delivered,
+            }
+        }
+    }
+
+    impl Sink for DeferredSink {
+        async fn write_batch(
+            &mut self,
+            outputs: Vec<Output>,
+        ) -> Result<aeon_types::BatchResult, AeonError> {
+            let ids: Vec<uuid::Uuid> = outputs
+                .iter()
+                .map(|o| o.source_event_id.unwrap_or(uuid::Uuid::nil()))
+                .collect();
+            self.pending.extend(outputs);
+            Ok(aeon_types::BatchResult::all_pending(ids))
+        }
+
+        async fn flush(&mut self) -> Result<(), AeonError> {
+            let drained = self.pending.len() as u64;
+            self.pending.clear();
+            self.delivered
+                .fetch_add(drained, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn buffered_pipeline_unordered_credits_metric_at_flush() {
+        // Regression guard for the pipeline metric bug: with DeliveryStrategy::
+        // UnorderedBatch, a sink that returns BatchResult::all_pending must
+        // still see its outputs credited to `outputs_sent` once flush completes.
+        // Prior to the fix, the sink task only added `batch_result.delivered
+        // .len()` to the counter, which is always 0 for all_pending sinks, so
+        // outputs_sent stayed at 0 even though every event was eventually
+        // delivered on flush.
+        let events = make_events(5_000);
+        let source = MemorySource::new(events, 128);
+        let processor = PassthroughProcessor::new(Arc::from("output"));
+        let delivered_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let sink = DeferredSink::new(Arc::clone(&delivered_count));
+        let config = PipelineConfig {
+            delivery: DeliveryConfig {
+                strategy: DeliveryStrategy::UnorderedBatch,
+                flush: crate::delivery::FlushStrategy {
+                    interval: std::time::Duration::from_millis(20),
+                    max_pending: 1_000,
+                    adaptive: false,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let metrics = Arc::new(PipelineMetrics::new());
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        run_buffered(
+            source,
+            processor,
+            sink,
+            config,
+            Arc::clone(&metrics),
+            shutdown,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Sink actually delivered all events on flush(es).
+        assert_eq!(
+            delivered_count.load(std::sync::atomic::Ordering::Relaxed),
+            5_000
+        );
+        // The metric must also agree.
+        assert_eq!(metrics.events_received.load(Ordering::Relaxed), 5_000);
+        assert_eq!(metrics.events_processed.load(Ordering::Relaxed), 5_000);
+        assert_eq!(metrics.outputs_sent.load(Ordering::Relaxed), 5_000);
     }
 
     fn make_events_with_ids(count: usize) -> Vec<Event> {

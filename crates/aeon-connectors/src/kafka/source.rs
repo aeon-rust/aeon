@@ -6,13 +6,13 @@
 use aeon_types::{AeonError, CoreLocalUuidGenerator, Event, PartitionId, Source};
 use bytes::Bytes;
 use rdkafka::TopicPartitionList;
-use std::time::Instant;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::message::{Headers, Message};
 use smallvec::SmallVec;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use std::time::Instant;
 
 /// Configuration for `KafkaSource`.
 pub struct KafkaSourceConfig {

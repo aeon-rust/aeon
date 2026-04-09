@@ -9,13 +9,14 @@ use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::auth;
-use crate::wire::{
-    self, Accepted, Challenge, Heartbeat, Register,
-};
+use crate::wire::{self, Accepted, Challenge, Heartbeat, Register};
 use crate::{BatchProcessFn, ProcessFn, ProcessorConfig, SessionInfo};
 
 /// Run a processor over T4 WebSocket with per-event processing.
-pub async fn run_websocket(config: ProcessorConfig, process_fn: ProcessFn) -> Result<(), AeonError> {
+pub async fn run_websocket(
+    config: ProcessorConfig,
+    process_fn: ProcessFn,
+) -> Result<(), AeonError> {
     let wrapper: Box<dyn Fn(Vec<crate::ProcessEvent>) -> Vec<Vec<crate::ProcessOutput>> + Send> =
         Box::new(move |events| events.into_iter().map(process_fn).collect());
     run_websocket_inner(config, wrapper).await
@@ -205,10 +206,7 @@ where
 }
 
 /// Build the AWPP Register message.
-fn build_register(
-    config: &ProcessorConfig,
-    challenge: &Challenge,
-) -> Result<Register, AeonError> {
+fn build_register(config: &ProcessorConfig, challenge: &Challenge) -> Result<Register, AeonError> {
     let pk = config.signing_key.verifying_key();
     let public_key = auth::format_public_key(&pk);
     let challenge_signature = auth::sign_challenge(&config.signing_key, &challenge.nonce)?;
@@ -278,9 +276,10 @@ mod tests {
 
     #[test]
     fn build_register_message() {
-        let config = ProcessorConfig::new("test-proc", "ws://localhost:4471/api/v1/processors/connect")
-            .pipeline("my-pipeline")
-            .version("2.0.0");
+        let config =
+            ProcessorConfig::new("test-proc", "ws://localhost:4471/api/v1/processors/connect")
+                .pipeline("my-pipeline")
+                .version("2.0.0");
 
         let challenge = Challenge {
             msg_type: "challenge".into(),

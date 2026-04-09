@@ -207,7 +207,10 @@ async fn a1_rust_native_t1_graceful_shutdown() {
     let received = metrics.events_received.load(Ordering::Relaxed);
     let sent = metrics.outputs_sent.load(Ordering::Relaxed);
     assert!(received > 0, "some events should have been processed");
-    assert_eq!(received, sent, "every received event should produce an output");
+    assert_eq!(
+        received, sent,
+        "every received event should produce an output"
+    );
 }
 
 /// A1 variant: large batch to stress batching logic.
@@ -404,8 +407,13 @@ async fn a2_rust_wasm_t2_memory_roundtrip_buffered() {
     let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     run_buffered(
-        source, processor, sink, config,
-        Arc::clone(&metrics), shutdown, None,
+        source,
+        processor,
+        sink,
+        config,
+        Arc::clone(&metrics),
+        shutdown,
+        None,
     )
     .await
     .unwrap();
@@ -431,8 +439,7 @@ async fn a3_assemblyscript_t2_memory_roundtrip() {
 
     let module = WasmModule::from_bytes(&wasm_bytes, WasmConfig::default())
         .expect("AssemblyScript .wasm compilation failed");
-    let processor =
-        WasmProcessor::new(Arc::new(module)).expect("WasmProcessor creation failed");
+    let processor = WasmProcessor::new(Arc::new(module)).expect("WasmProcessor creation failed");
 
     // AS processor is a JSON enrichment processor:
     // - If payload contains "user_id":"<val>", output = {"original":<payload>,"extracted_user_id":"<val>"}
@@ -442,9 +449,7 @@ async fn a3_assemblyscript_t2_memory_roundtrip() {
     let source_name: Arc<str> = Arc::from("as-test");
     let events: Vec<Event> = (0..event_count)
         .map(|i| {
-            let payload = Bytes::from(format!(
-                r#"{{"user_id":"user-{i:03}","data":"hello"}}"#
-            ));
+            let payload = Bytes::from(format!(r#"{{"user_id":"user-{i:03}","data":"hello"}}"#));
             Event::new(
                 uuid::Uuid::now_v7(),
                 i as i64,
@@ -511,16 +516,25 @@ async fn a4_c_native_t1_memory_roundtrip() {
     // aeon_process, aeon_process_batch per the C-ABI contract.
 
     let dll_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent().unwrap().parent().unwrap()
-        .join("sdks").join("c").join("build").join("passthrough_processor.dll");
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("sdks")
+        .join("c")
+        .join("build")
+        .join("passthrough_processor.dll");
 
     if !dll_path.exists() {
-        eprintln!("SKIP A4: C passthrough DLL not found at {}", dll_path.display());
+        eprintln!(
+            "SKIP A4: C passthrough DLL not found at {}",
+            dll_path.display()
+        );
         return;
     }
 
-    let processor = aeon_engine::NativeProcessor::load(&dll_path, b"")
-        .expect("load C passthrough processor");
+    let processor =
+        aeon_engine::NativeProcessor::load(&dll_path, b"").expect("load C passthrough processor");
 
     let events = make_test_events(EVENT_COUNT);
     let events_clone = events.clone();
@@ -565,13 +579,25 @@ async fn a6_dotnet_native_aot_t1_memory_roundtrip() {
     // Build: cd sdks/dotnet/AeonPassthroughNative && dotnet publish -c Release -r win-x64 -p:PublishAot=true
 
     let dll_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent().unwrap().parent().unwrap()
-        .join("sdks").join("dotnet").join("AeonPassthroughNative")
-        .join("bin").join("Release").join("net8.0").join("win-x64")
-        .join("publish").join("AeonPassthroughNative.dll");
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("sdks")
+        .join("dotnet")
+        .join("AeonPassthroughNative")
+        .join("bin")
+        .join("Release")
+        .join("net8.0")
+        .join("win-x64")
+        .join("publish")
+        .join("AeonPassthroughNative.dll");
 
     if !dll_path.exists() {
-        eprintln!("SKIP A6: .NET NativeAOT DLL not found at {}", dll_path.display());
+        eprintln!(
+            "SKIP A6: .NET NativeAOT DLL not found at {}",
+            dll_path.display()
+        );
         return;
     }
 
@@ -616,7 +642,11 @@ async fn a7_dotnet_ws_t4_memory_roundtrip() {
     let pub_key = identity.public_key.clone();
 
     let dotnet_dir = e2e_ws_harness::dotnet_passthrough_project(
-        server.port, &seed_path, &pub_key, pipeline_name, "dotnet-proc",
+        server.port,
+        &seed_path,
+        &pub_key,
+        pipeline_name,
+        "dotnet-proc",
     );
 
     let mut child = std::process::Command::new("dotnet")
@@ -626,20 +656,23 @@ async fn a7_dotnet_ws_t4_memory_roundtrip() {
         .spawn()
         .expect("spawn dotnet");
 
-    let connected = e2e_ws_harness::wait_for_connection(
-        &server, std::time::Duration::from_secs(30),
-    ).await;
+    let connected =
+        e2e_ws_harness::wait_for_connection(&server, std::time::Duration::from_secs(30)).await;
     assert!(connected, "A7: .NET processor failed to connect");
 
     let events = make_test_events(msg_count);
-    let outputs = e2e_ws_harness::drive_events_through_transport(
-        &server.ws_host, events, 64,
-    ).await.unwrap();
+    let outputs = e2e_ws_harness::drive_events_through_transport(&server.ws_host, events, 64)
+        .await
+        .unwrap();
 
     assert_eq!(outputs.len(), msg_count, "A7 C1: event count mismatch");
     for (i, output) in outputs.iter().enumerate() {
         let expected = format!("payload-{i:05}");
-        assert_eq!(output.payload.as_ref(), expected.as_bytes(), "A7 C2: payload mismatch at {i}");
+        assert_eq!(
+            output.payload.as_ref(),
+            expected.as_bytes(),
+            "A7 C2: payload mismatch at {i}"
+        );
     }
 
     drop(server);
@@ -664,7 +697,10 @@ async fn a8_python_ws_t4_memory_roundtrip() {
 
     // Check required packages
     let check = std::process::Command::new("python")
-        .args(["-c", "import websockets, nacl.signing, json, struct, zlib, hashlib, base64"])
+        .args([
+            "-c",
+            "import websockets, nacl.signing, json, struct, zlib, hashlib, base64",
+        ])
         .output();
     if check.map(|o| !o.status.success()).unwrap_or(true) {
         eprintln!("SKIP A8: Python packages missing (pip install websockets pynacl)");
@@ -681,7 +717,8 @@ async fn a8_python_ws_t4_memory_roundtrip() {
 
     // Inline Python passthrough processor — implements AWPP correctly
     // Note: serde_bytes serializes payload as integer array in JSON, e.g. [112,97,121,...]
-    let script = format!(r#"
+    let script = format!(
+        r#"
 import asyncio, json, struct, zlib, hashlib, base64, sys, os, traceback
 from nacl.signing import SigningKey
 
@@ -802,7 +839,8 @@ async def main():
                 break
 
 asyncio.run(main())
-"#);
+"#
+    );
 
     // Write script to temp file
     let script_path = std::env::temp_dir().join("aeon_e2e_a8_python.py");
@@ -815,10 +853,8 @@ asyncio.run(main())
         .spawn()
         .expect("spawn python");
 
-    let connected = e2e_ws_harness::wait_for_connection(
-        &server,
-        std::time::Duration::from_secs(10),
-    ).await;
+    let connected =
+        e2e_ws_harness::wait_for_connection(&server, std::time::Duration::from_secs(10)).await;
 
     if !connected {
         let _ = child.kill();
@@ -830,15 +866,20 @@ asyncio.run(main())
     let events = make_test_events(200);
     let events_clone = events.clone();
 
-    let outputs = e2e_ws_harness::drive_events_through_transport(
-        &server.ws_host, events, 32,
-    ).await.expect("A8: drive_events failed");
+    let outputs = e2e_ws_harness::drive_events_through_transport(&server.ws_host, events, 32)
+        .await
+        .expect("A8: drive_events failed");
 
     // Verify
-    assert_eq!(outputs.len(), events_clone.len(), "A8 C1: event count mismatch");
+    assert_eq!(
+        outputs.len(),
+        events_clone.len(),
+        "A8 C1: event count mismatch"
+    );
     for (i, (event, output)) in events_clone.iter().zip(outputs.iter()).enumerate() {
         assert_eq!(
-            output.payload.as_ref(), event.payload.as_ref(),
+            output.payload.as_ref(),
+            event.payload.as_ref(),
             "A8 C2: payload mismatch at index {i}",
         );
     }
@@ -870,32 +911,48 @@ async fn a9_go_ws_t4_memory_roundtrip() {
     let pub_key = identity.public_key.clone();
 
     let go_dir = e2e_ws_harness::go_passthrough_project(
-        server.port, &seed_path, &pub_key, pipeline_name, "go-proc",
+        server.port,
+        &seed_path,
+        &pub_key,
+        pipeline_name,
+        "go-proc",
     );
 
     let mut child = std::process::Command::new("go")
         .args(["run", "."])
         .current_dir(&go_dir)
-        .env("PATH", format!("C:\\Program Files\\Go\\bin;{}", std::env::var("PATH").unwrap_or_default()))
+        .env(
+            "PATH",
+            format!(
+                "C:\\Program Files\\Go\\bin;{}",
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn go");
 
     let connected = e2e_ws_harness::wait_for_connection(
-        &server, std::time::Duration::from_secs(30), // Go compile takes time
-    ).await;
+        &server,
+        std::time::Duration::from_secs(30), // Go compile takes time
+    )
+    .await;
     assert!(connected, "A9: Go processor failed to connect");
 
     let events = make_test_events(msg_count);
-    let outputs = e2e_ws_harness::drive_events_through_transport(
-        &server.ws_host, events, 64,
-    ).await.unwrap();
+    let outputs = e2e_ws_harness::drive_events_through_transport(&server.ws_host, events, 64)
+        .await
+        .unwrap();
 
     assert_eq!(outputs.len(), msg_count, "A9 C1: event count mismatch");
     for (i, output) in outputs.iter().enumerate() {
         let expected = format!("payload-{i:05}");
-        assert_eq!(output.payload.as_ref(), expected.as_bytes(), "A9 C2: payload mismatch at {i}");
+        assert_eq!(
+            output.payload.as_ref(),
+            expected.as_bytes(),
+            "A9 C2: payload mismatch at {i}"
+        );
     }
 
     drop(server);
@@ -913,7 +970,7 @@ async fn a9_go_ws_t4_memory_roundtrip() {
 async fn a10_rust_network_ws_t4_memory_roundtrip() {
     // T4 WebSocket Rust processor using aeon-processor-client.
     // Pure Rust — no external process needed.
-    use aeon_processor_client::{ProcessEvent, ProcessOutput, ProcessorConfig, ProcessorClient};
+    use aeon_processor_client::{ProcessEvent, ProcessOutput, ProcessorClient, ProcessorConfig};
 
     let pipeline_name = "a10-pipeline";
 
@@ -948,11 +1005,8 @@ async fn a10_rust_network_ws_t4_memory_roundtrip() {
     });
 
     // 4. Wait for processor to connect
-    let connected = e2e_ws_harness::wait_for_connection(
-        &server,
-        std::time::Duration::from_secs(5),
-    )
-    .await;
+    let connected =
+        e2e_ws_harness::wait_for_connection(&server, std::time::Duration::from_secs(5)).await;
     assert!(connected, "A10: Rust processor failed to connect within 5s");
 
     // 5. Drive events through WS transport
@@ -1005,7 +1059,10 @@ async fn a11_nodejs_ws_t4_memory_roundtrip() {
 
     // Check Node version >= 22 (built-in WebSocket) and @noble/ed25519
     let version_check = std::process::Command::new("node")
-        .args(["-e", "const v=parseInt(process.versions.node);if(v<22){process.exit(1)}"])
+        .args([
+            "-e",
+            "const v=parseInt(process.versions.node);if(v<22){process.exit(1)}",
+        ])
         .output();
     if version_check.map(|o| !o.status.success()).unwrap_or(true) {
         eprintln!("SKIP A11: Node.js 22+ required for built-in WebSocket");
@@ -1022,7 +1079,8 @@ async fn a11_nodejs_ws_t4_memory_roundtrip() {
     let pub_key = identity.public_key.clone();
 
     // Inline Node.js passthrough processor — uses built-in WebSocket + crypto
-    let script = format!(r#"
+    let script = format!(
+        r#"
 const fs = require('fs');
 const crypto = require('crypto');
 const zlib = require('zlib');
@@ -1158,7 +1216,8 @@ ws.onmessage = (evt) => {{
 
 ws.onerror = (e) => {{ console.error('WS error:', e.message); process.exit(1); }};
 ws.onclose = () => {{ process.exit(0); }};
-"#);
+"#
+    );
 
     let script_path = std::env::temp_dir().join("aeon_e2e_a11_nodejs.js");
     std::fs::write(&script_path, &script).expect("write nodejs script");
@@ -1170,10 +1229,8 @@ ws.onclose = () => {{ process.exit(0); }};
         .spawn()
         .expect("spawn node");
 
-    let connected = e2e_ws_harness::wait_for_connection(
-        &server,
-        std::time::Duration::from_secs(10),
-    ).await;
+    let connected =
+        e2e_ws_harness::wait_for_connection(&server, std::time::Duration::from_secs(10)).await;
 
     if !connected {
         let _ = child.kill();
@@ -1185,14 +1242,19 @@ ws.onclose = () => {{ process.exit(0); }};
     let events = make_test_events(200);
     let events_clone = events.clone();
 
-    let outputs = e2e_ws_harness::drive_events_through_transport(
-        &server.ws_host, events, 32,
-    ).await.expect("A11: drive_events failed");
+    let outputs = e2e_ws_harness::drive_events_through_transport(&server.ws_host, events, 32)
+        .await
+        .expect("A11: drive_events failed");
 
-    assert_eq!(outputs.len(), events_clone.len(), "A11 C1: event count mismatch");
+    assert_eq!(
+        outputs.len(),
+        events_clone.len(),
+        "A11 C1: event count mismatch"
+    );
     for (i, (event, output)) in events_clone.iter().zip(outputs.iter()).enumerate() {
         assert_eq!(
-            output.payload.as_ref(), event.payload.as_ref(),
+            output.payload.as_ref(),
+            event.payload.as_ref(),
             "A11 C2: payload mismatch at index {i}",
         );
     }
@@ -1218,15 +1280,18 @@ async fn a12_java_ws_t4_memory_roundtrip() {
     let java_ver = std::process::Command::new("java")
         .args(["--version"])
         .output();
-    let is_modern = java_ver.map(|o| {
-        let out = String::from_utf8_lossy(&o.stdout);
-        // Parse version like "openjdk 17.0.18" or "java 21.0.1"
-        out.split_whitespace().nth(1)
-            .and_then(|v| v.split('.').next())
-            .and_then(|v| v.parse::<u32>().ok())
-            .map(|v| v >= 15)
-            .unwrap_or(false)
-    }).unwrap_or(false);
+    let is_modern = java_ver
+        .map(|o| {
+            let out = String::from_utf8_lossy(&o.stdout);
+            // Parse version like "openjdk 17.0.18" or "java 21.0.1"
+            out.split_whitespace()
+                .nth(1)
+                .and_then(|v| v.split('.').next())
+                .and_then(|v| v.parse::<u32>().ok())
+                .map(|v| v >= 15)
+                .unwrap_or(false)
+        })
+        .unwrap_or(false);
     if !is_modern {
         eprintln!("SKIP A12: Java 15+ required for EdDSA support");
         return;
@@ -1241,7 +1306,11 @@ async fn a12_java_ws_t4_memory_roundtrip() {
     let pub_key = identity.public_key.clone();
 
     let java_dir = e2e_ws_harness::java_passthrough_project(
-        server.port, &seed_path, &pub_key, pipeline_name, "java-proc",
+        server.port,
+        &seed_path,
+        &pub_key,
+        pipeline_name,
+        "java-proc",
     );
     let java_src = java_dir.join("AeonProcessor.java");
 
@@ -1251,7 +1320,10 @@ async fn a12_java_ws_t4_memory_roundtrip() {
         .output()
         .expect("javac");
     if !compile.status.success() {
-        eprintln!("SKIP A12: javac failed: {}", String::from_utf8_lossy(&compile.stderr));
+        eprintln!(
+            "SKIP A12: javac failed: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
         let _ = std::fs::remove_dir_all(&java_dir);
         return;
     }
@@ -1263,20 +1335,23 @@ async fn a12_java_ws_t4_memory_roundtrip() {
         .spawn()
         .expect("spawn java");
 
-    let connected = e2e_ws_harness::wait_for_connection(
-        &server, std::time::Duration::from_secs(15),
-    ).await;
+    let connected =
+        e2e_ws_harness::wait_for_connection(&server, std::time::Duration::from_secs(15)).await;
     assert!(connected, "A12: Java processor failed to connect");
 
     let events = make_test_events(msg_count);
-    let outputs = e2e_ws_harness::drive_events_through_transport(
-        &server.ws_host, events, 64,
-    ).await.unwrap();
+    let outputs = e2e_ws_harness::drive_events_through_transport(&server.ws_host, events, 64)
+        .await
+        .unwrap();
 
     assert_eq!(outputs.len(), msg_count, "A12 C1: event count mismatch");
     for (i, output) in outputs.iter().enumerate() {
         let expected = format!("payload-{i:05}");
-        assert_eq!(output.payload.as_ref(), expected.as_bytes(), "A12 C2: payload mismatch at {i}");
+        assert_eq!(
+            output.payload.as_ref(),
+            expected.as_bytes(),
+            "A12 C2: payload mismatch at {i}"
+        );
     }
 
     drop(server);
@@ -1298,7 +1373,10 @@ async fn a13_php_ws_t4_memory_roundtrip() {
     }
     // Check sodium extension
     let check = std::process::Command::new("php")
-        .args(["-r", "if (!function_exists('sodium_crypto_sign_seed_keypair')) exit(1);"])
+        .args([
+            "-r",
+            "if (!function_exists('sodium_crypto_sign_seed_keypair')) exit(1);",
+        ])
         .output();
     if check.map(|o| !o.status.success()).unwrap_or(true) {
         eprintln!("SKIP A13: PHP sodium extension not available");
@@ -1314,7 +1392,11 @@ async fn a13_php_ws_t4_memory_roundtrip() {
     let pub_key = identity.public_key.clone();
 
     let script = e2e_ws_harness::php_passthrough_script(
-        server.port, &seed_path, &pub_key, pipeline_name, "php-proc",
+        server.port,
+        &seed_path,
+        &pub_key,
+        pipeline_name,
+        "php-proc",
     );
     let script_path = std::env::temp_dir().join("aeon_e2e_a13_php.php");
     std::fs::write(&script_path, &script).expect("write php script");
@@ -1326,20 +1408,23 @@ async fn a13_php_ws_t4_memory_roundtrip() {
         .spawn()
         .expect("spawn php");
 
-    let connected = e2e_ws_harness::wait_for_connection(
-        &server, std::time::Duration::from_secs(10),
-    ).await;
+    let connected =
+        e2e_ws_harness::wait_for_connection(&server, std::time::Duration::from_secs(10)).await;
     assert!(connected, "A13: PHP processor failed to connect");
 
     let events = make_test_events(msg_count);
-    let outputs = e2e_ws_harness::drive_events_through_transport(
-        &server.ws_host, events, 64,
-    ).await.unwrap();
+    let outputs = e2e_ws_harness::drive_events_through_transport(&server.ws_host, events, 64)
+        .await
+        .unwrap();
 
     assert_eq!(outputs.len(), msg_count, "A13 C1: event count mismatch");
     for (i, output) in outputs.iter().enumerate() {
         let expected = format!("payload-{i:05}");
-        assert_eq!(output.payload.as_ref(), expected.as_bytes(), "A13 C2: payload mismatch at {i}");
+        assert_eq!(
+            output.payload.as_ref(),
+            expected.as_bytes(),
+            "A13 C2: payload mismatch at {i}"
+        );
     }
 
     drop(server);

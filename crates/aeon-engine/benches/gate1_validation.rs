@@ -10,15 +10,48 @@
 //! Run: cargo bench -p aeon-engine --bench gate1_validation
 
 use aeon_connectors::kafka::{KafkaSinkConfig, KafkaSource, KafkaSourceConfig};
-use aeon_engine::{PassthroughProcessor, PipelineMetrics};
+use aeon_engine::{PassthroughProcessor, PipelineConfig, PipelineMetrics, run_buffered};
 use aeon_observability::LatencyHistogram;
-use aeon_types::{Processor, Sink, Source};
+use aeon_types::{AeonError, Event, Output, Processor};
 use rdkafka::config::ClientConfig;
 use rdkafka::producer::{BaseProducer, BaseRecord, Producer};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use sysinfo::{Pid, System};
+
+/// Processor wrapper that records end-to-end latency (source_ts → processing time).
+struct LatencyMeasuringProcessor {
+    inner: PassthroughProcessor,
+    histogram: Arc<LatencyHistogram>,
+}
+
+impl LatencyMeasuringProcessor {
+    fn new(inner: PassthroughProcessor, histogram: Arc<LatencyHistogram>) -> Self {
+        Self { inner, histogram }
+    }
+}
+
+impl Processor for LatencyMeasuringProcessor {
+    fn process(&self, event: Event) -> Result<Vec<Output>, AeonError> {
+        if let Some(ts) = event.source_ts {
+            let elapsed = Instant::now().duration_since(ts).as_nanos() as u64;
+            self.histogram.record_ns(elapsed);
+        }
+        self.inner.process(event)
+    }
+
+    fn process_batch(&self, events: Vec<Event>) -> Result<Vec<Output>, AeonError> {
+        let now = Instant::now();
+        for event in &events {
+            if let Some(ts) = event.source_ts {
+                let elapsed = now.duration_since(ts).as_nanos() as u64;
+                self.histogram.record_ns(elapsed);
+            }
+        }
+        self.inner.process_batch(events)
+    }
+}
 
 fn brokers() -> String {
     std::env::var("AEON_BENCH_BROKERS").unwrap_or_else(|_| "localhost:19092".to_string())
@@ -30,7 +63,7 @@ const SINK_TOPIC: &str = "aeon-bench-sink";
 /// Produce N messages to Redpanda.
 fn produce_messages(count: usize, payload_size: usize) {
     let producer: BaseProducer = ClientConfig::new()
-        .set("bootstrap.servers", &brokers())
+        .set("bootstrap.servers", brokers())
         .set("message.timeout.ms", "30000")
         .set("queue.buffering.max.messages", "1000000")
         .set("queue.buffering.max.kbytes", "1048576")
@@ -73,11 +106,11 @@ fn produce_messages(count: usize, payload_size: usize) {
 }
 
 fn make_source(batch_size: usize) -> KafkaSource {
-    let config = KafkaSourceConfig::new(&brokers(), SOURCE_TOPIC)
+    let config = KafkaSourceConfig::new(brokers(), SOURCE_TOPIC)
         .with_partitions((0..16_i32).collect())
         .with_batch_max(batch_size)
-        .with_poll_timeout(Duration::from_secs(1))
-        .with_drain_timeout(Duration::from_millis(5))
+        .with_poll_timeout(Duration::from_secs(2))
+        .with_drain_timeout(Duration::from_millis(50))
         .with_source_name("bench")
         .with_max_empty_polls(3);
 
@@ -92,7 +125,7 @@ fn main() {
 
     // Check Redpanda availability
     let available: Result<BaseProducer, _> = ClientConfig::new()
-        .set("bootstrap.servers", &brokers())
+        .set("bootstrap.servers", brokers())
         .set("message.timeout.ms", "5000")
         .create();
 
@@ -164,44 +197,33 @@ fn main() {
     let hist = Arc::clone(&histogram);
 
     let metrics = rt.block_on(async {
-        let mut source = make_source(1024);
-        let processor = PassthroughProcessor::new(Arc::from(SINK_TOPIC));
-        let sink_config =
-            KafkaSinkConfig::new(&brokers(), SINK_TOPIC).with_config("linger.ms", "0");
-        let mut sink = aeon_connectors::kafka::KafkaSink::new(sink_config).expect("sink");
+        let source = make_source(1024);
+        let base_processor = PassthroughProcessor::new(Arc::from(SINK_TOPIC));
+        let processor = LatencyMeasuringProcessor::new(base_processor, Arc::clone(&hist));
+        let sink_config = KafkaSinkConfig::new(brokers(), SINK_TOPIC).with_config("linger.ms", "0");
+        let sink = aeon_connectors::kafka::KafkaSink::new(sink_config).expect("sink");
 
-        let metrics = PipelineMetrics::new();
-        let shutdown = AtomicBool::new(false);
+        // Buffered pipeline with SPSC ring buffers — source/processor/sink run concurrently.
+        let config = PipelineConfig {
+            source_buffer_capacity: 256,
+            sink_buffer_capacity: 256,
+            max_batch_size: 1024,
+            ..Default::default()
+        };
+        let metrics = Arc::new(PipelineMetrics::new());
+        let shutdown = Arc::new(AtomicBool::new(false));
 
-        // Direct pipeline loop with latency measurement
-        while !shutdown.load(Ordering::Relaxed) {
-            let events = source.next_batch().await.expect("source");
-            if events.is_empty() {
-                break;
-            }
-            let count = events.len() as u64;
-            metrics.events_received.fetch_add(count, Ordering::Relaxed);
-
-            // Record source_ts for latency before processing
-            let source_timestamps: Vec<_> = events
-                .iter()
-                .filter_map(|e| e.source_ts)
-                .collect();
-
-            let outputs = processor.process_batch(events).expect("process");
-            metrics.events_processed.fetch_add(count, Ordering::Relaxed);
-
-            let now = Instant::now();
-            for ts in &source_timestamps {
-                let elapsed_ns = now.duration_since(*ts).as_nanos() as u64;
-                hist.record_ns(elapsed_ns);
-            }
-
-            let batch_result = sink.write_batch(outputs).await.expect("sink write");
-            let delivered = batch_result.delivered.len() as u64;
-            metrics.outputs_sent.fetch_add(delivered, Ordering::Relaxed);
-        }
-        sink.flush().await.expect("flush");
+        run_buffered(
+            source,
+            processor,
+            sink,
+            config,
+            Arc::clone(&metrics),
+            shutdown,
+            None,
+        )
+        .await
+        .expect("pipeline run");
 
         metrics
     });
@@ -251,9 +273,7 @@ fn main() {
     let avg_cpu_pct_of_system = avg_cpu_total / num_cpus as f64;
 
     println!("\n  CPU Usage ({num_samples} samples over {elapsed:.1?}):");
-    println!(
-        "    Raw total:  {avg_cpu_total:.1}% (sum across {num_cpus} logical cores)"
-    );
+    println!("    Raw total:  {avg_cpu_total:.1}% (sum across {num_cpus} logical cores)");
     println!("    Per-system: {avg_cpu_pct_of_system:.1}% (of total system capacity)");
 
     // ── Gate 1 Verdict ──
@@ -280,9 +300,7 @@ fn main() {
         "║  Zero Loss:    {sent}/{received}             {}       ║",
         if loss_pass { "✅ PASS" } else { "❌ FAIL" }
     );
-    println!(
-        "║  Throughput:   {throughput:.0} events/sec                    ║"
-    );
+    println!("║  Throughput:   {throughput:.0} events/sec                    ║");
     println!("╠══════════════════════════════════════════════════════════╣");
 
     if p99_pass && cpu_pass && loss_pass {

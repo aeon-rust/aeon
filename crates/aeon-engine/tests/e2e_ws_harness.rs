@@ -12,11 +12,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aeon_engine::identity_store::ProcessorIdentityStore;
+use aeon_engine::pipeline_manager::PipelineManager;
+use aeon_engine::registry::ProcessorRegistry;
 use aeon_engine::rest_api::{AppState, api_router};
 use aeon_engine::transport::session::PipelineResolver;
 use aeon_engine::transport::websocket_host::{WebSocketHostConfig, WebSocketProcessorHost};
-use aeon_engine::pipeline_manager::PipelineManager;
-use aeon_engine::registry::ProcessorRegistry;
 use aeon_types::awpp::PipelineAssignment;
 use aeon_types::error::AeonError;
 use aeon_types::event::{Event, Output};
@@ -91,6 +91,7 @@ pub async fn start_ws_test_server(pipeline_name: &str) -> WsTestServer {
         processor_version: "1.0.0".into(),
         pipeline_name: pipeline_name.to_string(),
         pipeline_codec: None,
+        max_inflight_batches: aeon_engine::transport::session::DEFAULT_MAX_INFLIGHT_BATCHES,
     };
 
     let ws_host = Arc::new(WebSocketProcessorHost::new(ws_config));
@@ -287,7 +288,10 @@ pub async fn run_sdk_t4_test(
     // Build args with connection info
     let port = server.port;
     let env_vars = vec![
-        ("AEON_WS_URL", format!("ws://127.0.0.1:{port}/api/v1/processors/connect")),
+        (
+            "AEON_WS_URL",
+            format!("ws://127.0.0.1:{port}/api/v1/processors/connect"),
+        ),
         ("AEON_PIPELINE", pipeline_name.to_string()),
         ("AEON_PROCESSOR_NAME", processor_name.to_string()),
         ("AEON_KEY_FILE", seed_file.to_string_lossy().to_string()),
@@ -303,13 +307,13 @@ pub async fn run_sdk_t4_test(
     if !connected {
         // Read stderr for diagnostics
         let _ = child.kill();
-        let output = child.wait_with_output().unwrap_or_else(|_| {
-            std::process::Output {
+        let output = child
+            .wait_with_output()
+            .unwrap_or_else(|_| std::process::Output {
                 status: std::process::ExitStatus::default(),
                 stdout: vec![],
                 stderr: b"(could not read output)".to_vec(),
-            }
-        });
+            });
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!(
             "{test_name}: SDK process failed to connect within 10s.\nstderr: {stderr}"
@@ -355,7 +359,8 @@ pub fn python_passthrough_script(
     pipeline_name: &str,
     processor_name: &str,
 ) -> String {
-    format!(r#"
+    format!(
+        r#"
 import asyncio, json, struct, zlib, base64, sys, traceback
 from nacl.signing import SigningKey
 
@@ -427,7 +432,8 @@ async def main():
                 print(f"ERROR: {{e}}", file=sys.stderr); traceback.print_exc(file=sys.stderr); break
 
 asyncio.run(main())
-"#)
+"#
+    )
 }
 
 /// Generate inline Node.js passthrough processor script.
@@ -439,7 +445,8 @@ pub fn nodejs_passthrough_script(
     pipeline_name: &str,
     processor_name: &str,
 ) -> String {
-    format!(r#"
+    format!(
+        r#"
 const fs = require('fs');
 const crypto = require('crypto');
 const zlib = require('zlib');
@@ -505,7 +512,8 @@ ws.onmessage = (evt) => {{
 }};
 ws.onerror = (e) => {{ console.error('WS error:', e.message); process.exit(1); }};
 ws.onclose = () => {{ process.exit(0); }};
-"#)
+"#
+    )
 }
 
 /// Generate a Go passthrough processor project in a temp directory.
@@ -524,19 +532,25 @@ pub fn go_passthrough_project(
 
     // Find the absolute path to sdks/go
     let sdk_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent().unwrap().parent().unwrap()
-        .join("sdks").join("go");
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("sdks")
+        .join("go");
     let sdk_path_str = sdk_path.to_string_lossy().replace('\\', "/");
 
     // go.mod
-    let go_mod = format!(r#"module aeon-e2e-go-test
+    let go_mod = format!(
+        r#"module aeon-e2e-go-test
 
 go 1.21
 
 require github.com/aeon-rust/aeon/sdks/go v0.0.0
 
 replace github.com/aeon-rust/aeon/sdks/go => {sdk_path_str}
-"#);
+"#
+    );
     std::fs::write(tmp_dir.join("go.mod"), &go_mod).expect("write go.mod");
 
     // Fix: seed_path on Windows may have backslashes
@@ -546,7 +560,8 @@ replace github.com/aeon-rust/aeon/sdks/go => {sdk_path_str}
     // The SDK signs []byte(nonce) (hex string) but engine expects signing hex-decoded bytes.
     // So we use the SDK directly but patch the signing by using a custom main that does
     // the handshake correctly.
-    let main_go = format!(r#"package main
+    let main_go = format!(
+        r#"package main
 
 import (
 	"context"
@@ -700,7 +715,8 @@ func main() {{
 		conn.WriteMessage(websocket.BinaryMessage, frame)
 	}}
 }}
-"#);
+"#
+    );
 
     std::fs::write(tmp_dir.join("main.go"), &main_go).expect("write main.go");
 
@@ -708,11 +724,21 @@ func main() {{
     let output = std::process::Command::new("go")
         .args(["mod", "tidy"])
         .current_dir(&tmp_dir)
-        .env("PATH", format!("{};{}", "C:\\Program Files\\Go\\bin", std::env::var("PATH").unwrap_or_default()))
+        .env(
+            "PATH",
+            format!(
+                "{};{}",
+                "C:\\Program Files\\Go\\bin",
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
         .output()
         .expect("go mod tidy");
     if !output.status.success() {
-        eprintln!("go mod tidy stderr: {}", String::from_utf8_lossy(&output.stderr));
+        eprintln!(
+            "go mod tidy stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     tmp_dir
@@ -740,7 +766,11 @@ pub fn dotnet_passthrough_project(
         .current_dir(&tmp_dir)
         .output()
         .expect("dotnet new console");
-    assert!(output.status.success(), "dotnet new console failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "dotnet new console failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     // Add NuGet packages for ED25519 and CRC32
     let output = std::process::Command::new("dotnet")
@@ -748,16 +778,25 @@ pub fn dotnet_passthrough_project(
         .current_dir(&tmp_dir)
         .output()
         .expect("dotnet add package NSec");
-    assert!(output.status.success(), "dotnet add NSec failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "dotnet add NSec failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let output = std::process::Command::new("dotnet")
         .args(["add", "package", "System.IO.Hashing"])
         .current_dir(&tmp_dir)
         .output()
         .expect("dotnet add package Hashing");
-    assert!(output.status.success(), "dotnet add Hashing failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "dotnet add Hashing failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
-    let program_cs = format!(r#"
+    let program_cs = format!(
+        r#"
 using System;
 using System.Buffers.Binary;
 using System.IO;
@@ -871,7 +910,8 @@ static async Task ProcessFrame(byte[] raw, bool batchSigning, SignatureAlgorithm
     frame.Write(sigBytes);
     await ws.SendAsync(frame.ToArray(), WebSocketMessageType.Binary, true, default);
 }}
-"#);
+"#
+    );
 
     std::fs::write(tmp_dir.join("Program.cs"), &program_cs).expect("write Program.cs");
 
@@ -882,7 +922,10 @@ static async Task ProcessFrame(byte[] raw, bool batchSigning, SignatureAlgorithm
         .output()
         .expect("dotnet restore");
     if !output.status.success() {
-        eprintln!("dotnet restore stderr: {}", String::from_utf8_lossy(&output.stderr));
+        eprintln!(
+            "dotnet restore stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     tmp_dir
@@ -907,7 +950,8 @@ pub fn java_passthrough_project(
     // Java 17 has EdDSA support via java.security and built-in WebSocket via java.net.http
     // But java.net.http.WebSocket is complex. Use a simpler approach with raw socket + HTTP upgrade.
     // Actually, Java 15+ has EdDSA, Java 11+ has HttpClient with WebSocket.
-    let java_src = format!(r#"
+    let java_src = format!(
+        r#"
 import java.io.*;
 import java.net.*;
 import java.net.http.*;
@@ -1162,7 +1206,8 @@ public class AeonProcessor implements WebSocket.Listener {{
         proc.done.get();
     }}
 }}
-"#);
+"#
+    );
 
     std::fs::write(tmp_dir.join("AeonProcessor.java"), &java_src).expect("write Java source");
     tmp_dir
@@ -1179,7 +1224,8 @@ pub fn php_passthrough_script(
     processor_name: &str,
 ) -> String {
     let seed_path_fixed = seed_path.replace('\\', "/");
-    format!(r#"<?php
+    format!(
+        r#"<?php
 // Minimal AWPP T4 WebSocket processor in pure PHP (sodium + stream_socket_client)
 $seed = file_get_contents('{seed_path_fixed}');
 $kp = sodium_crypto_sign_seed_keypair($seed);
@@ -1309,5 +1355,515 @@ while (true) {{
     ws_send($ws, 2, $frame);
 }}
 fclose($ws);
-"#)
+"#
+    )
+}
+
+// ── Composer helpers for PHP async adapter tests ───────────────────────
+
+/// Resolve a Composer invocation usable for `<prefix> install|require ...`.
+/// Tries, in order:
+/// 1. `AEON_COMPOSER` env var (path to composer.phar, invoked via `php`)
+/// 2. `composer` / `composer.bat` on PATH
+/// 3. `$HOME/.local/bin/composer` or `%USERPROFILE%\.local\bin\composer` (phar)
+pub fn composer_command() -> Option<Vec<String>> {
+    // 1. Explicit override via env var
+    if let Ok(path) = std::env::var("AEON_COMPOSER") {
+        if std::path::Path::new(&path).exists() {
+            return Some(vec!["php".to_string(), path]);
+        }
+    }
+    // 2. Native `composer` on PATH
+    let native = if cfg!(windows) {
+        "composer.bat"
+    } else {
+        "composer"
+    };
+    let probe = std::process::Command::new(native)
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if probe {
+        return Some(vec![native.to_string()]);
+    }
+    // 3. User-local phar install
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok()?;
+    let phar = std::path::Path::new(&home).join(".local").join("bin").join("composer");
+    if phar.exists() {
+        return Some(vec!["php".to_string(), phar.to_string_lossy().to_string()]);
+    }
+    None
+}
+
+/// Returns true if Composer can be invoked in some form on this machine.
+pub fn composer_available() -> bool {
+    composer_command().is_some()
+}
+
+/// Create (or reuse) a Composer project with the given packages.
+/// `project_name` is used as a stable subdirectory under the temp dir so
+/// repeated test runs can skip the download step once vendor/ is in place.
+/// Each package is `name:constraint`, e.g. `react/event-loop:^1.5`.
+/// Returns the project directory (containing `vendor/autoload.php`) or None
+/// if Composer is unavailable or the install failed.
+pub fn setup_composer_project(project_name: &str, packages: &[&str]) -> Option<std::path::PathBuf> {
+    let prefix = composer_command()?;
+    let dir = std::env::temp_dir().join(format!("aeon-e2e-{project_name}"));
+    let autoload = dir.join("vendor").join("autoload.php");
+    if autoload.exists() {
+        return Some(dir);
+    }
+    let _ = std::fs::create_dir_all(&dir);
+
+    // Write a minimal composer.json
+    let deps: Vec<String> = packages
+        .iter()
+        .map(|p| {
+            let mut parts = p.splitn(2, ':');
+            let name = parts.next().unwrap_or("");
+            let constraint = parts.next().unwrap_or("*");
+            format!("    \"{name}\": \"{constraint}\"")
+        })
+        .collect();
+    let composer_json = format!(
+        "{{\n  \"require\": {{\n{}\n  }},\n  \"config\": {{ \"preferred-install\": \"dist\" }}\n}}\n",
+        deps.join(",\n")
+    );
+    if std::fs::write(dir.join("composer.json"), composer_json).is_err() {
+        return None;
+    }
+
+    let mut cmd = std::process::Command::new(&prefix[0]);
+    for arg in &prefix[1..] {
+        cmd.arg(arg);
+    }
+    cmd.arg("install")
+        .arg("--no-interaction")
+        .arg("--no-progress")
+        .arg("--quiet")
+        .current_dir(&dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    let output = cmd.output().ok()?;
+    if !output.status.success() {
+        eprintln!(
+            "composer install failed for {project_name}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return None;
+    }
+    if !autoload.exists() {
+        return None;
+    }
+    Some(dir)
+}
+
+/// Generate a ReactPHP + Ratchet/Pawl AWPP T4 processor script.
+/// Requires a Composer project with `react/event-loop` + `ratchet/pawl`.
+/// `vendor_autoload` must be the absolute path to `vendor/autoload.php`.
+pub fn php_reactphp_passthrough_script(
+    port: u16,
+    seed_path: &str,
+    _pub_key: &str,
+    pipeline_name: &str,
+    processor_name: &str,
+    vendor_autoload: &str,
+) -> String {
+    let seed_path_fixed = seed_path.replace('\\', "/");
+    let autoload_fixed = vendor_autoload.replace('\\', "/");
+    format!(
+        r#"<?php
+// H2: ReactPHP event loop + Ratchet/Pawl WebSocket client — AWPP T4 processor
+require '{autoload_fixed}';
+
+use Ratchet\Client\Connector;
+use React\EventLoop\Loop;
+use Ratchet\RFC6455\Messaging\Frame;
+use Ratchet\RFC6455\Messaging\MessageInterface;
+
+$seed = file_get_contents('{seed_path_fixed}');
+$kp = sodium_crypto_sign_seed_keypair($seed);
+$sk = sodium_crypto_sign_secretkey($kp);
+$pk = sodium_crypto_sign_publickey($kp);
+$pubKeyStr = "ed25519:" . base64_encode($pk);
+
+$loop = Loop::get();
+$connector = new Connector($loop);
+$batchSigning = true;
+
+$connector('ws://127.0.0.1:{port}/api/v1/processors/connect', [], [])->then(
+    function ($conn) use ($sk, $pubKeyStr, &$batchSigning, $loop) {{
+        $conn->on('message', function (MessageInterface $msg) use ($conn, $sk, $pubKeyStr, &$batchSigning, $loop) {{
+            $data = (string)$msg;
+            if ($msg->isBinary()) {{
+                // Parse AWPP data frame
+                $nameLen = unpack('V', substr($data, 0, 4))[1];
+                $pipeline = substr($data, 4, $nameLen);
+                $partition = unpack('v', substr($data, 4 + $nameLen, 2))[1];
+                $bd = substr($data, 4 + $nameLen + 2);
+                $batchId = unpack('P', substr($bd, 0, 8))[1];
+                $eventCount = unpack('V', substr($bd, 8, 4))[1];
+                $off = 12;
+                $payloads = [];
+                for ($i = 0; $i < $eventCount; $i++) {{
+                    $eLen = unpack('V', substr($bd, $off, 4))[1]; $off += 4;
+                    $ev = json_decode(substr($bd, $off, $eLen), true); $off += $eLen;
+                    $payloads[] = $ev['payload'] ?? [];
+                }}
+                // Build passthrough response
+                $body = pack('P', $batchId) . pack('V', count($payloads));
+                foreach ($payloads as $p) {{
+                    $body .= pack('V', 1);
+                    $out = json_encode(['destination' => 'output', 'payload' => $p, 'headers' => []], JSON_UNESCAPED_SLASHES);
+                    $body .= pack('V', strlen($out)) . $out;
+                }}
+                $crc = pack('V', crc32($body));
+                $bwc = $body . $crc;
+                $sigBytes = $batchSigning ? sodium_crypto_sign_detached($bwc, $sk) : str_repeat("\0", 64);
+                $nameB = $pipeline;
+                $hdr = pack('V', strlen($nameB)) . $nameB . pack('v', $partition);
+                $frame = $hdr . $bwc . $sigBytes;
+                $conn->send(new Frame($frame, true, Frame::OP_BINARY));
+            }} else {{
+                // Text control frame
+                $ctrl = json_decode($data, true);
+                $type = $ctrl['type'] ?? '';
+                if ($type === 'challenge') {{
+                    $nonce = hex2bin($ctrl['nonce']);
+                    $sig = sodium_crypto_sign_detached($nonce, $sk);
+                    $register = json_encode([
+                        'type' => 'register', 'protocol' => 'awpp/1', 'transport' => 'websocket',
+                        'name' => '{processor_name}', 'version' => '1.0.0',
+                        'public_key' => $pubKeyStr, 'challenge_signature' => bin2hex($sig),
+                        'capabilities' => ['batch'], 'transport_codec' => 'json',
+                        'requested_pipelines' => ['{pipeline_name}'], 'binding' => 'dedicated',
+                    ]);
+                    $conn->send($register);
+                }} elseif ($type === 'accepted') {{
+                    $batchSigning = $ctrl['batch_signing'] ?? true;
+                }} elseif ($type === 'drain') {{
+                    $conn->close();
+                    $loop->stop();
+                }}
+            }}
+        }});
+        $conn->on('close', function ($code = null, $reason = null) use ($loop) {{
+            $loop->stop();
+        }});
+    }},
+    function ($e) use ($loop) {{
+        fwrite(STDERR, "pawl connect failed: " . $e->getMessage() . "\n");
+        $loop->stop();
+        exit(1);
+    }}
+);
+
+$loop->run();
+"#
+    )
+}
+
+/// Generate an AMPHP v3 (`amphp/websocket-client:^2`) AWPP T4 processor script.
+/// Requires a Composer project with `amphp/websocket-client` installed.
+/// `vendor_autoload` must be the absolute path to `vendor/autoload.php`.
+pub fn php_amphp_passthrough_script(
+    port: u16,
+    seed_path: &str,
+    _pub_key: &str,
+    pipeline_name: &str,
+    processor_name: &str,
+    vendor_autoload: &str,
+) -> String {
+    let seed_path_fixed = seed_path.replace('\\', "/");
+    let autoload_fixed = vendor_autoload.replace('\\', "/");
+    format!(
+        r#"<?php
+// H3: AMPHP v3 + amphp/websocket-client — AWPP T4 processor
+require '{autoload_fixed}';
+
+use Amp\Websocket\Client\WebsocketHandshake;
+use function Amp\Websocket\Client\connect;
+
+$seed = file_get_contents('{seed_path_fixed}');
+$kp = sodium_crypto_sign_seed_keypair($seed);
+$sk = sodium_crypto_sign_secretkey($kp);
+$pk = sodium_crypto_sign_publickey($kp);
+$pubKeyStr = "ed25519:" . base64_encode($pk);
+
+$handshake = new WebsocketHandshake('ws://127.0.0.1:{port}/api/v1/processors/connect');
+$conn = connect($handshake);
+$batchSigning = true;
+
+try {{
+    while ($message = $conn->receive()) {{
+        $data = $message->buffer();
+        if ($message->isBinary()) {{
+            // AWPP data frame
+            $nameLen = unpack('V', substr($data, 0, 4))[1];
+            $pipeline = substr($data, 4, $nameLen);
+            $partition = unpack('v', substr($data, 4 + $nameLen, 2))[1];
+            $bd = substr($data, 4 + $nameLen + 2);
+            $batchId = unpack('P', substr($bd, 0, 8))[1];
+            $eventCount = unpack('V', substr($bd, 8, 4))[1];
+            $off = 12;
+            $payloads = [];
+            for ($i = 0; $i < $eventCount; $i++) {{
+                $eLen = unpack('V', substr($bd, $off, 4))[1]; $off += 4;
+                $ev = json_decode(substr($bd, $off, $eLen), true); $off += $eLen;
+                $payloads[] = $ev['payload'] ?? [];
+            }}
+            $body = pack('P', $batchId) . pack('V', count($payloads));
+            foreach ($payloads as $p) {{
+                $body .= pack('V', 1);
+                $out = json_encode(['destination' => 'output', 'payload' => $p, 'headers' => []], JSON_UNESCAPED_SLASHES);
+                $body .= pack('V', strlen($out)) . $out;
+            }}
+            $crc = pack('V', crc32($body));
+            $bwc = $body . $crc;
+            $sigBytes = $batchSigning ? sodium_crypto_sign_detached($bwc, $sk) : str_repeat("\0", 64);
+            $nameB = $pipeline;
+            $hdr = pack('V', strlen($nameB)) . $nameB . pack('v', $partition);
+            $frame = $hdr . $bwc . $sigBytes;
+            $conn->sendBinary($frame);
+        }} else {{
+            $ctrl = json_decode($data, true);
+            $type = $ctrl['type'] ?? '';
+            if ($type === 'challenge') {{
+                $nonce = hex2bin($ctrl['nonce']);
+                $sig = sodium_crypto_sign_detached($nonce, $sk);
+                $register = json_encode([
+                    'type' => 'register', 'protocol' => 'awpp/1', 'transport' => 'websocket',
+                    'name' => '{processor_name}', 'version' => '1.0.0',
+                    'public_key' => $pubKeyStr, 'challenge_signature' => bin2hex($sig),
+                    'capabilities' => ['batch'], 'transport_codec' => 'json',
+                    'requested_pipelines' => ['{pipeline_name}'], 'binding' => 'dedicated',
+                ]);
+                $conn->sendText($register);
+            }} elseif ($type === 'accepted') {{
+                $batchSigning = $ctrl['batch_signing'] ?? true;
+            }} elseif ($type === 'drain') {{
+                $conn->close();
+                break;
+            }}
+        }}
+    }}
+}} catch (\Throwable $e) {{
+    fwrite(STDERR, "amphp error: " . $e->getMessage() . "\n");
+    exit(1);
+}}
+"#
+    )
+}
+
+/// Generate a Workerman (`workerman/workerman:^5.0`) AWPP T4 processor script.
+/// Uses `AsyncTcpConnection` with the native `ws://` protocol. Requires PHP
+/// 8.1+ and a Composer project with workerman/workerman installed. Must be
+/// invoked as `php <script> start` on all platforms (Workerman argv contract).
+pub fn php_workerman_passthrough_script(
+    port: u16,
+    seed_path: &str,
+    _pub_key: &str,
+    pipeline_name: &str,
+    processor_name: &str,
+    vendor_autoload: &str,
+) -> String {
+    let seed_path_fixed = seed_path.replace('\\', "/");
+    let autoload_fixed = vendor_autoload.replace('\\', "/");
+    format!(
+        r#"<?php
+// H4: Workerman AsyncTcpConnection (ws://) — AWPP T4 processor
+require '{autoload_fixed}';
+
+use Workerman\Worker;
+use Workerman\Connection\AsyncTcpConnection;
+use Workerman\Protocols\Websocket;
+
+$GLOBALS['h4_seed'] = file_get_contents('{seed_path_fixed}');
+$GLOBALS['h4_kp'] = sodium_crypto_sign_seed_keypair($GLOBALS['h4_seed']);
+$GLOBALS['h4_sk'] = sodium_crypto_sign_secretkey($GLOBALS['h4_kp']);
+$GLOBALS['h4_pk'] = sodium_crypto_sign_publickey($GLOBALS['h4_kp']);
+$GLOBALS['h4_pub'] = "ed25519:" . base64_encode($GLOBALS['h4_pk']);
+$GLOBALS['h4_batch_signing'] = true;
+
+$worker = new Worker();
+$worker->count = 1;
+$worker->onWorkerStart = function () {{
+    $conn = new AsyncTcpConnection('ws://127.0.0.1:{port}/api/v1/processors/connect');
+    // Default to text frames; we flip websocketType just before sending binary.
+    $conn->websocketType = Websocket::BINARY_TYPE_BLOB;
+    $conn->onMessage = function ($conn, $data) {{
+        $sk = $GLOBALS['h4_sk'];
+        $pubKeyStr = $GLOBALS['h4_pub'];
+        // Workerman hands us the decoded frame body regardless of opcode.
+        // Control frames are JSON starting with '{{'; data frames are binary AWPP.
+        if (strlen($data) > 0 && $data[0] === '{{') {{
+            $ctrl = json_decode($data, true);
+            $type = $ctrl['type'] ?? '';
+            if ($type === 'challenge') {{
+                $nonce = hex2bin($ctrl['nonce']);
+                $sig = sodium_crypto_sign_detached($nonce, $sk);
+                $register = json_encode([
+                    'type' => 'register', 'protocol' => 'awpp/1', 'transport' => 'websocket',
+                    'name' => '{processor_name}', 'version' => '1.0.0',
+                    'public_key' => $pubKeyStr, 'challenge_signature' => bin2hex($sig),
+                    'capabilities' => ['batch'], 'transport_codec' => 'json',
+                    'requested_pipelines' => ['{pipeline_name}'], 'binding' => 'dedicated',
+                ]);
+                $conn->websocketType = Websocket::BINARY_TYPE_BLOB;
+                $conn->send($register);
+            }} elseif ($type === 'accepted') {{
+                $GLOBALS['h4_batch_signing'] = $ctrl['batch_signing'] ?? true;
+            }} elseif ($type === 'drain') {{
+                $conn->close();
+                Worker::stopAll();
+            }}
+            return;
+        }}
+        // AWPP data frame
+        $batchSigning = $GLOBALS['h4_batch_signing'];
+        $nameLen = unpack('V', substr($data, 0, 4))[1];
+        $pipeline = substr($data, 4, $nameLen);
+        $partition = unpack('v', substr($data, 4 + $nameLen, 2))[1];
+        $bd = substr($data, 4 + $nameLen + 2);
+        $batchId = unpack('P', substr($bd, 0, 8))[1];
+        $eventCount = unpack('V', substr($bd, 8, 4))[1];
+        $off = 12;
+        $payloads = [];
+        for ($i = 0; $i < $eventCount; $i++) {{
+            $eLen = unpack('V', substr($bd, $off, 4))[1]; $off += 4;
+            $ev = json_decode(substr($bd, $off, $eLen), true); $off += $eLen;
+            $payloads[] = $ev['payload'] ?? [];
+        }}
+        $body = pack('P', $batchId) . pack('V', count($payloads));
+        foreach ($payloads as $p) {{
+            $body .= pack('V', 1);
+            $out = json_encode(['destination' => 'output', 'payload' => $p, 'headers' => []], JSON_UNESCAPED_SLASHES);
+            $body .= pack('V', strlen($out)) . $out;
+        }}
+        $crc = pack('V', crc32($body));
+        $bwc = $body . $crc;
+        $sigBytes = $batchSigning ? sodium_crypto_sign_detached($bwc, $sk) : str_repeat("\0", 64);
+        $nameB = $pipeline;
+        $hdr = pack('V', strlen($nameB)) . $nameB . pack('v', $partition);
+        $frame = $hdr . $bwc . $sigBytes;
+        $conn->websocketType = Websocket::BINARY_TYPE_ARRAYBUFFER;
+        $conn->send($frame);
+    }};
+    $conn->onClose = function ($conn) {{
+        Worker::stopAll();
+    }};
+    $conn->onError = function ($conn, $code, $msg) {{
+        fwrite(STDERR, "workerman error [$code]: $msg\n");
+        Worker::stopAll();
+    }};
+    $conn->connect();
+}};
+
+Worker::runAll();
+"#
+    )
+}
+
+/// Generate a Swoole / OpenSwoole AWPP T4 processor script.
+/// Uses `Swoole\Coroutine\Http\Client::upgrade()` to establish the WS
+/// connection, then `push()` / `recv()` in a coroutine loop.
+/// Requires PHP 8.1+ with either the `swoole` or `openswoole` extension loaded.
+pub fn php_swoole_passthrough_script(
+    port: u16,
+    seed_path: &str,
+    _pub_key: &str,
+    pipeline_name: &str,
+    processor_name: &str,
+) -> String {
+    let seed_path_fixed = seed_path.replace('\\', "/");
+    format!(
+        r#"<?php
+// H1: Swoole / OpenSwoole coroutine WebSocket client — AWPP T4 processor
+if (!extension_loaded('swoole') && !extension_loaded('openswoole')) {{
+    fwrite(STDERR, "swoole/openswoole extension not loaded\n");
+    exit(2);
+}}
+
+$seed = file_get_contents('{seed_path_fixed}');
+$kp = sodium_crypto_sign_seed_keypair($seed);
+$sk = sodium_crypto_sign_secretkey($kp);
+$pk = sodium_crypto_sign_publickey($kp);
+$pubKeyStr = "ed25519:" . base64_encode($pk);
+
+\Swoole\Coroutine\run(function () use ($sk, $pubKeyStr) {{
+    $cli = new \Swoole\Coroutine\Http\Client('127.0.0.1', {port});
+    $cli->set(['timeout' => 30, 'websocket_mask' => true]);
+    if (!$cli->upgrade('/api/v1/processors/connect')) {{
+        fwrite(STDERR, "swoole upgrade failed: " . $cli->errMsg . "\n");
+        exit(1);
+    }}
+    $batchSigning = true;
+    while (true) {{
+        $frame = $cli->recv(30);
+        if ($frame === false || $frame === '' || $frame === null) break;
+        if (!is_object($frame)) break;
+        $data = $frame->data;
+        $opcode = $frame->opcode ?? 1;
+        // OPCODE_CLOSE = 8
+        if ($opcode === 8) break;
+        if ($opcode === 1) {{
+            // Text control frame
+            $ctrl = json_decode($data, true);
+            $type = $ctrl['type'] ?? '';
+            if ($type === 'challenge') {{
+                $nonce = hex2bin($ctrl['nonce']);
+                $sig = sodium_crypto_sign_detached($nonce, $sk);
+                $register = json_encode([
+                    'type' => 'register', 'protocol' => 'awpp/1', 'transport' => 'websocket',
+                    'name' => '{processor_name}', 'version' => '1.0.0',
+                    'public_key' => $pubKeyStr, 'challenge_signature' => bin2hex($sig),
+                    'capabilities' => ['batch'], 'transport_codec' => 'json',
+                    'requested_pipelines' => ['{pipeline_name}'], 'binding' => 'dedicated',
+                ]);
+                $cli->push($register, 1); // WEBSOCKET_OPCODE_TEXT
+            }} elseif ($type === 'accepted') {{
+                $batchSigning = $ctrl['batch_signing'] ?? true;
+            }} elseif ($type === 'drain') {{
+                break;
+            }}
+            continue;
+        }}
+        if ($opcode !== 2) continue; // Not binary
+        // AWPP data frame
+        $nameLen = unpack('V', substr($data, 0, 4))[1];
+        $pipeline = substr($data, 4, $nameLen);
+        $partition = unpack('v', substr($data, 4 + $nameLen, 2))[1];
+        $bd = substr($data, 4 + $nameLen + 2);
+        $batchId = unpack('P', substr($bd, 0, 8))[1];
+        $eventCount = unpack('V', substr($bd, 8, 4))[1];
+        $off = 12;
+        $payloads = [];
+        for ($i = 0; $i < $eventCount; $i++) {{
+            $eLen = unpack('V', substr($bd, $off, 4))[1]; $off += 4;
+            $ev = json_decode(substr($bd, $off, $eLen), true); $off += $eLen;
+            $payloads[] = $ev['payload'] ?? [];
+        }}
+        $body = pack('P', $batchId) . pack('V', count($payloads));
+        foreach ($payloads as $p) {{
+            $body .= pack('V', 1);
+            $out = json_encode(['destination' => 'output', 'payload' => $p, 'headers' => []], JSON_UNESCAPED_SLASHES);
+            $body .= pack('V', strlen($out)) . $out;
+        }}
+        $crc = pack('V', crc32($body));
+        $bwc = $body . $crc;
+        $sigBytes = $batchSigning ? sodium_crypto_sign_detached($bwc, $sk) : str_repeat("\0", 64);
+        $nameB = $pipeline;
+        $hdr = pack('V', strlen($nameB)) . $nameB . pack('v', $partition);
+        $out = $hdr . $bwc . $sigBytes;
+        $cli->push($out, 2); // WEBSOCKET_OPCODE_BINARY
+    }}
+    $cli->close();
+}});
+"#
+    )
 }

@@ -115,8 +115,7 @@ async fn e1_memory_python_blackhole() {
     let server = e2e_ws_harness::start_ws_test_server(pipeline_name).await;
     let (mut child, script_path, seed_file) = start_python_processor(&server, "e1").await;
 
-    let connected =
-        e2e_ws_harness::wait_for_connection(&server, Duration::from_secs(10)).await;
+    let connected = e2e_ws_harness::wait_for_connection(&server, Duration::from_secs(10)).await;
     assert!(connected, "E1: Python processor failed to connect");
 
     let events = make_test_events("e1-payload", msg_count);
@@ -154,8 +153,7 @@ async fn e2_memory_python_stdout() {
     let server = e2e_ws_harness::start_ws_test_server(pipeline_name).await;
     let (mut child, script_path, seed_file) = start_python_processor(&server, "e2").await;
 
-    let connected =
-        e2e_ws_harness::wait_for_connection(&server, Duration::from_secs(10)).await;
+    let connected = e2e_ws_harness::wait_for_connection(&server, Duration::from_secs(10)).await;
     assert!(connected, "E2: Python processor failed to connect");
 
     let events = make_test_events("e2-payload", msg_count);
@@ -192,8 +190,7 @@ async fn e3_memory_python_file() {
     let server = e2e_ws_harness::start_ws_test_server(pipeline_name).await;
     let (mut child, script_path, seed_file) = start_python_processor(&server, "e3").await;
 
-    let connected =
-        e2e_ws_harness::wait_for_connection(&server, Duration::from_secs(10)).await;
+    let connected = e2e_ws_harness::wait_for_connection(&server, Duration::from_secs(10)).await;
     assert!(connected, "E3: Python processor failed to connect");
 
     let events = make_test_events("e3-payload", msg_count);
@@ -251,8 +248,7 @@ async fn e4_file_python_memory() {
     let server = e2e_ws_harness::start_ws_test_server(pipeline_name).await;
     let (mut child, script_path, seed_file) = start_python_processor(&server, "e4").await;
 
-    let connected =
-        e2e_ws_harness::wait_for_connection(&server, Duration::from_secs(10)).await;
+    let connected = e2e_ws_harness::wait_for_connection(&server, Duration::from_secs(10)).await;
     assert!(connected, "E4: Python processor failed to connect");
 
     // Read from file, process through WS
@@ -330,8 +326,7 @@ async fn e5_file_python_kafka() {
     let server = e2e_ws_harness::start_ws_test_server(pipeline_name).await;
     let (mut child, script_path, seed_file) = start_python_processor(&server, "e5").await;
 
-    let connected =
-        e2e_ws_harness::wait_for_connection(&server, Duration::from_secs(10)).await;
+    let connected = e2e_ws_harness::wait_for_connection(&server, Duration::from_secs(10)).await;
     assert!(connected, "E5: Python processor failed to connect");
 
     let source_config = FileSourceConfig::new(&input_path)
@@ -419,8 +414,7 @@ async fn e6_kafka_python_file() {
     let server = e2e_ws_harness::start_ws_test_server(pipeline_name).await;
     let (mut child, script_path, seed_file) = start_python_processor(&server, "e6").await;
 
-    let connected =
-        e2e_ws_harness::wait_for_connection(&server, Duration::from_secs(10)).await;
+    let connected = e2e_ws_harness::wait_for_connection(&server, Duration::from_secs(10)).await;
     assert!(connected, "E6: Python processor failed to connect");
 
     let source_config = KafkaSourceConfig::new("localhost:19092", source_topic)
@@ -511,8 +505,7 @@ async fn e7_kafka_python_blackhole() {
     let server = e2e_ws_harness::start_ws_test_server(pipeline_name).await;
     let (mut child, script_path, seed_file) = start_python_processor(&server, "e7").await;
 
-    let connected =
-        e2e_ws_harness::wait_for_connection(&server, Duration::from_secs(10)).await;
+    let connected = e2e_ws_harness::wait_for_connection(&server, Duration::from_secs(10)).await;
     assert!(connected, "E7: Python processor failed to connect");
 
     let source_config = KafkaSourceConfig::new("localhost:19092", source_topic)
@@ -563,8 +556,7 @@ async fn e8_http_webhook_python_memory() {
     let server = e2e_ws_harness::start_ws_test_server(pipeline_name).await;
     let (mut child, script_path, seed_file) = start_python_processor(&server, "e8").await;
 
-    let connected =
-        e2e_ws_harness::wait_for_connection(&server, Duration::from_secs(10)).await;
+    let connected = e2e_ws_harness::wait_for_connection(&server, Duration::from_secs(10)).await;
     assert!(connected, "E8: Python processor failed to connect");
 
     // Bind to random port, then create webhook source on it
@@ -575,10 +567,9 @@ async fn e8_http_webhook_python_memory() {
     let webhook_config2 = HttpWebhookSourceConfig::new(webhook_addr)
         .with_source_name("e8-webhook")
         .with_poll_timeout(Duration::from_millis(500));
-    let mut source =
-        aeon_connectors::http::HttpWebhookSource::new(webhook_config2)
-            .await
-            .expect("webhook source creation");
+    let mut source = aeon_connectors::http::HttpWebhookSource::new(webhook_config2)
+        .await
+        .expect("webhook source creation");
 
     // Post events via HTTP client
     let client = reqwest::Client::new();
@@ -655,8 +646,7 @@ async fn e9_http_webhook_python_kafka() {
     let server = e2e_ws_harness::start_ws_test_server(pipeline_name).await;
     let (mut child, script_path, seed_file) = start_python_processor(&server, "e9").await;
 
-    let connected =
-        e2e_ws_harness::wait_for_connection(&server, Duration::from_secs(10)).await;
+    let connected = e2e_ws_harness::wait_for_connection(&server, Duration::from_secs(10)).await;
     assert!(connected, "E9: Python processor failed to connect");
 
     // Bind to random port, then create webhook source on it
@@ -667,10 +657,9 @@ async fn e9_http_webhook_python_kafka() {
     let webhook_config = HttpWebhookSourceConfig::new(webhook_addr)
         .with_source_name("e9-webhook")
         .with_poll_timeout(Duration::from_millis(500));
-    let mut source =
-        aeon_connectors::http::HttpWebhookSource::new(webhook_config)
-            .await
-            .expect("webhook source creation");
+    let mut source = aeon_connectors::http::HttpWebhookSource::new(webhook_config)
+        .await
+        .expect("webhook source creation");
 
     let sink_topic = "aeon-e2e-e9-sink";
     let sink_config = KafkaSinkConfig::new("localhost:19092", sink_topic);
