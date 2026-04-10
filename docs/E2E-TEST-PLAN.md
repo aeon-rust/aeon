@@ -404,10 +404,11 @@ aspirational marks.
    H5 (FrankenPHP `php-cli` SAPI), H6 (native CLI). H1 and H5 self-skip
    when their runtime is absent — no `todo!()` stubs remain in Tier H.
 
-None of these are Gate 1 blockers. All 54 runnable tests pass — the
+None of these are Gate 1 blockers. All 55 runnable tests pass — the
 entire Gate 1 money path (Tier C: 11 SDK × Kafka E2E) is green, and
-D1 (Python, aioquic) + D3 (Rust Network, wtransport) now prove the T3
-WebTransport host end-to-end with two independent real clients.
+D1 (Python, aioquic) + D2 (Go, quic-go/webtransport-go) + D3 (Rust
+Network, wtransport) now prove the T3 WebTransport host end-to-end
+with three independent real clients across three languages.
 
 ### Resolved: SDK envelope Uuid serialization (msgpack)
 
