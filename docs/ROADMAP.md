@@ -906,6 +906,15 @@ Rolling binary upgrade: zero event loss during Aeon v1→v2 transition under loa
   TLS provisioning or engine host wiring. See
   `docs/E2E-TEST-PLAN.md` execution log for the updated Tier D row
   and the totals (53 passed / 1 ignored / 8 stubs, ~145s).
+- **SDK accuracy audit** — a read-only audit of every SDK source tree
+  found that only `aeon-processor-client` (12b-15) has a real T3
+  WebTransport client. Python / Go / Node.js / Java / .NET / C / PHP
+  are T4 WebSocket only — the `T3 + T4` tier column on earlier
+  revisions of the 12b SDK tables was aspirational. Updated the
+  "Phase 12b Language SDKs" and "Language SDK Status" tables to
+  reflect shipped-vs-pending T3 per SDK (with the specific library
+  each would need: `aioquic`, `quic-go`, `@fails-components/webtransport`,
+  kwik, `System.Net.Quic`, etc.). No code change — doc correction only.
 
 ### Latest updates (2026-04-09)
 
@@ -974,25 +983,41 @@ All 8 core sub-phases complete.
 
 **Note**: T3/T4 `call_batch` fully implemented — data stream routing, batch encode/send, response awaiting with timeout all wired. Both hosts add `pipeline_name` to config for routing lookup. T3 uses length-prefixed framing on QUIC bidi streams; T4 uses binary WebSocket frames with routing header. All session lifecycle, authentication, heartbeat, drain, and binary frame protocols are complete.
 
-### Phase 12b Language SDKs (12b-9 through 12b-14) — Status as of 2026-04-07
+### Phase 12b Language SDKs (12b-9 through 12b-14) — Status as of 2026-04-10
 
-| Sub-phase | Language | Tiers | Status | Notes |
-|-----------|----------|-------|--------|-------|
-| 12b-5 | Python | T3 + T4 | ✅ Complete | `sdks/python/`: AWPP client, ED25519 (PyNaCl), MsgPack/JSON, `@processor` decorator, 31 tests |
-| 12b-6 | Go | T3 + T4 | ✅ Complete | `sdks/go/`: AWPP client, ED25519 (stdlib), MsgPack (vmihailenco), `Run()`/`RunContext()`, 18 tests |
-| 12b-9 | Node.js / TypeScript | T3 + T4 | ✅ 2026-04-07 | `sdks/nodejs/`: AWPP WebSocket client, ED25519 (Node.js crypto), MsgPack (msgpackr)/JSON, CRC32, batch wire format, `processor()`/`batchProcessor()` decorators, 32 tests |
-| 12b-10 | Java / Kotlin | T3 + T4 | ✅ 2026-04-07 | `sdks/java/`: Zero-dependency (Java 21 stdlib only), ED25519 (built-in EdDSA), JSON codec, CRC32, batch wire format, data frame, `java.net.http.WebSocket` AWPP runner, `Processor.perEvent()`/`.batch()`, 28 tests |
-| 12b-11 | C# / .NET | T1 (NativeAOT) + T3 + T4 | ✅ 2026-04-07 | `sdks/dotnet/`: T1 NativeAOT C-ABI exports (`[UnmanagedCallersOnly]`), T4 WebSocket AWPP client, ED25519 (NSec/libsodium), MsgPack (MessagePack-CSharp)/JSON, CRC32, native wire format, `ProcessorRegistration.PerEvent()`/`.Batch()`, 40 tests |
-| 12b-12 | C / C++ | T1 + T2 + T3 + T4 | ✅ 2026-04-07 | `sdks/c/`: Pure C11 zero-dependency, T1 C-ABI (`AEON_EXPORT_PROCESSOR` macro), JSON codec (hand-rolled parser + base64), CRC32 IEEE, batch wire format (decode request/encode response), data frame build/parse, portable LE helpers, 22 tests |
-| 12b-13 | PHP | T4 (6 deployment models) | ✅ 2026-04-07 | `sdks/php/`: Core (Codec JSON/MsgPack, ED25519 via sodium_compat, CRC32, batch wire, data frame) + 6 adapters: Swoole/OpenSwoole (Laravel Octane), RevoltPHP+ReactPHP (Ratchet), RevoltPHP+AMPHP, Workerman, FrankenPHP/RoadRunner, Native CLI. `Processor::perEvent()`/`::batch()`, 33 tests |
+**Accuracy note (2026-04-10)**: an audit of the SDK source trees found
+that only the Rust processor-client (12b-15) has a real T3 WebTransport
+implementation. All other language SDKs are T4-only — the `T3 + T4` tier
+column in earlier revisions of this table was aspirational and has been
+corrected to reflect what's actually shipped. Tier D E2E tests for
+non-Rust SDKs (D1/D2/D4/D5) are therefore blocked on real WT client
+implementations, not TLS or host wiring. See `docs/E2E-TEST-PLAN.md`
+Tier D table.
+
+| Sub-phase | Language | Tiers (shipped) | Status | Notes |
+|-----------|----------|-----------------|--------|-------|
+| 12b-5 | Python | T4 | ✅ Complete | `sdks/python/aeon_transport.py`: AWPP WebSocket client (`websockets`), ED25519 (PyNaCl), MsgPack/JSON, `@processor` decorator, 31 tests. T3 aspirational — needs `aioquic` + h3 stack. |
+| 12b-6 | Go | T4 | ✅ Complete | `sdks/go/aeon.go`: AWPP WebSocket client (`gorilla/websocket`), ED25519 (stdlib), MsgPack (vmihailenco), `Run()`/`RunContext()`, 18 tests. T3 aspirational — needs `quic-go` + HTTP/3 client. |
+| 12b-9 | Node.js / TypeScript | T4 | ✅ 2026-04-07 | `sdks/nodejs/aeon.js` (590 lines): AWPP WebSocket client (`ws`), ED25519 (`@noble/ed25519`), MsgPack (msgpackr)/JSON, CRC32, batch wire format, `processor()`/`batchProcessor()` decorators, 32 tests. T3 aspirational — needs `@fails-components/webtransport` or equivalent. |
+| 12b-10 | Java / Kotlin | T4 | ✅ 2026-04-07 | `sdks/java/src/main/java/io/aeon/processor/Runner.java`: Zero-dependency (Java 21 stdlib only), ED25519 (built-in EdDSA), JSON codec, CRC32, batch wire format, data frame, `java.net.http.WebSocket` AWPP runner, `Processor.perEvent()`/`.batch()`, 28 tests. T3 aspirational — no JDK HTTP/3 yet; would need kwik/netty-incubator-codec-http3. |
+| 12b-11 | C# / .NET | T1 (NativeAOT) + T4 | ✅ 2026-04-07 | `sdks/dotnet/AeonProcessorSdk/Runner.cs`: T1 NativeAOT C-ABI exports (`[UnmanagedCallersOnly]`), T4 `ClientWebSocket` AWPP client, ED25519 (NSec/libsodium), MsgPack (MessagePack-CSharp)/JSON, CRC32, native wire format, `ProcessorRegistration.PerEvent()`/`.Batch()`, 40 tests. T3 aspirational — .NET 8+ `System.Net.Quic` could host it. |
+| 12b-12 | C / C++ | T1 + T2 + T4 | ✅ 2026-04-07 | `sdks/c/aeon_processor.c`: Pure C11 zero-dependency, T1 C-ABI (`AEON_EXPORT_PROCESSOR` macro), JSON codec (hand-rolled parser + base64), CRC32 IEEE, batch wire format, data frame build/parse, portable LE helpers, 22 tests. T3/T4 wire format primitives exist but no transport. |
+| 12b-13 | PHP | T4 (6 deployment models) | ✅ 2026-04-07 | `sdks/php/`: Core (Codec JSON/MsgPack, ED25519 via sodium_compat, CRC32, batch wire, data frame) + 6 adapters: Swoole/OpenSwoole (Laravel Octane), RevoltPHP+ReactPHP (Ratchet), RevoltPHP+AMPHP, Workerman, FrankenPHP/RoadRunner, Native CLI. `Processor::perEvent()`/`::batch()`, 33 tests. T3 intentionally deferred. |
 | 12b-14 | Swift | T3 + T4 | ❌ Not started | No directory |
 | 12b-14 | Elixir | T3 + T4 | ❌ Not started | No directory |
 | 12b-14 | Ruby | T4 (T3 future) | ❌ Not started | No directory |
 | 12b-14 | Scala | T3 + T4 | ❌ Not started | No directory |
 | 12b-14 | Haskell | T3 + T4 | ❌ Not started | No directory |
-| 12b-15 | Rust (Network) | T3 + T4 | ✅ 2026-04-06 | `aeon-processor-client` crate: AWPP handshake, ED25519 auth, batch wire format, CRC32, heartbeat, T4 WebSocket + T3 WebTransport clients, 17 tests |
+| 12b-15 | Rust (Network) | T3 + T4 | ✅ 2026-04-06 | `aeon-processor-client` crate: AWPP handshake, ED25519 auth, batch wire format, CRC32, heartbeat, T4 WebSocket client + **real T3 WebTransport client** (only SDK with shipped T3 today — proven end-to-end by Tier D D3, 2026-04-10), 17 tests |
 
-**Summary**: 8 of 14 target language SDKs implemented (Python, Go, Rust, Node.js, C#/.NET, PHP, Java, C/C++). Remaining 6 are demand-driven per ROADMAP design. Core platform (12b-1 through 12b-8) is complete — all language SDKs can be built against the existing `ProcessorTransport`, AWPP, `batch_wire`, and `processor_auth` infrastructure. Every language gets T3/T4 network access; T1/T2 in-process tiers are bonus options where the language supports it.
+**Summary**: 8 of 14 target language SDKs implemented (Python, Go, Rust,
+Node.js, C#/.NET, PHP, Java, C/C++). All 8 ship T4 WebSocket; **only
+Rust (12b-15) ships T3 WebTransport** today — the other 7 are T4-only,
+with T3 tracked as a demand-driven follow-up per SDK. Core platform
+(12b-1 through 12b-8) is complete — all language SDKs build against
+the existing `ProcessorTransport`, AWPP, `batch_wire`, and
+`processor_auth` infrastructure. T1/T2 in-process tiers are bonus
+options where the language supports it.
 
 ### Phase 12a — Processor SDKs + Dev Tooling (Complete)
 
@@ -2431,21 +2456,24 @@ docker compose up -d
 
 ### Language SDK Status (Phase 12b-5/6 + 12b-9 through 12b-15)
 
-Every language gets T3/T4 (network) access. T1/T2 (in-process) are additional high-perf options where available.
+Every language gets T4 (WebSocket) network access. T3 (WebTransport)
+is shipped for Rust today; other languages have T3 as a demand-driven
+follow-up. T1/T2 (in-process) are additional high-perf options where
+available.
 
-| Language | Available Tiers | Status | Location |
-|----------|----------------|--------|----------|
-| Rust (Native) | T1 | ✅ Complete | `crates/aeon-native-sdk/` (Phase 12a) |
-| Rust (Wasm) | T2 | ✅ Complete | `crates/aeon-wasm-sdk/` (Phase 12a) |
-| Rust (Network) | T3 + T4 | ✅ 2026-04-06 | 12b-15 (`aeon-processor-client` crate, 17 tests) |
-| AssemblyScript | T2 + T4 | T2 ✅ / T4 ❌ | `sdks/typescript/` (12a), T4 via 12b-9 |
-| Python | T3 + T4 | ✅ Complete | `sdks/python/` (12b-5) |
-| Go | T3 + T4 | ✅ Complete | `sdks/go/` (12b-6) |
-| Node.js / TypeScript | T3 + T4 | ✅ 2026-04-07 | `sdks/nodejs/` (12b-9, 32 tests) |
-| Java / Kotlin | T3 + T4 | ✅ 2026-04-07 | 12b-10 (28 tests) |
-| C# / .NET | T1 (NativeAOT) + T3 + T4 | ✅ 2026-04-07 | 12b-11 (40 tests) |
-| C / C++ | T1 + T2 + T3 + T4 | ✅ 2026-04-07 | 12b-12 (22 tests) |
-| PHP | T4 (6 deployment models) | ✅ 2026-04-07 | 12b-13 (33 tests) |
+| Language | Shipped Tiers | T3 status | Status | Location |
+|----------|---------------|-----------|--------|----------|
+| Rust (Native) | T1 | — | ✅ Complete | `crates/aeon-native-sdk/` (Phase 12a) |
+| Rust (Wasm) | T2 | — | ✅ Complete | `crates/aeon-wasm-sdk/` (Phase 12a) |
+| Rust (Network) | T3 + T4 | ✅ shipped (D3 E2E 2026-04-10) | ✅ 2026-04-06 | 12b-15 (`aeon-processor-client` crate, 17 tests) |
+| AssemblyScript | T2 | — | T2 ✅ / T4 ❌ | `sdks/typescript/` (12a) |
+| Python | T4 | pending (needs `aioquic` + h3) | ✅ Complete | `sdks/python/` (12b-5, 31 tests) |
+| Go | T4 | pending (needs `quic-go` HTTP/3) | ✅ Complete | `sdks/go/` (12b-6, 18 tests) |
+| Node.js / TypeScript | T4 | pending (needs `@fails-components/webtransport`) | ✅ 2026-04-07 | `sdks/nodejs/` (12b-9, 32 tests) |
+| Java / Kotlin | T4 | pending (no JDK HTTP/3; needs kwik/netty-incubator) | ✅ 2026-04-07 | 12b-10 (28 tests) |
+| C# / .NET | T1 (NativeAOT) + T4 | pending (could use `System.Net.Quic` on .NET 8+) | ✅ 2026-04-07 | 12b-11 (40 tests) |
+| C / C++ | T1 + T2 + T4 | pending (wire format ready, no transport) | ✅ 2026-04-07 | 12b-12 (22 tests) |
+| PHP | T4 (6 deployment models) | intentionally deferred | ✅ 2026-04-07 | 12b-13 (33 tests) |
 | Swift | T3 + T4 | ❌ Not started | 12b-14 |
 | Elixir | T3 + T4 | ❌ Not started | 12b-14 |
 | Ruby | T4 (T3 future) | ❌ Not started | 12b-14 |
