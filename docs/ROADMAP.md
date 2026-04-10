@@ -856,9 +856,83 @@ Rolling binary upgrade: zero event loss during Aeon v1→v2 transition under loa
 
 ---
 
-## Current State (2026-04-10, Tier D D1 Python WT landed + D3 Rust WT + msgpack SDK envelope fix)
+## Current State (2026-04-10, Tier D D1 Python WT + D2 Go WT landed + D3 Rust WT + msgpack SDK envelope fix)
 
 ### Latest updates (2026-04-10)
+
+- **Tier D D2 (Go T3 WebTransport) landed** — second non-Rust SDK Tier
+  D proof, same day as D1. The Go SDK's new
+  `aeon.RunWebTransport(ConfigWT{...})` drives 200 events through the
+  engine's `WebTransportProcessorHost` via a `go run .` subprocess
+  using `quic-go/webtransport-go` v0.9.0 — C1 zero loss, C2 payload
+  integrity, C3 metadata propagation, C4 per-partition ordering,
+  C5 graceful shutdown all green. Full Tier D suite now runs in
+  5.00s (D1 + D2 + D3 pass, D4 + D5 still deferred). Requires
+  `--features webtransport-host`; the Go client trusts the
+  self-signed `127.0.0.1` cert via `ConfigWT.Insecure: true` +
+  `ServerName: "localhost"`.
+
+  The Go `RunWebTransport` implementation mirrors the Rust reference
+  client in `crates/aeon-processor-client/src/webtransport.rs`
+  verbatim — same 6-step AWPP-over-WT adapter contract, same
+  `[4B len LE][JSON]` control frames, same `[4B name_len][name][2B
+  part][length-prefixed batch_wire]` data-stream layout. Three
+  library-interaction bugs had to be solved before D2 passed:
+  1. **quic-go lazy stream materialization**.
+     `session.OpenStreamSync` allocates a stream ID but
+     webtransport-go's `SendStream.maybeSendStreamHeader` only
+     writes the `[frame_type][session_id]` prologue on the first
+     `Write()` call. The control stream reads the challenge first,
+     so without an explicit flush the server's `accept_bi()` never
+     fires and the handshake deadlocks until the QUIC idle timeout.
+     Fix: call `ctrlStream.Write(nil)` right after `OpenStreamSync`
+     — quic-go short-circuits on `len(p)==0` but
+     `maybeSendStreamHeader()` runs unconditionally before the
+     delegated `Write`, so the header bytes are still enqueued.
+     See the comment block in `sdks/go/aeon_webtransport.go`
+     citing the specific files/lines in both libraries.
+  2. **Go SDK Signer bugs — identical pair to Python's**.
+     `PublicKeyHex()` returned raw hex instead of `ed25519:<base64>`,
+     and `SignChallenge` signed the UTF-8 bytes of the hex nonce
+     rather than the hex-decoded bytes. A9/C7 (Go T4) had been
+     silently working around this with an inline custom handshake
+     in `e2e_ws_harness::go_passthrough_project`; D2 uses the SDK
+     directly so the bugs surfaced. Fix: new `AWPPPublicKey()`
+     returning `ed25519:<base64>`, and
+     `SignChallenge(nonceHex string) (string, error)` now
+     `hex.DecodeString`-s the nonce before `ed25519.Sign`. The
+     inline A9/C7 workaround keeps working (it never calls the
+     SDK's `Signer` methods) so no WS-side tests regress.
+  3. **Handshake-vs-data-stream race**. `wait_for_connection`
+     returns once `session_count > 0` (handshake complete), but
+     data streams are opened asynchronously after the Accepted
+     message and the server's data-stream `accept_bi` loop
+     registers them one at a time. With three WT tests running
+     concurrently in the same binary, the test could race ahead of
+     `accept_bi` and `call_batch` would fail with `no T3 data
+     stream for pipeline=... partition=0`. Fix: new
+     `WebTransportProcessorHost::data_stream_count()` getter +
+     `wait_for_data_streams(expected, timeout)` harness helper;
+     D1, D2 and D3 now all wait for 16 data streams before driving
+     events. (D1 and D3 had been passing by luck when run alone;
+     the full D1+D2+D3 concurrent sweep exposed the race.)
+
+  Tests/artifacts: `sdks/go/aeon_webtransport.go` (full client,
+  ~430 lines), `sdks/go/aeon_webtransport_test.go` (4 wire-helper
+  tests), `sdks/go/go.mod` bumped to `go 1.23` + adds
+  `webtransport-go v0.9.0`, `sdks/go/aeon.go` Signer fixes,
+  `sdks/go/aeon_test.go` updated Signer tests +
+  `TestSignerAWPPPublicKey` + `TestSignerChallengeRejectsInvalidHex`.
+  Engine side: `crates/aeon-engine/tests/e2e_wt_harness.rs` gains
+  `go_wt_passthrough_project(url, seed, pipeline, name)` (temp go
+  module with replace directive + `go mod tidy`) and
+  `wait_for_data_streams`, and
+  `crates/aeon-engine/src/transport/webtransport_host.rs` exposes
+  `data_stream_count()`.
+
+  Tier D totals: **3/5 runnable passing** (D1 Python, D2 Go,
+  D3 Rust), **2 deferred** (D4 Node.js + D5 Java per WT plan).
+  See `docs/E2E-TEST-PLAN.md` 2026-04-10 execution log.
 
 - **Tier D D1 (Python T3 WebTransport) landed** — first non-Rust SDK
   Tier D proof and second shipped T3 client after Rust. The Python
@@ -906,9 +980,10 @@ Rolling binary upgrade: zero event loss during Aeon v1→v2 transition under loa
   `RUST_LOG=debug cargo test -- --nocapture` can trace the wtransport
   accept loop and AWPP handshake when debugging.
 
-  Tier D totals: **2/5 runnable passing** (D1 Python, D3 Rust), **3
-  stubs** (D2 Go in progress, D4 Node.js + D5 Java deferred per WT
-  plan). See `docs/E2E-TEST-PLAN.md` 2026-04-10 execution log.
+  Tier D totals (as of D1 landing): **2/5 runnable passing** (D1
+  Python, D3 Rust), **3 stubs** (D2 Go, D4 Node.js, D5 Java). See
+  the D2 entry above for the subsequent same-day D2 landing that
+  brought the total to 3/5.
 
 - **Tier D D3 (Rust Network T3 WebTransport) landed** — first full T3
   WebTransport E2E acceptance proof: Memory source → engine
@@ -950,12 +1025,10 @@ Rolling binary upgrade: zero event loss during Aeon v1→v2 transition under loa
   processors will use. `cargo test -p aeon-processor-client
   --all-features` green (17 unit + 1 doctest). Clippy clean. Commits:
   `a019378` (fix), `e9a71d5` (docs).
-- **Tier D status**: 2/5 runnable (D1 ✅ 2026-04-10, D3 ✅). D2 (Go),
-  D4 (Node.js), D5 (Java) remain `todo!()` stubs — D2 is the next to
-  land per the WT plan, D4 and D5 are deferred until their
-  respective library situations mature. See `docs/E2E-TEST-PLAN.md`
-  execution log for the updated Tier D row and the totals (54 passed
-  / 1 ignored / 7 stubs, ~147s).
+- **Tier D status**: 3/5 runnable (D1 ✅ 2026-04-10, D2 ✅ 2026-04-10,
+  D3 ✅). D4 (Node.js) and D5 (Java) remain deferred stubs per the WT
+  plan until their respective client libraries mature. See
+  `docs/E2E-TEST-PLAN.md` execution log for the updated Tier D row.
 - **SDK accuracy audit** — a read-only audit of every SDK source tree
   found that only `aeon-processor-client` (12b-15) has a real T3
   WebTransport client. Python / Go / Node.js / Java / .NET / C / PHP
@@ -1061,8 +1134,8 @@ Tier D table.
 **WT SDK roadmap (2026-04-10)**: see
 [`docs/WT-SDK-INTEGRATION-PLAN.md`](WT-SDK-INTEGRATION-PLAN.md) for the
 library maturity audit and approved sequencing. **Python (aioquic)
-shipped 2026-04-10** (D1 E2E green); **Go (quic-go/webtransport-go) is
-next**. **Java (Flupke experimental), Node.js (library is a
+and Go (quic-go/webtransport-go) both shipped 2026-04-10** (D1 + D2
+E2E green). **Java (Flupke experimental), Node.js (library is a
 self-described stopgap), C#/.NET (no client-side WT until .NET 11),
 and C/C++ (no production-grade library) are deferred** parallel to the
 pre-existing PHP deferral.
@@ -1070,7 +1143,7 @@ pre-existing PHP deferral.
 | Sub-phase | Language | Tiers (shipped) | Status | Notes |
 |-----------|----------|-----------------|--------|-------|
 | 12b-5 | Python | T3 + T4 | ✅ Complete (T3 2026-04-10) | `sdks/python/aeon_transport.py`: AWPP WebSocket client (`websockets`) + **AWPP WebTransport client (`aioquic`)**, ED25519 (PyNaCl), MsgPack/JSON, `@processor` decorator, 31 tests. `run_webtransport()` entrypoint shipped 2026-04-10 — proven end-to-end by Tier D D1. See [WT plan](WT-SDK-INTEGRATION-PLAN.md) §5.1. |
-| 12b-6 | Go | T4 (T3 in progress) | ✅ Complete | `sdks/go/aeon.go`: AWPP WebSocket client (`gorilla/websocket`), ED25519 (stdlib), MsgPack (vmihailenco), `Run()`/`RunContext()`, 18 tests. **T3 WT in progress** via `quic-go/webtransport-go` — see [WT plan](WT-SDK-INTEGRATION-PLAN.md) §5.2. |
+| 12b-6 | Go | T3 + T4 | ✅ Complete (T3 2026-04-10) | `sdks/go/`: AWPP WebSocket client (`gorilla/websocket`) + **AWPP WebTransport client (`quic-go/webtransport-go`)**, ED25519 (stdlib), MsgPack (vmihailenco), `Run()`/`RunContext()` + `RunWebTransport()`/`RunWebTransportContext()`, 22 tests. `RunWebTransport()` entrypoint shipped 2026-04-10 — proven end-to-end by Tier D D2. See [WT plan](WT-SDK-INTEGRATION-PLAN.md) §5.2. |
 | 12b-9 | Node.js / TypeScript | T4 (T3 deferred) | ✅ 2026-04-07 | `sdks/nodejs/aeon.js` (590 lines): AWPP WebSocket client (`ws`), ED25519 (`@noble/ed25519`), MsgPack (msgpackr)/JSON, CRC32, batch wire format, `processor()`/`batchProcessor()` decorators, 32 tests. **T3 WT deferred** — `@fails-components/webtransport` is a self-described stopgap; see [WT plan](WT-SDK-INTEGRATION-PLAN.md) §5.4. |
 | 12b-10 | Java / Kotlin | T4 (T3 deferred) | ✅ 2026-04-07 | `sdks/java/src/main/java/io/aeon/processor/Runner.java`: Zero-dependency (Java 21 stdlib only), ED25519 (built-in EdDSA), JSON codec, CRC32, batch wire format, data frame, `java.net.http.WebSocket` AWPP runner, `Processor.perEvent()`/`.batch()`, 28 tests. **T3 WT deferred** — Flupke WT is "still experimental"; see [WT plan](WT-SDK-INTEGRATION-PLAN.md) §5.3. |
 | 12b-11 | C# / .NET | T1 (NativeAOT) + T4 (T3 deferred) | ✅ 2026-04-07 | `sdks/dotnet/AeonProcessorSdk/Runner.cs`: T1 NativeAOT C-ABI exports (`[UnmanagedCallersOnly]`), T4 `ClientWebSocket` AWPP client, ED25519 (NSec/libsodium), MsgPack (MessagePack-CSharp)/JSON, CRC32, native wire format, `ProcessorRegistration.PerEvent()`/`.Batch()`, 40 tests. **T3 WT deferred** — no client-side WT in .NET; tracked for .NET 11+ (dotnet/runtime#43641); see [WT plan](WT-SDK-INTEGRATION-PLAN.md) §5.5. |
@@ -1085,10 +1158,10 @@ pre-existing PHP deferral.
 
 **Summary**: 8 of 14 target language SDKs implemented (Python, Go, Rust,
 Node.js, C#/.NET, PHP, Java, C/C++). All 8 ship T4 WebSocket; **Rust
-(12b-15) and Python (12b-5) ship T3 WebTransport** today (2026-04-10) —
-the other 6 are T4-only, with T3 sequenced per the
-[WT plan](WT-SDK-INTEGRATION-PLAN.md) (Go next; Java/Node.js/C#/.NET/C/C++/PHP
-deferred until their WT client libraries mature). Core platform
+(12b-15), Python (12b-5) and Go (12b-6) ship T3 WebTransport** today
+(2026-04-10) — the other 5 are T4-only, with T3 deferred per the
+[WT plan](WT-SDK-INTEGRATION-PLAN.md) (Java/Node.js/C#/.NET/C/C++/PHP
+all deferred until their WT client libraries mature). Core platform
 (12b-1 through 12b-8) is complete — all language SDKs build against
 the existing `ProcessorTransport`, AWPP, `batch_wire`, and
 `processor_auth` infrastructure. T1/T2 in-process tiers are bonus
@@ -2532,12 +2605,12 @@ docker compose up -d
 ### Language SDK Status (Phase 12b-5/6 + 12b-9 through 12b-15)
 
 Every language gets T4 (WebSocket) network access. T3 (WebTransport)
-is shipped for **Rust and Python** today (both 2026-04-10); every other
-SDK falls into one of three buckets per the
-[WT SDK integration plan](WT-SDK-INTEGRATION-PLAN.md): **in progress**
-(Go), **deferred** (Java, Node.js, C#/.NET, C/C++, PHP), or **not
-started** (Swift / Elixir / Ruby / Scala / Haskell). T1/T2 (in-process)
-are additional high-perf options where available.
+is shipped for **Rust, Python and Go** today (all 2026-04-10); every
+other SDK falls into one of two buckets per the
+[WT SDK integration plan](WT-SDK-INTEGRATION-PLAN.md): **deferred**
+(Java, Node.js, C#/.NET, C/C++, PHP) or **not started** (Swift /
+Elixir / Ruby / Scala / Haskell). T1/T2 (in-process) are additional
+high-perf options where available.
 
 | Language | Shipped Tiers | T3 status | Status | Location |
 |----------|---------------|-----------|--------|----------|
@@ -2546,7 +2619,7 @@ are additional high-perf options where available.
 | Rust (Network) | T3 + T4 | ✅ shipped (D3 E2E 2026-04-10) | ✅ 2026-04-06 | 12b-15 (`aeon-processor-client` crate, 17 tests) |
 | AssemblyScript | T2 | — | T2 ✅ / T4 ❌ | `sdks/typescript/` (12a) |
 | Python | T3 + T4 | ✅ shipped (D1 E2E 2026-04-10, via `aioquic`) — [WT plan §5.1](WT-SDK-INTEGRATION-PLAN.md) | ✅ Complete | `sdks/python/` (12b-5, 31 tests) |
-| Go | T4 | 🚧 in progress (quic-go/webtransport-go) — [WT plan §5.2](WT-SDK-INTEGRATION-PLAN.md) | ✅ Complete | `sdks/go/` (12b-6, 18 tests) |
+| Go | T3 + T4 | ✅ shipped (D2 E2E 2026-04-10, via `quic-go/webtransport-go`) — [WT plan §5.2](WT-SDK-INTEGRATION-PLAN.md) | ✅ Complete | `sdks/go/` (12b-6, 22 tests) |
 | Node.js / TypeScript | T4 | ⏸ deferred (stopgap library) — [WT plan §5.4](WT-SDK-INTEGRATION-PLAN.md) | ✅ 2026-04-07 | `sdks/nodejs/` (12b-9, 32 tests) |
 | Java / Kotlin | T4 | ⏸ deferred (Flupke experimental) — [WT plan §5.3](WT-SDK-INTEGRATION-PLAN.md) | ✅ 2026-04-07 | 12b-10 (28 tests) |
 | C# / .NET | T1 (NativeAOT) + T4 | ⏸ deferred (no client-side WT until .NET 11) — [WT plan §5.5](WT-SDK-INTEGRATION-PLAN.md) | ✅ 2026-04-07 | 12b-11 (40 tests) |

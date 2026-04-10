@@ -55,6 +55,7 @@ This plan captures:
 |---|---|---|---|
 | Rust Network (`aeon-processor-client`) | `crates/aeon-processor-client/` | `wtransport 0.6.1` | ✅ D3 (2026-04-10) |
 | Python (`sdks/python`) | `sdks/python/aeon_transport.py` | `aioquic` (H3 + WT) | ✅ D1 (2026-04-10) |
+| Go (`sdks/go`) | `sdks/go/aeon_webtransport.go` | `quic-go/webtransport-go 0.9.0` | ✅ D2 (2026-04-10) |
 
 **Canonical reference implementation**:
 `crates/aeon-processor-client/src/webtransport.rs`.
@@ -65,7 +66,6 @@ Every non-Rust SDK WT client should be a faithful port of the same
 
 | SDK | Status after this plan | Reason |
 |---|---|---|
-| Go | **Implementing** (D2) | `quic-go/webtransport-go` is the de-facto standard, actively maintained |
 | Java | **Deferred** (revisit when Flupke WT leaves experimental) | `Flupke` explicitly flags WT support as "still experimental (draft-ietf-webtrans-http3-13)" |
 | Node.js | **Deferred** (last-attempt language) | `@fails-components/webtransport` README self-describes as "duct tape until Node ships native WT" |
 | C#/.NET | **Deferred** (parallel to PHP) | No client-side WT in .NET today; tracked for .NET 11 (dotnet/runtime#43641, dotnet/aspnetcore#65406); only experimental Kestrel server-side exists |
@@ -73,8 +73,8 @@ Every non-Rust SDK WT client should be a faithful port of the same
 | PHP | **Deferred** (pre-existing decision) | Already deferred for all 6 deployment models — no usable PHP WT client library |
 
 Approved sequencing is therefore **Python → Go**, with Java/C/C++/C#/Node.js
-held until their library situations mature. **Python landed 2026-04-10**
-(D1 E2E green); Go is next.
+held until their library situations mature. **Python and Go both
+landed 2026-04-10** (D1 + D2 E2E green).
 
 ---
 
@@ -194,7 +194,7 @@ verdict, the candidate library, evidence, and the maturity tier.
 |---|---|---|---|
 | Rust (Network) | `wtransport` 0.6.1 | Tier 2 | ✅ Shipped (D3) |
 | Python | `aioquic` | Tier 2 | ✅ Shipped (D1, 2026-04-10) |
-| Go | `quic-go/webtransport-go` | Tier 2 | **Implement (D2)** |
+| Go | `quic-go/webtransport-go` | Tier 2 | ✅ Shipped (D2, 2026-04-10) |
 | Java | Flupke on kwik | Tier 3 (explicitly experimental) | Defer |
 | Node.js | `@fails-components/webtransport` | Tier 3 (self-described stopgap) | Defer |
 | C#/.NET | (none) — waits on .NET 11 | Tier 4 | Defer |
@@ -333,29 +333,55 @@ the shared contract in §4 verbatim.
   of the Rust `webtransport-insecure` feature) and drives 200 events
   through partition 0. All 5 E2E criteria (C1–C5) verified.
 
-### 5.2 Go (D2) — GO
+### 5.2 Go (D2) — ✅ SHIPPED (2026-04-10)
 
-- **Library**: `github.com/quic-go/webtransport-go` (latest).
-- **New dep** (`sdks/go/go.mod`): add
-  `github.com/quic-go/webtransport-go` and its transitive
-  `github.com/quic-go/quic-go`.
-- **Files to touch**:
-  - `sdks/go/aeon.go` — add `RunWebTransport(ctx, config, fn)` next to
-    existing `RunContext` (which is WS). Share the AWPP handshake code
-    with the WS client where possible; only the transport (dialing,
-    stream open, write/read) changes.
-  - New file `sdks/go/aeon_webtransport_test.go` — mirror the Python
-    test plan: routing header, length framing, AWPP handshake, mock
-    server round-trip.
-- **Risks**:
-  - `webtransport-go` is 0.x but very actively maintained; pin a
-    specific minor and document the pin in `go.mod`.
-  - Cert trust: add an `InsecureSkipVerify` escape hatch behind a
-    `ProcessorConfig.Insecure bool` field, default `false`.
-- **Validation gates**:
-  - `go test ./sdks/go/...` all green.
-  - Rust Tier D D2 test green against a Go subprocess runner.
-- **Tier D test**: D2.
+- **Library**: `github.com/quic-go/webtransport-go` v0.9.0 (pulls
+  `github.com/quic-go/quic-go` v0.53.0 transitively). Pinned in
+  `sdks/go/go.mod`; `go 1.23` required.
+- **Files**: new `sdks/go/aeon_webtransport.go` (~430 lines, full
+  client) + new `sdks/go/aeon_webtransport_test.go` (4 wire-helper
+  unit tests). Engine side: new `go_wt_passthrough_project` helper
+  in `crates/aeon-engine/tests/e2e_wt_harness.rs`, new
+  `wait_for_data_streams` in the same harness + new
+  `WebTransportProcessorHost::data_stream_count()` getter. Test
+  body: `crates/aeon-engine/tests/e2e_tier_d.rs` `d2_go_wt_t3`.
+- **Entry point**:
+  `aeon.RunWebTransport(ConfigWT{URL, Name, Version, PrivateKeyPath,
+  Pipelines, Codec, Processor|BatchProcessor, Insecure, ServerName})`.
+  `ConfigWT.Insecure` + `ConfigWT.ServerName` are the test-mode
+  escape hatches for self-signed certs; both default to `false` /
+  `""` (no insecure mode in production). Mirrors the Python kwargs
+  of the same name and the Rust `webtransport-insecure` feature.
+- **Landing summary**: the Go implementation mirrors the Rust
+  reference client verbatim (same 6-step AWPP-over-WT contract).
+  Three library-interaction bugs had to be solved before D2 passed:
+  1. **quic-go lazy stream materialization**. `OpenStreamSync`
+     allocates a stream ID but webtransport-go only writes the
+     `[frame_type][session_id]` prologue on the first `Write()`.
+     Fix: call `ctrlStream.Write(nil)` right after `OpenStreamSync`
+     — the webtransport-go wrapper calls `maybeSendStreamHeader()`
+     unconditionally before the delegated quic-go `Write`, so a
+     zero-length input flushes the header. See the comment in
+     `sdks/go/aeon_webtransport.go` citing the exact lines in both
+     libraries.
+  2. **Go SDK Signer bugs (same pair as Python's)**: `PublicKeyHex`
+     returned raw hex instead of `ed25519:<base64>`, and
+     `SignChallenge` signed the UTF-8 bytes of the hex nonce rather
+     than the hex-decoded bytes. Fix: new `AWPPPublicKey()` method
+     and `SignChallenge(nonceHex string) (string, error)` that
+     `hex.DecodeString`-s before signing. A9/C7 (the Go T4 tests)
+     keep passing because they use an inline custom handshake
+     instead of the SDK's `Signer` methods.
+  3. **Handshake-vs-data-stream race**: `wait_for_connection` only
+     tracks `session_count`, but data streams are opened
+     asynchronously after the Accepted message. Fix: new
+     `wait_for_data_streams(expected, timeout)` harness helper
+     backed by `WebTransportProcessorHost::data_stream_count()`;
+     D1/D2/D3 all now wait for 16 data streams before driving
+     events.
+- **Tier D test**: D2 — all 5 E2E criteria (C1–C5) green in ~5s.
+- **Test counts after landing**: 22 Go SDK tests (up from 18),
+  `go build`/`go test`/`go vet` clean.
 
 ### 5.3 Java (D5) — DEFER
 
@@ -509,3 +535,4 @@ Each re-evaluation updates §2.2 and §3 of this document. Keep the
 |---|---|
 | 2026-04-10 | Initial version. Captures WebSearch audit, maturity tiers, approved Python→Go sequencing, Java/Node.js/C#/C/C++ deferrals. |
 | 2026-04-10 | D1 (Python / aioquic) shipped. Moved §2.1 row; flipped §2.2, §3.8, §5.1 status to ✅. Captured the three Signer fixes that unblocked the handshake (H3 stream state patch, AWPP `ed25519:<base64>` public key, challenge hex-decode). |
+| 2026-04-10 | D2 (Go / quic-go/webtransport-go) shipped. Added §2.1 row; removed §2.2 Go row; flipped §3.8, §5.2 to ✅ SHIPPED. Captured the three bugs solved: quic-go lazy stream materialization (`Write(nil)` flush), Go SDK Signer pair (same as Python's), handshake-vs-data-stream race (`wait_for_data_streams` helper). |
