@@ -3,10 +3,12 @@ package aeon
 import (
 	"bytes"
 	"crypto/ed25519"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"hash/crc32"
+	"strings"
 	"testing"
 )
 
@@ -322,9 +324,9 @@ func TestSignerGenerate(t *testing.T) {
 		t.Fatalf("generate: %v", err)
 	}
 
-	hex := signer.PublicKeyHex()
-	if len(hex) != 64 {
-		t.Errorf("public key hex: got %d chars, want 64", len(hex))
+	rawHex := signer.PublicKeyHex()
+	if len(rawHex) != 64 {
+		t.Errorf("public key hex: got %d chars, want 64", len(rawHex))
 	}
 
 	fp := signer.Fingerprint()
@@ -333,20 +335,64 @@ func TestSignerGenerate(t *testing.T) {
 	}
 }
 
-func TestSignerChallengeResponse(t *testing.T) {
+func TestSignerAWPPPublicKey(t *testing.T) {
+	// The AWPP public key must be "ed25519:<base64>" — this is the
+	// form the Aeon identity store keys on. Both WS and WT Register
+	// messages send this, not the raw hex.
 	signer, _ := GenerateSigner()
-	nonce := "test-nonce-abc123"
-	sigHex := signer.SignChallenge(nonce)
+	pk := signer.AWPPPublicKey()
+
+	if !strings.HasPrefix(pk, "ed25519:") {
+		t.Fatalf("AWPPPublicKey: got %q, expected ed25519: prefix", pk)
+	}
+	b64 := strings.TrimPrefix(pk, "ed25519:")
+	decoded, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil {
+		t.Fatalf("base64 decode: %v", err)
+	}
+	if len(decoded) != 32 {
+		t.Errorf("decoded key len: got %d, want 32", len(decoded))
+	}
+	if !bytes.Equal(decoded, signer.publicKey) {
+		t.Error("decoded AWPPPublicKey doesn't match raw public key")
+	}
+}
+
+func TestSignerChallengeResponse(t *testing.T) {
+	// The server builds a hex-encoded random nonce, and
+	// processor_auth::verify_challenge hex-decodes it before verifying
+	// the ED25519 signature against the raw bytes. So SignChallenge
+	// must hex-decode the nonce first and sign the raw bytes — signing
+	// the UTF-8 bytes of the hex string would fail verification on
+	// the server side.
+	signer, _ := GenerateSigner()
+	nonceHex := strings.Repeat("0123456789abcdef", 4) // 32 raw bytes → 64 hex chars
+	sigHex, err := signer.SignChallenge(nonceHex)
+	if err != nil {
+		t.Fatalf("SignChallenge: %v", err)
+	}
 
 	if len(sigHex) != 128 {
 		t.Errorf("signature hex: got %d chars, want 128", len(sigHex))
 	}
 
-	// Verify signature
-	sigBytes := make([]byte, 64)
-	hex.Decode(sigBytes, []byte(sigHex))
-	if !ed25519.Verify(signer.publicKey, []byte(nonce), sigBytes) {
-		t.Error("signature verification failed")
+	nonceBytes, err := hex.DecodeString(nonceHex)
+	if err != nil {
+		t.Fatalf("hex decode nonce: %v", err)
+	}
+	sigBytes, err := hex.DecodeString(sigHex)
+	if err != nil {
+		t.Fatalf("hex decode sig: %v", err)
+	}
+	if !ed25519.Verify(signer.publicKey, nonceBytes, sigBytes) {
+		t.Error("signature verification failed (should verify against raw nonce bytes)")
+	}
+}
+
+func TestSignerChallengeRejectsInvalidHex(t *testing.T) {
+	signer, _ := GenerateSigner()
+	if _, err := signer.SignChallenge("not-valid-hex!"); err == nil {
+		t.Error("SignChallenge accepted invalid hex")
 	}
 }
 

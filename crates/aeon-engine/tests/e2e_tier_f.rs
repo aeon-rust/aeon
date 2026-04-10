@@ -1254,8 +1254,7 @@ async fn f6_websocket_rust_net_t4() {
             format!("ws://127.0.0.1:{port}/api/v1/processors/connect"),
         )
         .pipeline(pipeline_name.to_string())
-        .signing_key_from_seed(&seed)
-        .codec("json");
+        .signing_key_from_seed(&seed);
 
         fn passthrough(event: ProcessEvent) -> Vec<ProcessOutput> {
             vec![ProcessOutput {

@@ -1,5 +1,6 @@
-"""Tests for the Aeon Python Transport SDK (T4 WebSocket)."""
+"""Tests for the Aeon Python Transport SDK (T3 WebTransport + T4 WebSocket)."""
 
+import asyncio
 import json
 import struct
 import zlib
@@ -10,15 +11,21 @@ from aeon_transport import (
     Header,
     Output,
     Signer,
+    build_awpp_register_json,
     build_ws_data_frame,
+    build_wt_routing_header,
     decode_batch_request,
     encode_batch_response,
     parse_ws_data_frame,
     processor,
     batch_processor,
+    _pack_len_prefixed,
+    _parse_https_url,
     _process_batch,
     _output_to_dict,
+    _read_len_prefixed,
     _wire_event_from_dict,
+    _WtStreamBuffer,
 )
 
 
@@ -264,15 +271,18 @@ def test_signer_generate():
 
 def test_signer_challenge_response():
     signer = Signer.generate()
-    nonce = "test-nonce-abc123"
-    sig_hex = signer.sign_challenge(nonce)
+    # AWPP challenge nonces are hex-encoded random bytes (see
+    # `processor_auth::generate_nonce`). `sign_challenge` hex-decodes and
+    # signs the raw bytes to match the server's verification path.
+    nonce_hex = "0123456789abcdef" * 4  # 32 bytes → 64 hex chars
+    sig_hex = signer.sign_challenge(nonce_hex)
     assert len(sig_hex) == 128  # 64 bytes hex-encoded
 
-    # Verify the signature
+    # Verify the signature against the raw (hex-decoded) nonce bytes.
     from nacl.signing import VerifyKey
     vk = VerifyKey(bytes.fromhex(signer.public_key_hex))
     sig_bytes = bytes.fromhex(sig_hex)
-    vk.verify(nonce.encode("utf-8"), sig_bytes)  # raises if invalid
+    vk.verify(bytes.fromhex(nonce_hex), sig_bytes)  # raises if invalid
 
 
 def test_signer_batch_signing():
@@ -382,6 +392,194 @@ def test_wire_event_from_dict_minimal():
     assert event.payload == b""
 
 
+# ── T3 WebTransport Helper Tests ─────────────────────────────────────────
+#
+# These exercise the pure wire-format + async-buffer logic of the
+# WebTransport client. Full end-to-end (aioquic client vs wtransport
+# server) lives in the Rust Tier D D1 test — these tests stay hermetic
+# and do not require aioquic at import time.
+
+
+def test_wt_routing_header_matches_ws_frame_format():
+    """The T3 routing header is the same prefix format as the T4 data frame
+    (just without the trailing batch_wire payload). Round-trip it by
+    attaching an empty body and parsing with the WS helper."""
+    pipeline = "my-pipeline"
+    partition = 11
+    header = build_wt_routing_header(pipeline, partition)
+    name, part, rest = parse_ws_data_frame(header + b"")
+    assert name == pipeline
+    assert part == partition
+    assert rest == b""
+
+
+def test_wt_routing_header_empty_pipeline():
+    header = build_wt_routing_header("", 0)
+    # [4B len=0][name 0 bytes][2B part=0]
+    assert header == b"\x00\x00\x00\x00\x00\x00"
+
+
+def test_wt_routing_header_partition_bounds():
+    header = build_wt_routing_header("p", 0xFFFF)
+    # [4B len=1]['p'][2B 0xFFFF]
+    assert header == b"\x01\x00\x00\x00" + b"p" + b"\xff\xff"
+
+
+def test_pack_len_prefixed_basic():
+    assert _pack_len_prefixed(b"") == b"\x00\x00\x00\x00"
+    assert _pack_len_prefixed(b"ab") == b"\x02\x00\x00\x00ab"
+    assert _pack_len_prefixed(b"x" * 256) == struct.pack("<I", 256) + b"x" * 256
+
+
+def test_build_awpp_register_json_shape():
+    signer = Signer.generate()
+    # AWPP challenge nonces are hex-encoded random bytes.
+    nonce_hex = "deadbeef" * 8  # 32 bytes → 64 hex chars
+    js = build_awpp_register_json(
+        signer=signer,
+        challenge_nonce=nonce_hex,
+        name="proc-name",
+        version="1.2.3",
+        pipelines=["p1", "p2"],
+        codec_name="msgpack",
+        transport="webtransport",
+    )
+    reg = json.loads(js)
+    assert reg["type"] == "register"
+    assert reg["protocol"] == "awpp/1"
+    assert reg["transport"] == "webtransport"
+    assert reg["name"] == "proc-name"
+    assert reg["version"] == "1.2.3"
+    assert reg["transport_codec"] == "msgpack"
+    assert reg["requested_pipelines"] == ["p1", "p2"]
+    assert reg["capabilities"] == ["batch"]
+    assert reg["binding"] == "dedicated"
+    # Public key is "ed25519:<base64>" (matches Aeon identity store format);
+    # signature is 128 hex chars.
+    assert reg["public_key"].startswith("ed25519:")
+    assert len(reg["challenge_signature"]) == 128
+
+    # Signature must verify against the signer's raw key over the raw
+    # (hex-decoded) nonce bytes, matching the server's verify_challenge path.
+    from nacl.signing import VerifyKey
+    vk = VerifyKey(bytes.fromhex(signer.public_key_hex))
+    vk.verify(bytes.fromhex(nonce_hex), bytes.fromhex(reg["challenge_signature"]))
+
+
+def test_build_awpp_register_json_defaults_to_webtransport():
+    signer = Signer.generate()
+    js = build_awpp_register_json(
+        signer=signer,
+        challenge_nonce="ab" * 16,  # valid hex
+        name="p",
+        version="1",
+        pipelines=[],
+        codec_name="json",
+    )
+    assert json.loads(js)["transport"] == "webtransport"
+
+
+def test_parse_https_url_basic():
+    host, port, path = _parse_https_url("https://example.com:4472/")
+    assert host == "example.com"
+    assert port == 4472
+    assert path == "/"
+
+
+def test_parse_https_url_default_port():
+    host, port, path = _parse_https_url("https://example.com/proc")
+    assert host == "example.com"
+    assert port == 443
+    assert path == "/proc"
+
+
+def test_parse_https_url_ipv4():
+    host, port, path = _parse_https_url("https://127.0.0.1:12345/")
+    assert host == "127.0.0.1"
+    assert port == 12345
+    assert path == "/"
+
+
+def test_parse_https_url_rejects_non_https():
+    try:
+        _parse_https_url("ws://example.com/")
+        assert False, "should have rejected ws://"
+    except ValueError as e:
+        assert "https" in str(e)
+
+
+def _run(coro):
+    """Run an async coroutine for testing without requiring pytest-asyncio."""
+    return asyncio.new_event_loop().run_until_complete(coro)
+
+
+def test_wt_stream_buffer_read_exact_accumulates_chunks():
+    async def go():
+        buf = _WtStreamBuffer()
+        buf.feed(b"hel", ended=False)
+        buf.feed(b"lo-world", ended=False)
+        out = await buf.read_exact(11)
+        assert out == b"hello-world"
+        # Leftover bytes stay buffered
+        buf.feed(b"!", ended=False)
+        assert (await buf.read_exact(1)) == b"!"
+    _run(go())
+
+
+def test_wt_stream_buffer_read_exact_across_multiple_feeds():
+    async def go():
+        buf = _WtStreamBuffer()
+
+        async def reader():
+            return await buf.read_exact(6)
+
+        task = asyncio.get_event_loop().create_task(reader())
+        await asyncio.sleep(0)
+        buf.feed(b"ab", ended=False)
+        await asyncio.sleep(0)
+        buf.feed(b"cd", ended=False)
+        await asyncio.sleep(0)
+        buf.feed(b"ef", ended=False)
+        result = await task
+        assert result == b"abcdef"
+    _run(go())
+
+
+def test_wt_stream_buffer_eof_before_enough_bytes():
+    async def go():
+        buf = _WtStreamBuffer()
+        buf.feed(b"ab", ended=True)
+        try:
+            await buf.read_exact(4)
+            assert False, "should have raised EOFError"
+        except EOFError:
+            pass
+    _run(go())
+
+
+def test_wt_stream_buffer_read_len_prefixed():
+    async def go():
+        buf = _WtStreamBuffer()
+        payload = b'{"type":"heartbeat"}'
+        buf.feed(_pack_len_prefixed(payload), ended=False)
+        out = await _read_len_prefixed(buf)
+        assert out == payload
+    _run(go())
+
+
+def test_wt_stream_buffer_read_len_prefixed_oversize_rejected():
+    async def go():
+        buf = _WtStreamBuffer()
+        # 32 MiB length prefix, limit is 16 MiB
+        buf.feed(struct.pack("<I", 32 * 1024 * 1024), ended=False)
+        try:
+            await _read_len_prefixed(buf)
+            assert False, "should have rejected oversize frame"
+        except ValueError as e:
+            assert "too large" in str(e)
+    _run(go())
+
+
 if __name__ == "__main__":
     test_msgpack_codec_event_roundtrip()
     test_json_codec_event_roundtrip()
@@ -407,4 +605,19 @@ if __name__ == "__main__":
     test_output_to_dict_optional_fields()
     test_wire_event_from_dict()
     test_wire_event_from_dict_minimal()
+    test_wt_routing_header_matches_ws_frame_format()
+    test_wt_routing_header_empty_pipeline()
+    test_wt_routing_header_partition_bounds()
+    test_pack_len_prefixed_basic()
+    test_build_awpp_register_json_shape()
+    test_build_awpp_register_json_defaults_to_webtransport()
+    test_parse_https_url_basic()
+    test_parse_https_url_default_port()
+    test_parse_https_url_ipv4()
+    test_parse_https_url_rejects_non_https()
+    test_wt_stream_buffer_read_exact_accumulates_chunks()
+    test_wt_stream_buffer_read_exact_across_multiple_feeds()
+    test_wt_stream_buffer_eof_before_enough_bytes()
+    test_wt_stream_buffer_read_len_prefixed()
+    test_wt_stream_buffer_read_len_prefixed_oversize_rejected()
     print("All Python Transport SDK tests passed!")

@@ -989,8 +989,7 @@ async fn a10_rust_network_ws_t4_memory_roundtrip() {
             format!("ws://127.0.0.1:{port}/api/v1/processors/connect"),
         )
         .pipeline(pipeline_name.to_string())
-        .signing_key_from_seed(&seed)
-        .codec("json");
+        .signing_key_from_seed(&seed);
 
         fn passthrough(event: ProcessEvent) -> Vec<ProcessOutput> {
             vec![ProcessOutput {

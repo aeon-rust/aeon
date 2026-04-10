@@ -123,13 +123,24 @@ Kafka Source -> Processor -> Kafka Sink. The Gate 1 money path.
 
 Memory Source -> Processor (T3) -> Memory Sink. Validates QUIC/WebTransport transport.
 
+**Sequencing (2026-04-10)**: per
+[`WT-SDK-INTEGRATION-PLAN.md`](WT-SDK-INTEGRATION-PLAN.md), the order
+of attack is **D1 (Python, aioquic) → D2 (Go, quic-go/webtransport-go)**,
+after which Tier D is fully runnable for every SDK where a
+production-grade WT client library exists. D4 (Node.js) and D5 (Java)
+are **deferred** (Node.js library is a self-described stopgap; Flupke
+WT is explicitly "still experimental") and remain `todo!()` stubs
+until their libraries mature. There is no Tier D row for C#/.NET or
+C/C++ yet — when those languages get WT client support they will be
+added as D6+ rows.
+
 | # | Processor | Test | Status |
 |---|-----------|------|--------|
-| D1 | Python | Memory -> Python_WT -> Memory | ❌ |
-| D2 | Go | Memory -> Go_WT -> Memory | ❌ |
-| D3 | Rust Network | Memory -> RustNet_WT -> Memory | ❌ |
-| D4 | Node.js | Memory -> NodeJS_WT -> Memory | ❌ |
-| D5 | Java | Memory -> Java_WT -> Memory | ❌ |
+| D1 | Python | Memory -> Python_WT -> Memory | ✅ 2026-04-10 (aioquic) |
+| D2 | Go | Memory -> Go_WT -> Memory | ✅ 2026-04-10 (quic-go/webtransport-go) |
+| D3 | Rust Network | Memory -> RustNet_WT -> Memory | ✅ |
+| D4 | Node.js | Memory -> NodeJS_WT -> Memory | ❌ (deferred — WT plan §5.4) |
+| D5 | Java | Memory -> Java_WT -> Memory | ❌ (deferred — WT plan §5.3) |
 
 ### Tier E: Cross-Connector Coverage — P2, mixed infra
 
@@ -215,6 +226,84 @@ Each E2E test must verify:
 
 ## Execution Log
 
+### 2026-04-10 — Tier D D2 (Go WT) landed
+
+Ran the full Tier D suite after adding the Go WT E2E test: `cargo test
+--test e2e_tier_d -p aeon-engine --features webtransport-host --
+--nocapture`: **3 passed, 2 ignored, 0 failed in 5.00s** (D1 Python,
+D2 Go, D3 Rust Network all green; D4 Node.js + D5 Java still deferred
+per the WT plan).
+
+The Go `RunWebTransport` path mirrors the Rust reference client in
+`crates/aeon-processor-client/src/webtransport.rs` verbatim — same
+6-step AWPP-over-WT adapter contract (control stream → challenge →
+register → accepted → heartbeat + per-(pipeline, partition) data
+streams → batch loop). Hidden cost of the port was a trio of
+library-interaction bugs that had to be solved before D2 passed:
+
+1. **quic-go lazy stream materialization**. `session.OpenStreamSync`
+   allocates a stream ID but webtransport-go only writes the
+   `[frame_type][session_id]` stream header on the first `Write()`.
+   The control stream reads the challenge first, so without an
+   explicit flush the server's `accept_bi()` never fires and the
+   handshake dead-locks until the QUIC idle timeout. Fix: call
+   `ctrlStream.Write(nil)` right after `OpenStreamSync` —
+   `maybeSendStreamHeader()` in webtransport-go is invoked
+   unconditionally before the delegated quic-go `Write`, so a
+   zero-length input is enough to flush the header. See the comment
+   in `sdks/go/aeon_webtransport.go` for the exact chain.
+2. **Go SDK Signer bugs (same pair as Python's)**. `PublicKeyHex()`
+   returned raw hex instead of `ed25519:<base64>`, and
+   `SignChallenge` signed the UTF-8 bytes of the hex nonce rather
+   than the hex-decoded bytes. A9/C7 (Go T4) had been silently
+   working around this via an inline custom handshake in the WS
+   harness; the WT path uses the SDK directly so the bugs surfaced.
+   Fix: new `AWPPPublicKey()` returning `ed25519:<base64>`, and
+   `SignChallenge(nonceHex)` now `hex.DecodeString` s the nonce
+   before `ed25519.Sign`.
+3. **Handshake-vs-data-stream race**. `wait_for_connection` returns
+   once `session_count > 0` (the handshake completed), but the
+   client opens data streams asynchronously after the Accepted
+   message, and the server's data-stream `accept_bi` loop registers
+   them one at a time. With multiple WT tests running concurrently
+   the test could race ahead of `accept_bi` and `call_batch` would
+   fail with `no T3 data stream for pipeline=... partition=0`.
+   Fix: new `WebTransportProcessorHost::data_stream_count()` getter
+   + `wait_for_data_streams` harness helper; D1/D2/D3 all now wait
+   for 16 data streams before driving events. (D1 and D3 were
+   passing by luck when run alone — the concurrent sweep exposed
+   the race.)
+
+Tier D totals: **3/5 passed** (D1, D2, D3), **0 stubs in the
+in-progress lane**, **2 deferred** (D4 Node.js + D5 Java per WT plan).
+
+### 2026-04-10 — Tier D D1 (Python WT) landed
+
+Ran the D1 Python WebTransport E2E alone (`cargo test --test e2e_tier_d
+-p aeon-engine --features webtransport-host d1_python_wt_t3 --
+--nocapture`): **passed in 1.49s**. First non-Rust SDK Tier D proof —
+the Python `aeon_transport.run_webtransport()` entrypoint drives 200
+events through a self-signed `WebTransportProcessorHost` via an
+`aioquic` subprocess, all 5 E2E criteria (C1/C2/C3/C4/C5) green.
+
+Three Python SDK Signer fixes landed alongside the test (pre-existing
+bugs never caught by A8 because A8 uses an inline handshake script, not
+the SDK's `run_websocket/run_webtransport` entrypoints):
+
+1. `open_wt_bi_stream` now manually sets `H3Stream.frame_type =
+   FrameType.WEBTRANSPORT_STREAM` + `session_id` after calling
+   `create_webtransport_stream`. Works around an aioquic gap where bi
+   WT streams send the `[0x41][session_id]` prologue but don't
+   register the stream in `H3Connection._stream`, so incoming server
+   bytes are misparsed as HTTP/3 frames.
+2. New `Signer.awpp_public_key` property returns `ed25519:<base64>`
+   instead of raw hex (matches the identity store key format).
+3. `Signer.sign_challenge` now hex-decodes the nonce before signing,
+   matching the server's `hex::decode(nonce).verify(raw_bytes)` flow.
+
+Tier D totals: **2/5 passed** (D1, D3), **3 stubs** (D2 Go in progress,
+D4 Node.js + D5 Java deferred per WT plan).
+
 ### 2026-04-09 — Full E2E sweep (post-audit close)
 
 Executed after the connector audit pass closed and Gate 1 was re-validated.
@@ -227,12 +316,16 @@ Python / Node.js / .NET / Java / PHP / Go runtimes available.
 | A (Memory round-trip, all SDKs) | 17 | **16** | 1 (A5, wasi-sdk) | 0 | 21s |
 | B (File round-trip) | 5 | **5** | 0 | 0 | 2s |
 | C (Kafka/Redpanda E2E, all SDKs) | 11 | **11** | 0 | 0 | 79s |
-| D (T3 WebTransport variants) | 5 | 0 | 0 | **5** | — |
+| D (T3 WebTransport variants) | 5 | **3** (D1‡, D2‡, D3) | 0 | **2** | ~5s |
 | E (Cross-connector, Python T4) | 9 | **9** | 0 | 0 | 24s |
 | F (External messaging) | 7 | **5** (F1, F3, F4, F5, F6) | 0 | **1** | ~5s |
 | G (CDC database sources) | 3 | 0 | 0 | **3** | — |
 | H (PHP adapter variants) | 6 | **6** (H1–H6)† | 0 | 0 | ~8s |
-| **Total** | **63** | **52** | **1** | **9** | **~142s** |
+| **Total** | **63** | **55** | **1** | **6** | **~147s** |
+
+‡ D1 and D2 landed on 2026-04-10 (see the dedicated sections above) —
+counted in this table for current-state accuracy; the original
+2026-04-09 sweep had both as stubs.
 
 † H1 (Swoole) and H5 (FrankenPHP) self-skip when their runtime is absent,
 matching the A12 (Java) / C7 (Go) convention. Both are real, compiled
@@ -253,15 +346,48 @@ aspirational marks.
 
 ### Implementation debt captured
 
-9 stub tests remain. They fall into three natural groups:
+6 stub tests remain. They fall into three natural groups:
 
-1. **T3 WebTransport end-to-end (5)** — Tier D, all 5 SDKs need TLS cert
-   provisioning + engine WebTransport host wiring. T3 *transport* is
-   production-grade after §5.3 (see `docs/CONNECTOR-AUDIT.md`); these
-   tests are the SDK-level acceptance proof.
+1. **T3 WebTransport end-to-end (2)** — Tier D4/D5, blocked on
+   per-language WebTransport clients in the Node.js/Java SDKs.
+   D1 (Python) landed on 2026-04-10 via `aioquic` — first non-Rust
+   SDK Tier D proof, 200 events through a subprocess runner, all 5
+   E2E criteria green; required three Python SDK Signer fixes (H3
+   stream state patch, AWPP `ed25519:<base64>` public key, challenge
+   hex-decode) — see the 2026-04-10 execution-log entry. D2 (Go)
+   landed on 2026-04-10 via `quic-go/webtransport-go` — the Go
+   `RunWebTransport` implementation mirrors the Rust reference
+   client verbatim; required a `Write(nil)` flush workaround for
+   webtransport-go's lazy stream-header write, the same pair of
+   Signer fixes the Python SDK needed (public-key format + nonce
+   hex-decode), and a new `wait_for_data_streams` harness helper
+   to serialize the test against the server's async `accept_bi`
+   loop. D3 (Rust Network) landed in the 2026-04-09 sweep:
+   in-process Rust WT processor client, self-signed localhost cert
+   via `wtransport::Identity::self_signed`, 200 events through a
+   partition-pinned data stream, C1/C2/C3 + graceful shutdown
+   verified. T3 *transport* was already production-grade after §5.3
+   (see `docs/CONNECTOR-AUDIT.md`); D1, D2 and D3 are the three
+   SDK-level acceptance proofs that exist today. All require
+   `--features webtransport-host`; D3 uses the `aeon-processor-client`
+   `webtransport-insecure` feature; D1 uses a Python `insecure=True`
+   kwarg, and D2 uses `ConfigWT.Insecure: true` +
+   `ServerName: "localhost"` to trust the self-signed cert.
+
+   **WT SDK plan (2026-04-10)**: per
+   [`WT-SDK-INTEGRATION-PLAN.md`](WT-SDK-INTEGRATION-PLAN.md),
+   **D1 (Python, `aioquic`) and D2 (Go, `quic-go/webtransport-go`)
+   both shipped on 2026-04-10**. **D4 (Node.js) and D5 (Java) are
+   deferred** — Node.js's `@fails-components/webtransport` is a
+   self-described stopgap, and Flupke's Java WT is explicitly
+   "still experimental". They stay `todo!()` stubs until their
+   libraries mature.
 2. **QUIC loopback (1)** — Tier F7 (QUIC loopback with Go T3) is the
-   last Tier F stub. It shares the same TLS-cert + WebTransport-host
-   blocker as Tier D. All other Tier F tests landed this sweep: F1
+   last Tier F stub. The Go SDK's WT client landed on 2026-04-10
+   alongside Tier D2, so F7 is now unblocked on the SDK side; it
+   remains a stub only because the QUIC connector itself still needs
+   a loopback sink/source pair. All other Tier F tests landed this
+   sweep: F1
    NATS→Python, F2 NATS→Kafka→Go, F3 Redis→Node.js, F4 MQTT→Java,
    F5 RabbitMQ→PHP. Together they cover every external-messaging
    audit fix with a non-Rust SDK (§4.0 flush-credit, §4.4
@@ -278,5 +404,17 @@ aspirational marks.
    H5 (FrankenPHP `php-cli` SAPI), H6 (native CLI). H1 and H5 self-skip
    when their runtime is absent — no `todo!()` stubs remain in Tier H.
 
-None of these are Gate 1 blockers. All 52 runnable tests pass — the
-entire Gate 1 money path (Tier C: 11 SDK × Kafka E2E) is green.
+None of these are Gate 1 blockers. All 54 runnable tests pass — the
+entire Gate 1 money path (Tier C: 11 SDK × Kafka E2E) is green, and
+D1 (Python, aioquic) + D3 (Rust Network, wtransport) now prove the T3
+WebTransport host end-to-end with two independent real clients.
+
+### Resolved: SDK envelope Uuid serialization (msgpack)
+
+For a brief window A10 / C8 / D3 / F6 all pinned to `.codec("json")`
+because `aeon_processor_client::ProcessEvent.id` was a `String` while
+the engine's `WireEvent.id` is a `uuid::Uuid` — msgpack serializes
+`Uuid` as a 16-byte array and decode blew up with
+`invalid value: byte array, expected a string`. Fixed by flipping
+`ProcessEvent.id` to `uuid::Uuid`; all four tests now run with the
+default `msgpack` codec, matching production processors.

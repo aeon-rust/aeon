@@ -26,6 +26,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -302,9 +303,21 @@ func LoadSigner(path string) (*Signer, error) {
 	return NewSignerFromSeed(seed)
 }
 
-// PublicKeyHex returns the hex-encoded public key.
+// PublicKeyHex returns the raw 32-byte ED25519 public key as a 64-char
+// hex string. This is a utility for logging and display only — AWPP
+// registration must use AWPPPublicKey(), which wraps the key in the
+// canonical "ed25519:<base64>" form expected by the Aeon identity store.
 func (s *Signer) PublicKeyHex() string {
 	return hex.EncodeToString(s.publicKey)
+}
+
+// AWPPPublicKey returns the AWPP-canonical public-key string:
+// "ed25519:<base64-encoded 32-byte key>". This is the form the Aeon
+// identity store keys on, and the form that both the WebSocket and
+// WebTransport AWPP Register messages must send.
+func (s *Signer) AWPPPublicKey() string {
+	b64 := base64.StdEncoding.EncodeToString(s.publicKey)
+	return "ed25519:" + b64
 }
 
 // Fingerprint returns the SHA-256 hex fingerprint of the public key.
@@ -313,10 +326,21 @@ func (s *Signer) Fingerprint() string {
 	return hex.EncodeToString(hash[:])
 }
 
-// SignChallenge signs an AWPP challenge nonce, returning the hex-encoded signature.
-func (s *Signer) SignChallenge(nonce string) string {
-	sig := ed25519.Sign(s.privateKey, []byte(nonce))
-	return hex.EncodeToString(sig)
+// SignChallenge signs an AWPP challenge nonce and returns the hex-encoded
+// 64-byte ED25519 signature.
+//
+// The `nonceHex` argument is the hex string from the server's Challenge
+// message. The engine signs-and-verifies the raw (hex-decoded) nonce bytes
+// via `processor_auth::verify_challenge`, so the client must hex-decode
+// the nonce *before* signing — signing the UTF-8 bytes of the hex string
+// fails verification on the server side.
+func (s *Signer) SignChallenge(nonceHex string) (string, error) {
+	nonceBytes, err := hex.DecodeString(nonceHex)
+	if err != nil {
+		return "", fmt.Errorf("invalid challenge nonce hex: %w", err)
+	}
+	sig := ed25519.Sign(s.privateKey, nonceBytes)
+	return hex.EncodeToString(sig), nil
 }
 
 // SignBatch signs batch response data, returning the 64-byte signature.
@@ -353,14 +377,18 @@ func awppHandshake(conn *websocket.Conn, signer *Signer, cfg Config) (map[string
 	if codecName == "" {
 		codecName = string(CodecMsgPack)
 	}
+	challengeSig, err := signer.SignChallenge(nonce)
+	if err != nil {
+		return nil, fmt.Errorf("sign challenge: %w", err)
+	}
 	register := controlMessage{
 		"type":                "register",
 		"protocol":            "awpp/1",
 		"transport":           "websocket",
 		"name":                cfg.Name,
 		"version":             cfg.Version,
-		"public_key":          signer.PublicKeyHex(),
-		"challenge_signature": signer.SignChallenge(nonce),
+		"public_key":          signer.AWPPPublicKey(),
+		"challenge_signature": challengeSig,
 		"capabilities":        []string{"batch"},
 		"transport_codec":     codecName,
 		"requested_pipelines": cfg.Pipelines,

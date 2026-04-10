@@ -20558,6 +20558,922 @@ claude's response:
 
 
 ===============================
+continue
+================================
+claude's response:
+
+ Good — wtransport::Connection is Clone. Now let me check what the server sends in Accepted to understand what data the client has about pipeline
+  assignments:
+
+  Searched for 2 patterns, read 1 file (ctrl+o to expand)
+
+● Now I understand the protocol mismatch. The current aeon-processor-client WT client uses a stream-per-batch protocol (accept_bi) but the server expects
+  long-lived streams (client opens, writes routing header, then length-prefixed frames). This is a real audit finding. Let me fix the client first.
+
+ Now rewrite the data-stream processing loop in processor-client's WT module:
+
+
+✢ Fix aeon-processor-client WT data stream protocol… (11m 38s · ↓ 3.5k tokens)
+  ⎿  √ Expose local_addr on WebTransportProcessorHost
+     □ Add WT test harness helpers
+     □ Implement D3 Rust WT T3 test
+     ■ Fix aeon-processor-client WT data stream protocol
+	 
+ Now replace the handshake accepted branch to also capture pipeline assignments, and rewrite the processing loop to open one long-lived bi stream per
+  (pipeline, partition).
+
+ Protocol fix landed as f8cf41f. Now building the WT test harness (Task #68). Let me study the existing WS harness to mirror its pattern.
+
+  Searched for 1 pattern, read 2 files (ctrl+o to expand)
+
+● Bash(cd D:/my-opensource/aeon && find ~/.cargo/registry/src -type d -name "wtransport-0.6.1" 2>/dev/null | head -3)
+  ⎿  /c/Users/raghu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wtransport-0.6.1
+
+  Searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+● Now I have the API pieces I need. Let me create the WT test harness.
+
+Let me check whether the engine's WT host needs batch_size configuration for test flows, and confirm the processor auth session flow.
+
+
+● Now wire the harness into e2e_tier_d.rs by making it a submodule there, and replace the D3 stub.
+
+
+● The client is likely stuck because localhost resolves to IPv6 on Windows while the server is bound to IPv4. Let me use the explicit IP.
+
+
+ Progress — connection established, handshake worked, streams opened. Now there's a msgpack serialization mismatch on the first batch. Let me find where
+  both sides encode/decode.
+
+
+ All passing tests use json. The msgpack path is a real SDK bug (uuid serializes to bytes, ProcessEvent.id is String). Switching D3 to json to match.
+
+
+Now re-run without debug to confirm it still passes cleanly and also run the non-feature stub path.
+
+
+ Both paths work: D3 passes with --features webtransport-host, and without the feature it gracefully shows as ignored. Let me also double-check the full
+  tier_d with feature on.
+
+
+D3 passes. Now let me stage and commit the bundle.
+
+
+● Now the docs update. Let me look at the current E2E test plan.
+
+
+Now update the implementation debt section — Tier D now has only 4 stubs, and D3 is the landed proof-point for the WT host:
+
+Tier D D3 landed. Three commits closing out the pivot:
+
+  - f8cf41f — rewrote the WT client to match the server protocol (long-lived bi streams, routing header, length-prefixed batch frames)
+  - 263daf2 — D3 Rust Network T3 WebTransport E2E test + new e2e_wt_harness.rs + WebTransportProcessorHost::local_addr()
+  - 9a8e8e6 — docs flip (D3 ❌→✅, totals 52→53, stubs 9→8) + follow-up note on the msgpack Uuid envelope bug
+
+  Tasks #68 and #69 marked completed. Created #71 capturing the SDK WireEvent.id msgpack fix as a follow-up.
+
+  Tier D status: 1/5 runnable (D3 green). D1/D2/D4/D5 remain todo!() stubs — each blocked on a real per-language WebTransport client in the
+  Python/Go/Node.js/Java SDKs, which is the next sweep if we want to keep pushing Tier D.
+
+✻ Brewed for 36m 25s
+
+● Background command "Search all for run_webtransport usage" completed (exit code 0)
+
+● Noted — that's a stale background task from before the compact. No action needed; D3 work is already landed and committed.
+
+  1 tasks (0 done, 1 open)
+  □ Switch SDK WireEvent.id to uuid::Uuid
+
+===================================
+continue
+=====================================
+claude's response:
+
+D4 needs a new WT client in the Node.js SDK — that's a multi-commit implementation, not a test landing. Let me size Task #71 (the Uuid envelope fix)
+  instead since that's bounded and unlocks msgpack across all existing tests.
+
+
+ Good — uuid is already there. Let me look at the full file to understand the layout before editing.
+
+  Searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+● Now let me check if there are ANY consumers of ProcessEvent.id across the whole codebase to make sure flipping the type is safe.
+Those are aeon_types::event::Event, not ProcessEvent — no change needed. Now let me look at the wire.rs decode and websocket.rs usage to make sure no
+  consumer touches .id as String:
+
+	  The fix scope is clear: flip ProcessEvent.id: String → uuid::Uuid. Since the SDK uses serde_bytes for payload already and Uuid round-trips natively, this
+  is a single-field change. Let me also plan to drop the .codec("json") pins from the four tests (A10/C8/F6/D3) so the default msgpack path gets exercised.
+
+
+ A10 + D3 both pass with default msgpack. C8 and F6 share the exact same processor-client path, only differing in source/sink. Let me check if Redpanda is
+  available for C8 and infra for F6:
+
+
+ All four tests (A10, C8, D3, F6) green with the default msgpack codec. Let me also run the processor-client's own unit tests:
+
+
+All 17 processor-client tests + doctest pass. Let me also run clippy on processor-client and the engine tests to make sure nothing regressed:
+
+
+Now update the E2E test plan doc to drop the "Known follow-up" note since the bug is fixed, and mark task done:
+
+ Task #71 closed. Two commits landed:
+
+  - a019378 — flipped ProcessEvent.id: String → uuid::Uuid, dropped .codec("json") pins from A10/C8/D3/F6. All four now exercise the default msgpack codec
+  (A10 2.16s, C8 5.96s, D3 3.15s, F6 0.55s). Clippy clean, processor-client unit tests green.
+  - e9a71d5 — docs flip from "Known follow-up" to "Resolved".
+
+  The five-commit sweep since resuming:
+  - f8cf41f WT client long-lived bi-stream rewrite
+  - 263daf2 D3 Rust Network T3 WT E2E test + harness
+  - 9a8e8e6 docs: D3 landed
+  - a019378 processor-client Uuid fix
+  - e9a71d5 docs: Uuid bug resolved
+
+  Tier D stays at 1/5 runnable (D3 green). The remaining stubs (D1/D2/D4/D5) all still need per-language WT client implementations in their respective SDKs,
+   which is a multi-commit effort per language. Next natural pivot if you want to keep pushing is either the Node.js SDK WT client (highest SDK priority) or
+   one of the CDC tiers (G1/G2/G3), depending on where you want to spend energy.
+
+✻ Baked for 8m 24s
+
+========================
+ do save current status update in roadmap document too, as a summary while referencing to relevant documents accordingly. I am noting in dev notes for my
+reference purposes primarily though
+
+===========================
+claude's response:
+
+ Done. ROADMAP.md now has a 2026-04-10 "Latest updates" subsection at the top of Current State, summarizing:
+
+  - D3 landing (commits 263daf2, 9a8e8e6) with pointers to e2e_wt_harness.rs and e2e_tier_d.rs
+  - WT client protocol rewrite (f8cf41f) + local_addr() exposure
+  - ProcessEvent.id Uuid fix (a019378, e9a71d5) and the four dropped json pins with per-test runtimes
+  - Tier D status snapshot pointing at docs/E2E-TEST-PLAN.md for the updated totals
+
+  The 2026-04-09 entry below is untouched as a historical record. docs/aeon-dev-notes.txt is still sitting in your working tree unstaged — left as-is since
+  you noted it's for your personal reference.
+
+✻ Cogitated for 1m 19s
+
+===============================
+ dev-notes is something I am noting manually to, while I wish you document and track in roadmap and topic related documents kind of.... you may refer
+dev-notes if you find it helpful anytime though
+
+====================================
+claude's response:
+
+ Got it — noted. ROADMAP.md is the canonical status tracker; topic docs (E2E-TEST-PLAN.md, CONNECTOR-AUDIT.md, GATE1-VALIDATION.md, etc.) carry the deep
+  detail. docs/aeon-dev-notes.txt is your personal notebook — I'll read it when it helps for context but won't write to it.
+
+  Let me save this as a durable preference so future sessions don't have to be told again.
+
+
+Saved as a feedback memory so future sessions start with this rule already internalized. Summary of how I'll treat docs going forward:
+
+  - docs/ROADMAP.md — status tracker, dated "Current State" bullets, phase completions, cross-cutting summaries, references to topic docs + commits
+  - Topic docs (E2E-TEST-PLAN.md, CONNECTOR-AUDIT.md, GATE1-VALIDATION.md, etc.) — deep detail, tables, execution logs
+  - docs/aeon-dev-notes.txt — your personal notebook. I'll read it when it gives useful context but won't write to it, and I'll leave it alone if it shows
+  up modified in git status
+
+
+=====================================
+continue
+========================================
+claude's response:
+
+ Let me scan which SDKs already claim T3 WebTransport support vs what's actually implemented. The ROADMAP says Python/Go/Node.js/Java are all "T3 + T4" —
+  let me verify whether these are real or aspirational.
+
+
+ Audit findings landed in ROADMAP. Key correction: only aeon-processor-client (Rust 12b-15) ships T3 WebTransport — every other SDK is T4 WebSocket only.
+  The earlier T3 + T4 tier columns were aspirational.
+
+  Updated tables now distinguish:
+  - Tiers (shipped) — what actually exists in the SDK source tree
+  - T3 status — shipped (Rust), pending with required library (Python/Go/Node/Java/.NET/C — each with the specific library named: aioquic, quic-go,
+  @fails-components/webtransport, kwik, System.Net.Quic), or intentionally deferred (PHP)
+
+  This frames the remaining Tier D work properly: D1/D2/D4/D5 aren't blocked on TLS or engine wiring — they're each blocked on a real WT client
+  implementation in the respective SDK. Each one is a multi-commit piece (add dep, implement client, write CLI runner, then the E2E test).
+
+  Per the SDK priority memory (Node.js → C# → PHP → Java → C/C++), the natural next pivot is implementing a real WebTransport client in the Node.js SDK
+  using @fails-components/webtransport — but that's a substantial chunk of work in a different language stack and doesn't fit the per-test commit cadence of
+   the recent sweeps. Worth checking with you before kicking off, since it'd be a multi-day effort spanning the Node SDK, a CLI runner, and the D4 test
+  landing.
+
+✻ Cooked for 4m 49s
+
+=======================================
+ if there are no webtransport clients in opensorce community that are stable and that can be integrated, we may attempt, but, if possible, we need to do
+as so, more as a separate project on github, and then consider integrating that in here. how do you think?
+
+
+========================================
+claude's response:
+
+ Strong verdict: stable WT clients exist for every target language — no need to build our own from scratch for any of them. The "separate GitHub project"
+  hedge would only matter if a language had no viable library, and that's not the case here.
+
+  Per-language assessment (from my knowledge cutoff, libraries that have been mature for multiple years):
+
+  ┌──────────┬─────────────────────────────────────┬────────────────────┬──────────────────────────────────────────────────────────────────────────────┐
+  │   SDK    │         Recommended library         │      Maturity      │                                    Notes                                     │
+  ├──────────┼─────────────────────────────────────┼────────────────────┼──────────────────────────────────────────────────────────────────────────────┤
+  │ Python   │ aioquic                             │ High (3K+ stars,   │ Has HTTP/3 + WebTransport. Used by many projects. Drop-in.                   │
+  │          │                                     │ since 2019)        │                                                                              │
+  ├──────────┼─────────────────────────────────────┼────────────────────┼──────────────────────────────────────────────────────────────────────────────┤
+  │ Go       │ webtransport-go (marten-seemann)    │ High               │ Built on top of quic-go (10K+ stars, since 2017). Same maintainer.           │
+  ├──────────┼─────────────────────────────────────┼────────────────────┼──────────────────────────────────────────────────────────────────────────────┤
+  │ C# /     │ System.Net.Quic (built-in .NET 8+)  │ Highest            │ First-party Microsoft, no third-party dep. Just wire it.                     │
+  │ .NET     │                                     │                    │                                                                              │
+  ├──────────┼─────────────────────────────────────┼────────────────────┼──────────────────────────────────────────────────────────────────────────────┤
+  │ Java     │ kwik (Peter Doornbosch)             │ High               │ Pure-Java QUIC + WebTransport. Active. JDK has no native HTTP/3 yet.         │
+  ├──────────┼─────────────────────────────────────┼────────────────────┼──────────────────────────────────────────────────────────────────────────────┤
+  │ C / C++  │ quiche (Cloudflare) or msquic       │ Highest            │ Both production CDN-grade, C API. quiche is leaner; msquic is                │
+  │          │ (Microsoft)                         │                    │ cross-platform.                                                              │
+  ├──────────┼─────────────────────────────────────┼────────────────────┼──────────────────────────────────────────────────────────────────────────────┤
+  │ Node.js  │ @fails-components/webtransport      │ Medium             │ The wobbly one. Newer (2022-ish), less battle-tested, but functional. Only   │
+  │          │                                     │                    │ practical Node option since Node has no first-party WT yet.                  │
+  └──────────┴─────────────────────────────────────┴────────────────────┴──────────────────────────────────────────────────────────────────────────────┘
+
+  Strategic implications:
+
+  1. For 5 of 6 SDKs (Python, Go, C#, Java, C/C++) — just add the library as a dep and write a thin AWPP adapter (challenge → register → length-prefixed
+  batch frames over QUIC bidi streams), exactly like the Rust aeon-processor-client does over wtransport. This is per-SDK work, but each one is bounded —
+  maybe 1-3 commits per language: dep + adapter + E2E test landing.
+  2. Node.js is the only wobble. Recommend trying @fails-components/webtransport first. If it pans out → land D4. If it doesn't → that's when the "separate
+  GitHub project" pattern kicks in. Even then, the right move is probably to fork @fails-components or contribute upstream rather than start from scratch —
+  building a JS QUIC stack from raw UDP is an undertaking measured in months, not commits.
+  3. Verification suggestion: my knowledge cutoff is 2025-05 and we're in 2026-04 — about 11 months. The big libraries (aioquic, quic-go, quiche, msquic,
+  kwik, System.Net.Quic) have all been stable for years and are unlikely to have been abandoned, but @fails-components/webtransport is newer and worth a
+  fresh check. I'd do a quick WebSearch to confirm its current state before committing to the Node.js path. The other 5 are safe to assume stable.
+
+  Recommended sequencing (per your SDK priority order Node.js → C# → PHP → Java → C/C++, with PHP intentionally deferring T3):
+
+  1. Start with C# (D4 → D5 swap) — System.Net.Quic is first-party Microsoft, .NET 8+ ships it built-in, lowest-risk integration. No third-party dep, no
+  fork risk. Lands fast and proves the per-SDK pattern.
+  2. Then Java — kwik is mature, second-lowest risk.
+  3. Then C/C++ — quiche or msquic, both rock-solid.
+  4. Then Node.js — leave the wobbly one for last, when the pattern is well-understood and we know exactly what shape the AWPP-over-WT adapter needs. By
+  then we'll have informed judgment about whether @fails-components is workable or whether a fork/separate-project is warranted.
+  5. Python and Go — fill in opportunistically; both have rock-solid libraries (aioquic, webtransport-go).
+
+  Key insight: implementing WT in each SDK is still substantial work even with a stable library — you have to thread AWPP handshake, length-prefixed
+  framing, ED25519 signing, heartbeat, and graceful shutdown through whatever streams API the library exposes. But it's bounded per-language work, not
+  "rewrite QUIC".
+
+  What do you want to do?
+  - (a) I run a quick WebSearch to verify current maturity of @fails-components/webtransport and the other libraries before any commitment
+  - (b) Start implementing WT in the C#/.NET SDK using System.Net.Quic (lowest risk, fastest landing, would naturally lead to D5 — wait, actually D5 is Java
+   in the test plan; .NET WT doesn't have a Tier D row currently since C5 .NET is T4 only)
+  - (c) Pick a different SDK to start with
+  - (d) Defer Tier D work entirely and pivot to something else (CDC, more connectors, etc.)
+
+  Note on (b): looking at the Tier D table, the slots are Python/Go/Rust/Node/Java — not .NET. So a .NET WT integration wouldn't immediately unlock a Tier D
+   test, but it would unlock real WT for the .NET SDK and could justify adding a D6 row. Worth deciding before committing to a sequence.
+
+✻ Brewed for 1m 15s
+
+
+=================================
+First do a quick WebSearch to verify current maturity of @fails-components/webtransport and the other libraries before any commitment.
+Then, based on response, let us start with C#, then, Java, then, C/C++, then, Python, then Go, then Node.js. 
+Even this, not as a direct coding exercise. Let us plan the detailed approach and validate that, let us discuss to ensure, our thought process and plan, that was documented in roadmap and other documents is perfect for this implementation. Then we can prioritize in the sequence mentioned in the above. This is especially for webtransport scenario only.
+
+A point to note is that, I have mentioned about a different sequence in the past since, Node.js is among my regular expected scenarios when compared to other programming languages.
+
+how do you think?
+
+==================================
+claude's response:
+
+ Let me run parallel WebSearches to verify current maturity of the WT libraries before we plan anything.
+
+● Web Search("@fails-components/webtransport node.js library 2026 maturity production")
+  ⎿  Did 1 search in 8s
+
+● Web Search(".NET 9 System.Net.Quic WebTransport client support 2026")
+  ⎿  Did 1 search in 7s
+
+● Web Search("kwik java QUIC WebTransport library 2026 maintained")
+  ⎿  Did 1 search in 6s
+
+● Web Search("webtransport-go marten-seemann quic-go 2026 stable release")
+  ⎿  Did 1 search in 6s
+
+● Let me search the remaining libraries plus dig deeper on the .NET situation since the first sweep flagged .NET as weaker than I thought:
+
+● Web Search("aioquic python WebTransport client 2026 production ready")
+  ⎿  Did 1 search in 6s
+
+● Web Search("cloudflare quiche WebTransport C library client 2026")
+  ⎿  Did 1 search in 6s
+
+● Web Search("microsoft msquic WebTransport client native library 2026")
+  ⎿  Did 1 search in 7s
+
+● Web Search(".NET 10 WebTransport client API HTTP/3 dotnet/runtime issue 2026")
+  ⎿  Did 1 search in 7s
+
+● WebTransport SDK Integration — Findings & Plan
+
+  The WebSearch results materially change the picture. Here's the honest reality vs. our earlier assumptions, then a revised plan.
+
+  Maturity findings
+
+  SDK: Python
+  Library: aioquic (built-in WT in H3Connection.enable_webtransport) or PyWebTransport (announced 2025-09 as "canonical async-native WT stack for Python")
+  T3 client status: High — both are real WT clients, actively maintained
+  Production-ready?: ✅ Yes
+  ────────────────────────────────────────
+  SDK: Go
+  Library: quic-go/webtransport-go
+  T3 client status: High — de-facto standard, latest release 2026-01-12, but still 0.x (technically pre-stable)
+  Production-ready?: ✅ Yes (with 0.x caveat)
+  ────────────────────────────────────────
+  SDK: Java
+  Library: kwik + Flupke (HTTP/3 add-on) by Peter Doornbosch
+  T3 client status: Medium — actively maintained, but Flupke explicitly says WT support is "still experimental (draft-ietf-webtrans-http3-13)"
+  Production-ready?: ⚠️ Real but experimental
+  ────────────────────────────────────────
+  SDK: C / C++
+  Library: No first-party WT client. quiche (Cloudflare) doesn't ship WT — open issue cloudflare/quiche#1114. msquic (Microsoft) is QUIC only, no HTTP/3
+    layer, would need to be added on top. Third-party libwtf (built on MsQuic) implements WT draft-07 with forward compat to draft-13.
+  T3 client status: Low — no clean first-party path; libwtf is the only practical option and is very new
+  Production-ready?: ❌ No first-party
+  ────────────────────────────────────────
+  SDK: C# / .NET
+  Library: No client-side WT in the runtime. System.Net.Quic is stable in .NET 9 but only the QUIC layer. WebTransport client tracked for .NET 11+
+    (dotnet/runtime#43641, dotnet/aspnetcore#65406). Kestrel has experimental server-side WT only.
+  T3 client status: Very low — would require either P/Invoke into libwtf, or rolling HTTP/3 + WT on top of System.Net.Quic ourselves
+  Production-ready?: ❌ No client at all
+  ────────────────────────────────────────
+  SDK: Node.js
+  Library: @fails-components/webtransport
+  T3 client status: Low — self-described as "duct tape-style solution until a bulletproof native support of HTTP/3 and WebTransport is provided by node
+    itself"
+  Production-ready?: ❌ Not production-ready by author's own statement
+
+  The big surprise: C# is actually the worst option, not the best
+
+  You proposed sequencing C# → Java → C/C++ → Python → Go → Node.js assuming System.Net.Quic would give us a clean first-party WT client. It doesn't. .NET
+  only ships server-side WT in Kestrel (experimental, draft-02, no datagrams). The client-side API is still tracked as a future ask. Same story for C/C++:
+  no first-party WT client in either quiche or msquic.
+
+  The actual maturity ranking is roughly the inverse of your proposal for the top three:
+
+  ┌─────────────────────────────────────────┬──────────────────────┬───────────────────────────────────────────────────────────────────────────────────┐
+  │                  Tier                   │      Languages       │                                        Why                                        │
+  ├─────────────────────────────────────────┼──────────────────────┼───────────────────────────────────────────────────────────────────────────────────┤
+  │ 1 — real, mature, drop-in               │ Python, Go, (Rust    │ First-party WT clients, actively maintained, used in production by other projects │
+  │                                         │ ✅)                  │                                                                                   │
+  ├─────────────────────────────────────────┼──────────────────────┼───────────────────────────────────────────────────────────────────────────────────┤
+  │ 2 — real, experimental                  │ Java                 │ Flupke ships WT but flags it as experimental                                      │
+  ├─────────────────────────────────────────┼──────────────────────┼───────────────────────────────────────────────────────────────────────────────────┤
+  │ 3 — no first-party client, glue         │ C/C++, C#/.NET       │ Either depend on third-party (libwtf) or write HTTP/3 + WT on top of QUIC         │
+  │ required                                │                      │ ourselves                                                                         │
+  ├─────────────────────────────────────────┼──────────────────────┼───────────────────────────────────────────────────────────────────────────────────┤
+  │ 4 — wobbly third-party only             │ Node.js              │ @fails-components is the only option and isn't production-grade                   │
+  └─────────────────────────────────────────┴──────────────────────┴───────────────────────────────────────────────────────────────────────────────────┘
+
+  Recommended revised sequencing
+
+  I'd suggest reversing the top half of your proposal:
+
+  1. Python (D1) — aioquic is mature; pick aioquic over PyWebTransport because it's older and we control more of the stack. Lowest risk, validates the
+  AWPP-over-WT pattern.
+  2. Go (D2) — webtransport-go is the de-facto Go standard. Two Tier D rows fall in succession with the most boring libraries.
+  3. Java (D5) — kwik + Flupke. By this point the AWPP-over-WT shape is mature; the experimental WT flag in Flupke is the main risk and we'll know exactly
+  what we're absorbing.
+  4. C/C++ — wait until we have 3 working SDKs. Pick libwtf-on-msquic vs. rolling HTTP/3 over quiche based on which one we're willing to depend on. No Tier
+  D row currently — we'd add one (D6 or similar).
+  5. C#/.NET — same situation as C/C++, but worse: no client at all. Strong candidate for "wait for .NET 11" vs. P/Invoking libwtf. Also no Tier D row
+  currently.
+  6. Node.js (D4) — last, exactly as you suggested. By the time we get here, we'll have 4-5 reference implementations and know exactly what AWPP-over-WT
+  needs from a transport library, so we can judge whether @fails-components is good enough or whether the "fork as separate project" hedge kicks in.
+
+  Where this lands vs. your original ordering: same instinct (Node last), but the mature/wobbly axis goes the opposite way at the top. Python/Go are more
+  polished than C# for WT specifically.
+
+  Your historical SDK priority (Node → C# → PHP → Java → C/C++) is unchanged for things like T4 WebSocket, native bindings, deployment, etc. — it's only the
+   WebTransport sequencing that flips, because the library maturity story doesn't match the language popularity story for this one transport.
+
+  The AWPP-over-WT adapter pattern — what every SDK must implement
+
+  This is the contract every WT client SDK needs to honor, mirroring crates/aeon-processor-client/src/webtransport.rs:
+
+  1. Open WebTransport session to https://host:port (URL from ProcessorConfig)
+  2. Open ONE bi-directional control stream
+  3. Length-prefixed JSON messaging on control stream:
+       a. Read Challenge { msg_type: "challenge", nonce, protocol }
+       b. Send Register { msg_type: "register", transport: "webtransport",
+                           name, version, public_key, challenge_signature,
+                           capabilities, transport_codec, requested_pipelines, binding }
+       c. Read Accepted { session_id, transport_codec, heartbeat_interval_ms,
+                           batch_signing, pipelines: [{name, partitions, batch_size}] }
+          OR Rejected { code, message }
+  4. Spawn heartbeat task — send Heartbeat { msg_type, timestamp_ms } on control
+     stream every heartbeat_interval_ms
+  5. For EACH (pipeline, partition) in Accepted.pipelines:
+       a. Open a NEW bi-directional data stream
+       b. Write routing header: [4B name_len LE][name UTF-8][2B partition LE]
+       c. Loop forever:
+            i.   Read [4B frame_len LE][frame_bytes] from data stream
+            ii.  Decode batch_request: [8B batch_id LE][4B count LE]
+                    for each event: [4B len LE][event_bytes (msgpack/json WireEvent)]
+                  [4B CRC32 LE]
+            iii. Verify CRC, decode each WireEvent → ProcessEvent
+            iv.  Run user processor function → Vec<Vec<ProcessOutput>>
+            v.   Encode batch_response: [8B batch_id LE][4B count LE]
+                    for each event_outputs: [4B output_count LE]
+                      for each output: [4B len LE][output_bytes (WireOutput)]
+                  [4B CRC32 LE][64B ED25519 sig if batch_signing else zeros]
+            vi.  Write [4B resp_len LE][resp_bytes] to data stream
+  6. Graceful shutdown on disconnect: cancel heartbeat, close streams, close session
+
+  Wire format is identical across all SDKs (defined in crates/aeon-engine/src/batch_wire.rs and mirrored in crates/aeon-processor-client/src/wire.rs). Each
+  SDK already has the JSON/MsgPack codec + CRC32 + ED25519 signing helpers from its T4 implementation — we're only adding the transport substrate (WT
+  bi-streams + length-prefixed framing) on top of code that already exists.
+
+  Critically: the recent fix to WireEvent.id/ProcessEvent.id (now uuid::Uuid everywhere) means all SDKs can use the default msgpack codec — no
+  language-specific workarounds required. This is the right baseline to start from.
+
+  Per-SDK detailed plan
+
+  Below is what each step looks like; none of this is "write code now", it's a checklist for when we agree on sequencing.
+
+  Common pre-work (do once, before any SDK)
+
+  - Add D6 (.NET T3) and D7 (C/C++ T3) rows to the Tier D table in docs/E2E-TEST-PLAN.md so the test plan reflects the full target set, not just the
+  original 5. Mark them ❌ (stub) initially.
+  - Add a "WebTransport client substrate" section to ROADMAP Phase 12b documenting the AWPP-over-WT contract above as the SDK-side spec, with a pointer to
+  crates/aeon-processor-client/src/webtransport.rs as the canonical reference implementation.
+  - Generate a longer-lived test cert if any SDK can't accept self-signed certs as easily as Rust does via the webtransport-insecure feature. (Most can, but
+   worth confirming per language.)
+
+  1. Python (D1)
+
+  ┌───────────────────┬─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+  │      Aspect       │                                                             Detail                                                              │
+  ├───────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Library           │ aioquic (preferred) or PyWebTransport (alternative)                                                                             │
+  ├───────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ New deps          │ aioquic                                                                                                                         │
+  ├───────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Files touched     │ sdks/python/aeon_transport.py (add run_webtransport() next to existing run_websocket()); sdks/python/test_transport.py (new WT  │
+  │                   │ tests using a test server fixture)                                                                                              │
+  ├───────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Engine harness    │ e2e_wt_harness.rs already exists — D1 reuses it just like D3                                                                    │
+  ├───────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Test runner       │ Spawn Python subprocess via tokio::process::Command in the test, exactly like A6/C6 do today for Python WS                      │
+  │ approach          │                                                                                                                                 │
+  ├───────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Risks             │ aioquic's enable_webtransport=True API has had churn; need to verify against current docs                                       │
+  ├───────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Validation gate   │ D1 test green: 200 events through Memory→Python_WT→Memory with msgpack codec, all 5 E2E criteria                                │
+  └───────────────────┴─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+  2. Go (D2)
+
+  ┌──────────────────────┬──────────────────────────────────────────────────────────────────────────────┐
+  │        Aspect        │                                    Detail                                    │
+  ├──────────────────────┼──────────────────────────────────────────────────────────────────────────────┤
+  │ Library              │ github.com/quic-go/webtransport-go                                           │
+  ├──────────────────────┼──────────────────────────────────────────────────────────────────────────────┤
+  │ New deps             │ webtransport-go + transitively quic-go                                       │
+  ├──────────────────────┼──────────────────────────────────────────────────────────────────────────────┤
+  │ Files touched        │ sdks/go/aeon.go (add RunWebTransport() next to Run()); sdks/go/aeon_test.go  │
+  ├──────────────────────┼──────────────────────────────────────────────────────────────────────────────┤
+  │ Test runner approach │ Spawn Go binary via subprocess (mirror C7 Kafka Go test)                     │
+  ├──────────────────────┼──────────────────────────────────────────────────────────────────────────────┤
+  │ Risks                │ webtransport-go is 0.x — not officially stable, but de-facto used everywhere │
+  ├──────────────────────┼──────────────────────────────────────────────────────────────────────────────┤
+  │ Validation gate      │ D2 test green                                                                │
+  └──────────────────────┴──────────────────────────────────────────────────────────────────────────────┘
+
+  3. Java (D5)
+
+  ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+  │        Aspect        │                                                   Detail                                                    │
+  ├──────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Library              │ kwik + Flupke (Maven Central)                                                                               │
+  ├──────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ New deps             │ tech.kwik:kwik + tech.kwik:flupke                                                                           │
+  ├──────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Files touched        │ sdks/java/src/main/java/io/aeon/processor/WebTransportRunner.java (new); update build.sh for new Maven deps │
+  ├──────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Test runner approach │ Spawn java -cp ... ProcessorMain subprocess (mirror C10 Kafka Java test)                                    │
+  ├──────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Risks                │ Flupke flags WT as "still experimental" — protocol drafts may shift. Pin a Flupke version and document it.  │
+  ├──────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Validation gate      │ D5 test green; document that WT support is via experimental Flupke API                                      │
+  └──────────────────────┴─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+  4. C/C++ (proposed new D6)
+
+  ┌───────────────┬─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+  │    Aspect     │                                                               Detail                                                                │
+  ├───────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Library       │ libwtf (built on msquic) OR roll HTTP/3 + WT on top of Cloudflare quiche ourselves                                                  │
+  ├───────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Decision      │ Adopt libwtf as a hard dependency (with all the third-party risk) vs. write a minimal HTTP/3 + WT layer on quiche (more code, but   │
+  │ point         │ we own it)                                                                                                                          │
+  ├───────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Files touched │ sdks/c/aeon_processor_wt.c (new); update Makefile                                                                                   │
+  ├───────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Risks         │ Either path is significant work — libwtf is very new; rolling our own HTTP/3 layer is multi-week effort                             │
+  ├───────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Validation    │ New D6_c_wt_t3 test slot; same 5 criteria                                                                                           │
+  │ gate          │                                                                                                                                     │
+  ├───────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Open question │ This is the point where the "separate GitHub project" pattern might kick in — a minimal HTTP/3-over-quiche library that Aeon        │
+  │               │ depends on but lives in its own repo                                                                                                │
+  └───────────────┴─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+  5. C#/.NET (proposed new D7)
+
+  ┌────────────────┬────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+  │     Aspect     │                                                               Detail                                                               │
+  ├────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Library        │ Defer until .NET 11 ships first-party WT client (dotnet/runtime#43641), OR P/Invoke into libwtf from .NET, OR roll WT over         │
+  │                │ System.Net.Quic                                                                                                                    │
+  ├────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Decision point │ Three bad options. Cleanest: wait for .NET 11. Meanwhile, .NET SDK stays T1 + T4 only.                                             │
+  ├────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Risks          │ Whichever non-wait path we pick, the integration cost is comparable to writing the C/C++ version                                   │
+  ├────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Validation     │ New D7_dotnet_wt_t3 test slot; conditional on .NET 11 availability or third-party adoption decision                                │
+  │ gate           │                                                                                                                                    │
+  ├────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Recommendation │ Defer .NET T3 entirely until .NET 11 lands. Document this as a deliberate hold in ROADMAP.                                         │
+  └────────────────┴────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+  6. Node.js (D4)
+
+  ┌──────────────────────────────┬──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+  │            Aspect            │                                                        Detail                                                        │
+  ├──────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Library                      │ @fails-components/webtransport (only practical option)                                                               │
+  ├──────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ New deps                     │ @fails-components/webtransport                                                                                       │
+  ├──────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Files touched                │ sdks/nodejs/aeon.js (add runWebTransport() next to existing runWebSocket()); sdks/nodejs/test_aeon.js                │
+  ├──────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Risks                        │ Highest — author's own README says "duct tape until Node ships native WT". Protocol drafts shift; Node API may break │
+  │                              │  between versions                                                                                                    │
+  ├──────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Validation gate              │ D4 test green; document the upstream stability concern                                                               │
+  ├──────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Fallback if                  │ Spin up @aeon-rust/aeon-webtransport-node as a separate GitHub project that wraps either MsQuic via N-API or builds  │
+  │ @fails-components doesn't    │ WT over Node's experimental node:http3. Aeon depends on that package; the package can grow its own community         │
+  │ pan out                      │ independent of Aeon.                                                                                                 │
+  └──────────────────────────────┴──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+  Documentation updates needed (per SDK landing)
+
+  Each SDK landing produces one or more focused commits in the rhythm we've established:
+
+  1. Library integration commit — feat(sdk-{lang}): add WebTransport client (kwik / aioquic / etc.)
+    - Adds dep
+    - Implements run_webtransport() (or language equivalent)
+    - Adds SDK-internal unit tests
+  2. E2E test commit — test(tier-d): D{N} {lang} WT T3 E2E test
+    - Wires the SDK into a test harness like D3 does
+    - Drives 200 events end-to-end with msgpack codec
+  3. Docs commit — docs(roadmap): {lang} T3 WT shipped
+    - Flip "pending" → "shipped" in the Phase 12b SDK table
+    - Flip ❌ → ✅ in docs/E2E-TEST-PLAN.md Tier D table
+    - Update execution log totals
+
+  That's roughly 3 commits per SDK, so the full WT propagation is ~12-18 commits (4 viable SDKs × 3 commits, assuming we defer .NET and treat C/C++ as one
+  slot).
+
+  Open questions / decisions I need from you
+
+  Before any code, please decide on these:
+
+  1. Sequencing: Stick with your original C# → Java → C/C++ → Python → Go → Node.js, or flip to my recommended Python → Go → Java → C/C++ → C# → Node.js?
+  The latter front-loads the easy wins and validates the AWPP-over-WT pattern with the most stable libraries. The former matches your stated preference but
+  starts with the worst library landscape.
+  2. C# / .NET strategy: Defer to .NET 11 (clean wait) vs. adopt libwtf via P/Invoke (commit to a third-party hard dep) vs. roll our own HTTP/3 over
+  System.Net.Quic (multi-week effort)?
+  3. C/C++ strategy: Same three-way fork: libwtf (third-party hard dep) vs. roll HTTP/3 over quiche ourselves vs. defer.
+  4. Node.js fallback threshold: At what point during the Node.js attempt do we abandon @fails-components and pivot to "spin up a separate
+  aeon-webtransport-node project"? (e.g., "if integration takes more than 3 commits worth of effort", "if we hit any protocol bug we can't work around",
+  etc.)
+  5. New Tier D rows: Add D6 (C/C++ WT) and D7 (.NET WT) to docs/E2E-TEST-PLAN.md even though they're long-deferred? My recommendation is yes — having the
+  slots in the table makes the gap visible and prevents a future "wait, we never planned for those" surprise.
+  6. Memory update: Should I save a feedback memory recording that for WebTransport specifically, the SDK sequencing differs from your general SDK priority
+  order (Node.js → C# → PHP → Java → C/C++) because of library maturity? This way future sessions don't accidentally restart from the general priority
+  order.
+
+  I'm ready to flesh any of this out further, or to revise the sequencing once you've decided on the trade-offs above. No code yet.
+
+  Sources:
+  - https://github.com/fails-components/webtransport
+  - https://www.npmjs.com/package/@fails-components/webtransport
+  - https://learn.microsoft.com/en-us/dotnet/fundamentals/networking/quic/quic-overview
+  - https://github.com/dotnet/aspnetcore/issues/65406
+  - https://github.com/dotnet/runtime/issues/43641
+  - https://devblogs.microsoft.com/dotnet/experimental-webtransport-over-http-3-support-in-kestrel/
+  - https://github.com/ptrd/kwik
+  - https://github.com/ptrd/flupke
+  - https://github.com/quic-go/webtransport-go
+  - https://pkg.go.dev/github.com/quic-go/webtransport-go
+  - https://github.com/aiortc/aioquic
+  - https://aioquic.readthedocs.io/en/latest/h3.html
+  - https://discuss.python.org/t/announcing-pywebtransport-the-canonical-async-native-webtransport-stack-for-python/103657
+  - https://github.com/cloudflare/quiche
+  - https://github.com/cloudflare/quiche/issues/1114
+  - https://github.com/microsoft/msquic
+  - https://github.com/microsoft/msquic/discussions/2078
+  - https://github.com/andrewmd5/libwtf
+
+✻ Brewed for 3m 43s
+
+
+=================================
+ flip to your recommended Python → Go → Java → C/C++ → C# → Node.js sequence. Defer C/C++ and C#/.NET. If Java's support is not stable too, defer Java
+too, when implementing webtransport support in those programming languages, the way we have deferred webtransport for PHP (for all its deployment models).
+Proceed in this order for webtransport support in processor SDKs of respective programming languages. Do save all the above discussion in a document while
+referencing that in roadmap document for easier tracking on approach and current understanding (as of today's date). Let us implement for supported
+programming languages accordingly now.
+
+==================================
+claude's response:
+
+Now update the Language SDK Status table at line ~2464 with the same updated T3 status column.
+
+
+ Plan doc committed as ea7e40b. docs/aeon-dev-notes.txt remains modified but untouched by me, as required.
+
+  Now moving into the implementation phase, starting with task #76 — Python run_webtransport() via aioquic.
+
+
+ Now I understand the aioquic API well enough to implement. Let me add the WebTransport support to aeon_transport.py.
+
+
+ Status
+
+  Committed:
+  - ea7e40b — docs/WT-SDK-INTEGRATION-PLAN.md + ROADMAP + E2E-TEST-PLAN updates (the plan doc captures the WebSearch maturity audit, the 6-step AWPP-over-WT
+   adapter contract, per-SDK detailed plans, and the approved sequencing with deferral rationale for Java / Node.js / C#/.NET / C/C++).
+  - c88a587 — feat(sdk-python): T3 WebTransport client via aioquic — run_webtransport() in sdks/python/aeon_transport.py faithfully porting
+  crates/aeon-processor-client/src/webtransport.rs. 14 new unit tests; all 39 Python SDK tests green. aioquic is lazy-imported so the base T4 SDK stays
+  usable without it.
+
+  Also saved:
+  - feedback_wt_sdk_sequencing.md memory — WT-specific SDK sequencing override so future sessions don't drift back to the general Node.js-first priority.
+  - docs/aeon-dev-notes.txt left untouched as required.
+
+  Remaining tasks:
+  - #77 Land Tier D D1 (Python WT E2E) — wire the Python client into crates/aeon-engine/tests/e2e_tier_d.rs behind a subprocess runner (mirroring A6/C6).
+  This validates the Python implementation end-to-end against the engine's WebTransportProcessorHost. Should come before the Go SDK so any AWPP-over-WT
+  contract bugs surface once and get fixed before being ported to Go.
+  - #78 Go SDK: RunWebTransport via quic-go/webtransport-go — same 6-step pattern, unit tests.
+  - #79 Land Tier D D2 (Go WT E2E).
+
+  Ready to continue with D1 next. The subprocess runner pattern I land for D1 will also be reused for D2, so it's the highest-leverage next step. Let me
+  know if you'd like me to proceed, or pause here for the night.
+
+✻ Sautéed for 20m 11s
+
+  8 tasks (5 done, 3 open)
+  √ Write WT-SDK-INTEGRATION-PLAN.md
+  √ Reference plan from ROADMAP + E2E-TEST-PLAN
+  √ Save WT sequencing feedback memory
+  √ Commit: docs — WT SDK integration plan
+  √ Python SDK: add run_webtransport() (aioquic)
+  □ Land Tier D D1 (Python WT E2E)
+  □ Go SDK: add RunWebTransport (webtransport-go)
+  □ Land Tier D D2 (Go WT E2E)
+
+
+=====================================
+proceed
+========================================
+claude's response:
+
+ Found the root cause: aioquic's create_webtransport_stream for bi streams sends the WT prologue bytes but doesn't register the stream type on the
+  client-side H3 state machine, so incoming server data on that stream gets misparsed as HTTP/3 frames. Need to patch the H3 stream state after creation.
+
+  Searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+● Now I'll add the H3Stream+FrameType imports and patch the stream state after creation:
+
+
+ D1 landed. Python is now the second T3 WebTransport SDK.
+
+  Landed:
+  - 0801b84 — D1 E2E test + 3 Python SDK Signer fixes (H3 stream state patch, awpp_public_key format, sign_challenge hex-decode) + new
+  write_seed_file/runtime_available WT harness helpers + tracing-subscriber dev-dep
+  - ff44519 — E2E-TEST-PLAN, ROADMAP, WT-SDK-INTEGRATION-PLAN flipped to shipped
+
+  Tier D: 2/5 runnable (D1 Python ✅, D3 Rust ✅), 3 stubs (D2 Go next; D4 Node.js + D5 Java deferred).
+
+  Next up per the WT plan: task #78 — Go SDK RunWebTransport via quic-go/webtransport-go. Proceed with D2 now, or pause here?
+
+✻ Cooked for 30m 54s
+
+  10 tasks (8 done, 2 open)
+  √ Write WT-SDK-INTEGRATION-PLAN.md
+  √ Reference plan from ROADMAP + E2E-TEST-PLAN
+  √ Save WT sequencing feedback memory
+  √ Commit: docs — WT SDK integration plan
+  √ Python SDK: add run_webtransport() (aioquic)
+  √ Land Tier D D1 (Python WT E2E)
+  □ Go SDK: add RunWebTransport (webtransport-go)
+  □ Land Tier D D2 (Go WT E2E)
+  √ Update docs for D1 landing
+  √ Commit D1 landing (code + docs)
+  
+  ==========================
+  proceed
+  =========================
+  claude's response:
+  
+   Same two bugs that existed in the Python SDK exist in the Go SDK — the comment on line 559-562 confirms it, and A9/C7 work around them with an inline
+  custom handshake. Both need fixing before RunWebTransport can work. Let me check the Go unit tests first.
+
+
+ Confirmed. Now I have the full wire contract. Let me add RunWebTransport to the Go SDK, plus fix the two Signer bugs. First, check if webtransport-go is
+  available offline via the Go module cache:
+
+
+ D2 Go T3 WebTransport E2E is fully landed. Here's what shipped:
+
+  Code (506bc89):
+  - sdks/go/aeon_webtransport.go — full RunWebTransport/RunWebTransportContext client (~430 lines) via quic-go/webtransport-go v0.9.0
+  - sdks/go/aeon_webtransport_test.go — 4 wire-helper unit tests
+  - sdks/go/aeon.go — Signer fixes: new AWPPPublicKey() (ed25519:<base64>), SignChallenge hex-decodes nonce
+  - crates/aeon-engine/tests/e2e_tier_d.rs — D2 test body + wait_for_data_streams in D1/D2/D3
+  - crates/aeon-engine/tests/e2e_wt_harness.rs — go_wt_passthrough_project + wait_for_data_streams
+  - crates/aeon-engine/src/transport/webtransport_host.rs — data_stream_count() getter
+
+  Docs (d30c472): E2E-TEST-PLAN, ROADMAP, WT-SDK-INTEGRATION-PLAN all flipped to shipped.
+
+  Three bugs solved:
+  1. quic-go lazy stream materialization — Write(nil) after OpenStreamSync forces the WT stream header to flush
+  2. Go SDK Signer bugs (same pair as Python's) — public key format + nonce hex-decode
+  3. Handshake-vs-data-stream race — new wait_for_data_streams helper prevents call_batch from racing accept_bi
+
+  Tier D totals: 3/5 passing (D1 Python, D2 Go, D3 Rust), 2 deferred (D4 Node.js, D5 Java) in ~5s.
+
+✻ Crunched for 29m 23s
+
+===========================
+ based upon previously created to do list and current progress, can we create an updated to do list? through a comprehensive review of roadmap, its
+documents and actual code? I will do a quick commit to github, post noting that in my dev notes
+
+============================
+claude's response:
+
+ Here's the comprehensive, audited to-do list based on a full cross-reference of ROADMAP, docs, and actual code.
+
+  ---
+  Aeon v3 — Updated To-Do List (2026-04-10)
+
+  Current State: Production-Ready (Scenario 1)
+
+  Gate 1 ✅ (130x headroom) | Gate 2 ✅ (single-node Raft) | 797 Rust tests + 23 Go + 47 Python = 867 total | 51/58 E2E tests passing, 7 stubs
+
+  ---
+  P0: Nothing — all gates passed, core architecture proven
+
+  ---
+  P1: Near-term actionable items
+
+  ┌─────┬───────────────────┬─────────────┬─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+  │  #  │       Item        │   Status    │                                                    Notes                                                    │
+  ├─────┼───────────────────┼─────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │     │ Fix Go SDK Signer │             │ A9/C7 still use an inline custom handshake that bypasses the SDK's Signer. Now that AWPPPublicKey() and     │
+  │ 1   │  in A9/C7         │ Unfinished  │ SignChallenge are fixed, could simplify those harness Go programs to use aeon.Run() directly instead of the │
+  │     │                   │             │  150-line inline workaround                                                                                 │
+  ├─────┼───────────────────┼─────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ 2   │ Fix Python SDK    │ Same story  │ A8/C6 also bypass the SDK's run_websocket() with inline scripts. The Signer fixes landed for WT; WS path    │
+  │     │ Signer in A8/C6   │             │ should benefit too                                                                                          │
+  ├─────┼───────────────────┼─────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ 3   │ F7 QUIC loopback  │ Stub        │ Go WT SDK now landed — F7 is unblocked on the SDK side. Needs a QUIC loopback source+sink pair wired in the │
+  │     │ E2E               │             │  test                                                                                                       │
+  ├─────┼───────────────────┼─────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ 4   │ aeon verify —     │ Placeholder │ CLI prints "not yet connected to runtime". PoH/Merkle modules exist in aeon-crypto; needs integration with  │
+  │     │ wire to runtime   │             │ live pipeline event tracing                                                                                 │
+  ├─────┼───────────────────┼─────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ 5   │ ROADMAP test      │ Stale       │ ROADMAP says Go=18 tests (actually 23), Python=31 tests (actually 47), Rust=691 (actually 797). Should      │
+  │     │ count accuracy    │             │ update                                                                                                      │
+  └─────┴───────────────────┴─────────────┴─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+  P2: Deferred WT T3 SDKs (blocked on external libraries)
+
+  ┌─────┬────────────┬─────────────────────────────────────────────┬───────────────────────────────────────────────┐
+  │  #  │  Language  │                   Blocker                   │                Revisit trigger                │
+  ├─────┼────────────┼─────────────────────────────────────────────┼───────────────────────────────────────────────┤
+  │ 6   │ Java T3    │ Flupke WT is "still experimental"           │ Flupke stable milestone or Netty WT client    │
+  ├─────┼────────────┼─────────────────────────────────────────────┼───────────────────────────────────────────────┤
+  │ 7   │ Node.js T3 │ @fails-components/webtransport is a stopgap │ 1.0 release or Node.js native WT              │
+  ├─────┼────────────┼─────────────────────────────────────────────┼───────────────────────────────────────────────┤
+  │ 8   │ C#/.NET T3 │ No client-side WT in .NET                   │ .NET 11 with System.Net.Quic WT support       │
+  ├─────┼────────────┼─────────────────────────────────────────────┼───────────────────────────────────────────────┤
+  │ 9   │ C/C++ T3   │ No production WT library                    │ quiche #1114 closure or msquic WT             │
+  ├─────┼────────────┼─────────────────────────────────────────────┼───────────────────────────────────────────────┤
+  │ 10  │ PHP T3     │ No WT library                               │ Unlikely; users should use Rust/Go processors │
+  └─────┴────────────┴─────────────────────────────────────────────┴───────────────────────────────────────────────┘
+
+  P3: E2E test stubs (infra-gated)
+
+  ┌─────┬───────────────────────────┬──────────────────────────────────────┬────────────────────────────────────┐
+  │  #  │           Test            │               Blocker                │               Effort               │
+  ├─────┼───────────────────────────┼──────────────────────────────────────┼────────────────────────────────────┤
+  │ 11  │ A5 C/C++ Wasm T2          │ wasi-sdk or emscripten not installed │ Low — just needs toolchain         │
+  ├─────┼───────────────────────────┼──────────────────────────────────────┼────────────────────────────────────┤
+  │ 12  │ D4 Node.js WT             │ Library maturity (see P2 #7)         │ Medium                             │
+  ├─────┼───────────────────────────┼──────────────────────────────────────┼────────────────────────────────────┤
+  │ 13  │ D5 Java WT                │ Library maturity (see P2 #6)         │ Medium                             │
+  ├─────┼───────────────────────────┼──────────────────────────────────────┼────────────────────────────────────┤
+  │ 14  │ G1 PostgreSQL CDC → Kafka │ PostgreSQL + Redpanda Docker infra   │ Medium — CDC source exists in code │
+  ├─────┼───────────────────────────┼──────────────────────────────────────┼────────────────────────────────────┤
+  │ 15  │ G2 MySQL CDC → Memory     │ MySQL Docker infra                   │ Medium — CDC source exists in code │
+  ├─────┼───────────────────────────┼──────────────────────────────────────┼────────────────────────────────────┤
+  │ 16  │ G3 MongoDB CDC → Memory   │ MongoDB Docker infra                 │ Medium — CDC source exists in code │
+  └─────┴───────────────────────────┴──────────────────────────────────────┴────────────────────────────────────┘
+
+  P4: Multi-node cluster (Raft networking)
+
+  ┌─────┬─────────────────────────┬────────────┬───────────────────────────────────────────────────────────────────────────────────────────────────────┐
+  │  #  │          Item           │   Status   │                                                 Notes                                                 │
+  ├─────┼─────────────────────────┼────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ 17  │ Raft multi-node         │ Stub       │ StubNetworkFactory returns errors for all RPCs. Single-node Raft works. Needs QUIC-based RaftNetwork  │
+  │     │ networking              │            │ impl for multi-node                                                                                   │
+  ├─────┼─────────────────────────┼────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ 18  │ Multi-node cluster E2E  │ Not        │ Deferred per memory project_gate2_deferred.md — Rancher Desktop is single-node K3s                    │
+  │     │ test                    │ started    │                                                                                                       │
+  ├─────┼─────────────────────────┼────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ 19  │ Cluster operations      │ Not        │ Raft management, scaling, failover procedures                                                         │
+  │     │ guide                   │ started    │                                                                                                       │
+  └─────┴─────────────────────────┴────────────┴───────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+  P5: Operational hardening (optional, not blocking)
+
+  ┌─────┬─────────────────────────────┬─────────────┬────────────────────────────────────────────────────────┐
+  │  #  │            Item             │   Status    │                         Notes                          │
+  ├─────┼─────────────────────────────┼─────────────┼────────────────────────────────────────────────────────┤
+  │ 20  │ Long-running stability test │ Not started │ 24-72h sustained load, memory leak detection           │
+  ├─────┼─────────────────────────────┼─────────────┼────────────────────────────────────────────────────────┤
+  │ 21  │ Chaos testing               │ Not started │ Kill processors mid-batch, disk full, broker rebalance │
+  ├─────┼─────────────────────────────┼─────────────┼────────────────────────────────────────────────────────┤
+  │ 22  │ Large message benchmark     │ Not started │ 1MB+ payloads, confirm zero-copy effectiveness         │
+  ├─────┼─────────────────────────────┼─────────────┼────────────────────────────────────────────────────────┤
+  │ 23  │ Auto-scaling / HPA config   │ Not started │ K8s HPA in Helm chart                                  │
+  ├─────┼─────────────────────────────┼─────────────┼────────────────────────────────────────────────────────┤
+  │ 24  │ Backup/restore automation   │ Not started │ Raft snapshots exist but no turnkey backup strategy    │
+  └─────┴─────────────────────────────┴─────────────┴────────────────────────────────────────────────────────┘
+
+  P6: New language SDKs (demand-driven, not blocking)
+
+  ┌─────┬──────────┬────────────────┬────────────────────────────────────────────┐
+  │  #  │ Language │     Tiers      │                   Notes                    │
+  ├─────┼──────────┼────────────────┼────────────────────────────────────────────┤
+  │ 25  │ Swift    │ T3 + T4        │ Need Network.framework WT or swift-quic    │
+  ├─────┼──────────┼────────────────┼────────────────────────────────────────────┤
+  │ 26  │ Elixir   │ T3 + T4        │ Need QUIC NIF or equivalent                │
+  ├─────┼──────────┼────────────────┼────────────────────────────────────────────┤
+  │ 27  │ Ruby     │ T4 (T3 future) │ WebSocket-first, T3 waits on library       │
+  ├─────┼──────────┼────────────────┼────────────────────────────────────────────┤
+  │ 28  │ Scala    │ T3 + T4        │ JVM — depends on Java WT maturity (Flupke) │
+  ├─────┼──────────┼────────────────┼────────────────────────────────────────────┤
+  │ 29  │ Haskell  │ T3 + T4        │ Need WT bindings                           │
+  └─────┴──────────┴────────────────┴────────────────────────────────────────────┘
+
+  P7: Documentation (nice-to-have)
+
+  ┌─────┬──────────────────────────┬────────────────────────────────────────────────┐
+  │  #  │           Item           │                     Notes                      │
+  ├─────┼──────────────────────────┼────────────────────────────────────────────────┤
+  │ 30  │ Getting-started tutorial │ Processor dev walkthrough for each SDK         │
+  ├─────┼──────────────────────────┼────────────────────────────────────────────────┤
+  │ 31  │ Performance tuning guide │ Batch size, flush interval, core pinning knobs │
+  ├─────┼──────────────────────────┼────────────────────────────────────────────────┤
+  │ 32  │ Troubleshooting guide    │ Observability, common failure modes            │
+  └─────┴──────────────────────────┴────────────────────────────────────────────────┘
+
+  ---
+  Quick wins (can do now, low effort)
+
+  - #1/#2: Simplify A8/A9/C6/C7 harness Go/Python programs to use SDK directly (now that Signer bugs are fixed)
+  - #5: Update test counts in ROADMAP (one-line edits)
+  - #11: Install wasi-sdk and unblock A5
+
+  Biggest remaining architectural gap
+
+  - #17: Raft multi-node networking — the StubNetworkFactory is the only real stub in the core engine. Everything else is production-ready or intentionally
+  deferred on external dependencies.
+
+✻ Brewed for 11m 12s
+
+=================================
+
+
+
 
 
   

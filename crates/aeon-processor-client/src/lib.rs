@@ -101,7 +101,12 @@ impl ProcessorConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessEvent {
     /// Event UUID (v7).
-    pub id: String,
+    ///
+    /// Must match the engine's `WireEvent.id` type exactly. `uuid::Uuid`'s
+    /// default serde impl branches on `is_human_readable()` — 16-byte array
+    /// in msgpack, string in JSON — so a `String` field here would fail to
+    /// decode msgpack frames emitted by the engine.
+    pub id: uuid::Uuid,
     /// Unix epoch nanoseconds.
     pub timestamp: i64,
     /// Source identifier.

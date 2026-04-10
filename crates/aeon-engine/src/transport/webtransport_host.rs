@@ -106,6 +106,8 @@ pub struct WebTransportProcessorHost {
     config: Arc<WebTransportHostConfig>,
     /// When the host was started.
     created_at: Instant,
+    /// Actual bound socket address (resolved after `Endpoint::server`).
+    local_addr: SocketAddr,
     /// Background accept loop handle.
     _accept_handle: JoinHandle<()>,
 }
@@ -125,7 +127,14 @@ impl WebTransportProcessorHost {
             ))
         })?;
 
-        tracing::info!(addr = %config.bind_addr, "T3 WebTransport processor host listening");
+        // Resolve the *actual* bound address before the endpoint moves into
+        // the accept loop. When tests bind to `0.0.0.0:0` the real port is
+        // only known after the socket is created.
+        let local_addr = endpoint.local_addr().map_err(|e| {
+            AeonError::connection(format!("webtransport host local_addr failed: {e}"))
+        })?;
+
+        tracing::info!(addr = %local_addr, "T3 WebTransport processor host listening");
 
         let sessions: Arc<DashMap<String, Arc<AwppSession>>> = Arc::new(DashMap::new());
         let routing: RoutingTable = Arc::new(DashMap::new());
@@ -146,13 +155,30 @@ impl WebTransportProcessorHost {
             data_streams,
             config,
             created_at: Instant::now(),
+            local_addr,
             _accept_handle: handle,
         })
+    }
+
+    /// The actual socket address the host is listening on.
+    ///
+    /// Useful for tests that bind to port 0 and need to discover the
+    /// ephemeral port assigned by the OS.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
     }
 
     /// Number of active sessions.
     pub fn session_count(&self) -> usize {
         self.sessions.len()
+    }
+
+    /// Number of registered (pipeline, partition) data streams across all
+    /// sessions. Tests use this to wait until the client has opened every
+    /// expected data stream before driving events, since `accept_bi()` +
+    /// routing-header reads are asynchronous with the handshake completion.
+    pub fn data_stream_count(&self) -> usize {
+        self.data_streams.len()
     }
 
     /// Total pending batches across all sessions.
