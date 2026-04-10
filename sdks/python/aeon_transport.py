@@ -384,12 +384,39 @@ class Signer:
 
     @property
     def public_key_hex(self) -> str:
-        """Hex-encoded public key (for AWPP registration)."""
+        """Hex-encoded 32-byte public key (raw, no framing).
+
+        Primarily exposed for tests and crypto verification. For the
+        ``public_key`` field of an AWPP Register message, use
+        :attr:`awpp_public_key` instead — Aeon's identity store keys
+        identities by the ``ed25519:<base64>`` string, not raw hex.
+        """
         return self._verify_key.encode().hex()
 
-    def sign_challenge(self, nonce: str) -> str:
-        """Sign an AWPP challenge nonce, returning hex-encoded signature."""
-        signed = self._signing_key.sign(nonce.encode("utf-8"))
+    @property
+    def awpp_public_key(self) -> str:
+        """Canonical AWPP public-key string: ``ed25519:<base64>``.
+
+        Matches the format used by Aeon's processor identity store when
+        registering an ED25519 identity (see
+        ``crates/aeon-engine/src/identity_store.rs``). This is what the
+        ``public_key`` field of an AWPP Register message must contain.
+        """
+        import base64
+        b64 = base64.b64encode(self._verify_key.encode()).decode("ascii")
+        return f"ed25519:{b64}"
+
+    def sign_challenge(self, nonce_hex: str) -> str:
+        """Sign an AWPP challenge nonce, returning hex-encoded signature.
+
+        The AWPP Challenge nonce is a hex-encoded random byte string. The
+        processor must sign the **raw bytes** (hex-decoded), NOT the
+        UTF-8 encoding of the hex string — the server verifies against
+        ``hex::decode(nonce)`` on its side
+        (``processor_auth.rs::verify_challenge``).
+        """
+        nonce_bytes = bytes.fromhex(nonce_hex)
+        signed = self._signing_key.sign(nonce_bytes)
         return signed.signature.hex()
 
     def sign_batch(self, batch_data: bytes) -> bytes:
@@ -443,7 +470,7 @@ async def awpp_handshake(
         "transport": "websocket",
         "name": name,
         "version": version,
-        "public_key": signer.public_key_hex,
+        "public_key": signer.awpp_public_key,
         "challenge_signature": signer.sign_challenge(nonce),
         "capabilities": ["batch"],
         "transport_codec": codec_name,
@@ -777,7 +804,7 @@ def build_awpp_register_json(
         "transport": transport,
         "name": name,
         "version": version,
-        "public_key": signer.public_key_hex,
+        "public_key": signer.awpp_public_key,
         "challenge_signature": signer.sign_challenge(challenge_nonce),
         "capabilities": ["batch"],
         "transport_codec": codec_name,
@@ -800,7 +827,7 @@ def _import_aioquic():
     try:
         from aioquic.asyncio.client import connect
         from aioquic.asyncio.protocol import QuicConnectionProtocol
-        from aioquic.h3.connection import H3Connection
+        from aioquic.h3.connection import FrameType, H3Connection, H3Stream
         from aioquic.h3.events import (
             DataReceived,
             HeadersReceived,
@@ -816,6 +843,8 @@ def _import_aioquic():
         "connect": connect,
         "QuicConnectionProtocol": QuicConnectionProtocol,
         "H3Connection": H3Connection,
+        "H3Stream": H3Stream,
+        "FrameType": FrameType,
         "HeadersReceived": HeadersReceived,
         "DataReceived": DataReceived,
         "WebTransportStreamDataReceived": WebTransportStreamDataReceived,
@@ -876,6 +905,8 @@ def _make_wt_protocol_cls():
     mods = _import_aioquic()
     QuicConnectionProtocol = mods["QuicConnectionProtocol"]
     H3Connection = mods["H3Connection"]
+    H3Stream = mods["H3Stream"]
+    FrameType = mods["FrameType"]
     HeadersReceived = mods["HeadersReceived"]
     WebTransportStreamDataReceived = mods["WebTransportStreamDataReceived"]
 
@@ -947,12 +978,33 @@ def _make_wt_protocol_cls():
         # -- User-stream helpers --
 
         def open_wt_bi_stream(self) -> int:
-            """Open a new bidirectional WebTransport stream."""
+            """Open a new bidirectional WebTransport stream.
+
+            Workaround for an aioquic gap: `create_webtransport_stream`
+            sends the `[0x41][session_id]` prologue on the wire but does
+            not register the new stream's type in the H3 connection's
+            internal `_stream` dict. When the server writes back on that
+            stream, `_receive_request_or_push_data` misparses the raw
+            WT bytes as HTTP/3 frames (looking for HEADERS/DATA/SETTINGS)
+            and emits nothing — so the session hangs waiting for the
+            AWPP Challenge. We patch the stream state here with the
+            same fields `_receive_stream_data_uni` would set for an
+            incoming WT stream, so the "shortcut for WEBTRANSPORT_STREAM
+            frame fragments" branch in `_receive_request_or_push_data`
+            fires correctly on the client side too.
+            """
             if self._session_id is None:
                 raise RuntimeError("CONNECT has not completed")
             stream_id = self._h3.create_webtransport_stream(
                 session_id=self._session_id, is_unidirectional=False
             )
+            # Register the stream in H3's state dict as a WT bi stream so
+            # incoming server data is dispatched as WebTransportStreamDataReceived.
+            if stream_id not in self._h3._stream:
+                self._h3._stream[stream_id] = H3Stream(stream_id)
+            h3_stream = self._h3._stream[stream_id]
+            h3_stream.frame_type = FrameType.WEBTRANSPORT_STREAM
+            h3_stream.session_id = self._session_id
             self.transmit()
             return stream_id
 

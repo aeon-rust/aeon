@@ -219,3 +219,35 @@ pub async fn drive_events_through_transport(
     }
     Ok(all_outputs)
 }
+
+/// Write the 32-byte ED25519 seed to a temp file (for external SDK processes).
+///
+/// Mirrors `e2e_ws_harness::write_seed_file` so Tier D tests can hand the seed
+/// to a Python / Go / Node.js / Java subprocess running the per-language WT
+/// client SDK.
+pub fn write_seed_file(identity: &TestIdentity) -> std::path::PathBuf {
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!("aeon-e2e-wt-key-{}.bin", &identity.fingerprint[7..23]));
+    std::fs::write(&path, identity.signing_key.as_bytes()).expect("write WT seed file");
+    path
+}
+
+/// Check if a runtime command exists (returns true if executable is found).
+///
+/// Mirrors `e2e_ws_harness::runtime_available` so Tier D tests can skip
+/// cleanly when a per-language SDK runtime isn't installed on the host.
+pub fn runtime_available(command: &str) -> bool {
+    // Go uses `go version` not `go --version`.
+    let args = if command == "go" {
+        vec!["version"]
+    } else {
+        vec!["--version"]
+    };
+    std::process::Command::new(command)
+        .args(&args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}

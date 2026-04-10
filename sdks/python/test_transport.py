@@ -271,15 +271,18 @@ def test_signer_generate():
 
 def test_signer_challenge_response():
     signer = Signer.generate()
-    nonce = "test-nonce-abc123"
-    sig_hex = signer.sign_challenge(nonce)
+    # AWPP challenge nonces are hex-encoded random bytes (see
+    # `processor_auth::generate_nonce`). `sign_challenge` hex-decodes and
+    # signs the raw bytes to match the server's verification path.
+    nonce_hex = "0123456789abcdef" * 4  # 32 bytes → 64 hex chars
+    sig_hex = signer.sign_challenge(nonce_hex)
     assert len(sig_hex) == 128  # 64 bytes hex-encoded
 
-    # Verify the signature
+    # Verify the signature against the raw (hex-decoded) nonce bytes.
     from nacl.signing import VerifyKey
     vk = VerifyKey(bytes.fromhex(signer.public_key_hex))
     sig_bytes = bytes.fromhex(sig_hex)
-    vk.verify(nonce.encode("utf-8"), sig_bytes)  # raises if invalid
+    vk.verify(bytes.fromhex(nonce_hex), sig_bytes)  # raises if invalid
 
 
 def test_signer_batch_signing():
@@ -430,9 +433,11 @@ def test_pack_len_prefixed_basic():
 
 def test_build_awpp_register_json_shape():
     signer = Signer.generate()
+    # AWPP challenge nonces are hex-encoded random bytes.
+    nonce_hex = "deadbeef" * 8  # 32 bytes → 64 hex chars
     js = build_awpp_register_json(
         signer=signer,
-        challenge_nonce="nonce-abc",
+        challenge_nonce=nonce_hex,
         name="proc-name",
         version="1.2.3",
         pipelines=["p1", "p2"],
@@ -449,21 +454,23 @@ def test_build_awpp_register_json_shape():
     assert reg["requested_pipelines"] == ["p1", "p2"]
     assert reg["capabilities"] == ["batch"]
     assert reg["binding"] == "dedicated"
-    # Public key is 64 hex chars; signature is 128 hex chars
-    assert len(reg["public_key"]) == 64
+    # Public key is "ed25519:<base64>" (matches Aeon identity store format);
+    # signature is 128 hex chars.
+    assert reg["public_key"].startswith("ed25519:")
     assert len(reg["challenge_signature"]) == 128
 
-    # Signature must verify against the signer's key for the nonce
+    # Signature must verify against the signer's raw key over the raw
+    # (hex-decoded) nonce bytes, matching the server's verify_challenge path.
     from nacl.signing import VerifyKey
-    vk = VerifyKey(bytes.fromhex(reg["public_key"]))
-    vk.verify(b"nonce-abc", bytes.fromhex(reg["challenge_signature"]))
+    vk = VerifyKey(bytes.fromhex(signer.public_key_hex))
+    vk.verify(bytes.fromhex(nonce_hex), bytes.fromhex(reg["challenge_signature"]))
 
 
 def test_build_awpp_register_json_defaults_to_webtransport():
     signer = Signer.generate()
     js = build_awpp_register_json(
         signer=signer,
-        challenge_nonce="n",
+        challenge_nonce="ab" * 16,  # valid hex
         name="p",
         version="1",
         pipelines=[],

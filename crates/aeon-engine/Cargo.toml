@@ -66,6 +66,7 @@ tower = "0.5"
 axum = { workspace = true }
 serde = { workspace = true }
 aeon-processor-client = { workspace = true, features = ["webtransport-insecure"] }
+tracing-subscriber = { workspace = true }
 aeon-crypto = { workspace = true }
 tokio-tungstenite = { workspace = true }
 ed25519-dalek = { workspace = true }
