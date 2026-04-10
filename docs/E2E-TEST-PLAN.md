@@ -123,13 +123,24 @@ Kafka Source -> Processor -> Kafka Sink. The Gate 1 money path.
 
 Memory Source -> Processor (T3) -> Memory Sink. Validates QUIC/WebTransport transport.
 
+**Sequencing (2026-04-10)**: per
+[`WT-SDK-INTEGRATION-PLAN.md`](WT-SDK-INTEGRATION-PLAN.md), the order
+of attack is **D1 (Python, aioquic) → D2 (Go, quic-go/webtransport-go)**,
+after which Tier D is fully runnable for every SDK where a
+production-grade WT client library exists. D4 (Node.js) and D5 (Java)
+are **deferred** (Node.js library is a self-described stopgap; Flupke
+WT is explicitly "still experimental") and remain `todo!()` stubs
+until their libraries mature. There is no Tier D row for C#/.NET or
+C/C++ yet — when those languages get WT client support they will be
+added as D6+ rows.
+
 | # | Processor | Test | Status |
 |---|-----------|------|--------|
-| D1 | Python | Memory -> Python_WT -> Memory | ❌ |
-| D2 | Go | Memory -> Go_WT -> Memory | ❌ |
+| D1 | Python | Memory -> Python_WT -> Memory | ❌ (in progress — aioquic) |
+| D2 | Go | Memory -> Go_WT -> Memory | ❌ (in progress — quic-go/webtransport-go) |
 | D3 | Rust Network | Memory -> RustNet_WT -> Memory | ✅ |
-| D4 | Node.js | Memory -> NodeJS_WT -> Memory | ❌ |
-| D5 | Java | Memory -> Java_WT -> Memory | ❌ |
+| D4 | Node.js | Memory -> NodeJS_WT -> Memory | ❌ (deferred — WT plan §5.4) |
+| D5 | Java | Memory -> Java_WT -> Memory | ❌ (deferred — WT plan §5.3) |
 
 ### Tier E: Cross-Connector Coverage — P2, mixed infra
 
@@ -266,6 +277,15 @@ aspirational marks.
    is the first SDK-level acceptance proof. D3 requires
    `--features webtransport-host` and uses the `aeon-processor-client`
    `webtransport-insecure` feature to trust the self-signed cert.
+
+   **WT SDK plan (2026-04-10)**: per
+   [`WT-SDK-INTEGRATION-PLAN.md`](WT-SDK-INTEGRATION-PLAN.md),
+   **D1 (Python, `aioquic`) and D2 (Go, `quic-go/webtransport-go`)**
+   are approved to proceed now. **D4 (Node.js) and D5 (Java) are
+   deferred** — Node.js's `@fails-components/webtransport` is a
+   self-described stopgap, and Flupke's Java WT is explicitly
+   "still experimental". They stay `todo!()` stubs until their
+   libraries mature.
 2. **QUIC loopback (1)** — Tier F7 (QUIC loopback with Go T3) is the
    last Tier F stub. It shares the same Go-SDK WT-client blocker as
    Tier D2. All other Tier F tests landed this sweep: F1

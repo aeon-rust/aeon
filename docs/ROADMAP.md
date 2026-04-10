@@ -915,6 +915,20 @@ Rolling binary upgrade: zero event loss during Aeon v1→v2 transition under loa
   reflect shipped-vs-pending T3 per SDK (with the specific library
   each would need: `aioquic`, `quic-go`, `@fails-components/webtransport`,
   kwik, `System.Net.Quic`, etc.). No code change — doc correction only.
+- **WT SDK integration plan drafted** — see
+  [`docs/WT-SDK-INTEGRATION-PLAN.md`](WT-SDK-INTEGRATION-PLAN.md) for
+  the full WebSearch maturity audit, library decisions, and the
+  approved sequencing. Verdict: **Python (aioquic) and Go
+  (quic-go/webtransport-go) proceed**; **Java (Flupke is
+  experimental), Node.js (`@fails-components/webtransport` is a
+  self-described stopgap), C#/.NET (no client-side WT until .NET 11),
+  and C/C++ (no production-grade library; `quiche` #1114 open) are
+  deferred** — parallel to the pre-existing PHP deferral across all
+  6 deployment models. This is a WT-specific override of the general
+  SDK priority order (which had Node.js first); Node.js WT waits
+  until its library situation stabilises. The plan doc is the
+  canonical reference for the AWPP-over-WT adapter contract and the
+  per-SDK deep-dive.
 
 ### Latest updates (2026-04-09)
 
@@ -994,15 +1008,23 @@ non-Rust SDKs (D1/D2/D4/D5) are therefore blocked on real WT client
 implementations, not TLS or host wiring. See `docs/E2E-TEST-PLAN.md`
 Tier D table.
 
+**WT SDK roadmap (2026-04-10)**: see
+[`docs/WT-SDK-INTEGRATION-PLAN.md`](WT-SDK-INTEGRATION-PLAN.md) for the
+library maturity audit and approved sequencing. Summary: **Python
+(aioquic) and Go (quic-go/webtransport-go) proceed**; **Java (Flupke
+experimental), Node.js (library is a self-described stopgap), C#/.NET
+(no client-side WT until .NET 11), and C/C++ (no production-grade
+library) are deferred** parallel to the pre-existing PHP deferral.
+
 | Sub-phase | Language | Tiers (shipped) | Status | Notes |
 |-----------|----------|-----------------|--------|-------|
-| 12b-5 | Python | T4 | ✅ Complete | `sdks/python/aeon_transport.py`: AWPP WebSocket client (`websockets`), ED25519 (PyNaCl), MsgPack/JSON, `@processor` decorator, 31 tests. T3 aspirational — needs `aioquic` + h3 stack. |
-| 12b-6 | Go | T4 | ✅ Complete | `sdks/go/aeon.go`: AWPP WebSocket client (`gorilla/websocket`), ED25519 (stdlib), MsgPack (vmihailenco), `Run()`/`RunContext()`, 18 tests. T3 aspirational — needs `quic-go` + HTTP/3 client. |
-| 12b-9 | Node.js / TypeScript | T4 | ✅ 2026-04-07 | `sdks/nodejs/aeon.js` (590 lines): AWPP WebSocket client (`ws`), ED25519 (`@noble/ed25519`), MsgPack (msgpackr)/JSON, CRC32, batch wire format, `processor()`/`batchProcessor()` decorators, 32 tests. T3 aspirational — needs `@fails-components/webtransport` or equivalent. |
-| 12b-10 | Java / Kotlin | T4 | ✅ 2026-04-07 | `sdks/java/src/main/java/io/aeon/processor/Runner.java`: Zero-dependency (Java 21 stdlib only), ED25519 (built-in EdDSA), JSON codec, CRC32, batch wire format, data frame, `java.net.http.WebSocket` AWPP runner, `Processor.perEvent()`/`.batch()`, 28 tests. T3 aspirational — no JDK HTTP/3 yet; would need kwik/netty-incubator-codec-http3. |
-| 12b-11 | C# / .NET | T1 (NativeAOT) + T4 | ✅ 2026-04-07 | `sdks/dotnet/AeonProcessorSdk/Runner.cs`: T1 NativeAOT C-ABI exports (`[UnmanagedCallersOnly]`), T4 `ClientWebSocket` AWPP client, ED25519 (NSec/libsodium), MsgPack (MessagePack-CSharp)/JSON, CRC32, native wire format, `ProcessorRegistration.PerEvent()`/`.Batch()`, 40 tests. T3 aspirational — .NET 8+ `System.Net.Quic` could host it. |
-| 12b-12 | C / C++ | T1 + T2 + T4 | ✅ 2026-04-07 | `sdks/c/aeon_processor.c`: Pure C11 zero-dependency, T1 C-ABI (`AEON_EXPORT_PROCESSOR` macro), JSON codec (hand-rolled parser + base64), CRC32 IEEE, batch wire format, data frame build/parse, portable LE helpers, 22 tests. T3/T4 wire format primitives exist but no transport. |
-| 12b-13 | PHP | T4 (6 deployment models) | ✅ 2026-04-07 | `sdks/php/`: Core (Codec JSON/MsgPack, ED25519 via sodium_compat, CRC32, batch wire, data frame) + 6 adapters: Swoole/OpenSwoole (Laravel Octane), RevoltPHP+ReactPHP (Ratchet), RevoltPHP+AMPHP, Workerman, FrankenPHP/RoadRunner, Native CLI. `Processor::perEvent()`/`::batch()`, 33 tests. T3 intentionally deferred. |
+| 12b-5 | Python | T4 (T3 in progress) | ✅ Complete | `sdks/python/aeon_transport.py`: AWPP WebSocket client (`websockets`), ED25519 (PyNaCl), MsgPack/JSON, `@processor` decorator, 31 tests. **T3 WT in progress** via `aioquic` — see [WT plan](WT-SDK-INTEGRATION-PLAN.md) §5.1. |
+| 12b-6 | Go | T4 (T3 in progress) | ✅ Complete | `sdks/go/aeon.go`: AWPP WebSocket client (`gorilla/websocket`), ED25519 (stdlib), MsgPack (vmihailenco), `Run()`/`RunContext()`, 18 tests. **T3 WT in progress** via `quic-go/webtransport-go` — see [WT plan](WT-SDK-INTEGRATION-PLAN.md) §5.2. |
+| 12b-9 | Node.js / TypeScript | T4 (T3 deferred) | ✅ 2026-04-07 | `sdks/nodejs/aeon.js` (590 lines): AWPP WebSocket client (`ws`), ED25519 (`@noble/ed25519`), MsgPack (msgpackr)/JSON, CRC32, batch wire format, `processor()`/`batchProcessor()` decorators, 32 tests. **T3 WT deferred** — `@fails-components/webtransport` is a self-described stopgap; see [WT plan](WT-SDK-INTEGRATION-PLAN.md) §5.4. |
+| 12b-10 | Java / Kotlin | T4 (T3 deferred) | ✅ 2026-04-07 | `sdks/java/src/main/java/io/aeon/processor/Runner.java`: Zero-dependency (Java 21 stdlib only), ED25519 (built-in EdDSA), JSON codec, CRC32, batch wire format, data frame, `java.net.http.WebSocket` AWPP runner, `Processor.perEvent()`/`.batch()`, 28 tests. **T3 WT deferred** — Flupke WT is "still experimental"; see [WT plan](WT-SDK-INTEGRATION-PLAN.md) §5.3. |
+| 12b-11 | C# / .NET | T1 (NativeAOT) + T4 (T3 deferred) | ✅ 2026-04-07 | `sdks/dotnet/AeonProcessorSdk/Runner.cs`: T1 NativeAOT C-ABI exports (`[UnmanagedCallersOnly]`), T4 `ClientWebSocket` AWPP client, ED25519 (NSec/libsodium), MsgPack (MessagePack-CSharp)/JSON, CRC32, native wire format, `ProcessorRegistration.PerEvent()`/`.Batch()`, 40 tests. **T3 WT deferred** — no client-side WT in .NET; tracked for .NET 11+ (dotnet/runtime#43641); see [WT plan](WT-SDK-INTEGRATION-PLAN.md) §5.5. |
+| 12b-12 | C / C++ | T1 + T2 + T4 (T3 deferred) | ✅ 2026-04-07 | `sdks/c/aeon_processor.c`: Pure C11 zero-dependency, T1 C-ABI (`AEON_EXPORT_PROCESSOR` macro), JSON codec (hand-rolled parser + base64), CRC32 IEEE, batch wire format, data frame build/parse, portable LE helpers, 22 tests. **T3 WT deferred** — no production-grade C/C++ WT client library (quiche #1114 open); see [WT plan](WT-SDK-INTEGRATION-PLAN.md) §5.6. |
+| 12b-13 | PHP | T4 (6 deployment models) | ✅ 2026-04-07 | `sdks/php/`: Core (Codec JSON/MsgPack, ED25519 via sodium_compat, CRC32, batch wire, data frame) + 6 adapters: Swoole/OpenSwoole (Laravel Octane), RevoltPHP+ReactPHP (Ratchet), RevoltPHP+AMPHP, Workerman, FrankenPHP/RoadRunner, Native CLI. `Processor::perEvent()`/`::batch()`, 33 tests. **T3 WT deferred** (no usable PHP WT client library); see [WT plan](WT-SDK-INTEGRATION-PLAN.md) §5.7. |
 | 12b-14 | Swift | T3 + T4 | ❌ Not started | No directory |
 | 12b-14 | Elixir | T3 + T4 | ❌ Not started | No directory |
 | 12b-14 | Ruby | T4 (T3 future) | ❌ Not started | No directory |
@@ -2457,8 +2479,11 @@ docker compose up -d
 ### Language SDK Status (Phase 12b-5/6 + 12b-9 through 12b-15)
 
 Every language gets T4 (WebSocket) network access. T3 (WebTransport)
-is shipped for Rust today; other languages have T3 as a demand-driven
-follow-up. T1/T2 (in-process) are additional high-perf options where
+is shipped for Rust today; every other SDK falls into one of three
+buckets per the [WT SDK integration plan](WT-SDK-INTEGRATION-PLAN.md):
+**in progress** (Python, Go), **deferred** (Java, Node.js, C#/.NET,
+C/C++, PHP), or **not started** (Swift / Elixir / Ruby / Scala /
+Haskell). T1/T2 (in-process) are additional high-perf options where
 available.
 
 | Language | Shipped Tiers | T3 status | Status | Location |
@@ -2467,13 +2492,13 @@ available.
 | Rust (Wasm) | T2 | — | ✅ Complete | `crates/aeon-wasm-sdk/` (Phase 12a) |
 | Rust (Network) | T3 + T4 | ✅ shipped (D3 E2E 2026-04-10) | ✅ 2026-04-06 | 12b-15 (`aeon-processor-client` crate, 17 tests) |
 | AssemblyScript | T2 | — | T2 ✅ / T4 ❌ | `sdks/typescript/` (12a) |
-| Python | T4 | pending (needs `aioquic` + h3) | ✅ Complete | `sdks/python/` (12b-5, 31 tests) |
-| Go | T4 | pending (needs `quic-go` HTTP/3) | ✅ Complete | `sdks/go/` (12b-6, 18 tests) |
-| Node.js / TypeScript | T4 | pending (needs `@fails-components/webtransport`) | ✅ 2026-04-07 | `sdks/nodejs/` (12b-9, 32 tests) |
-| Java / Kotlin | T4 | pending (no JDK HTTP/3; needs kwik/netty-incubator) | ✅ 2026-04-07 | 12b-10 (28 tests) |
-| C# / .NET | T1 (NativeAOT) + T4 | pending (could use `System.Net.Quic` on .NET 8+) | ✅ 2026-04-07 | 12b-11 (40 tests) |
-| C / C++ | T1 + T2 + T4 | pending (wire format ready, no transport) | ✅ 2026-04-07 | 12b-12 (22 tests) |
-| PHP | T4 (6 deployment models) | intentionally deferred | ✅ 2026-04-07 | 12b-13 (33 tests) |
+| Python | T4 | 🚧 in progress (aioquic) — [WT plan §5.1](WT-SDK-INTEGRATION-PLAN.md) | ✅ Complete | `sdks/python/` (12b-5, 31 tests) |
+| Go | T4 | 🚧 in progress (quic-go/webtransport-go) — [WT plan §5.2](WT-SDK-INTEGRATION-PLAN.md) | ✅ Complete | `sdks/go/` (12b-6, 18 tests) |
+| Node.js / TypeScript | T4 | ⏸ deferred (stopgap library) — [WT plan §5.4](WT-SDK-INTEGRATION-PLAN.md) | ✅ 2026-04-07 | `sdks/nodejs/` (12b-9, 32 tests) |
+| Java / Kotlin | T4 | ⏸ deferred (Flupke experimental) — [WT plan §5.3](WT-SDK-INTEGRATION-PLAN.md) | ✅ 2026-04-07 | 12b-10 (28 tests) |
+| C# / .NET | T1 (NativeAOT) + T4 | ⏸ deferred (no client-side WT until .NET 11) — [WT plan §5.5](WT-SDK-INTEGRATION-PLAN.md) | ✅ 2026-04-07 | 12b-11 (40 tests) |
+| C / C++ | T1 + T2 + T4 | ⏸ deferred (no WT library) — [WT plan §5.6](WT-SDK-INTEGRATION-PLAN.md) | ✅ 2026-04-07 | 12b-12 (22 tests) |
+| PHP | T4 (6 deployment models) | ⏸ deferred (no WT library) — [WT plan §5.7](WT-SDK-INTEGRATION-PLAN.md) | ✅ 2026-04-07 | 12b-13 (33 tests) |
 | Swift | T3 + T4 | ❌ Not started | 12b-14 |
 | Elixir | T3 + T4 | ❌ Not started | 12b-14 |
 | Ruby | T4 (T3 future) | ❌ Not started | 12b-14 |
