@@ -202,6 +202,30 @@ pub async fn wait_for_connection(server: &WtTestServer, timeout: Duration) -> bo
     }
 }
 
+/// Wait until `expected` data streams have been registered on the server.
+///
+/// AWPP handshake completes before the client opens data streams, so
+/// `wait_for_connection` returning does not mean the server has yet
+/// accepted the `(pipeline, partition)` streams the test will drive
+/// events through. Without this the test races the client and
+/// `call_batch` can fail with `no T3 data stream for pipeline=...`.
+pub async fn wait_for_data_streams(
+    server: &WtTestServer,
+    expected: usize,
+    timeout: Duration,
+) -> bool {
+    let start = std::time::Instant::now();
+    loop {
+        if server.wt_host.data_stream_count() >= expected {
+            return true;
+        }
+        if start.elapsed() > timeout {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// Drive events through the T3 WebTransport host's `call_batch` API and
 /// collect the resulting outputs in order.
 ///
@@ -250,4 +274,133 @@ pub fn runtime_available(command: &str) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+/// Build a temp Go module that imports the in-repo Go SDK via a
+/// `replace` directive and calls `aeon.RunWebTransport` with the
+/// passthrough processor used by D2.
+///
+/// Returns the temp directory path — caller is responsible for
+/// cleaning it up (and for passing it as `current_dir` to `go run .`).
+///
+/// Mirrors `e2e_ws_harness::go_passthrough_project` but targets the
+/// T3 WT entry point and always uses `insecure=true` + `ServerName:
+/// "localhost"` so the self-signed `127.0.0.1` server cert is
+/// accepted (same trick as the Rust `webtransport-insecure` feature
+/// and the Python `insecure=True` kwarg).
+pub fn go_wt_passthrough_project(
+    url: &str,
+    seed_path: &str,
+    pipeline_name: &str,
+    processor_name: &str,
+) -> std::path::PathBuf {
+    let tmp_dir = std::env::temp_dir().join(format!("aeon_e2e_go_wt_{pipeline_name}"));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&tmp_dir).expect("create go wt temp dir");
+
+    // Locate the in-repo Go SDK via the engine crate's CARGO_MANIFEST_DIR.
+    let sdk_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("sdks")
+        .join("go");
+    let sdk_path_str = sdk_path.to_string_lossy().replace('\\', "/");
+
+    // go.mod — pin the same Go version the SDK requires (1.23), depend
+    // on the in-repo SDK via a replace directive.
+    let go_mod = format!(
+        r#"module aeon-e2e-go-wt-test
+
+go 1.23
+
+require github.com/aeon-rust/aeon/sdks/go v0.0.0
+
+replace github.com/aeon-rust/aeon/sdks/go => {sdk_path_str}
+"#
+    );
+    std::fs::write(tmp_dir.join("go.mod"), &go_mod).expect("write go.mod");
+
+    // go.sum: copy from the in-repo SDK so `go run .` doesn't need
+    // network access to resolve modules. This assumes the SDK's
+    // go.sum covers all transitive deps reached by `RunWebTransport`
+    // (which it does — webtransport-go + quic-go + x/net etc. were
+    // pulled in by `go mod tidy` when the dep was added).
+    let sdk_go_sum = sdk_path.join("go.sum");
+    if sdk_go_sum.exists() {
+        std::fs::copy(&sdk_go_sum, tmp_dir.join("go.sum")).expect("copy go.sum");
+    }
+
+    let seed_path_fixed = seed_path.replace('\\', "/");
+
+    // main.go — imports the SDK and calls RunWebTransport with the
+    // passthrough processor (copy event.Payload to output, surface
+    // event.Metadata as output.Headers so the D2 C3 metadata-propagation
+    // assertion can see it round-trip).
+    let main_go = format!(
+        r#"package main
+
+import (
+	"log"
+
+	aeon "github.com/aeon-rust/aeon/sdks/go"
+)
+
+func main() {{
+	err := aeon.RunWebTransport(aeon.ConfigWT{{
+		URL:            "{url}",
+		Name:           "{processor_name}",
+		Version:        "1.0.0",
+		PrivateKeyPath: "{seed_path}",
+		Pipelines:      []string{{"{pipeline_name}"}},
+		Codec:          "msgpack",
+		Insecure:       true,
+		ServerName:     "localhost",
+		Processor: func(e aeon.Event) []aeon.Output {{
+			return []aeon.Output{{{{
+				Destination: "output",
+				Payload:     e.Payload,
+				Headers:     e.Metadata,
+			}}}}
+		}},
+	}})
+	if err != nil {{
+		log.Fatalf("RunWebTransport: %v", err)
+	}}
+}}
+"#,
+        url = url,
+        processor_name = processor_name,
+        seed_path = seed_path_fixed,
+        pipeline_name = pipeline_name,
+    );
+    std::fs::write(tmp_dir.join("main.go"), &main_go).expect("write main.go");
+
+    // Run `go mod tidy` to materialise the temp module's transitive deps.
+    // The temp go.mod only directly requires the SDK; `go run .` needs every
+    // indirect dep (quic-go, webtransport-go, x/net, etc.) recorded in
+    // go.mod + go.sum before it will compile. Mirrors the pattern used by
+    // `e2e_ws_harness::go_passthrough_project`.
+    let output = std::process::Command::new("go")
+        .args(["mod", "tidy"])
+        .current_dir(&tmp_dir)
+        .env(
+            "PATH",
+            format!(
+                "{};{}",
+                "C:\\Program Files\\Go\\bin",
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .output()
+        .expect("go mod tidy");
+    if !output.status.success() {
+        eprintln!(
+            "go mod tidy stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    tmp_dir
 }

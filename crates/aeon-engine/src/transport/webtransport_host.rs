@@ -173,6 +173,14 @@ impl WebTransportProcessorHost {
         self.sessions.len()
     }
 
+    /// Number of registered (pipeline, partition) data streams across all
+    /// sessions. Tests use this to wait until the client has opened every
+    /// expected data stream before driving events, since `accept_bi()` +
+    /// routing-header reads are asynchronous with the handshake completion.
+    pub fn data_stream_count(&self) -> usize {
+        self.data_streams.len()
+    }
+
     /// Total pending batches across all sessions.
     fn total_pending_batches(&self) -> u32 {
         self.sessions

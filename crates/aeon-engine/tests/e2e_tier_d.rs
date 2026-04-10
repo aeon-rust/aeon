@@ -158,6 +158,25 @@ except BaseException as e:
         );
     }
 
+    // 6b. Wait for all 16 data streams to be registered server-side.
+    //     Handshake completion doesn't imply data streams are up —
+    //     aioquic opens them asynchronously after the Accepted message,
+    //     and test loads with multiple WT tests running concurrently
+    //     can otherwise race `call_batch` ahead of `accept_bi`.
+    let streams_ready =
+        e2e_wt_harness::wait_for_data_streams(&server, 16, Duration::from_secs(10)).await;
+    if !streams_ready {
+        let _ = child.kill();
+        let output = child.wait_with_output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let _ = std::fs::remove_file(&script_path);
+        let _ = std::fs::remove_file(&seed_path);
+        panic!(
+            "D1: only {} of 16 data streams registered within 10s\nstderr: {stderr}",
+            server.wt_host.data_stream_count(),
+        );
+    }
+
     // 7. Drive 200 events through the T3 transport, pinned to partition 0
     //    so a single data stream carries the whole flow (ordering check C4
     //    is a side-effect of single-stream delivery).
@@ -240,10 +259,182 @@ async fn d1_python_wt_t3() {
 // D2: Memory -> Go T3 WebTransport -> Memory
 // ===========================================================================
 
+#[cfg(feature = "webtransport-host")]
 #[tokio::test]
-#[ignore = "requires TLS certs + Go SDK with WebTransport support + engine WT host"]
 async fn d2_go_wt_t3() {
-    todo!("Implement with engine WebTransport host + Go SDK (T3)");
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use aeon_types::event::Event;
+    use aeon_types::partition::PartitionId;
+    use bytes::Bytes;
+
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("off")),
+        )
+        .try_init();
+
+    // 1. Preflight: Go toolchain available. Tier D is opt-in and should
+    //    skip cleanly on a bare CI box.
+    if !e2e_wt_harness::runtime_available("go") {
+        eprintln!("SKIP D2: go not found");
+        return;
+    }
+
+    let pipeline_name = "d2-pipeline";
+
+    // 2. Start engine WT host (self-signed cert on 127.0.0.1:<random>).
+    let server = e2e_wt_harness::start_wt_test_server(pipeline_name).await;
+    let url = server.url.clone();
+
+    // 3. Register processor identity + persist the seed for the Go subprocess.
+    let identity = e2e_wt_harness::register_test_identity(&server, "go-wt-proc");
+    let seed_path = e2e_wt_harness::write_seed_file(&identity);
+    let seed_path_str = seed_path.to_string_lossy().to_string();
+
+    // 4. Build a temp Go module that imports the in-repo Go SDK via a
+    //    replace directive and calls `aeon.RunWebTransport` with a
+    //    passthrough processor.
+    let go_dir = e2e_wt_harness::go_wt_passthrough_project(
+        &url,
+        &seed_path_str,
+        pipeline_name,
+        "go-wt-proc",
+    );
+
+    // 5. Spawn `go run .` from the temp dir. On Windows the Go binary
+    //    often isn't on PATH for child processes, so prepend the
+    //    default install dir the same way the A9/C7 harness does.
+    let mut child = std::process::Command::new("go")
+        .args(["run", "."])
+        .current_dir(&go_dir)
+        .env(
+            "PATH",
+            format!(
+                "C:\\Program Files\\Go\\bin;{}",
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn go run");
+
+    // 6. Wait for processor to connect. `go run .` has to compile
+    //    quic-go + webtransport-go from the module cache the first
+    //    time, so allow a generous window (60s). Subsequent runs are
+    //    cached and fast.
+    let connected =
+        e2e_wt_harness::wait_for_connection(&server, Duration::from_secs(60)).await;
+    if !connected {
+        let _ = child.kill();
+        let output = child.wait_with_output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let _ = std::fs::remove_file(&seed_path);
+        let _ = std::fs::remove_dir_all(&go_dir);
+        panic!(
+            "D2: Go WT processor failed to connect within 60s.\nstderr: {stderr}\nstdout: {stdout}"
+        );
+    }
+
+    // 6b. Wait for all 16 data streams (one per partition) to be
+    //     registered on the server. The handshake completes before the
+    //     client opens data streams, and on webtransport-go each
+    //     OpenStreamSync + routing-header write has to round-trip
+    //     through quic-go's packet scheduler, so there's a small but
+    //     real window where `call_batch` can race ahead of the
+    //     server-side `accept_bi`.
+    let streams_ready =
+        e2e_wt_harness::wait_for_data_streams(&server, 16, Duration::from_secs(10)).await;
+    if !streams_ready {
+        let _ = child.kill();
+        let output = child.wait_with_output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let _ = std::fs::remove_file(&seed_path);
+        let _ = std::fs::remove_dir_all(&go_dir);
+        panic!(
+            "D2: only {} of 16 data streams registered within 10s\nstderr: {stderr}",
+            server.wt_host.data_stream_count(),
+        );
+    }
+
+    // 7. Drive 200 events through the T3 transport pinned to partition 0
+    //    so a single data stream carries the whole flow (ordering check
+    //    C4 is a side-effect of single-stream delivery).
+    let source: Arc<str> = Arc::from("d2-source");
+    let events: Vec<Event> = (0..200)
+        .map(|i| {
+            let payload = Bytes::from(format!("d2-payload-{i:05}"));
+            Event::new(
+                uuid::Uuid::now_v7(),
+                i as i64,
+                Arc::clone(&source),
+                PartitionId::new(0),
+                payload,
+            )
+            .with_metadata(Arc::from("d2-key"), Arc::from(format!("val-{i}")))
+        })
+        .collect();
+    let events_clone = events.clone();
+
+    let drive_result =
+        e2e_wt_harness::drive_events_through_transport(&server.wt_host, events, 32).await;
+    let outputs = match drive_result {
+        Ok(o) => o,
+        Err(e) => {
+            let _ = child.kill();
+            let output = child.wait_with_output().unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let _ = std::fs::remove_file(&seed_path);
+            let _ = std::fs::remove_dir_all(&go_dir);
+            panic!("D2: drive_events_through_transport failed: {e}\nstderr: {stderr}");
+        }
+    };
+
+    // 8. Verify the E2E criteria.
+    // C1: zero loss.
+    assert_eq!(
+        outputs.len(),
+        events_clone.len(),
+        "D2 C1: event count mismatch: {} outputs vs {} events",
+        outputs.len(),
+        events_clone.len(),
+    );
+
+    // C2: payload integrity, C4: per-partition ordering (single stream).
+    for (i, (event, output)) in events_clone.iter().zip(outputs.iter()).enumerate() {
+        assert_eq!(
+            output.payload.as_ref(),
+            event.payload.as_ref(),
+            "D2 C2: payload mismatch at index {i}",
+        );
+    }
+
+    // C3: metadata propagation — the Go passthrough copies event.Metadata
+    // into output.Headers.
+    for (i, output) in outputs.iter().enumerate() {
+        let found = output.headers.iter().any(|(k, v)| {
+            k.as_ref() == "d2-key" && v.as_ref() == format!("val-{i}").as_str()
+        });
+        assert!(found, "D2 C3: metadata not propagated at index {i}");
+    }
+
+    // 9. C5 graceful shutdown.
+    drop(server);
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_file(&seed_path);
+    let _ = std::fs::remove_dir_all(&go_dir);
+}
+
+#[cfg(not(feature = "webtransport-host"))]
+#[tokio::test]
+#[ignore = "requires --features webtransport-host"]
+async fn d2_go_wt_t3() {
+    todo!("rebuild with --features webtransport-host");
 }
 
 // ===========================================================================
@@ -314,6 +505,19 @@ async fn d3_rust_network_wt_t3() {
         } else {
             panic!("D3: Rust WT processor failed to connect within 15s; client still running");
         }
+    }
+
+    // 4b. Wait for all 16 data streams to be registered server-side —
+    //     handshake completion doesn't imply data streams are up, and
+    //     `call_batch` racing ahead of `accept_bi` produces a confusing
+    //     "no T3 data stream" error (same race the Python/Go WT tests hit).
+    let streams_ready =
+        e2e_wt_harness::wait_for_data_streams(&server, 16, Duration::from_secs(10)).await;
+    if !streams_ready {
+        panic!(
+            "D3: only {} of 16 data streams registered within 10s",
+            server.wt_host.data_stream_count(),
+        );
     }
 
     // 5. Drive 200 events through the T3 transport.
