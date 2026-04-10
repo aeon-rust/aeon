@@ -1,10 +1,10 @@
 # WebTransport (T3) SDK Integration Plan
 
-**Status**: Active plan — as of 2026-04-10
+**Status**: Active plan — as of 2026-04-10 (D1 Python shipped)
 **Scope**: Extending real T3 WebTransport client support into the
-per-language processor SDKs, beyond `aeon-processor-client` (Rust), which
-is the only SDK that ships a shipped T3 client today (proven by Tier D
-D3, 2026-04-10).
+per-language processor SDKs, beyond `aeon-processor-client` (Rust, D3)
+and `sdks/python` (aioquic, D1) — the two SDKs that ship a real T3
+client today.
 **Owner**: Aeon engine + SDK workstream
 **Related docs**:
 - `docs/ROADMAP.md` — Phase 12b Language SDKs + Language SDK Status tables
@@ -54,6 +54,7 @@ This plan captures:
 | SDK | Crate / path | Library | Tier D E2E |
 |---|---|---|---|
 | Rust Network (`aeon-processor-client`) | `crates/aeon-processor-client/` | `wtransport 0.6.1` | ✅ D3 (2026-04-10) |
+| Python (`sdks/python`) | `sdks/python/aeon_transport.py` | `aioquic` (H3 + WT) | ✅ D1 (2026-04-10) |
 
 **Canonical reference implementation**:
 `crates/aeon-processor-client/src/webtransport.rs`.
@@ -64,7 +65,6 @@ Every non-Rust SDK WT client should be a faithful port of the same
 
 | SDK | Status after this plan | Reason |
 |---|---|---|
-| Python | **Implementing** (D1) | `aioquic` is high-maturity, WT built-in via `H3Connection.enable_webtransport` |
 | Go | **Implementing** (D2) | `quic-go/webtransport-go` is the de-facto standard, actively maintained |
 | Java | **Deferred** (revisit when Flupke WT leaves experimental) | `Flupke` explicitly flags WT support as "still experimental (draft-ietf-webtrans-http3-13)" |
 | Node.js | **Deferred** (last-attempt language) | `@fails-components/webtransport` README self-describes as "duct tape until Node ships native WT" |
@@ -73,7 +73,8 @@ Every non-Rust SDK WT client should be a faithful port of the same
 | PHP | **Deferred** (pre-existing decision) | Already deferred for all 6 deployment models — no usable PHP WT client library |
 
 Approved sequencing is therefore **Python → Go**, with Java/C/C++/C#/Node.js
-held until their library situations mature.
+held until their library situations mature. **Python landed 2026-04-10**
+(D1 E2E green); Go is next.
 
 ---
 
@@ -192,7 +193,7 @@ verdict, the candidate library, evidence, and the maturity tier.
 | Language | Library | Maturity tier | Decision |
 |---|---|---|---|
 | Rust (Network) | `wtransport` 0.6.1 | Tier 2 | ✅ Shipped (D3) |
-| Python | `aioquic` | Tier 2 | **Implement (D1)** |
+| Python | `aioquic` | Tier 2 | ✅ Shipped (D1, 2026-04-10) |
 | Go | `quic-go/webtransport-go` | Tier 2 | **Implement (D2)** |
 | Java | Flupke on kwik | Tier 3 (explicitly experimental) | Defer |
 | Node.js | `@fails-components/webtransport` | Tier 3 (self-described stopgap) | Defer |
@@ -283,7 +284,7 @@ Each plan lists: library, new dependencies, files to touch, risks,
 validation gates, and the Tier D test id that blocks on it. Follow
 the shared contract in §4 verbatim.
 
-### 5.1 Python (D1) — GO
+### 5.1 Python (D1) — ✅ SHIPPED (2026-04-10)
 
 - **Library**: `aioquic` (0.9.x+).
 - **New dep** (`sdks/python/setup.py`): add `aioquic>=0.9` as an
@@ -312,6 +313,25 @@ the shared contract in §4 verbatim.
     all green.
   - Rust Tier D D1 test green against a Python subprocess runner.
 - **Tier D test**: D1 (`crates/aeon-engine/tests/e2e_tier_d.rs`).
+- **Landed 2026-04-10**: D1 passes in ~1.5s. Three Python SDK Signer
+  fixes landed alongside the test (pre-existing bugs never caught by
+  A8, which uses an inline handshake script rather than the SDK's
+  `run_*` entrypoints):
+  1. `open_wt_bi_stream` manually patches `H3Stream.frame_type =
+     FrameType.WEBTRANSPORT_STREAM` + `session_id` after
+     `create_webtransport_stream`. Works around an aioquic gap where
+     bi WT streams send the `[0x41][session_id]` prologue on the wire
+     but don't register in `H3Connection._stream`, so incoming server
+     bytes are misparsed as HTTP/3 frames.
+  2. New `Signer.awpp_public_key` property returns `ed25519:<base64>`
+     to match the identity store key format (raw hex was rejected
+     with `KEY_NOT_FOUND`).
+  3. `Signer.sign_challenge` now hex-decodes the nonce before signing
+     — server verifies against raw bytes via `hex::decode(nonce)`.
+  The Rust side of D1 spawns a Python subprocess via
+  `run_webtransport(insecure=True, server_name="localhost")` (mirror
+  of the Rust `webtransport-insecure` feature) and drives 200 events
+  through partition 0. All 5 E2E criteria (C1–C5) verified.
 
 ### 5.2 Go (D2) — GO
 
@@ -488,3 +508,4 @@ Each re-evaluation updates §2.2 and §3 of this document. Keep the
 | Date | Change |
 |---|---|
 | 2026-04-10 | Initial version. Captures WebSearch audit, maturity tiers, approved Python→Go sequencing, Java/Node.js/C#/C/C++ deferrals. |
+| 2026-04-10 | D1 (Python / aioquic) shipped. Moved §2.1 row; flipped §2.2, §3.8, §5.1 status to ✅. Captured the three Signer fixes that unblocked the handshake (H3 stream state patch, AWPP `ed25519:<base64>` public key, challenge hex-decode). |
