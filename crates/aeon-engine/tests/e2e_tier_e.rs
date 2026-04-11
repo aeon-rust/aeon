@@ -296,15 +296,17 @@ async fn e4_file_python_memory() {
 #[tokio::test]
 async fn e5_file_python_kafka() {
     // Needs Redpanda
-    if tokio::time::timeout(
+    match tokio::time::timeout(
         Duration::from_secs(3),
         tokio::net::TcpStream::connect("127.0.0.1:19092"),
     )
     .await
-    .is_err()
     {
-        eprintln!("SKIP E5: Redpanda not available");
-        return;
+        Ok(Ok(_)) => {}
+        _ => {
+            eprintln!("SKIP E5: Redpanda not available");
+            return;
+        }
     }
     if !python_available() {
         return;
@@ -369,15 +371,17 @@ async fn e5_file_python_kafka() {
 #[tokio::test]
 async fn e6_kafka_python_file() {
     // Needs Redpanda
-    if tokio::time::timeout(
+    match tokio::time::timeout(
         Duration::from_secs(3),
         tokio::net::TcpStream::connect("127.0.0.1:19092"),
     )
     .await
-    .is_err()
     {
-        eprintln!("SKIP E6: Redpanda not available");
-        return;
+        Ok(Ok(_)) => {}
+        _ => {
+            eprintln!("SKIP E6: Redpanda not available");
+            return;
+        }
     }
     if !python_available() {
         return;
@@ -461,15 +465,17 @@ async fn e6_kafka_python_file() {
 #[tokio::test]
 async fn e7_kafka_python_blackhole() {
     // Needs Redpanda
-    if tokio::time::timeout(
+    match tokio::time::timeout(
         Duration::from_secs(3),
         tokio::net::TcpStream::connect("127.0.0.1:19092"),
     )
     .await
-    .is_err()
     {
-        eprintln!("SKIP E7: Redpanda not available");
-        return;
+        Ok(Ok(_)) => {}
+        _ => {
+            eprintln!("SKIP E7: Redpanda not available");
+            return;
+        }
     }
     if !python_available() {
         return;
@@ -624,15 +630,17 @@ async fn e8_http_webhook_python_memory() {
 #[tokio::test]
 async fn e9_http_webhook_python_kafka() {
     // Needs Redpanda
-    if tokio::time::timeout(
+    match tokio::time::timeout(
         Duration::from_secs(3),
         tokio::net::TcpStream::connect("127.0.0.1:19092"),
     )
     .await
-    .is_err()
     {
-        eprintln!("SKIP E9: Redpanda not available");
-        return;
+        Ok(Ok(_)) => {}
+        _ => {
+            eprintln!("SKIP E9: Redpanda not available");
+            return;
+        }
     }
     if !python_available() {
         return;

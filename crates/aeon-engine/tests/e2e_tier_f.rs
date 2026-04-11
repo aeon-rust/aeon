@@ -54,8 +54,8 @@ async fn require_nats() -> Option<async_nats::jetstream::Context> {
 #[tokio::test]
 async fn f1_nats_python_t4() {
     use aeon_connectors::nats::{NatsSink, NatsSinkConfig, NatsSource, NatsSourceConfig};
-    use aeon_types::traits::{Sink, Source};
     use aeon_types::DeliveryStrategy;
+    use aeon_types::traits::{Sink, Source};
 
     // --- 1. Preconditions ----------------------------------------------------
     let Some(js) = require_nats().await else {
@@ -144,7 +144,9 @@ async fn f1_nats_python_t4() {
         .with_batch_size(64)
         .with_fetch_timeout(Duration::from_millis(500))
         .with_source_name("f1-nats-source");
-    let mut source = NatsSource::new(source_config).await.expect("NatsSource::new");
+    let mut source = NatsSource::new(source_config)
+        .await
+        .expect("NatsSource::new");
 
     // OrderedBatch exercises the §4.0 metric-credit-on-flush path for NATS's
     // JetStream ack futures (publish then await-all-acks at batch boundary).
@@ -332,7 +334,9 @@ async fn f2_nats_kafka_go_t4() {
         .with_batch_size(64)
         .with_fetch_timeout(Duration::from_millis(500))
         .with_source_name("f2-nats-source");
-    let mut source = NatsSource::new(source_config).await.expect("NatsSource::new");
+    let mut source = NatsSource::new(source_config)
+        .await
+        .expect("NatsSource::new");
 
     let sink_config = KafkaSinkConfig::new(F2_BROKERS, &kafka_sink_topic);
     let mut sink = KafkaSink::new(sink_config).expect("KafkaSink::new");
@@ -472,8 +476,8 @@ async fn f3_redis_nodejs_t4() {
     use aeon_connectors::redis_streams::{
         RedisSink, RedisSinkConfig, RedisSource, RedisSourceConfig,
     };
-    use aeon_types::traits::{Sink, Source};
     use aeon_types::DeliveryStrategy;
+    use aeon_types::traits::{Sink, Source};
     use redis::AsyncCommands;
 
     // --- 1. Preconditions ----------------------------------------------------
@@ -665,7 +669,11 @@ async fn require_mqtt() -> bool {
     let host = mqtt_host();
     let port = mqtt_port();
     let addr = format!("{host}:{port}");
-    match tokio::time::timeout(Duration::from_secs(2), tokio::net::TcpStream::connect(&addr)).await
+    match tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::net::TcpStream::connect(&addr),
+    )
+    .await
     {
         Ok(Ok(_)) => true,
         Ok(Err(e)) => {
@@ -727,8 +735,8 @@ fn resolve_modern_java() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
 #[tokio::test]
 async fn f4_mqtt_java_t4() {
     use aeon_connectors::mqtt::{MqttSink, MqttSinkConfig, MqttSource, MqttSourceConfig};
-    use aeon_types::traits::{Sink, Source};
     use aeon_types::Output;
+    use aeon_types::traits::{Sink, Source};
     use bytes::Bytes;
     use std::sync::Arc as StdArc;
 
@@ -762,7 +770,9 @@ async fn f4_mqtt_java_t4() {
         .with_client_id(format!("aeon-f4-src-{suffix}"))
         .with_poll_timeout(Duration::from_millis(500))
         .with_source_name("f4-mqtt-source");
-    let mut source = MqttSource::new(source_config).await.expect("MqttSource::new");
+    let mut source = MqttSource::new(source_config)
+        .await
+        .expect("MqttSource::new");
 
     let verifier_config = MqttSourceConfig::new(&host, port, &sink_topic)
         .with_client_id(format!("aeon-f4-verify-{suffix}"))
@@ -795,17 +805,10 @@ async fn f4_mqtt_java_t4() {
         pipeline_name,
         "java-proc",
     );
-    let java_src = java_dir.join("AeonProcessor.java");
-
-    let compile = std::process::Command::new(&javac_bin)
-        .arg(&java_src)
-        .output()
-        .expect("javac");
-    if !compile.status.success() {
-        eprintln!(
-            "SKIP F4: javac failed: {}",
-            String::from_utf8_lossy(&compile.stderr)
-        );
+    if let Err(stderr) =
+        e2e_ws_harness::compile_java_with_sdk(&javac_bin.to_string_lossy(), &java_dir)
+    {
+        eprintln!("SKIP F4: javac failed: {stderr}");
         let _ = std::fs::remove_dir_all(&java_dir);
         drop(server);
         return;
@@ -965,13 +968,13 @@ async fn f5_rabbitmq_php_t4() {
     use aeon_connectors::rabbitmq::{
         RabbitMqSink, RabbitMqSinkConfig, RabbitMqSource, RabbitMqSourceConfig,
     };
-    use aeon_types::traits::{Sink, Source};
     use aeon_types::DeliveryStrategy;
+    use aeon_types::traits::{Sink, Source};
+    use lapin::BasicProperties;
     use lapin::options::{
         BasicConsumeOptions, BasicPublishOptions, QueueDeclareOptions, QueueDeleteOptions,
     };
     use lapin::types::FieldTable;
-    use lapin::BasicProperties;
 
     // --- 1. Preconditions ----------------------------------------------------
     let Some(setup_conn) = require_rabbitmq().await else {
@@ -1080,7 +1083,9 @@ async fn f5_rabbitmq_php_t4() {
     // fix (batch boundary awaits all PublisherConfirm futures concurrently).
     let sink_config = RabbitMqSinkConfig::direct_to_queue(rabbitmq_url(), &sink_queue)
         .with_strategy(DeliveryStrategy::OrderedBatch);
-    let mut sink = RabbitMqSink::new(sink_config).await.expect("RabbitMqSink::new");
+    let mut sink = RabbitMqSink::new(sink_config)
+        .await
+        .expect("RabbitMqSink::new");
 
     // --- 6. Drain loop: RabbitMQ -> PHP T4 -> RabbitMQ -----------------------
     let mut total_received: usize = 0;
@@ -1334,11 +1339,180 @@ async fn f6_websocket_rust_net_t4() {
 }
 
 // ===========================================================================
-// F7: QUIC -> QUIC (Go T3)
+// F7: QUIC -> Rust T4 -> QUIC (loopback, no Docker)
 // ===========================================================================
+//
+// QuicSource receives events from a QUIC client, routes them through a Rust
+// T4 WebSocket processor, and QuicSink sends outputs to a QUIC server.
+// Pure loopback — self-signed certs via dev_quic_configs(), no infra needed.
 
 #[tokio::test]
-#[ignore = "requires TLS certs + Go SDK T3 + engine WebTransport host (loopback, no Docker)"]
-async fn f7_quic_go_t3() {
-    todo!("Implement with QuicSource -> Go T3 -> QuicSink (loopback)");
+async fn f7_quic_rust_t4() {
+    use aeon_connectors::quic::{
+        QuicSink, QuicSinkConfig, QuicSource, QuicSourceConfig, dev_quic_configs,
+    };
+    use aeon_processor_client::{ProcessEvent, ProcessOutput, ProcessorClient, ProcessorConfig};
+    use aeon_types::traits::{Sink, Source};
+
+    let msg_count = 100usize;
+
+    // === 1. QuicSource — accepts events from a QUIC client ===
+    let (server_config, client_config_for_source) = dev_quic_configs();
+    let source_config = QuicSourceConfig::new("127.0.0.1:0".parse().unwrap(), server_config)
+        .with_source_name("f7-quic-source")
+        .with_poll_timeout(Duration::from_millis(500));
+    let mut source = QuicSource::new(source_config).unwrap();
+    let source_addr = source.local_addr();
+
+    // === 2. QUIC "sink server" — receives outputs from QuicSink ===
+    let (sink_server_config, sink_client_config) = dev_quic_configs();
+    let sink_server_endpoint =
+        quinn::Endpoint::server(sink_server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+    let sink_server_addr = sink_server_endpoint.local_addr().unwrap();
+
+    let sink_collected = Arc::new(tokio::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+    let sink_collected_clone = Arc::clone(&sink_collected);
+
+    let sink_server_handle = tokio::spawn(async move {
+        // Accept one connection, then read all streams
+        let incoming = sink_server_endpoint.accept().await.unwrap();
+        let conn = incoming.await.unwrap();
+        while let Ok((_, mut recv)) = conn.accept_bi().await {
+            let collected = Arc::clone(&sink_collected_clone);
+            tokio::spawn(async move {
+                loop {
+                    // Read length prefix
+                    let mut len_buf = [0u8; 4];
+                    match recv.read_exact(&mut len_buf).await {
+                        Ok(()) => {}
+                        Err(_) => break,
+                    }
+                    let len = u32::from_le_bytes(len_buf) as usize;
+                    if len == 0 {
+                        continue;
+                    }
+                    let mut payload = vec![0u8; len];
+                    if recv.read_exact(&mut payload).await.is_err() {
+                        break;
+                    }
+                    collected.lock().await.push(payload);
+                }
+            });
+        }
+    });
+
+    // === 3. Start Rust T4 processor via engine WS host ===
+    let pipeline_name = "f7-pipeline";
+    let server = e2e_ws_harness::start_ws_test_server(pipeline_name).await;
+    let identity = e2e_ws_harness::register_test_identity(&server, "rust-quic-proc");
+    let port = server.port;
+    let seed = *identity.signing_key.as_bytes();
+
+    let _client_handle = tokio::spawn(async move {
+        let config = ProcessorConfig::new(
+            "rust-quic-proc",
+            format!("ws://127.0.0.1:{port}/api/v1/processors/connect"),
+        )
+        .pipeline(pipeline_name.to_string())
+        .signing_key_from_seed(&seed);
+
+        fn passthrough(event: ProcessEvent) -> Vec<ProcessOutput> {
+            vec![ProcessOutput {
+                destination: "output".into(),
+                key: None,
+                payload: event.payload,
+                headers: vec![],
+            }]
+        }
+        ProcessorClient::run(config, passthrough).await
+    });
+
+    let connected = e2e_ws_harness::wait_for_connection(&server, Duration::from_secs(5)).await;
+    assert!(connected, "F7: Rust processor failed to connect");
+
+    // === 4. Send events via QUIC client to the source ===
+    let source_client_handle = tokio::spawn(async move {
+        let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        endpoint.set_default_client_config(client_config_for_source);
+        let conn = endpoint
+            .connect(source_addr, "localhost")
+            .unwrap()
+            .await
+            .unwrap();
+
+        let (mut send, _recv) = conn.open_bi().await.unwrap();
+        for i in 0..msg_count {
+            let payload = format!("f7-payload-{i:05}");
+            let len = payload.len() as u32;
+            send.write_all(&len.to_le_bytes()).await.unwrap();
+            send.write_all(payload.as_bytes()).await.unwrap();
+        }
+        send.finish().unwrap();
+        // Wait for stream to flush
+        send.stopped().await.ok();
+    });
+
+    // === 5. Wire: QuicSource → T4 Processor → QuicSink ===
+    let mut sink = QuicSink::new(QuicSinkConfig::new(
+        sink_server_addr,
+        "localhost",
+        sink_client_config,
+    ))
+    .await
+    .unwrap();
+
+    let mut total_received = 0usize;
+    let mut total_outputs = 0usize;
+    let mut empty_polls = 0;
+    loop {
+        let events = source.next_batch().await.unwrap();
+        if events.is_empty() {
+            empty_polls += 1;
+            if empty_polls >= 5 {
+                break;
+            }
+            continue;
+        }
+        empty_polls = 0;
+        total_received += events.len();
+        let outputs = server.ws_host.call_batch(events).await.unwrap();
+        total_outputs += outputs.len();
+        sink.write_batch(outputs).await.unwrap();
+    }
+    sink.flush().await.unwrap();
+
+    // Wait for source client to finish sending
+    source_client_handle.await.unwrap();
+
+    // Wait for sink server to collect
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // === 6. Verify criteria ===
+    assert_eq!(
+        total_received, msg_count,
+        "F7 C1: source received {total_received}, expected {msg_count}"
+    );
+    assert_eq!(
+        total_outputs, msg_count,
+        "F7 C1: processor produced {total_outputs}, expected {msg_count}"
+    );
+
+    let collected = sink_collected.lock().await;
+    assert_eq!(
+        collected.len(),
+        msg_count,
+        "F7 C1: sink received {}, expected {msg_count}",
+        collected.len()
+    );
+    for (i, data) in collected.iter().enumerate() {
+        let payload = std::str::from_utf8(data).unwrap();
+        assert_eq!(
+            payload,
+            format!("f7-payload-{i:05}"),
+            "F7 C2: payload mismatch at {i}"
+        );
+    }
+
+    drop(server);
+    sink_server_handle.abort();
 }

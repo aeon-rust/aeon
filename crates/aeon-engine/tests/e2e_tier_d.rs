@@ -50,15 +50,10 @@ async fn d1_python_wt_t3() {
         return;
     }
     let check = std::process::Command::new("python")
-        .args([
-            "-c",
-            "import aioquic, nacl.signing, msgpack, struct, json",
-        ])
+        .args(["-c", "import aioquic, nacl.signing, msgpack, struct, json"])
         .output();
     if check.map(|o| !o.status.success()).unwrap_or(true) {
-        eprintln!(
-            "SKIP D1: Python WT packages missing (pip install aioquic pynacl msgpack)"
-        );
+        eprintln!("SKIP D1: Python WT packages missing (pip install aioquic pynacl msgpack)");
         return;
     }
 
@@ -144,8 +139,7 @@ except BaseException as e:
 
     // 6. Wait for processor to connect (allow 20s — aioquic + QUIC handshake
     //    is a bit slower than raw WebSocket).
-    let connected =
-        e2e_wt_harness::wait_for_connection(&server, Duration::from_secs(20)).await;
+    let connected = e2e_wt_harness::wait_for_connection(&server, Duration::from_secs(20)).await;
     if !connected {
         let _ = child.kill();
         let output = child.wait_with_output().unwrap();
@@ -206,9 +200,7 @@ except BaseException as e:
             let stderr = String::from_utf8_lossy(&output.stderr);
             let _ = std::fs::remove_file(&script_path);
             let _ = std::fs::remove_file(&seed_path);
-            panic!(
-                "D1: drive_events_through_transport failed: {e}\nstderr: {stderr}"
-            );
+            panic!("D1: drive_events_through_transport failed: {e}\nstderr: {stderr}");
         }
     };
 
@@ -233,9 +225,10 @@ except BaseException as e:
 
     // C3: metadata propagation — passthrough copied metadata into headers.
     for (i, output) in outputs.iter().enumerate() {
-        let found = output.headers.iter().any(|(k, v)| {
-            k.as_ref() == "d1-key" && v.as_ref() == format!("val-{i}").as_str()
-        });
+        let found = output
+            .headers
+            .iter()
+            .any(|(k, v)| k.as_ref() == "d1-key" && v.as_ref() == format!("val-{i}").as_str());
         assert!(found, "D1 C3: metadata not propagated at index {i}");
     }
 
@@ -326,8 +319,7 @@ async fn d2_go_wt_t3() {
     //    quic-go + webtransport-go from the module cache the first
     //    time, so allow a generous window (60s). Subsequent runs are
     //    cached and fast.
-    let connected =
-        e2e_wt_harness::wait_for_connection(&server, Duration::from_secs(60)).await;
+    let connected = e2e_wt_harness::wait_for_connection(&server, Duration::from_secs(60)).await;
     if !connected {
         let _ = child.kill();
         let output = child.wait_with_output().unwrap();
@@ -416,9 +408,10 @@ async fn d2_go_wt_t3() {
     // C3: metadata propagation — the Go passthrough copies event.Metadata
     // into output.Headers.
     for (i, output) in outputs.iter().enumerate() {
-        let found = output.headers.iter().any(|(k, v)| {
-            k.as_ref() == "d2-key" && v.as_ref() == format!("val-{i}").as_str()
-        });
+        let found = output
+            .headers
+            .iter()
+            .any(|(k, v)| k.as_ref() == "d2-key" && v.as_ref() == format!("val-{i}").as_str());
         assert!(found, "D2 C3: metadata not propagated at index {i}");
     }
 
@@ -538,10 +531,9 @@ async fn d3_rust_network_wt_t3() {
         .collect();
     let events_clone = events.clone();
 
-    let outputs =
-        e2e_wt_harness::drive_events_through_transport(&server.wt_host, events, 32)
-            .await
-            .expect("D3: drive_events_through_transport failed");
+    let outputs = e2e_wt_harness::drive_events_through_transport(&server.wt_host, events, 32)
+        .await
+        .expect("D3: drive_events_through_transport failed");
 
     // 6. Verify the 5 E2E criteria.
     // C1: zero loss
@@ -564,9 +556,10 @@ async fn d3_rust_network_wt_t3() {
 
     // C3: metadata propagation — the passthrough routed `metadata` into output headers.
     for (i, output) in outputs.iter().enumerate() {
-        let found = output.headers.iter().any(|(k, v)| {
-            k.as_ref() == "d3-key" && v.as_ref() == format!("val-{i}").as_str()
-        });
+        let found = output
+            .headers
+            .iter()
+            .any(|(k, v)| k.as_ref() == "d3-key" && v.as_ref() == format!("val-{i}").as_str());
         assert!(found, "D3 C3: metadata not propagated at index {i}");
     }
 
