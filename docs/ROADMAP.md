@@ -986,7 +986,7 @@ placeholders). Test counts updated to reflect current state.
 9. **P9 — User-facing documentation** (nice-to-have):
    - Getting-started processor dev guide, multi-node ops guide,
      performance tuning guide, troubleshooting guide.
-10. **P10 — Zero-downtime deployment & management** (Phase A+B done, Phase C–D pending):
+10. **P10 — Zero-downtime deployment & management** (Phase A+B+C done, Phase D pending):
     Full to-do list: `docs/PROCESSOR-DEPLOYMENT.md` §13, referenced from
     `docs/MULTI-NODE-AND-DEPLOYMENT-STRATEGY.md` §7.
 
@@ -1003,8 +1003,11 @@ placeholders). Test counts updated to reflect current state.
       with MemorySource/KafkaSource overrides. `pipeline_controls` map in AppState.
       2 tests: hot-swap zero-loss, managed-no-swap. 257 engine tests pass.
 
-    **Phase C — Source/sink reconfiguration (not started, medium priority):**
-    - ZD-7/ZD-8: Same-type source/sink config change without restart
+    **Phase C — Source/sink reconfiguration ✅ (2026-04-11):**
+    - ZD-7/ZD-8: Same-type source/sink config change via `drain_and_swap_source()`/`drain_and_swap_sink()`.
+      Uses `Box<dyn Any + Send>` swap slots with runtime downcast (Source/Sink traits use APIT, not object-safe).
+      Source task checks swap slot when paused; sink task checks in idle path. 2 tests: source-swap, sink-swap.
+      Total managed pipeline tests: 4 (hot-swap, no-swap, source-swap, sink-swap). 259 engine tests pass.
 
     **Phase D — Advanced strategies (not started, medium priority):**
     - ZD-5: Blue-green pipeline runtime wiring

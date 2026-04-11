@@ -505,14 +505,14 @@ Full to-do list with item IDs: `docs/PROCESSOR-DEPLOYMENT.md` Section 13.
 | ~~**Must fix**~~ | ~~ZD-1 (POST route), ZD-2 (CLI serde), ZD-3 (SHA-512)~~ | ~~Processor registration via CLI/REST, artifact integrity~~ **Done (2026-04-11)** |
 | ~~**High**~~ | ~~ZD-4 (hot-swap orchestrator)~~ | ~~Zero-downtime Wasm and Native .so processor upgrades~~ **Done (2026-04-11)** — `PipelineControl` + `run_buffered_managed()` |
 | **Medium** | ZD-5 (blue-green runtime), ZD-6 (canary traffic split) | Advanced upgrade strategies for production |
-| **Medium** | ZD-7, ZD-8 (same-type source/sink reconfig) | Connector config changes without pipeline restart |
+| ~~**Medium**~~ | ~~ZD-7, ZD-8 (same-type source/sink reconfig)~~ | ~~Connector config changes without pipeline restart~~ **Done (2026-04-11)** — `drain_and_swap_source()`/`drain_and_swap_sink()` via `Box<dyn Any>` downcast |
 | **Low** | ZD-9 (cross-type via blue-green pipeline), ZD-10 (batch replay), ZD-11 (Wasm state), ZD-12 (file watcher), ZD-13 (child process) | Edge cases, dev experience, full isolation |
 
 ### 7.3 Deployment Environments — What Changes Where
 
 | Environment | Processor Deploy | Source/Sink Config Change | Aeon Binary Upgrade |
 |-------------|-----------------|--------------------------|---------------------|
-| **VM / bare metal** | T2: `aeon deploy` → drain→swap (~1ms). T3/T4: reconnect. T1 .so: `dlclose`/`dlopen`. | Currently: pipeline stop/start. Future: drain→swap (ZD-7/8). | Rolling restart via systemd. Blue-green with LB (manual). |
+| **VM / bare metal** | T2: `aeon deploy` → drain→swap (~1ms). T3/T4: reconnect. T1 .so: `dlclose`/`dlopen`. | Drain→swap via `PipelineControl` (ZD-7/8 done). | Rolling restart via systemd. Blue-green with LB (manual). |
 | **Kubernetes (single)** | Same as VM, via REST API or `aeon deploy` | Same. K8s restarts pod if config changes. | Rolling update via Deployment. |
 | **Kubernetes (cluster)** | Same, but registry is Raft-replicated across nodes | Same. Leader coordinates via Raft. | StatefulSet rolling update (one pod at a time). Raft handles leader re-election. |
 | **AWS ECS** | Same as K8s single-node. Task re-deployment for binary updates. | Same. ECS service update. | ECS rolling deployment or blue-green via ALB. |

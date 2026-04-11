@@ -17,9 +17,9 @@
 > | REST API — `POST /api/v1/processors` (register) | **Implemented + tested** |
 > | REST API — all pipeline lifecycle endpoints | **Implemented + tested** (19 REST tests) |
 > | PipelineManager state machine (upgrade/blue-green/canary) | **Implemented** — state transitions tracked |
-> | Hot-swap orchestrator (drain → swap → resume) | **Implemented** — `PipelineControl` + `run_buffered_managed()`: pause source → drain SPSC rings → swap processor → resume. 2 tests (hot-swap zero-loss, managed no-swap). |
+> | Hot-swap orchestrator (drain → swap → resume) | **Implemented** — `PipelineControl` + `run_buffered_managed()`: pause source → drain SPSC rings → swap processor/source/sink → resume. 4 tests (hot-swap zero-loss, no-swap, source-swap, sink-swap). |
 > | T3/T4 processor replacement | **Working** — reconnect-based; routing table auto-updates on connect/disconnect |
-> | Source/Sink zero-downtime reconfiguration | **Not implemented** — requires pipeline stop/start for connector config changes |
+> | Source/Sink zero-downtime reconfiguration | **Implemented** — `PipelineControl.drain_and_swap_source()`/`drain_and_swap_sink()`: pause → drain SPSC rings → swap via `Box<dyn Any>` downcast → resume. 2 tests (source-swap, sink-swap). |
 > | SHA-512 artifact verification | **Implemented** — `sha2::Sha512` (replaced `DefaultHasher` placeholder) |
 > | Child process isolation tier | **Design only** — not implemented |
 > | File watcher / config hot-reload | **Not implemented** — no `notify` crate; config changes via REST API |
@@ -1340,8 +1340,8 @@ Tracked in `docs/ROADMAP.md` as P10.
 
 | # | Item | Approach | Details |
 |---|------|----------|---------|
-| ZD-7 | Same-type source config change | Drain→swap→resume | New source instance with new config, pause old, swap, resume. Architecturally same as processor hot-swap. `Source::pause()`/`resume()` now available (ZD-4). |
-| ZD-8 | Same-type sink config change | Drain→swap→resume | New sink instance with new config, drain in-flight, swap, resume. Must ensure all pending acks resolve before swap. |
+| ZD-7 | Same-type source config change | Drain→swap→resume | **Done (2026-04-11)** — `PipelineControl.drain_and_swap_source()`: pause source → drain rings → downcast `Box<dyn Any>` to concrete `S` → swap → resume. Test: `managed_pipeline_source_swap`. |
+| ZD-8 | Same-type sink config change | Drain→swap→resume | **Done (2026-04-11)** — `PipelineControl.drain_and_swap_sink()`: pause source → drain rings → downcast `Box<dyn Any>` to concrete `K` → swap in `run_sink_task` → resume. Test: `managed_pipeline_sink_swap`. |
 | ZD-9 | Cross-type connector change | Blue-green pipeline | Different generic types → cannot swap within pipeline. Use `PipelineManager` blue-green: start new pipeline with new connectors, cutover, stop old. Already supported by state machine (ZD-5 must be wired first). |
 
 ### 13.4 Additional Improvements
