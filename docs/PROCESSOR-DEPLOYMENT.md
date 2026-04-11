@@ -1344,14 +1344,15 @@ Tracked in `docs/ROADMAP.md` as P10.
 | ZD-8 | Same-type sink config change | Drain→swap→resume | **Done (2026-04-11)** — `PipelineControl.drain_and_swap_sink()`: pause source → drain rings → downcast `Box<dyn Any>` to concrete `K` → swap in `run_sink_task` → resume. Test: `managed_pipeline_sink_swap`. |
 | ZD-9 | Cross-type connector change | Blue-green pipeline | Different generic types → cannot swap within pipeline. Use `PipelineManager` blue-green: start new pipeline with new connectors, cutover, stop old. Already supported by state machine (ZD-5 must be wired first). |
 
-### 13.4 Additional Improvements
+### 13.4 Additional Improvements (updated 2026-04-11)
 
-| # | Item | Details |
-|---|------|---------|
-| ZD-10 | In-flight batch replay on T3/T4 disconnect | When a T3/T4 session disconnects during upgrade, in-flight batches awaiting responses fail with "session closed". Need: track unanswered batches, replay to new session. |
-| ZD-11 | Wasm state transfer on hot-swap | Per-instance in-memory state (`HostState.state` HashMap) is lost on swap. Option: serialize state before swap, inject into new instance. Low priority — stateless processors preferred. |
-| ~~ZD-12~~ | ~~Config file watcher (`aeon dev`)~~ | **Done (2026-04-11)** — `aeon dev watch --artifact <path>`. `notify` v7 watches parent dir (handles editor delete+recreate). 500ms debounce, loads processor via `WasmModule::from_bytes` or `NativeProcessor::load`, calls `PipelineControl.drain_and_swap()`. TickSource → StdoutSink dev loop. |
-| ZD-13 | Child process isolation tier | Design in Section 2.3 is complete. Implementation: spawn child, IPC via Unix socket or shared memory, two-phase partition transfer. Low priority. |
+| # | Item | Status | Details |
+|---|------|--------|---------|
+| ZD-9 | Cross-type connector swap (e.g. Kafka→NATS) | **Deferred** | Different generic types → cannot swap within pipeline. Requires spawning full blue-green pipeline pair. Blue-green infra (ZD-5) is done; needs pipeline-level (not processor-level) orchestration. |
+| ZD-10 | In-flight batch replay on T3/T4 disconnect | **Deferred** | When a T3/T4 session disconnects during upgrade, in-flight batches awaiting responses fail with "session closed". Need: track unanswered batches, replay to new session. No user demand yet. |
+| ZD-11 | Wasm state transfer on hot-swap | **Deferred** | Per-instance in-memory state (`HostState.state` HashMap) is lost on swap. Option: serialize state before swap, inject into new instance. Low priority — stateless processors preferred. |
+| ~~ZD-12~~ | ~~Config file watcher (`aeon dev`)~~ | **Done (2026-04-11)** | `aeon dev watch --artifact <path>`. `notify` v7 watches parent dir (handles editor delete+recreate). 500ms debounce, loads processor via `WasmModule::from_bytes` or `NativeProcessor::load`, calls `PipelineControl.drain_and_swap()`. TickSource → StdoutSink dev loop. |
+| ZD-13 | Child process isolation tier | **Deferred** | Design in Section 2.3 is complete. Implementation: spawn child, IPC via Unix socket or shared memory, two-phase partition transfer. Low priority — no user demand. |
 
 ### 13.5 TLS Certificate Handling (Verified Correct)
 

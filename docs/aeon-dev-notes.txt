@@ -24576,11 +24576,317 @@ claude's response:
 
 ✻ Brewed for 14m 21s · 1 shell still running
 
+====================
+ analyse code and roadmap and other documents, provide a comprehensive to do list.
+==========================
+claude's response:
 
+Comprehensive To-Do List — Aeon v3
 
+  Tier 1: Locally Actionable (Can Do Now)
 
+  Code — Low Priority / Deferred by Design
+
+  ┌───────┬────────────────────────────────────────────────────────────────┬────────────────────────┬────────────────────────────────────────────┐
+  │  ID   │                              Item                              │         Files          │                   Notes                    │
+  ├───────┼────────────────────────────────────────────────────────────────┼────────────────────────┼────────────────────────────────────────────┤
+  │ ZD-9  │ Cross-type connector swap (Kafka→NATS) via blue-green pipeline │ pipeline.rs            │ Needs blue-green infra (done), just wiring │
+  ├───────┼────────────────────────────────────────────────────────────────┼────────────────────────┼────────────────────────────────────────────┤
+  │ ZD-10 │ In-flight batch replay on T3/T4 disconnect                     │ processor-client       │ Edge case, no user demand yet              │
+  ├───────┼────────────────────────────────────────────────────────────────┼────────────────────────┼────────────────────────────────────────────┤
+  │ ZD-11 │ Wasm state transfer on hot-swap                                │ pipeline.rs, aeon-wasm │ Stateless processors preferred             │
+  ├───────┼────────────────────────────────────────────────────────────────┼────────────────────────┼────────────────────────────────────────────┤
+  │ ZD-13 │ Child process isolation tier (T5)                              │ Design only            │ No implementation started                  │
+  └───────┴────────────────────────────────────────────────────────────────┴────────────────────────┴────────────────────────────────────────────┘
+
+  CI/CD & Publishing
+
+  ┌─────┬──────────────────────────────────────────────────────────────────────────────────────┬──────────────────────────────┐
+  │  #  │                                         Item                                         │            Source            │
+  ├─────┼──────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────┤
+  │ 1   │ Create .github/workflows/release.yml — crates.io publish + Docker build + GH release │ PUBLISHING.md template       │
+  ├─────┼──────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────┤
+  │ 2   │ Create docker/Dockerfile.release — multi-stage, multi-platform                       │ PUBLISHING.md template       │
+  ├─────┼──────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────┤
+  │ 3   │ Wire cargo-deny into CI (advisories, licenses, bans)                                 │ PUBLISHING.md checklist item │
+  ├─────┼──────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────┤
+  │ 4   │ Add CHANGELOG.md (keep-a-changelog format)                                           │ PUBLISHING.md checklist item │
+  └─────┴──────────────────────────────────────────────────────────────────────────────────────┴──────────────────────────────┘
+
+  Tests — Stubs / Ignored
+
+  ┌─────┬────────────────────────────────────────────┬────────────────────────────────────────┐
+  │  #  │                    Item                    │                  File                  │
+  ├─────┼────────────────────────────────────────────┼────────────────────────────────────────┤
+  │ 1   │ D4 stub: Node.js T3 WebTransport E2E       │ e2e_ws_harness.rs — blocked on library │
+  ├─────┼────────────────────────────────────────────┼────────────────────────────────────────┤
+  │ 2   │ D5 stub: Java T3 WebTransport E2E          │ e2e_ws_harness.rs — blocked on library │
+  ├─────┼────────────────────────────────────────────┼────────────────────────────────────────┤
+  │ 3   │ 2 #[ignore] tests in engine (QUIC-related) │ Need real QUIC endpoint                │
+  └─────┴────────────────────────────────────────────┴────────────────────────────────────────┘
+
+  Code TODOs in Source
+
+  ┌─────┬───────────────────────────────┬──────────────────────────────────────────────────┐
+  │  #  │           Location            │                       TODO                       │
+  ├─────┼───────────────────────────────┼──────────────────────────────────────────────────┤
+  │ 1   │ aeon-cluster/src/lib.rs       │ Raft + PoH integration stubs                     │
+  ├─────┼───────────────────────────────┼──────────────────────────────────────────────────┤
+  │ 2   │ aeon-observability/src/lib.rs │ Prometheus/Jaeger/Loki stubs                     │
+  ├─────┼───────────────────────────────┼──────────────────────────────────────────────────┤
+  │ 3   │ aeon-state/src/lib.rs         │ L2 mmap tier not implemented                     │
+  ├─────┼───────────────────────────────┼──────────────────────────────────────────────────┤
+  │ 4   │ pipeline.rs                   │ run_multi_partition — partition-aware scheduling │
+  ├─────┼───────────────────────────────┼──────────────────────────────────────────────────┤
+  │ 5   │ registry.rs                   │ Artifact storage (currently in-memory HashMap)   │
+  ├─────┼───────────────────────────────┼──────────────────────────────────────────────────┤
+  │ 6   │ rest_api.rs                   │ WebSocket live-tail for logs/metrics             │
+  └─────┴───────────────────────────────┴──────────────────────────────────────────────────┘
+
+  ---
+  Tier 2: Blocked on External Factors
+
+  SDK / Language Support
+
+  ┌─────┬─────────────────────────────┬────────────────────────────────────┐
+  │  #  │            Item             │              Blocker               │
+  ├─────┼─────────────────────────────┼────────────────────────────────────┤
+  │ 1   │ Node.js T3 WebTransport SDK │ No stable webtransport npm package │
+  ├─────┼─────────────────────────────┼────────────────────────────────────┤
+  │ 2   │ Java T3 WebTransport SDK    │ No stable Java WebTransport client │
+  ├─────┼─────────────────────────────┼────────────────────────────────────┤
+  │ 3   │ C# T3 WebTransport SDK      │ .NET WebTransport preview only     │
+  ├─────┼─────────────────────────────┼────────────────────────────────────┤
+  │ 4   │ C/C++ T3 WebTransport SDK   │ No mature library                  │
+  ├─────┼─────────────────────────────┼────────────────────────────────────┤
+  │ 5   │ PHP T3 WebTransport SDK     │ No library exists                  │
+  ├─────┼─────────────────────────────┼────────────────────────────────────┤
+  │ 6   │ Swift SDK (all tiers)       │ Demand-driven                      │
+  ├─────┼─────────────────────────────┼────────────────────────────────────┤
+  │ 7   │ Elixir SDK (all tiers)      │ Demand-driven                      │
+  ├─────┼─────────────────────────────┼────────────────────────────────────┤
+  │ 8   │ Ruby SDK (all tiers)        │ Demand-driven                      │
+  ├─────┼─────────────────────────────┼────────────────────────────────────┤
+  │ 9   │ Scala SDK (all tiers)       │ Demand-driven                      │
+  ├─────┼─────────────────────────────┼────────────────────────────────────┤
+  │ 10  │ Haskell SDK (all tiers)     │ Demand-driven                      │
+  └─────┴─────────────────────────────┴────────────────────────────────────┘
+
+  Infrastructure / Cloud
+
+  ┌─────┬────────────────────────────────────────────┬───────────────────────────┐
+  │  #  │                    Item                    │          Blocker          │
+  ├─────┼────────────────────────────────────────────┼───────────────────────────┤
+  │ 1   │ Gate 2 multi-node cluster validation (P4f) │ Needs DOKS 3-node cluster │
+  ├─────┼────────────────────────────────────────────┼───────────────────────────┤
+  │ 2   │ Raft consensus real-network testing        │ Needs multi-node          │
+  ├─────┼────────────────────────────────────────────┼───────────────────────────┤
+  │ 3   │ PoH chain transfer protocol                │ Needs multi-node          │
+  ├─────┼────────────────────────────────────────────┼───────────────────────────┤
+  │ 4   │ Checkpoint replication via Raft            │ Needs multi-node          │
+  ├─────┼────────────────────────────────────────────┼───────────────────────────┤
+  │ 5   │ Cross-node QUIC real-network test          │ Needs multi-node          │
+  ├─────┼────────────────────────────────────────────┼───────────────────────────┤
+  │ 6   │ Partition reassignment on node join/leave  │ Needs multi-node          │
+  └─────┴────────────────────────────────────────────┴───────────────────────────┘
+
+  ---
+  Tier 3: Manual / External Actions (Pre-Publish)
+
+  ┌─────┬───────────────────────────────────────────────────────────────────────┬────────────────────┐
+  │  #  │                                Action                                 │       Where        │
+  ├─────┼───────────────────────────────────────────────────────────────────────┼────────────────────┤
+  │ 1   │ Reserve crate names on crates.io (cargo publish --dry-run for all 13) │ Terminal           │
+  ├─────┼───────────────────────────────────────────────────────────────────────┼────────────────────┤
+  │ 2   │ Create Docker Hub org aeonrust                                        │ hub.docker.com     │
+  ├─────┼───────────────────────────────────────────────────────────────────────┼────────────────────┤
+  │ 3   │ Set GitHub repo secrets (CARGO_REGISTRY_TOKEN, DOCKERHUB_*)           │ GitHub Settings    │
+  ├─────┼───────────────────────────────────────────────────────────────────────┼────────────────────┤
+  │ 4   │ Verify Docker multi-platform build (linux/amd64 + linux/arm64)        │ CI or local buildx │
+  ├─────┼───────────────────────────────────────────────────────────────────────┼────────────────────┤
+  │ 5   │ Publish crates in dependency order per PUBLISHING.md                  │ Terminal           │
+  └─────┴───────────────────────────────────────────────────────────────────────┴────────────────────┘
+
+  ---
+  Summary
+
+  ┌───────────────────────────────────────────────────────┬────────────────────────────────┬───────────────────┐
+  │                       Category                        │             Count              │      Status       │
+  ├───────────────────────────────────────────────────────┼────────────────────────────────┼───────────────────┤
+  │ Gate 1 core (pipeline, connectors, processors)        │ All                            │ Done              │
+  ├───────────────────────────────────────────────────────┼────────────────────────────────┼───────────────────┤
+  │ Zero-downtime (drain-swap, blue-green, canary, watch) │ 8/13                           │ Done (5 deferred) │
+  ├───────────────────────────────────────────────────────┼────────────────────────────────┼───────────────────┤
+  │ E2E tests passing                                     │ 263 engine + 18 REST + harness │ Done              │
+  ├───────────────────────────────────────────────────────┼────────────────────────────────┼───────────────────┤
+  │ T3 WebTransport SDKs (Python, Go, Rust)               │ 3/8                            │ Done (5 blocked)  │
+  ├───────────────────────────────────────────────────────┼────────────────────────────────┼───────────────────┤
+  │ T4 WebSocket SDKs (Python, Go, Rust, C#, PHP)         │ 5/5                            │ Done              │
+  ├───────────────────────────────────────────────────────┼────────────────────────────────┼───────────────────┤
+  │ T1/T2 processor tiers (Native .so, Wasm)              │ 2/2                            │ Done              │
+  ├───────────────────────────────────────────────────────┼────────────────────────────────┼───────────────────┤
+  │ Pre-publish metadata (all 13 crates)                  │ 13/13                          │ Done              │
+  ├───────────────────────────────────────────────────────┼────────────────────────────────┼───────────────────┤
+  │ CI/CD release pipeline                                │ 0/4                            │ Not started       │
+  ├───────────────────────────────────────────────────────┼────────────────────────────────┼───────────────────┤
+  │ Multi-node / Gate 2                                   │ 0/6                            │ Blocked on infra  │
+  └───────────────────────────────────────────────────────┴────────────────────────────────┴───────────────────┘
+
+  Everything critical for a single-node v0.1.0 publish is complete. The remaining locally-actionable work is either low-priority deferred items or CI/CD
+  scaffolding for the actual publish workflow.
+
+✻ Baked for 4m 59s · 1 shell still running
+
+========================
+ added this to roadmap and related documents? I will do one more commit after local git commit.
+
+========================
+claude's response:
+
+● All four documents are updated:
+
+  1. ROADMAP.md — Added new "Comprehensive To-Do List (2026-04-11 Audit)" section with 3 tiers (locally actionable, blocked on external, manual/external),
+  summary counts table, and a "Latest updates (session 4)" entry. Consolidated the "Outstanding Work" section to reference the new to-do list.
+  2. PROCESSOR-DEPLOYMENT.md §13.4 — Added Status column to the remaining items table, explicitly marking ZD-9/10/11/13 as Deferred with reasons.
+  3. MULTI-NODE-AND-DEPLOYMENT-STRATEGY.md §7 — Updated heading date, annotated the low-priority row with "All deferred — edge cases, no user demand."
+  4. E2E-TEST-PLAN.md — Already accurate, no changes needed.
+
+  Ready for your commit.
+
+✻ Brewed for 3m 35s · 1 shell still running
+
+=========================
+continue
+===========================
+claude's response:
+Committed as 7648b83. Three docs updated:
+
+  - ROADMAP.md — New "Comprehensive To-Do List (2026-04-11 Audit)" section + consolidated Outstanding Work + session 4 log entry
+  - PROCESSOR-DEPLOYMENT.md — §13.4 table with explicit Deferred status column
+  - MULTI-NODE-AND-DEPLOYMENT-STRATEGY.md — §7 annotations for deferred items
+
+===============================
+
+ can we do a quick load test?
 ============================
+claude's response:
 
+All green:
+
+  Sustained Load (30s)
+  - Direct pipeline: 1,603,231 events/sec — 48M events, zero loss
+  - Buffered pipeline (SPSC): 848,863 events/sec — 25.7M events, zero loss
+  - Every counter matches: generated = received = processed = sent = sunk
+
+  Backpressure (5 tests)
+  - All 5 passed in 0.33s — slow sink, very slow sink, bursty source, graceful shutdown all verified zero loss
+
+  Pipeline is solid. Want me to also run the blackhole ceiling benchmark or the chaos/fault-injection tests?
+
+✻ Churned for 2m 50s · 1 shell still running
+
+=================================
+try blackhole ceiling benchmark. then chaos/fault-injection test afterwards
+
+=====================================
+claude's response:
+
+ All results:
+
+  Blackhole Ceiling Benchmark (optimized release build)
+
+  ┌─────────────────────────┬───────────────────┐
+  │         Config          │    Throughput     │
+  ├─────────────────────────┼───────────────────┤
+  │ 10K events, batch 64    │ 3.49 M events/sec │
+  ├─────────────────────────┼───────────────────┤
+  │ 10K events, batch 256   │ 3.50 M events/sec │
+  ├─────────────────────────┼───────────────────┤
+  │ 10K events, batch 1024  │ 3.33 M events/sec │
+  ├─────────────────────────┼───────────────────┤
+  │ 100K events, batch 64   │ 3.56 M events/sec │
+  ├─────────────────────────┼───────────────────┤
+  │ 100K events, batch 256  │ 3.55 M events/sec │
+  ├─────────────────────────┼───────────────────┤
+  │ 100K events, batch 1024 │ 3.40 M events/sec │
+  ├─────────────────────────┼───────────────────┤
+  │ 1M events, batch 64     │ 3.52 M events/sec │
+  ├─────────────────────────┼───────────────────┤
+  │ 1M events, batch 256    │ 3.49 M events/sec │
+  ├─────────────────────────┼───────────────────┤
+  │ 1M events, batch 1024   │ 3.50 M events/sec │
+  └─────────────────────────┴───────────────────┘
+
+  Per-event overhead (100K events, passthrough):
+  - 64B payload: 3.49 M/s (~286ns/event)
+  - 256B payload: 3.35 M/s (~299ns/event)
+  - 1024B payload: 3.37 M/s (~297ns/event)
+
+  Consistent ~3.4–3.5M events/sec ceiling across all configurations. Payload size barely affects throughput (zero-copy Bytes working as designed).
+
+  Chaos / Fault-Injection Tests — 6/6 passed in 0.08s
+  - Source connection errors, fatal errors, processor errors, sink errors all propagate correctly
+  - Metrics remain consistent on normal path
+  - Shutdown signal cleanly stops pipeline under load
+
+✻ Cogitated for 7m 13s · 1 shell still running
+
+=====================
+save the stats
+=======================
+claude's response:
+
+==============================================
+Load Test Results — 2026-04-11 Session 4
+==============================================
+
+** Sustained Load Test (30s, debug build, no external infra) **
+
+  Direct pipeline:   1,603,231 events/sec — 48,098,304 events, ZERO loss
+  Buffered pipeline:   848,863 events/sec — 25,691,136 events, ZERO loss
+  All counters match: generated = received = processed = sent = sunk
+
+** Backpressure Tests — 5/5 passed (0.33s) **
+
+  - direct_pipeline_slow_sink_no_loss
+  - buffered_pipeline_slow_sink_no_loss
+  - buffered_pipeline_very_slow_sink_no_loss (4-slot buffer)
+  - buffered_pipeline_bursty_source_slow_sink (1024 events burst)
+  - direct_pipeline_shutdown_during_slow_sink
+
+** Blackhole Ceiling Benchmark (release build, Criterion) **
+
+  10K events:  batch 64 → 3.49M/s  |  batch 256 → 3.50M/s  |  batch 1024 → 3.33M/s
+  100K events: batch 64 → 3.56M/s  |  batch 256 → 3.55M/s  |  batch 1024 → 3.40M/s
+  1M events:   batch 64 → 3.52M/s  |  batch 256 → 3.49M/s  |  batch 1024 → 3.50M/s
+
+  Per-event overhead (100K events, passthrough):
+  - 64B payload:   3.49 M/s (~286ns/event)
+  - 256B payload:  3.35 M/s (~299ns/event)
+  - 1024B payload: 3.37 M/s (~297ns/event)
+
+  Ceiling: ~3.4-3.5M events/sec consistent across all configs.
+  Payload size barely affects throughput -- zero-copy Bytes working as designed.
+
+** Chaos / Fault-Injection Tests — 6/6 passed (0.08s) **
+
+  - chaos_source_connection_error_propagates
+  - chaos_source_fatal_error_propagates
+  - chaos_processor_error_propagates
+  - chaos_sink_error_propagates
+  - chaos_metrics_consistency_normal_path
+  - chaos_shutdown_signal_stops_pipeline
+
+** Summary **
+
+  All tests green. Pipeline handles:
+  - 3.5M events/sec ceiling (release, in-memory)
+  - 1.6M events/sec sustained 30s (debug, direct pipeline)
+  - Zero event loss under backpressure (slow sink, bursty source)
+  - Correct error propagation for all fault types
+  - Clean shutdown under load
+
+=====================
 
 
 
