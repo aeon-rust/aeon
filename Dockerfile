@@ -7,7 +7,7 @@
 # Usage:
 #   docker build -t aeonrust/aeon:latest .
 #   docker build -t aeonrust/aeon:latest --build-arg PROFILE=release .
-#   docker run aeonrust/aeon:latest aeon --version
+#   docker run aeonrust/aeon:latest --version
 #
 # Multi-stage:
 #   1. rust-builder: compiles `aeon` CLI binary
@@ -124,12 +124,12 @@ RUN mkdir -p /app/data /app/artifacts /app/processors && \
     chown -R aeon:aeon /app
 
 # Expose ports:
-#   4460 — QUIC (Raft cluster + processor transport) [UDP]
-#   4461 — REST API + WebSocket processor host [TCP]
-#   4462 — Prometheus metrics [TCP]
-EXPOSE 4460/udp
-EXPOSE 4461/tcp
-EXPOSE 4462/tcp
+#   4470 — QUIC (Raft cluster + processor transport) [UDP]
+#   4471 — REST API + WebSocket processor host [TCP]
+#   4472 — Prometheus metrics [TCP]
+EXPOSE 4470/udp
+EXPOSE 4471/tcp
+EXPOSE 4472/tcp
 
 USER aeon
 
@@ -138,4 +138,4 @@ HEALTHCHECK --interval=15s --timeout=3s --start-period=5s --retries=3 \
     CMD ["/usr/local/bin/aeon", "--version"]
 
 ENTRYPOINT ["aeon"]
-CMD ["--help"]
+CMD ["serve"]

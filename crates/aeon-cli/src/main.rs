@@ -135,6 +135,16 @@ enum Commands {
         #[command(subcommand)]
         action: TlsAction,
     },
+    /// Start the Aeon server (REST API + pipeline engine)
+    #[cfg(feature = "rest-api")]
+    Serve {
+        /// REST API listen address
+        #[arg(long, default_value = "0.0.0.0:4471")]
+        addr: String,
+        /// Artifact storage directory
+        #[arg(long, default_value = "/app/artifacts")]
+        artifact_dir: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -324,12 +334,57 @@ fn main() -> Result<()> {
         Some(Commands::Diff { file, api }) => cmd_diff(&file, &api),
         Some(Commands::Dev { action }) => cmd_dev(&action),
         Some(Commands::Tls { action }) => cmd_tls(&action),
+        #[cfg(feature = "rest-api")]
+        Some(Commands::Serve { addr, artifact_dir }) => cmd_serve(&addr, &artifact_dir),
         None => {
             println!("Aeon v{}", env!("CARGO_PKG_VERSION"));
             println!("Run `aeon --help` for available commands.");
             Ok(())
         }
     }
+}
+
+// ── Server ────────────────────────────────────────────────────────────
+
+#[cfg(feature = "rest-api")]
+fn cmd_serve(addr: &str, artifact_dir: &str) -> Result<()> {
+    use std::sync::Arc;
+
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to build tokio runtime")?;
+
+    rt.block_on(async {
+        // Resolve artifact directory from env or CLI flag
+        let dir = std::env::var("AEON_ARTIFACT_DIR").unwrap_or_else(|_| artifact_dir.to_string());
+        let registry = aeon_engine::registry::ProcessorRegistry::new(&dir)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let pipelines = aeon_engine::pipeline_manager::PipelineManager::new();
+        let identities = aeon_engine::identity_store::ProcessorIdentityStore::new();
+
+        let state = Arc::new(aeon_engine::AppState {
+            registry: Arc::new(registry),
+            pipelines: Arc::new(pipelines),
+            delivery_ledgers: dashmap::DashMap::new(),
+            identities: Arc::new(identities),
+            authenticator: None,
+            ws_host: None,
+        });
+
+        let listen_addr =
+            std::env::var("AEON_API_ADDR").unwrap_or_else(|_| addr.to_string());
+        aeon_engine::serve(state, &listen_addr)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    })
 }
 
 // ── Input validation ──────────────────────────────────────────────────
