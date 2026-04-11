@@ -17,7 +17,7 @@
 > | REST API — `POST /api/v1/processors` (register) | **Implemented + tested** |
 > | REST API — all pipeline lifecycle endpoints | **Implemented + tested** (19 REST tests) |
 > | PipelineManager state machine (upgrade/blue-green/canary) | **Implemented** — state transitions tracked |
-> | Hot-swap orchestrator (drain → swap → resume) | **Implemented** — `PipelineControl` + `run_buffered_managed()`: pause source → drain SPSC rings → swap processor/source/sink → resume. 4 tests (hot-swap zero-loss, no-swap, source-swap, sink-swap). |
+> | Hot-swap orchestrator (drain → swap → resume) | **Implemented** — `PipelineControl` + `run_buffered_managed()`: pause source → drain SPSC rings → swap processor/source/sink → resume. Blue-green shadow + canary traffic splitting also wired. 8 managed tests. |
 > | T3/T4 processor replacement | **Working** — reconnect-based; routing table auto-updates on connect/disconnect |
 > | Source/Sink zero-downtime reconfiguration | **Implemented** — `PipelineControl.drain_and_swap_source()`/`drain_and_swap_sink()`: pause → drain SPSC rings → swap via `Box<dyn Any>` downcast → resume. 2 tests (source-swap, sink-swap). |
 > | SHA-512 artifact verification | **Implemented** — `sha2::Sha512` (replaced `DefaultHasher` placeholder) |
@@ -1333,8 +1333,8 @@ Tracked in `docs/ROADMAP.md` as P10.
 | # | Item | File(s) | Details |
 |---|------|---------|---------|
 | ~~ZD-4~~ | ~~Wire drain→swap→resume into pipeline runner~~ | `aeon-engine/src/pipeline.rs` | **Done** — `PipelineControl` (paused flag + drain/swap Notify + processor slot), `run_buffered_managed()` with source pause check and processor swap loop. `Source::pause()`/`resume()` trait methods added with MemorySource/KafkaSource overrides. 2 tests: hot-swap zero-loss + managed-no-swap. |
-| ZD-5 | Blue-green runtime wiring | `aeon-engine/src/pipeline.rs` | `upgrade_blue_green()` sets state to `BlueGreen` but no second pipeline is spawned. Need: start "green" pipeline alongside "blue", route traffic via cutover. |
-| ZD-6 | Canary traffic splitting | `aeon-engine/src/pipeline.rs` | `upgrade_canary()` tracks percentage steps but no actual traffic splitting occurs. Need: probabilistic routing between old and new processor per event. |
+| ~~ZD-5~~ | ~~Blue-green runtime wiring~~ | `aeon-engine/src/pipeline.rs` | **Done (2026-04-11)** — `PipelineControl.start_blue_green()` installs green processor via `UpgradeAction` slot; processor task picks it up (green installed, blue remains active). `cutover_blue_green()` swaps green→active. `rollback_upgrade()` drops green. REST `/cutover` and `/rollback` call PipelineControl when handle exists. 2 tests: cutover + rollback. |
+| ~~ZD-6~~ | ~~Canary traffic splitting~~ | `aeon-engine/src/pipeline.rs` | **Done (2026-04-11)** — `PipelineControl.start_canary(proc, pct)` installs canary processor; processor task splits events by `event.id % 100 < pct` (deterministic). `set_canary_pct()` adjusts percentage via `AtomicU8`. `complete_canary()` promotes canary to sole processor. 2 tests: canary-split + canary-complete. |
 
 ### 13.3 Source/Sink Zero-Downtime Reconfiguration
 

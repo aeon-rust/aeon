@@ -986,7 +986,7 @@ placeholders). Test counts updated to reflect current state.
 9. **P9 — User-facing documentation** (nice-to-have):
    - Getting-started processor dev guide, multi-node ops guide,
      performance tuning guide, troubleshooting guide.
-10. **P10 — Zero-downtime deployment & management** (Phase A+B+C done, Phase D pending):
+10. **P10 — Zero-downtime deployment & management** (Phase A+B+C+D done, Phase E deferred):
     Full to-do list: `docs/PROCESSOR-DEPLOYMENT.md` §13, referenced from
     `docs/MULTI-NODE-AND-DEPLOYMENT-STRATEGY.md` §7.
 
@@ -1009,10 +1009,16 @@ placeholders). Test counts updated to reflect current state.
       Source task checks swap slot when paused; sink task checks in idle path. 2 tests: source-swap, sink-swap.
       Total managed pipeline tests: 4 (hot-swap, no-swap, source-swap, sink-swap). 259 engine tests pass.
 
-    **Phase D — Advanced strategies (not started, medium priority):**
-    - ZD-5: Blue-green pipeline runtime wiring
-    - ZD-6: Canary traffic splitting
-    - ZD-9: Cross-type connector swap via blue-green pipeline
+    **Phase D — Advanced strategies ✅ (2026-04-11):**
+    - ZD-5: Blue-green — `UpgradeAction` enum with `StartBlueGreen`/`CutoverBlueGreen`/`Rollback`.
+      Green processor installed live (no pause), processor task picks up via `try_lock` on action slot.
+      Cutover swaps green→active; rollback drops green. REST `/cutover`+`/rollback` call PipelineControl.
+    - ZD-6: Canary — `StartCanary(proc, pct)` + `SetCanaryPct` + `CompleteCanary`. Events split
+      deterministically by `event.id % 100 < canary_pct` (AtomicU8 for lock-free hot-path reads).
+      Both processor outputs go to sink. Complete promotes canary to sole active processor.
+    - ZD-9: Cross-type connector swap deferred (needs full separate pipeline spawn, not same-pipeline swap).
+    - 4 new tests: blue-green-cutover, blue-green-rollback, canary-split, canary-complete.
+      Total managed pipeline tests: 8. 263 engine tests pass.
 
     **Phase E — Deferred (low priority):**
     - ZD-10 through ZD-13: batch replay, Wasm state, file watcher, child process tier

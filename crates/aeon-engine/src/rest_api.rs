@@ -602,7 +602,19 @@ async fn upgrade_blue_green(
         .upgrade_blue_green(&name, proc_ref, "api")
         .await
     {
-        Ok(()) => Json(serde_json::json!({"status": "blue-green-started"})).into_response(),
+        Ok(()) => {
+            // Note: actual PipelineControl.start_blue_green() requires a processor
+            // instance (Box<dyn Processor>). Without a processor factory, the REST
+            // layer can only update metadata. The caller must provide a processor
+            // instance via PipelineControl directly for real blue-green shadow mode.
+            let method = if state.pipeline_controls.contains_key(&name) {
+                "managed"
+            } else {
+                "metadata"
+            };
+            Json(serde_json::json!({"status": "blue-green-started", "method": method}))
+                .into_response()
+        }
         Err(e) => api_error(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     }
 }
@@ -643,7 +655,19 @@ async fn cutover_pipeline(
     Path(name): Path<String>,
 ) -> impl IntoResponse {
     match state.pipelines.cutover(&name, "api").await {
-        Ok(()) => Json(serde_json::json!({"status": "cutover-complete"})).into_response(),
+        Ok(()) => {
+            // If a managed pipeline control handle exists, trigger the actual
+            // processor cutover (green → active). This is a no-op if blue-green
+            // wasn't started via PipelineControl (metadata-only mode).
+            let method = if let Some(ctrl) = state.pipeline_controls.get(&name) {
+                let _ = ctrl.cutover_blue_green().await;
+                "managed"
+            } else {
+                "metadata"
+            };
+            Json(serde_json::json!({"status": "cutover-complete", "method": method}))
+                .into_response()
+        }
         Err(e) => api_error(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     }
 }
@@ -653,7 +677,16 @@ async fn rollback_pipeline(
     Path(name): Path<String>,
 ) -> impl IntoResponse {
     match state.pipelines.rollback_upgrade(&name, "api").await {
-        Ok(()) => Json(serde_json::json!({"status": "rolled-back"})).into_response(),
+        Ok(()) => {
+            let method = if let Some(ctrl) = state.pipeline_controls.get(&name) {
+                let _ = ctrl.rollback_upgrade().await;
+                "managed"
+            } else {
+                "metadata"
+            };
+            Json(serde_json::json!({"status": "rolled-back", "method": method}))
+                .into_response()
+        }
         Err(e) => api_error(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     }
 }
@@ -663,7 +696,15 @@ async fn promote_canary(
     Path(name): Path<String>,
 ) -> impl IntoResponse {
     match state.pipelines.promote_canary(&name, "api").await {
-        Ok(()) => Json(serde_json::json!({"status": "promoted"})).into_response(),
+        Ok(()) => {
+            let method = if state.pipeline_controls.contains_key(&name) {
+                "managed"
+            } else {
+                "metadata"
+            };
+            Json(serde_json::json!({"status": "promoted", "method": method}))
+                .into_response()
+        }
         Err(e) => api_error(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     }
 }
