@@ -557,16 +557,65 @@ async fn a4_c_native_t1_memory_roundtrip() {
 // ===========================================================================
 
 #[tokio::test]
-#[ignore = "requires compiled C .wasm (via wasi-sdk or emscripten)"]
 async fn a5_c_wasm_t2_memory_roundtrip() {
     // T2 Wasm C/C++ processor compiled to .wasm via wasi-sdk.
-    // Build: cd sdks/c && make wasm
-    //
-    // When available, this test will:
-    // 1. Load .wasm via WasmModule::from_bytes()
-    // 2. Run Memory -> WasmProcessor -> Memory pipeline
-    // 3. Verify all 5 E2E criteria
-    todo!("Implement after C Wasm SDK compilation is set up");
+    // Build: wasi-sdk clang --target=wasm32-unknown-unknown -nostdlib ...
+    // Source: sdks/c/src/passthrough_wasm.c
+    use aeon_wasm::{WasmConfig, WasmModule, WasmProcessor};
+
+    let wasm_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("sdks")
+        .join("c")
+        .join("build")
+        .join("passthrough_wasm.wasm");
+
+    if !wasm_path.exists() {
+        eprintln!(
+            "SKIP A5: C Wasm module not found at {}. Build with wasi-sdk.",
+            wasm_path.display()
+        );
+        return;
+    }
+
+    let wasm_bytes = std::fs::read(&wasm_path).expect("read .wasm file");
+    let module = WasmModule::from_bytes(&wasm_bytes, WasmConfig::default())
+        .expect("WasmModule from C .wasm");
+    let processor = WasmProcessor::new(Arc::new(module)).expect("WasmProcessor creation failed");
+
+    let events = make_test_events(EVENT_COUNT);
+    let events_clone = events.clone();
+
+    let mut source = MemorySource::new(events, 64);
+    let mut sink = MemorySink::new();
+    let metrics = PipelineMetrics::new();
+    let shutdown = std::sync::atomic::AtomicBool::new(false);
+
+    run(&mut source, &processor, &mut sink, &metrics, &shutdown)
+        .await
+        .unwrap();
+
+    // Verify all 5 criteria
+    let outputs = sink.outputs();
+    assert_eq!(outputs.len(), EVENT_COUNT, "A5 C1: zero event loss");
+
+    for (i, (event, output)) in events_clone.iter().zip(outputs.iter()).enumerate() {
+        assert_eq!(
+            output.payload.as_ref(),
+            event.payload.as_ref(),
+            "A5 C2: payload mismatch at {i}",
+        );
+        assert_eq!(
+            output.source_event_id,
+            Some(event.id),
+            "A5 C3: event identity not propagated at {i}",
+        );
+    }
+
+    verify_metrics(&metrics, EVENT_COUNT as u64);
 }
 
 // ===========================================================================
@@ -1049,22 +1098,25 @@ async fn a10_rust_network_ws_t4_memory_roundtrip() {
 
 #[tokio::test]
 async fn a11_nodejs_ws_t4_memory_roundtrip() {
-    // T4 WebSocket Node.js processor (inline script using built-in WebSocket API).
-    // Requires: Node.js 22+ (built-in WebSocket API) + @noble/ed25519.
+    // T4 WebSocket Node.js processor using the SDK's run() directly.
+    // Requires: Node.js 18+ with `npm install` run in sdks/nodejs/.
     if !e2e_ws_harness::runtime_available("node") {
         eprintln!("SKIP A11: node not found");
         return;
     }
 
-    // Check Node version >= 22 (built-in WebSocket) and @noble/ed25519
-    let version_check = std::process::Command::new("node")
-        .args([
-            "-e",
-            "const v=parseInt(process.versions.node);if(v<22){process.exit(1)}",
-        ])
-        .output();
-    if version_check.map(|o| !o.status.success()).unwrap_or(true) {
-        eprintln!("SKIP A11: Node.js 22+ required for built-in WebSocket");
+    // Check that the SDK's node_modules exist (npm install has been run)
+    let sdk_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("sdks")
+        .join("nodejs");
+    if !sdk_path.join("node_modules").exists() {
+        eprintln!(
+            "SKIP A11: sdks/nodejs/node_modules not found — run `npm install` in sdks/nodejs/"
+        );
         return;
     }
 
@@ -1074,148 +1126,14 @@ async fn a11_nodejs_ws_t4_memory_roundtrip() {
     let seed_file = e2e_ws_harness::write_seed_file(&identity);
 
     let port = server.port;
-    let seed_path = seed_file.to_string_lossy().to_string().replace('\\', "/");
-    let pub_key = identity.public_key.clone();
+    let seed_path = seed_file.to_string_lossy().to_string();
 
-    // Inline Node.js passthrough processor — uses built-in WebSocket + crypto
-    let script = format!(
-        r#"
-const fs = require('fs');
-const crypto = require('crypto');
-const zlib = require('zlib');
-
-const seed = fs.readFileSync('{seed_path}');
-// Generate ed25519 keypair from seed
-const privKey = crypto.createPrivateKey({{
-    key: Buffer.concat([
-        Buffer.from('302e020100300506032b657004220420', 'hex'), // DER prefix for ed25519 seed
-        seed
-    ]),
-    format: 'der',
-    type: 'pkcs8'
-}});
-
-function signBytes(data) {{
-    return crypto.sign(null, Buffer.from(data), privKey);
-}}
-
-const ws = new WebSocket(`ws://127.0.0.1:{port}/api/v1/processors/connect`);
-ws.binaryType = 'arraybuffer';
-
-ws.onopen = () => {{}};
-
-let handshakeState = 0; // 0=waiting_challenge, 1=waiting_accepted, 2=active
-let batchSigning = true;
-let codecName = 'json';
-
-ws.onmessage = (evt) => {{
-    if (typeof evt.data === 'string') {{
-        const msg = JSON.parse(evt.data);
-        if (handshakeState === 0 && msg.type === 'challenge') {{
-            // Sign hex-decoded nonce bytes
-            const nonceBytes = Buffer.from(msg.nonce, 'hex');
-            const sig = signBytes(nonceBytes);
-            const register = {{
-                type: 'register',
-                protocol: 'awpp/1',
-                transport: 'websocket',
-                name: 'nodejs-proc',
-                version: '1.0.0',
-                public_key: '{pub_key}',
-                challenge_signature: sig.toString('hex'),
-                capabilities: ['batch'],
-                transport_codec: 'json',
-                requested_pipelines: ['{pipeline_name}'],
-                binding: 'dedicated',
-            }};
-            ws.send(JSON.stringify(register));
-            handshakeState = 1;
-        }} else if (handshakeState === 1 && msg.type === 'accepted') {{
-            batchSigning = msg.batch_signing !== false;
-            codecName = msg.transport_codec || 'json';
-            handshakeState = 2;
-        }} else if (msg.type === 'drain') {{
-            ws.close();
-        }}
-    }} else {{
-        // Binary data frame
-        const buf = Buffer.from(evt.data);
-        const nameLen = buf.readUInt32LE(0);
-        const pipeline = buf.toString('utf8', 4, 4 + nameLen);
-        const partition = buf.readUInt16LE(4 + nameLen);
-        const batchData = buf.subarray(4 + nameLen + 2);
-
-        // Parse batch request
-        const crcOffset = batchData.length - 4;
-        const batchId = batchData.readBigUInt64LE(0);
-        const eventCount = batchData.readUInt32LE(8);
-
-        let offset = 12;
-        const events = [];
-        for (let i = 0; i < eventCount; i++) {{
-            const elen = batchData.readUInt32LE(offset);
-            offset += 4;
-            const evJson = JSON.parse(batchData.toString('utf8', offset, offset + elen));
-            offset += elen;
-            events.push(evJson);
-        }}
-
-        // Build response (passthrough)
-        const parts = [];
-        const bidBuf = Buffer.alloc(8);
-        bidBuf.writeBigUInt64LE(batchId);
-        parts.push(bidBuf);
-        const cntBuf = Buffer.alloc(4);
-        cntBuf.writeUInt32LE(events.length);
-        parts.push(cntBuf);
-
-        for (const ev of events) {{
-            const ocBuf = Buffer.alloc(4);
-            ocBuf.writeUInt32LE(1);
-            parts.push(ocBuf);
-
-            let payload = ev.payload || '';
-            if (typeof payload === 'string') {{
-                payload = Buffer.from(payload, 'base64').toString('base64');
-            }}
-            const out = JSON.stringify({{destination:'output',payload:payload,headers:[]}});
-            const outBuf = Buffer.from(out);
-            const olBuf = Buffer.alloc(4);
-            olBuf.writeUInt32LE(outBuf.length);
-            parts.push(olBuf);
-            parts.push(outBuf);
-        }}
-
-        const body = Buffer.concat(parts);
-        const crc = require('buffer').Buffer.alloc(4);
-        // CRC32 using zlib
-        const crcVal = zlib.crc32(body);
-        crc.writeUInt32LE(crcVal >>> 0);
-        const bodyWithCrc = Buffer.concat([body, crc]);
-
-        let sigBytes;
-        if (batchSigning) {{
-            sigBytes = signBytes(bodyWithCrc);
-        }} else {{
-            sigBytes = Buffer.alloc(64);
-        }}
-
-        const responseWire = Buffer.concat([bodyWithCrc, sigBytes]);
-
-        // Wrap in data frame
-        const nameBytes = Buffer.from(pipeline);
-        const header = Buffer.alloc(4 + nameBytes.length + 2);
-        header.writeUInt32LE(nameBytes.length, 0);
-        nameBytes.copy(header, 4);
-        header.writeUInt16LE(partition, 4 + nameBytes.length);
-        const frame = Buffer.concat([header, responseWire]);
-        ws.send(frame);
-    }}
-}};
-
-ws.onerror = (e) => {{ console.error('WS error:', e.message); process.exit(1); }};
-ws.onclose = () => {{ process.exit(0); }};
-"#
+    let script = e2e_ws_harness::nodejs_passthrough_script(
+        port,
+        &seed_path,
+        &identity.public_key,
+        pipeline_name,
+        "nodejs-proc",
     );
 
     let script_path = std::env::temp_dir().join("aeon_e2e_a11_nodejs.js");
@@ -1275,7 +1193,7 @@ async fn a12_java_ws_t4_memory_roundtrip() {
         eprintln!("SKIP A12: java not found");
         return;
     }
-    // Check Java 15+ for EdDSA
+    // Check Java 17+ (SDK uses records [Java 16+], EdDSA [Java 15+], switch arrows [Java 14+])
     let java_ver = std::process::Command::new("java")
         .args(["--version"])
         .output();
@@ -1287,12 +1205,12 @@ async fn a12_java_ws_t4_memory_roundtrip() {
                 .nth(1)
                 .and_then(|v| v.split('.').next())
                 .and_then(|v| v.parse::<u32>().ok())
-                .map(|v| v >= 15)
+                .map(|v| v >= 17)
                 .unwrap_or(false)
         })
         .unwrap_or(false);
     if !is_modern {
-        eprintln!("SKIP A12: Java 15+ required for EdDSA support");
+        eprintln!("SKIP A12: Java 17+ required for SDK (records, EdDSA)");
         return;
     }
 
@@ -1311,18 +1229,8 @@ async fn a12_java_ws_t4_memory_roundtrip() {
         pipeline_name,
         "java-proc",
     );
-    let java_src = java_dir.join("AeonProcessor.java");
-
-    // Compile
-    let compile = std::process::Command::new("javac")
-        .arg(&java_src)
-        .output()
-        .expect("javac");
-    if !compile.status.success() {
-        eprintln!(
-            "SKIP A12: javac failed: {}",
-            String::from_utf8_lossy(&compile.stderr)
-        );
+    if let Err(stderr) = e2e_ws_harness::compile_java_with_sdk("javac", &java_dir) {
+        eprintln!("SKIP A12: javac failed: {stderr}");
         let _ = std::fs::remove_dir_all(&java_dir);
         return;
     }
@@ -1339,9 +1247,19 @@ async fn a12_java_ws_t4_memory_roundtrip() {
     assert!(connected, "A12: Java processor failed to connect");
 
     let events = make_test_events(msg_count);
-    let outputs = e2e_ws_harness::drive_events_through_transport(&server.ws_host, events, 64)
-        .await
-        .unwrap();
+    let result = e2e_ws_harness::drive_events_through_transport(&server.ws_host, events, 64).await;
+
+    if result.is_err() {
+        let _ = child.kill();
+        let output = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        panic!(
+            "A12: drive_events failed: {}\nJava stdout: {stdout}\nJava stderr: {stderr}",
+            result.unwrap_err()
+        );
+    }
+    let outputs = result.unwrap();
 
     assert_eq!(outputs.len(), msg_count, "A12 C1: event count mismatch");
     for (i, output) in outputs.iter().enumerate() {

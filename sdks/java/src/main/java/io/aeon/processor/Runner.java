@@ -59,6 +59,10 @@ public final class Runner {
         var sessionEstablished = new AtomicBoolean(false);
         var wsRef = new AtomicReference<WebSocket>();
         var textBuffer = new StringBuilder();
+        // Accumulation buffer for fragmented binary messages (Java's onBinary
+        // can deliver a single WebSocket message across multiple calls with
+        // last=false until the final fragment arrives with last=true).
+        var binaryAccum = ByteBuffer.allocate(4 * 1024 * 1024);
 
         var listener = new WebSocket.Listener() {
 
@@ -96,6 +100,10 @@ public final class Runner {
                             startHeartbeat(webSocket, heartbeatInterval.get(), closeLatch);
                         }
                         case "heartbeat" -> { /* Server heartbeat — acknowledged implicitly */ }
+                        case "drain" -> {
+                            System.out.println("[AEON] Drain received, closing connection");
+                            closeLatch.countDown();
+                        }
                         case "error" -> {
                             System.err.println("[AEON] Error from server: " + json.get("message"));
                             closeLatch.countDown();
@@ -111,11 +119,20 @@ public final class Runner {
 
             @Override
             public CompletionStage<?> onBinary(WebSocket webSocket, ByteBuffer data, boolean last) {
-                webSocket.request(1);
-
                 try {
-                    byte[] frameBytes = new byte[data.remaining()];
-                    data.get(frameBytes);
+                    // Accumulate fragments — Java's WebSocket can deliver a
+                    // single message across multiple onBinary calls.
+                    binaryAccum.put(data);
+                    if (!last) {
+                        webSocket.request(1);
+                        return CompletableFuture.completedFuture(null);
+                    }
+                    binaryAccum.flip();
+                    byte[] frameBytes = new byte[binaryAccum.remaining()];
+                    binaryAccum.get(frameBytes);
+                    binaryAccum.clear();
+
+                    webSocket.request(1);
 
                     // Parse data frame (routing header)
                     var frame = Wire.parseDataFrame(frameBytes);

@@ -43,7 +43,7 @@ public final class Codec {
         long timestamp = toLong(map.get("timestamp"));
         String source = (String) map.get("source");
         int partition = (int) toLong(map.get("partition"));
-        byte[] payload = Base64.getDecoder().decode((String) map.get("payload"));
+        byte[] payload = decodePayload(map.get("payload"));
         @SuppressWarnings("unchecked")
         List<String[]> metadata = decodeMetadata(map.get("metadata"));
         Long sourceOffset = map.containsKey("source_offset") && map.get("source_offset") != null
@@ -55,14 +55,12 @@ public final class Codec {
         var sb = new StringBuilder(256);
         sb.append('{');
         appendString(sb, "destination", o.destination()); sb.append(',');
-        sb.append("\"payload\":\"");
-        sb.append(Base64.getEncoder().encodeToString(o.payload()));
-        sb.append('"');
+        sb.append("\"payload\":");
+        appendByteArray(sb, o.payload());
         if (o.key() != null) {
             sb.append(',');
-            sb.append("\"key\":\"");
-            sb.append(Base64.getEncoder().encodeToString(o.key()));
-            sb.append('"');
+            sb.append("\"key\":");
+            appendByteArray(sb, o.key());
         }
         sb.append(',');
         sb.append("\"headers\":");
@@ -86,9 +84,9 @@ public final class Codec {
     public Output decodeOutput(byte[] data) {
         var map = parseObject(new String(data, StandardCharsets.UTF_8));
         String destination = (String) map.get("destination");
-        byte[] payload = Base64.getDecoder().decode((String) map.get("payload"));
+        byte[] payload = decodePayload(map.get("payload"));
         byte[] key = map.containsKey("key") && map.get("key") != null
-                ? Base64.getDecoder().decode((String) map.get("key")) : null;
+                ? decodePayload(map.get("key")) : null;
         List<String[]> headers = decodeMetadata(map.get("headers"));
         String sourceEventId = (String) map.get("source_event_id");
         Integer sourcePartition = map.containsKey("source_partition") && map.get("source_partition") != null
@@ -96,6 +94,28 @@ public final class Codec {
         Long sourceOffset = map.containsKey("source_offset") && map.get("source_offset") != null
                 ? toLong(map.get("source_offset")) : null;
         return new Output(destination, payload, key, headers, sourceEventId, sourcePartition, sourceOffset);
+    }
+
+    // ── Payload decoding ────────────────────────────────────────────────
+
+    /**
+     * Decode a payload value which may be either a base64 string (SDK encoding)
+     * or a JSON array of byte values (engine's serde encoding for Bytes/Vec<u8>).
+     */
+    @SuppressWarnings("unchecked")
+    private static byte[] decodePayload(Object raw) {
+        if (raw == null) return new byte[0];
+        if (raw instanceof String s) {
+            return Base64.getDecoder().decode(s);
+        }
+        if (raw instanceof List<?> list) {
+            byte[] result = new byte[list.size()];
+            for (int i = 0; i < list.size(); i++) {
+                result[i] = (byte) ((Number) list.get(i)).intValue();
+            }
+            return result;
+        }
+        throw new RuntimeException("Cannot decode payload: unexpected type " + raw.getClass());
     }
 
     // ── JSON helpers ────────────────────────────────────────────────────
@@ -106,6 +126,15 @@ public final class Codec {
 
     private static void appendNumber(StringBuilder sb, String key, long value) {
         sb.append('"').append(escapeJson(key)).append("\":").append(value);
+    }
+
+    private static void appendByteArray(StringBuilder sb, byte[] data) {
+        sb.append('[');
+        for (int i = 0; i < data.length; i++) {
+            if (i > 0) sb.append(',');
+            sb.append(data[i] & 0xFF);
+        }
+        sb.append(']');
     }
 
     private static void appendStringPairArray(StringBuilder sb, List<String[]> pairs) {
