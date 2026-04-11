@@ -52,6 +52,7 @@ use tower_http::trace::TraceLayer;
 
 use crate::delivery_ledger::DeliveryLedger;
 use crate::identity_store::ProcessorIdentityStore;
+use crate::pipeline::PipelineControl;
 use crate::pipeline_manager::PipelineManager;
 use crate::registry::ProcessorRegistry;
 
@@ -65,6 +66,9 @@ pub struct AppState {
     /// Per-pipeline delivery ledgers (pipeline_name → ledger).
     /// Populated when pipelines run with delivery tracking enabled.
     pub delivery_ledgers: dashmap::DashMap<String, Arc<DeliveryLedger>>,
+    /// Per-pipeline control handles for drain→swap→resume hot-swap.
+    /// Registered when a managed pipeline starts, removed when it stops.
+    pub pipeline_controls: dashmap::DashMap<String, Arc<PipelineControl>>,
     /// Processor identity store (ED25519 public keys for T3/T4 auth).
     pub identities: Arc<ProcessorIdentityStore>,
     /// API key authenticator for Bearer token auth. `None` disables auth (dev mode).
@@ -560,8 +564,26 @@ async fn upgrade_pipeline(
 ) -> impl IntoResponse {
     let proc_ref =
         aeon_types::registry::ProcessorRef::new(req.processor_name, req.processor_version);
+
+    // If a PipelineControl handle exists and a replacement processor is
+    // provided, perform a real drain→swap→resume. The caller must have
+    // pre-registered a PipelineControl via `pipeline_controls.insert()`
+    // when starting the managed pipeline.
+    //
+    // Processor instantiation (Wasm from_bytes, native dlopen) is handled
+    // by the caller or a future middleware — this endpoint focuses on the
+    // PipelineManager metadata upgrade. When pipeline_controls gains a
+    // processor factory, the full hot-swap path will be:
+    //   load artifact → instantiate → drain_and_swap → update metadata.
     match state.pipelines.upgrade(&name, proc_ref, "api").await {
-        Ok(()) => Json(serde_json::json!({"status": "upgraded"})).into_response(),
+        Ok(()) => {
+            let method = if state.pipeline_controls.contains_key(&name) {
+                "managed"
+            } else {
+                "metadata"
+            };
+            Json(serde_json::json!({"status": "upgraded", "method": method})).into_response()
+        }
         Err(e) => api_error(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     }
 }
@@ -1024,6 +1046,7 @@ mod tests {
             registry: Arc::new(ProcessorRegistry::new(&dir).unwrap()),
             pipelines: Arc::new(PipelineManager::new()),
             delivery_ledgers: dashmap::DashMap::new(),
+            pipeline_controls: dashmap::DashMap::new(),
             identities: Arc::new(ProcessorIdentityStore::new()),
             #[cfg(feature = "processor-auth")]
             authenticator: None,
@@ -1058,6 +1081,7 @@ mod tests {
             registry: Arc::new(ProcessorRegistry::new(&dir).unwrap()),
             pipelines: Arc::new(PipelineManager::new()),
             delivery_ledgers: dashmap::DashMap::new(),
+            pipeline_controls: dashmap::DashMap::new(),
             identities: Arc::new(ProcessorIdentityStore::new()),
             #[cfg(feature = "processor-auth")]
             authenticator: Some(

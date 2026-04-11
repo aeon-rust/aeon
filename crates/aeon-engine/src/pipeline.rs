@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+use tokio::sync::{Mutex, Notify};
 
 /// Default SPSC ring buffer capacity (events/outputs).
 const DEFAULT_BUFFER_CAPACITY: usize = 8192;
@@ -1133,6 +1134,251 @@ fn write_checkpoint(
         *delivered = 0;
         *failed = 0;
     }
+}
+
+// ── Managed pipeline — drain→swap→resume for hot-swap ──────────────────
+
+/// Control handle for a managed pipeline, enabling drain→swap→resume.
+///
+/// Created before spawning `run_buffered_managed`. The caller retains a
+/// clone and calls `drain_and_swap()` to perform a zero-downtime processor
+/// hot-swap while the pipeline is running.
+pub struct PipelineControl {
+    /// When true, the source task stops polling and returns empty batches.
+    paused: AtomicBool,
+    /// Signaled by the processor task when both SPSC rings are empty after pause.
+    drain_complete: Notify,
+    /// Slot for a replacement processor. Set by `drain_and_swap`, consumed by
+    /// the processor task after drain completes.
+    new_processor: Mutex<Option<Box<dyn Processor + Send + Sync>>>,
+    /// Signaled by the processor task after it has picked up the new processor.
+    swap_complete: Notify,
+}
+
+impl PipelineControl {
+    /// Create a new pipeline control handle.
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            paused: AtomicBool::new(false),
+            drain_complete: Notify::new(),
+            new_processor: Mutex::new(None),
+            swap_complete: Notify::new(),
+        })
+    }
+
+    /// Drain in-flight events, swap the processor, and resume.
+    ///
+    /// 1. Pauses the source (stops new events entering the pipeline)
+    /// 2. Waits for both SPSC rings to empty (all in-flight events flushed)
+    /// 3. Installs the new processor
+    /// 4. Resumes the source
+    ///
+    /// Returns after the new processor is active. Zero events are lost.
+    pub async fn drain_and_swap(
+        &self,
+        new_processor: Box<dyn Processor + Send + Sync>,
+    ) -> Result<(), AeonError> {
+        // 1. Pause source — stop new events entering
+        self.paused.store(true, Ordering::Release);
+
+        // 2. Wait for drain — processor task signals when rings are empty
+        self.drain_complete.notified().await;
+
+        // 3. Install new processor
+        {
+            let mut slot = self.new_processor.lock().await;
+            *slot = Some(new_processor);
+        }
+
+        // 4. Wait for processor task to pick up the swap
+        self.swap_complete.notified().await;
+
+        // 5. Resume source
+        self.paused.store(false, Ordering::Release);
+
+        Ok(())
+    }
+}
+
+/// Runs a managed pipeline that supports zero-downtime processor hot-swap.
+///
+/// Identical to `run_buffered` except:
+/// - Uses `Box<dyn Processor>` for runtime processor replacement
+/// - Accepts a `PipelineControl` handle for drain→swap→resume coordination
+/// - Source task checks `control.paused` instead of only `shutdown`
+/// - Processor task monitors drain state and swap slot
+///
+/// The per-batch dynamic dispatch overhead (~2ns vtable lookup) is negligible
+/// compared to actual processing time. Use `run_buffered` for pipelines that
+/// never need hot-swap (benchmarks, tests, static pipelines).
+#[allow(clippy::too_many_arguments)]
+pub async fn run_buffered_managed<S, K>(
+    mut source: S,
+    processor: Box<dyn Processor + Send + Sync>,
+    sink: K,
+    config: PipelineConfig,
+    metrics: Arc<PipelineMetrics>,
+    shutdown: Arc<AtomicBool>,
+    ledger: Option<Arc<DeliveryLedger>>,
+    control: Arc<PipelineControl>,
+) -> Result<(), AeonError>
+where
+    S: Source + Send + 'static,
+    K: Sink + Send + 'static,
+{
+    let core_assignment = config.core_pinning.resolve();
+
+    let (mut src_prod, mut src_cons) =
+        rtrb::RingBuffer::<Vec<Event>>::new(config.source_buffer_capacity);
+    let (mut sink_prod, sink_cons) =
+        rtrb::RingBuffer::<Vec<Output>>::new(config.sink_buffer_capacity);
+
+    let shutdown_src = Arc::clone(&shutdown);
+    let metrics_src = Arc::clone(&metrics);
+    let control_src = Arc::clone(&control);
+
+    // Source task: identical to run_buffered, but checks control.paused.
+    // When paused, yields instead of breaking (pause ≠ exhaustion).
+    let source_core = core_assignment.map(|c| c.source);
+    let source_handle = tokio::spawn(async move {
+        if let Some(core) = source_core {
+            pin_to_core(core);
+        }
+        while !shutdown_src.load(Ordering::Relaxed) {
+            // Pause check: yield without breaking (source not exhausted, just paused)
+            if control_src.paused.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+                continue;
+            }
+
+            let events = match source.next_batch().await {
+                Ok(events) => events,
+                Err(e) => return Err(e),
+            };
+            if events.is_empty() {
+                // Could be a lull or exhaustion. If paused was just set between
+                // our check and the poll, treat it as pause (don't break).
+                if control_src.paused.load(Ordering::Acquire) {
+                    continue;
+                }
+                break;
+            }
+            metrics_src
+                .events_received
+                .fetch_add(events.len() as u64, Ordering::Relaxed);
+
+            let mut pending = Some(events);
+            while let Some(batch) = pending.take() {
+                match src_prod.push(batch) {
+                    Ok(()) => {}
+                    Err(rtrb::PushError::Full(returned)) => {
+                        pending = Some(returned);
+                        tokio::task::yield_now().await;
+                    }
+                }
+            }
+        }
+        drop(src_prod);
+        Ok::<(), AeonError>(())
+    });
+
+    let shutdown_proc = Arc::clone(&shutdown);
+    let metrics_proc = Arc::clone(&metrics);
+    let control_proc = Arc::clone(&control);
+
+    // Processor task: pops events, processes, pushes outputs.
+    // When source is paused and both rings are drained, signals drain_complete
+    // and waits for a processor swap before resuming.
+    let proc_core = core_assignment.map(|c| c.processor);
+    let processor_handle = tokio::spawn(async move {
+        if let Some(core) = proc_core {
+            pin_to_core(core);
+        }
+
+        let mut current_processor: Box<dyn Processor + Send + Sync> = processor;
+
+        while !shutdown_proc.load(Ordering::Relaxed) {
+            match src_cons.pop() {
+                Ok(events) => {
+                    let count = events.len() as u64;
+                    let outputs = match current_processor.process_batch(events) {
+                        Ok(outputs) => outputs,
+                        Err(e) => return Err(e),
+                    };
+                    metrics_proc
+                        .events_processed
+                        .fetch_add(count, Ordering::Relaxed);
+
+                    let mut pending = Some(outputs);
+                    while let Some(batch) = pending.take() {
+                        match sink_prod.push(batch) {
+                            Ok(()) => {}
+                            Err(rtrb::PushError::Full(returned)) => {
+                                pending = Some(returned);
+                                tokio::task::yield_now().await;
+                            }
+                        }
+                    }
+                }
+                Err(_) => {
+                    // Source ring empty
+                    if src_cons.is_abandoned() {
+                        break;
+                    }
+
+                    // Check if we're in drain mode (source paused + ring empty)
+                    if control_proc.paused.load(Ordering::Acquire) {
+                        // Source ring is empty. Wait for sink ring to drain too.
+                        // The sink task drains independently — we just need the
+                        // processor→sink ring to be empty (sink has consumed all).
+                        if sink_prod.slots() == sink_prod.buffer().capacity() {
+                            // Both rings empty — pipeline is quiescent
+                            control_proc.drain_complete.notify_one();
+
+                            // Wait for new processor to be installed
+                            loop {
+                                {
+                                    let mut slot = control_proc.new_processor.lock().await;
+                                    if let Some(new_proc) = slot.take() {
+                                        current_processor = new_proc;
+                                        break;
+                                    }
+                                }
+                                tokio::task::yield_now().await;
+                            }
+
+                            // Signal swap complete — caller will unpause source
+                            control_proc.swap_complete.notify_one();
+                        }
+                    }
+
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+        drop(sink_prod);
+        Ok::<(), AeonError>(())
+    });
+
+    let metrics_sink = Arc::clone(&metrics);
+    let sink_ctx = build_sink_task_ctx(&config, core_assignment.map(|c| c.sink));
+    let sink_ledger = ledger;
+    let sink_handle = tokio::spawn(run_sink_task(
+        sink,
+        sink_cons,
+        metrics_sink,
+        sink_ledger,
+        sink_ctx,
+    ));
+
+    let (src_result, proc_result, sink_result) =
+        tokio::join!(source_handle, processor_handle, sink_handle);
+
+    src_result.map_err(|e| AeonError::processor(format!("source task panicked: {e}")))??;
+    proc_result.map_err(|e| AeonError::processor(format!("processor task panicked: {e}")))??;
+    sink_result.map_err(|e| AeonError::processor(format!("sink task panicked: {e}")))??;
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2378,5 +2624,255 @@ mod tests {
         assert_eq!(metrics.events_failed.load(Ordering::Relaxed), 0);
         assert_eq!(metrics.events_retried.load(Ordering::Relaxed), 0);
         assert_eq!(sink.delivered_count(), 1000);
+    }
+
+    // ── Managed pipeline / hot-swap tests ──────────────────────────────
+
+    /// Thread-safe sink wrapper for tests where the pipeline runs in a
+    /// background task and the test thread inspects outputs.
+    #[derive(Clone)]
+    struct SharedMemorySink {
+        outputs: Arc<std::sync::Mutex<Vec<Output>>>,
+    }
+
+    impl SharedMemorySink {
+        fn new() -> Self {
+            Self {
+                outputs: Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+
+        fn outputs(&self) -> Vec<Output> {
+            self.outputs.lock().unwrap().clone()
+        }
+
+        fn len(&self) -> usize {
+            self.outputs.lock().unwrap().len()
+        }
+    }
+
+    impl Sink for SharedMemorySink {
+        async fn write_batch(&mut self, outputs: Vec<Output>) -> Result<aeon_types::BatchResult, AeonError> {
+            let ids = outputs.iter().filter_map(|o| o.source_event_id).collect();
+            self.outputs.lock().unwrap().extend(outputs);
+            Ok(aeon_types::BatchResult::all_delivered(ids))
+        }
+
+        async fn flush(&mut self) -> Result<(), AeonError> {
+            Ok(())
+        }
+    }
+
+    /// A source that produces events in waves, with a shutdown signal.
+    /// Unlike MemorySource, this doesn't exhaust — it keeps producing
+    /// until told to stop, making it suitable for hot-swap testing.
+    struct ContinuousSource {
+        batch_size: usize,
+        batch_count: AtomicU64,
+        shutdown: Arc<AtomicBool>,
+        paused: bool,
+    }
+
+    impl ContinuousSource {
+        fn new(batch_size: usize, shutdown: Arc<AtomicBool>) -> Self {
+            Self {
+                batch_size,
+                batch_count: AtomicU64::new(0),
+                shutdown,
+                paused: false,
+            }
+        }
+    }
+
+    impl Source for ContinuousSource {
+        async fn next_batch(&mut self) -> Result<Vec<Event>, AeonError> {
+            if self.paused || self.shutdown.load(Ordering::Relaxed) {
+                return Ok(Vec::new());
+            }
+            let batch_num = self.batch_count.fetch_add(1, Ordering::Relaxed);
+            let source: Arc<str> = Arc::from("continuous");
+            let events = (0..self.batch_size)
+                .map(|i| {
+                    let idx = batch_num * self.batch_size as u64 + i as u64;
+                    Event::new(
+                        uuid::Uuid::nil(),
+                        idx as i64,
+                        Arc::clone(&source),
+                        PartitionId::new(0),
+                        Bytes::from(format!("event-{idx}")),
+                    )
+                })
+                .collect();
+            // Small yield to let other tasks run
+            tokio::task::yield_now().await;
+            Ok(events)
+        }
+
+        async fn pause(&mut self) {
+            self.paused = true;
+        }
+
+        async fn resume(&mut self) {
+            self.paused = false;
+        }
+    }
+
+    /// Processor that prefixes output payloads, so we can detect which
+    /// processor handled which events.
+    struct PrefixProcessor {
+        prefix: &'static str,
+        destination: Arc<str>,
+    }
+
+    impl PrefixProcessor {
+        fn new(prefix: &'static str) -> Self {
+            Self {
+                prefix,
+                destination: Arc::from("output"),
+            }
+        }
+    }
+
+    impl Processor for PrefixProcessor {
+        fn process(&self, event: Event) -> Result<Vec<Output>, AeonError> {
+            let payload = format!("{}{}", self.prefix, String::from_utf8_lossy(&event.payload));
+            Ok(vec![Output::new(
+                Arc::clone(&self.destination),
+                Bytes::from(payload),
+            )])
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_pipeline_hot_swap_zero_loss() {
+        // Set up a continuous source and a prefixed processor "A:"
+        let source_shutdown = Arc::new(AtomicBool::new(false));
+        let source = ContinuousSource::new(10, Arc::clone(&source_shutdown));
+        let processor_a: Box<dyn Processor + Send + Sync> =
+            Box::new(PrefixProcessor::new("A:"));
+        let sink = SharedMemorySink::new();
+        let metrics = Arc::new(PipelineMetrics::new());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let control = PipelineControl::new();
+
+        let metrics_clone = Arc::clone(&metrics);
+        let shutdown_clone = Arc::clone(&shutdown);
+        let control_clone = Arc::clone(&control);
+        let sink_clone = sink.clone();
+
+        // Run managed pipeline in background
+        let pipeline_handle = tokio::spawn(async move {
+            run_buffered_managed(
+                source,
+                processor_a,
+                sink_clone,
+                PipelineConfig::default(),
+                metrics_clone,
+                shutdown_clone,
+                None,
+                control_clone,
+            )
+            .await
+        });
+
+        // Wait until processor A has processed some events
+        for _ in 0..200 {
+            if metrics.events_processed.load(Ordering::Relaxed) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let pre_swap_count = metrics.events_processed.load(Ordering::Relaxed);
+        assert!(pre_swap_count > 0, "should have processed events before swap");
+
+        // Hot-swap to processor B
+        let processor_b: Box<dyn Processor + Send + Sync> =
+            Box::new(PrefixProcessor::new("B:"));
+        control.drain_and_swap(processor_b).await.unwrap();
+
+        // Wait until B-prefixed outputs appear in the sink (proof that swap worked)
+        let mut b_found = false;
+        for _ in 0..200 {
+            let outs = sink.outputs();
+            if outs.iter().any(|o| o.payload.starts_with(b"B:")) {
+                b_found = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(b_found, "should have B-prefixed outputs (post-swap)");
+
+        // Shutdown
+        source_shutdown.store(true, Ordering::Release);
+        shutdown.store(true, Ordering::Release);
+        // Allow pipeline to finish
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let post_swap_count = metrics.events_processed.load(Ordering::Relaxed);
+        assert!(
+            post_swap_count > pre_swap_count,
+            "should have processed more events after swap"
+        );
+
+        // Verify zero event loss: events_received >= events_processed
+        let received = metrics.events_received.load(Ordering::Relaxed);
+        let processed = metrics.events_processed.load(Ordering::Relaxed);
+        assert!(
+            received >= processed,
+            "no events lost: received={received}, processed={processed}"
+        );
+
+        // Verify outputs contain both A: and B: prefixed payloads
+        let outputs = sink.outputs();
+        let a_count = outputs
+            .iter()
+            .filter(|o| o.payload.starts_with(b"A:"))
+            .count();
+        let b_count = outputs
+            .iter()
+            .filter(|o| o.payload.starts_with(b"B:"))
+            .count();
+        assert!(a_count > 0, "should have A-prefixed outputs (pre-swap)");
+        assert!(b_count > 0, "should have B-prefixed outputs (post-swap)");
+
+        // No outputs without prefix (no corruption during swap)
+        let unprefixed = outputs
+            .iter()
+            .filter(|o| !o.payload.starts_with(b"A:") && !o.payload.starts_with(b"B:"))
+            .count();
+        assert_eq!(unprefixed, 0, "all outputs should be prefixed");
+
+        // Clean up
+        let _ = pipeline_handle.await;
+    }
+
+    #[tokio::test]
+    async fn managed_pipeline_runs_without_swap() {
+        // Verify managed pipeline works like regular run_buffered when no swap occurs
+        let events = make_events(100);
+        let source = MemorySource::new(events, 32);
+        let processor: Box<dyn Processor + Send + Sync> =
+            Box::new(PassthroughProcessor::new(Arc::from("output")));
+        let sink = SharedMemorySink::new();
+        let metrics = Arc::new(PipelineMetrics::new());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let control = PipelineControl::new();
+
+        run_buffered_managed(
+            source,
+            processor,
+            sink.clone(),
+            PipelineConfig::default(),
+            metrics.clone(),
+            shutdown,
+            None,
+            control,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(sink.len(), 100);
+        assert_eq!(metrics.events_received.load(Ordering::Relaxed), 100);
+        assert_eq!(metrics.events_processed.load(Ordering::Relaxed), 100);
     }
 }

@@ -374,6 +374,7 @@ fn cmd_serve(addr: &str, artifact_dir: &str) -> Result<()> {
             registry: Arc::new(registry),
             pipelines: Arc::new(pipelines),
             delivery_ledgers: dashmap::DashMap::new(),
+            pipeline_controls: dashmap::DashMap::new(),
             identities: Arc::new(identities),
             authenticator: None,
             ws_host: None,

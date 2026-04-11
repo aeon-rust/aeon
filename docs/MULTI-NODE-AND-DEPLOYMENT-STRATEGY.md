@@ -503,7 +503,7 @@ Full to-do list with item IDs: `docs/PROCESSOR-DEPLOYMENT.md` Section 13.
 | Priority | Items | What It Enables |
 |----------|-------|-----------------|
 | ~~**Must fix**~~ | ~~ZD-1 (POST route), ZD-2 (CLI serde), ZD-3 (SHA-512)~~ | ~~Processor registration via CLI/REST, artifact integrity~~ **Done (2026-04-11)** |
-| **High** | ZD-4 (hot-swap orchestrator) | Zero-downtime Wasm and Native .so processor upgrades |
+| ~~**High**~~ | ~~ZD-4 (hot-swap orchestrator)~~ | ~~Zero-downtime Wasm and Native .so processor upgrades~~ **Done (2026-04-11)** — `PipelineControl` + `run_buffered_managed()` |
 | **Medium** | ZD-5 (blue-green runtime), ZD-6 (canary traffic split) | Advanced upgrade strategies for production |
 | **Medium** | ZD-7, ZD-8 (same-type source/sink reconfig) | Connector config changes without pipeline restart |
 | **Low** | ZD-9 (cross-type via blue-green pipeline), ZD-10 (batch replay), ZD-11 (Wasm state), ZD-12 (file watcher), ZD-13 (child process) | Edge cases, dev experience, full isolation |

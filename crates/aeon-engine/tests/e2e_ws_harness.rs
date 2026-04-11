@@ -109,6 +109,7 @@ pub async fn start_ws_test_server(pipeline_name: &str) -> WsTestServer {
         registry: Arc::new(ProcessorRegistry::new(&dir).unwrap()),
         pipelines: Arc::new(PipelineManager::new()),
         delivery_ledgers: dashmap::DashMap::new(),
+        pipeline_controls: dashmap::DashMap::new(),
         identities: Arc::clone(&identity_store),
         #[cfg(feature = "processor-auth")]
         authenticator: None,

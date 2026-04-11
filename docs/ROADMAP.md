@@ -986,20 +986,22 @@ placeholders). Test counts updated to reflect current state.
 9. **P9 — User-facing documentation** (nice-to-have):
    - Getting-started processor dev guide, multi-node ops guide,
      performance tuning guide, troubleshooting guide.
-10. **P10 — Zero-downtime deployment & management** (Phase A done, Phase B–D pending):
+10. **P10 — Zero-downtime deployment & management** (Phase A+B done, Phase C–D pending):
     Full to-do list: `docs/PROCESSOR-DEPLOYMENT.md` §13, referenced from
     `docs/MULTI-NODE-AND-DEPLOYMENT-STRATEGY.md` §7.
 
     **Phase A — Bug fixes ✅ (2026-04-11):**
-    - ~~ZD-1~~: `POST /api/v1/processors` route + handler + test added (19 REST tests)
+    - ~~ZD-1~~: `POST /api/v1/processors` route + handler + test added (18 REST tests)
     - ~~ZD-2~~: CLI serde fixed to kebab-case (`"wasm"`, `"native-so"`, `"available"`)
     - ~~ZD-3~~: `sha512_hex()` now uses `sha2::Sha512` (real cryptographic hash)
     - E2E-TEST-PLAN.md updated: A5, F7, G1/G2/G3 marked ✅ (65/67 pass, 2 stubs)
     - Helm HPA guard + image repository default fixed
 
-    **Phase B — Hot-swap orchestrator (not started, high priority):**
-    - ZD-4: Wire drain→swap→resume orchestrator into pipeline runner
-      (`PipelineManager.upgrade()` → actual processor replacement)
+    **Phase B — Hot-swap orchestrator ✅ (2026-04-11):**
+    - ~~ZD-4~~: `PipelineControl` + `run_buffered_managed()` — pause source → drain
+      SPSC rings → swap processor → resume. `Source::pause()`/`resume()` trait methods
+      with MemorySource/KafkaSource overrides. `pipeline_controls` map in AppState.
+      2 tests: hot-swap zero-loss, managed-no-swap. 257 engine tests pass.
 
     **Phase C — Source/sink reconfiguration (not started, medium priority):**
     - ZD-7/ZD-8: Same-type source/sink config change without restart

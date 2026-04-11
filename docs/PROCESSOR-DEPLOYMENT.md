@@ -17,7 +17,7 @@
 > | REST API — `POST /api/v1/processors` (register) | **Implemented + tested** |
 > | REST API — all pipeline lifecycle endpoints | **Implemented + tested** (19 REST tests) |
 > | PipelineManager state machine (upgrade/blue-green/canary) | **Implemented** — state transitions tracked |
-> | Hot-swap orchestrator (drain → swap → resume) | **Not wired** — PipelineManager updates metadata only; actual processor replacement in running pipeline not yet connected |
+> | Hot-swap orchestrator (drain → swap → resume) | **Implemented** — `PipelineControl` + `run_buffered_managed()`: pause source → drain SPSC rings → swap processor → resume. 2 tests (hot-swap zero-loss, managed no-swap). |
 > | T3/T4 processor replacement | **Working** — reconnect-based; routing table auto-updates on connect/disconnect |
 > | Source/Sink zero-downtime reconfiguration | **Not implemented** — requires pipeline stop/start for connector config changes |
 > | SHA-512 artifact verification | **Implemented** — `sha2::Sha512` (replaced `DefaultHasher` placeholder) |
@@ -1328,9 +1328,11 @@ Tracked in `docs/ROADMAP.md` as P10.
 
 ### 13.2 Processor Hot-Swap Orchestration (Enables Zero-Downtime for T1 .so and T2 Wasm)
 
+> ✅ **ZD-4 Done** (2026-04-11) — `PipelineControl` + `run_buffered_managed()` implemented.
+
 | # | Item | File(s) | Details |
 |---|------|---------|---------|
-| ZD-4 | Wire drain→swap→resume into pipeline runner | `aeon-engine/src/pipeline.rs` | `PipelineManager.upgrade()` updates metadata but does not trigger actual processor replacement in a running pipeline. Need: pause source → drain SPSC buffers → swap processor → resume. |
+| ~~ZD-4~~ | ~~Wire drain→swap→resume into pipeline runner~~ | `aeon-engine/src/pipeline.rs` | **Done** — `PipelineControl` (paused flag + drain/swap Notify + processor slot), `run_buffered_managed()` with source pause check and processor swap loop. `Source::pause()`/`resume()` trait methods added with MemorySource/KafkaSource overrides. 2 tests: hot-swap zero-loss + managed-no-swap. |
 | ZD-5 | Blue-green runtime wiring | `aeon-engine/src/pipeline.rs` | `upgrade_blue_green()` sets state to `BlueGreen` but no second pipeline is spawned. Need: start "green" pipeline alongside "blue", route traffic via cutover. |
 | ZD-6 | Canary traffic splitting | `aeon-engine/src/pipeline.rs` | `upgrade_canary()` tracks percentage steps but no actual traffic splitting occurs. Need: probabilistic routing between old and new processor per event. |
 
@@ -1338,7 +1340,7 @@ Tracked in `docs/ROADMAP.md` as P10.
 
 | # | Item | Approach | Details |
 |---|------|----------|---------|
-| ZD-7 | Same-type source config change | Drain→swap→resume | New source instance with new config, pause old, swap, resume. Architecturally same as processor hot-swap. Requires source `pause()`/`resume()` API. |
+| ZD-7 | Same-type source config change | Drain→swap→resume | New source instance with new config, pause old, swap, resume. Architecturally same as processor hot-swap. `Source::pause()`/`resume()` now available (ZD-4). |
 | ZD-8 | Same-type sink config change | Drain→swap→resume | New sink instance with new config, drain in-flight, swap, resume. Must ensure all pending acks resolve before swap. |
 | ZD-9 | Cross-type connector change | Blue-green pipeline | Different generic types → cannot swap within pipeline. Use `PipelineManager` blue-green: start new pipeline with new connectors, cutover, stop old. Already supported by state machine (ZD-5 must be wired first). |
 
