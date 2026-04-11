@@ -5,6 +5,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/aeon-connectors"
+keywords = ["kafka", "redpanda", "nats", "mqtt", "connector"]
+categories = ["asynchronous", "network-programming"]
 
 [dependencies]
 aeon-types = { workspace = true }

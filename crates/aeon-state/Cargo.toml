@@ -5,6 +5,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/aeon-state"
+keywords = ["stream-processing", "state-store", "cache", "mmap"]
+categories = ["data-structures", "caching"]
 
 [features]
 default = []

@@ -4,8 +4,10 @@
 > Covers crate ordering, metadata requirements, Docker image strategy,
 > pre-built binaries, and CI/CD automation.
 >
-> **Status**: Pre-publish. All crates compile and test (820 tests passing).
-> Publishing pipeline is designed and documented but has not been executed yet.
+> **Status**: Pre-publish. All crates compile and test. Metadata (keywords,
+> categories, documentation, repository, homepage) added to all 13 publishable
+> crate Cargo.tomls. `cargo publish --dry-run` passes for Tier 1 (aeon-types,
+> aeon-wasm-sdk). Tier 2+ blocked on Tier 1 not being on crates.io yet (expected).
 > Crate names (`aeon-*`) and Docker Hub org (`aeonrust`) should be reserved
 > before first public release.
 
@@ -692,10 +694,10 @@ The workspace already uses `version.workspace = true` which enforces lockstep.
   - `CARGO_REGISTRY_TOKEN` — crates.io API token
   - `DOCKERHUB_USERNAME` — Docker Hub username
   - `DOCKERHUB_TOKEN` — Docker Hub access token
-- [ ] Add `repository`, `homepage`, `keywords`, `categories` to all crate Cargo.tomls
-- [ ] Add `version = "0.1.0"` alongside `path` for all workspace internal deps
-- [ ] Mark sample crates with `publish = false`
-- [ ] Verify `cargo publish --dry-run` passes for all 12 crates
+- [x] Add `repository`, `homepage`, `keywords`, `categories` to all crate Cargo.tomls
+- [x] Add `version = "0.1.0"` alongside `path` for all workspace internal deps
+- [x] Mark sample crates with `publish = false`
+- [x] Verify `cargo publish --dry-run` passes for Tier 1 (aeon-types, aeon-wasm-sdk); Tier 2+ expected to fail until deps published
 - [ ] Verify Docker multi-platform build works
 - [ ] Write crates.io README (can be workspace README or per-crate)
 
