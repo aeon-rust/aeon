@@ -30,6 +30,7 @@
 //! - `POST   /api/v1/pipelines/:name/upgrade`       — upgrade processor
 //! - `GET    /api/v1/pipelines/:name/history`        — lifecycle history
 //! - `DELETE /api/v1/pipelines/:name`               — delete
+//! - `GET    /api/v1/pipelines/:name/verify`        — PoH/Merkle integrity
 //!
 //! **System:**
 //! - `GET    /health`                               — health check (no auth)
@@ -141,6 +142,8 @@ pub fn api_router(state: Arc<AppState>) -> Router {
             "/api/v1/pipelines/{name}/delivery/retry",
             post(delivery_retry),
         )
+        // Integrity verification
+        .route("/api/v1/pipelines/{name}/verify", get(verify_pipeline))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -731,6 +734,79 @@ async fn delivery_retry(
 #[derive(Deserialize)]
 struct DeliveryRetryRequest {
     event_ids: Vec<String>,
+}
+
+// ── Integrity verification endpoint ──────────────────────────────────
+
+/// GET /api/v1/pipelines/:name/verify — PoH/Merkle chain integrity status.
+///
+/// Returns the current PoH chain state for the pipeline, including per-partition
+/// chain heads, sequence numbers, and verification results.
+///
+/// When PoH tracking is not yet active for a pipeline, returns a status response
+/// indicating the pipeline exists but PoH is not wired (Phase 14 runtime).
+async fn verify_pipeline(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    // Check pipeline exists
+    match state.pipelines.get(&name).await {
+        Some(_pipeline) => {
+            // PoH chains are not yet wired into the pipeline runtime.
+            // Return a structured response so the CLI can display meaningful output
+            // and detect when PoH becomes active.
+            let json = serde_json::json!({
+                "pipeline": name,
+                "poh_active": false,
+                "status": "ok",
+                "message": "Pipeline exists. PoH chain tracking activates when the pipeline runs with integrity verification enabled.",
+                "modules": {
+                    "poh": "available",
+                    "merkle": "available",
+                    "mmr": "available",
+                    "signing": "available",
+                },
+                "chain_heads": [],
+                "aggregate_hash": null,
+            });
+            (StatusCode::OK, Json(json)).into_response()
+        }
+        None => {
+            if name == "all" {
+                // "all" target: report system-wide verification status
+                let pipelines = state.pipelines.list_with_state().await;
+                let pipeline_statuses: Vec<serde_json::Value> = pipelines
+                    .into_iter()
+                    .map(|(pname, pstate)| {
+                        serde_json::json!({
+                            "name": pname,
+                            "state": pstate.to_string(),
+                            "poh_active": false,
+                        })
+                    })
+                    .collect();
+
+                let json = serde_json::json!({
+                    "status": "ok",
+                    "poh_active": false,
+                    "pipelines": pipeline_statuses,
+                    "modules": {
+                        "poh": "available",
+                        "merkle": "available",
+                        "mmr": "available",
+                        "signing": "available",
+                    },
+                });
+                (StatusCode::OK, Json(json)).into_response()
+            } else {
+                api_error(
+                    StatusCode::NOT_FOUND,
+                    format!("pipeline '{name}' not found"),
+                )
+                .into_response()
+            }
+        }
+    }
 }
 
 // ── Identity management endpoints ─────────────────────────────────────

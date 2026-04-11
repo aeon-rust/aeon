@@ -1248,26 +1248,174 @@ fn cmd_top(api: &str) -> Result<()> {
 
 // ── aeon verify ───────────────────────────────────────────────────────
 
-fn cmd_verify(target: &str, _api: &str) -> Result<()> {
-    // Placeholder for PoH/Merkle verification.
-    // In production, this would:
-    // 1. Fetch the PoH chain for the target pipeline(s)
-    // 2. Verify each entry's hash links to the previous
-    // 3. Verify Merkle proofs for event batches
-    // 4. Report any integrity violations
+fn cmd_verify(target: &str, api: &str) -> Result<()> {
+    use aeon_crypto::hash::sha512;
+    use aeon_crypto::merkle::MerkleTree;
+    use aeon_crypto::mmr::MerkleMountainRange;
+    use aeon_crypto::poh::PohChain;
+    use aeon_types::PartitionId;
+
     println!("Aeon Integrity Verification");
-    println!("{}", "=".repeat(50));
+    println!("{}", "=".repeat(60));
     println!("Target: {target}");
+    println!("API:    {api}");
     println!();
-    println!("PoH chain verification is not yet connected to the runtime.");
-    println!("This command will verify Proof-of-History and Merkle tree");
-    println!("integrity once pipeline event tracing is wired in Phase 14.");
+
+    // Step 1: Validate local crypto modules are functional
+    println!("Local module validation:");
+
+    // PoH chain: create, append, verify
+    let mut chain = PohChain::new(PartitionId::new(0), 64);
+    chain.append_batch(&[b"test-event-1", b"test-event-2"], 1_000_000, None);
+    chain.append_batch(&[b"test-event-3"], 2_000_000, None);
+    let poh_ok = chain.verify_recent().is_none(); // None = all valid
+    println!(
+        "  PoH chain:    {} (seq={}, hash={}..)",
+        if poh_ok { "OK" } else { "FAIL" },
+        chain.sequence(),
+        &chain.current_hash().to_hex()[..16],
+    );
+
+    // Merkle tree: build, prove, verify
+    let tree = MerkleTree::from_data(&[b"a", b"b", b"c", b"d"]);
+    let merkle_ok = match &tree {
+        Some(t) => {
+            let proof = t.proof(0);
+            proof.is_some_and(|p: aeon_crypto::merkle::MerkleProof| p.verify())
+        }
+        None => false,
+    };
+    println!(
+        "  Merkle tree:  {} (root={}..)",
+        if merkle_ok { "OK" } else { "FAIL" },
+        tree.as_ref()
+            .map(|t| t.root().to_hex()[..16].to_string())
+            .unwrap_or_else(|| "none".to_string()),
+    );
+
+    // MMR: append, verify root
+    let mut mmr = MerkleMountainRange::new();
+    mmr.append(sha512(b"leaf-0"));
+    mmr.append(sha512(b"leaf-1"));
+    mmr.append(sha512(b"leaf-2"));
+    let mmr_ok = mmr.root() != aeon_crypto::hash::Hash512::ZERO;
+    println!(
+        "  MMR:          {} (leaves={}, root={}..)",
+        if mmr_ok { "OK" } else { "FAIL" },
+        mmr.leaf_count(),
+        &mmr.root().to_hex()[..16],
+    );
+
+    // Signing: generate key, sign, verify
+    let signing_key = aeon_crypto::signing::SigningKey::generate();
+    let msg = b"integrity-check";
+    let sig = signing_key.sign(msg);
+    let vk = signing_key.verifying_key();
+    let sig_ok = vk.verify(msg, &sig);
+    let pubkey_hex = hex::encode(vk.to_bytes());
+    println!(
+        "  Ed25519 sign: {} (pubkey={}..)",
+        if sig_ok { "OK" } else { "FAIL" },
+        &pubkey_hex[..16],
+    );
+
+    let all_local_ok = poh_ok && merkle_ok && mmr_ok && sig_ok;
     println!();
-    println!("Available verification modules:");
-    println!("  - PoH chain continuity (aeon-crypto::poh)");
-    println!("  - Merkle batch proofs (aeon-crypto::merkle)");
-    println!("  - MMR append-only log (aeon-crypto::mmr)");
-    println!("  - Ed25519 signature validation (aeon-crypto::signing)");
+
+    // Step 2: Query the API for pipeline verification state
+    println!("Remote pipeline verification:");
+
+    let url = format!("{api}/api/v1/pipelines/{target}/verify");
+    match ureq::get(&url).call() {
+        Ok(resp) => {
+            let body: serde_json::Value = resp.into_json().context("invalid JSON response")?;
+
+            let poh_active = body["poh_active"].as_bool().unwrap_or(false);
+            let status = body["status"].as_str().unwrap_or("unknown");
+
+            if target == "all" {
+                // System-wide report
+                let pipelines = body["pipelines"].as_array();
+                match pipelines {
+                    Some(arr) if !arr.is_empty() => {
+                        println!("  {:<25} {:<12} {:<10}", "PIPELINE", "STATE", "POH");
+                        println!("  {}", "-".repeat(47));
+                        for p in arr {
+                            let name = p["name"].as_str().unwrap_or("-");
+                            let state = p["state"].as_str().unwrap_or("-");
+                            let active = if p["poh_active"].as_bool().unwrap_or(false) {
+                                "active"
+                            } else {
+                                "pending"
+                            };
+                            println!("  {:<25} {:<12} {:<10}", name, state, active);
+                        }
+                    }
+                    _ => println!("  No pipelines found."),
+                }
+            } else {
+                // Single pipeline report
+                println!("  Pipeline:   {target}");
+                println!("  Status:     {status}");
+                println!(
+                    "  PoH active: {}",
+                    if poh_active {
+                        "yes"
+                    } else {
+                        "no (pending runtime wiring)"
+                    }
+                );
+
+                // Show chain heads if present
+                if let Some(heads) = body["chain_heads"].as_array() {
+                    if !heads.is_empty() {
+                        println!();
+                        println!(
+                            "  {:<12} {:<10} {:<34}",
+                            "PARTITION", "SEQUENCE", "HEAD HASH"
+                        );
+                        println!("  {}", "-".repeat(56));
+                        for head in heads {
+                            let part = head["partition"].as_u64().unwrap_or(0);
+                            let seq = head["sequence"].as_u64().unwrap_or(0);
+                            let hash = head["hash"].as_str().unwrap_or("-");
+                            let hash_short = if hash.len() > 32 { &hash[..32] } else { hash };
+                            println!("  {:<12} {:<10} {}...", part, seq, hash_short);
+                        }
+                    }
+                }
+
+                if let Some(agg) = body["aggregate_hash"].as_str() {
+                    println!("  Aggregate:  {}...", &agg[..32.min(agg.len())]);
+                }
+            }
+
+            // Module availability
+            if let Some(modules) = body["modules"].as_object() {
+                println!();
+                println!("  Crypto modules:");
+                for (name, status) in modules {
+                    println!("    {:<10} {}", name, status.as_str().unwrap_or("unknown"));
+                }
+            }
+        }
+        Err(ureq::Error::Status(404, _)) => {
+            println!("  Pipeline '{target}' not found on {api}");
+        }
+        Err(e) => {
+            println!("  Could not reach API at {api}: {e}");
+            println!("  (Run `aeon verify` while the Aeon server is running)");
+        }
+    }
+
+    println!();
+    println!("Result:");
+    if all_local_ok {
+        println!("  All local crypto modules operational.");
+    } else {
+        println!("  WARNING: One or more crypto modules failed self-test!");
+    }
+
     Ok(())
 }
 
