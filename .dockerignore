@@ -1,15 +1,25 @@
 target/
 .git/
-*.md
-!README.md
-docker/
 docs/
-benches/
-tests/
 *.log
 .env*
 .vscode/
 .idea/
 node_modules/
+
+# SDK source (not needed in container)
+sdks/
+
+# Test artifacts
 samples/processors/rust-wasm/target/
+samples/processors/rust-wasm-sdk/target/
 samples/processors/assemblyscript-wasm/node_modules/
+
+# Helm charts (not needed in container image)
+helm/
+
+# CI/CD config
+.github/
+
+# Dev notes
+*.txt
