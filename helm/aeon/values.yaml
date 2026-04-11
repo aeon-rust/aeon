@@ -50,6 +50,15 @@ persistence:
 processors:
   configMap: ""  # Name of ConfigMap containing .wasm files
 
+# Multi-node cluster mode (StatefulSet + Raft consensus)
+cluster:
+  enabled: false
+  replicas: 3
+  partitions: 16
+  tls:
+    enabled: false
+    secretName: aeon-tls  # K8s Secret with tls.crt, tls.key, ca.crt
+
 # Horizontal Pod Autoscaler
 autoscaling:
   enabled: false
