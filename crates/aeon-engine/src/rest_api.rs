@@ -92,7 +92,10 @@ pub fn api_router(state: Arc<AppState>) -> Router {
     // API routes — auth required when token is configured
     let api_routes = Router::new()
         // Processors
-        .route("/api/v1/processors", get(list_processors))
+        .route(
+            "/api/v1/processors",
+            get(list_processors).post(register_processor),
+        )
         .route("/api/v1/processors/{name}", get(get_processor))
         .route(
             "/api/v1/processors/{name}/versions",
@@ -383,6 +386,41 @@ async fn list_processors(State(state): State<Arc<AppState>>) -> impl IntoRespons
     }
 
     Json(items)
+}
+
+#[derive(Deserialize)]
+struct RegisterProcessorRequest {
+    name: String,
+    #[serde(default)]
+    description: String,
+    version: aeon_types::registry::ProcessorVersion,
+}
+
+async fn register_processor(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<RegisterProcessorRequest>,
+) -> impl IntoResponse {
+    let cmd = aeon_types::registry::RegistryCommand::RegisterProcessor {
+        name: req.name,
+        description: req.description,
+        version: req.version,
+    };
+    let resp = state.registry.apply(cmd).await;
+    match resp {
+        aeon_types::registry::RegistryResponse::ProcessorRegistered { name, version } => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({"status": "registered", "name": name, "version": version})),
+        )
+            .into_response(),
+        aeon_types::registry::RegistryResponse::Error { message } => {
+            api_error(StatusCode::BAD_REQUEST, message).into_response()
+        }
+        other => (
+            StatusCode::OK,
+            Json(serde_json::to_value(&other).unwrap_or_default()),
+        )
+            .into_response(),
+    }
 }
 
 async fn get_processor(
@@ -1093,6 +1131,63 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn register_processor_via_api() {
+        let state = test_state();
+        let app = api_router(state.clone());
+
+        let resp = app
+            .oneshot(
+                Request::post("/api/v1/processors")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "name": "my-proc",
+                            "description": "test processor",
+                            "version": {
+                                "version": "1.0.0",
+                                "sha512": "abc123",
+                                "size_bytes": 1024,
+                                "processor_type": "wasm",
+                                "platform": "wasm32",
+                                "status": "available",
+                                "registered_at": 1000,
+                                "registered_by": "test"
+                            }
+                        }"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "registered");
+        assert_eq!(json["name"], "my-proc");
+        assert_eq!(json["version"], "1.0.0");
+
+        // Verify it shows up in list
+        let app = api_router(state);
+        let resp = app
+            .oneshot(
+                Request::get("/api/v1/processors")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json.as_array().unwrap().len(), 1);
+        assert_eq!(json[0]["name"], "my-proc");
     }
 
     #[tokio::test]

@@ -3,7 +3,7 @@
 replicaCount: 1
 
 image:
-  repository: aeon
+  repository: aeonrust/aeon
   tag: latest
   pullPolicy: IfNotPresent
 

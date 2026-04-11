@@ -284,29 +284,9 @@ impl std::fmt::Debug for ProcessorRegistry {
 
 /// Compute SHA-512 hex digest of bytes.
 pub fn sha512_hex(data: &[u8]) -> String {
-    use std::io::Write;
-    // Use ring for SHA-512 (already in the dep tree via rustls)
-    // Fallback: manual implementation for portability
-    let digest = {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        // For now, use a simple hash until we wire in ring/sha2
-        // This will be replaced with proper SHA-512 in integration
-        let mut hasher = DefaultHasher::new();
-        data.hash(&mut hasher);
-        let h1 = hasher.finish();
-        data.len().hash(&mut hasher);
-        let h2 = hasher.finish();
-        // Produce a deterministic hex string (not cryptographic — placeholder)
-        let mut buf = Vec::new();
-        write!(buf, "{h1:016x}{h2:016x}").unwrap_or_default();
-        // Pad to 128 hex chars (SHA-512 length)
-        while buf.len() < 128 {
-            write!(buf, "0").unwrap_or_default();
-        }
-        buf
-    };
-    String::from_utf8(digest).unwrap_or_default()
+    use sha2::Digest;
+    let hash = sha2::Sha512::digest(data);
+    hex::encode(hash)
 }
 
 fn now_millis() -> i64 {

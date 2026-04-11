@@ -9,7 +9,7 @@ rust-version.workspace = true
 [features]
 default = ["native-loader", "rest-api", "processor-auth", "websocket-host"]
 native-loader = ["libloading", "aeon-native-sdk", "sha2", "hex"]
-rest-api = ["axum", "tower-http"]
+rest-api = ["axum", "tower-http", "sha2", "hex"]
 processor-auth = ["aeon-crypto", "rand", "sha2", "hex", "base64"]
 webtransport-host = ["wtransport", "rustls", "processor-auth"]
 websocket-host = ["processor-auth", "rest-api", "axum/ws"]

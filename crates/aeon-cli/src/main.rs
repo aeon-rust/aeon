@@ -904,9 +904,9 @@ fn cmd_processor(api: &str, action: &ProcessorAction) -> Result<()> {
             let sha512 = aeon_engine::registry::sha512_hex(&artifact_bytes);
 
             let processor_type = if artifact.extension().is_some_and(|e| e == "wasm") {
-                "Wasm"
+                "wasm"
             } else {
-                "NativeSo"
+                "native-so"
             };
 
             let payload = serde_json::json!({
@@ -918,7 +918,7 @@ fn cmd_processor(api: &str, action: &ProcessorAction) -> Result<()> {
                     "size_bytes": artifact_bytes.len(),
                     "processor_type": processor_type,
                     "platform": platform,
-                    "status": "Available",
+                    "status": "available",
                     "registered_at": now_millis(),
                     "registered_by": "cli",
                 },
@@ -1193,9 +1193,9 @@ fn cmd_deploy(
 
     let sha512 = aeon_engine::registry::sha512_hex(&artifact_bytes);
     let processor_type = if artifact.extension().is_some_and(|e| e == "wasm") {
-        "Wasm"
+        "wasm"
     } else {
-        "NativeSo"
+        "native-so"
     };
 
     // Step 1: Register processor
@@ -1209,7 +1209,7 @@ fn cmd_deploy(
             "size_bytes": artifact_bytes.len(),
             "processor_type": processor_type,
             "platform": "wasm32",
-            "status": "Available",
+            "status": "available",
             "registered_at": now_millis(),
             "registered_by": "cli",
         },
