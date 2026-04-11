@@ -135,6 +135,16 @@ enum Commands {
         #[command(subcommand)]
         action: TlsAction,
     },
+    /// Start the Aeon server (REST API + pipeline engine)
+    #[cfg(feature = "rest-api")]
+    Serve {
+        /// REST API listen address
+        #[arg(long, default_value = "0.0.0.0:4471")]
+        addr: String,
+        /// Artifact storage directory
+        #[arg(long, default_value = "/app/artifacts")]
+        artifact_dir: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -265,6 +275,13 @@ enum DevAction {
     Down,
     /// Show development environment status
     Status,
+    /// Watch a processor artifact and hot-reload on change
+    #[cfg(feature = "rest-api")]
+    Watch {
+        /// Path to the processor artifact (.wasm, .so, .dll)
+        #[arg(long)]
+        artifact: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -322,14 +339,67 @@ fn main() -> Result<()> {
         Some(Commands::Apply { file, api, dry_run }) => cmd_apply(&file, &api, dry_run),
         Some(Commands::Export { file, api }) => cmd_export(file.as_deref(), &api),
         Some(Commands::Diff { file, api }) => cmd_diff(&file, &api),
-        Some(Commands::Dev { action }) => cmd_dev(&action),
+        Some(Commands::Dev { action }) => {
+            #[cfg(feature = "rest-api")]
+            if let DevAction::Watch { artifact } = &action {
+                let rt = tokio::runtime::Runtime::new()?;
+                return rt.block_on(cmd_dev_watch(artifact));
+            }
+            cmd_dev(&action)
+        }
         Some(Commands::Tls { action }) => cmd_tls(&action),
+        #[cfg(feature = "rest-api")]
+        Some(Commands::Serve { addr, artifact_dir }) => cmd_serve(&addr, &artifact_dir),
         None => {
             println!("Aeon v{}", env!("CARGO_PKG_VERSION"));
             println!("Run `aeon --help` for available commands.");
             Ok(())
         }
     }
+}
+
+// ── Server ────────────────────────────────────────────────────────────
+
+#[cfg(feature = "rest-api")]
+fn cmd_serve(addr: &str, artifact_dir: &str) -> Result<()> {
+    use std::sync::Arc;
+
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to build tokio runtime")?;
+
+    rt.block_on(async {
+        // Resolve artifact directory from env or CLI flag
+        let dir = std::env::var("AEON_ARTIFACT_DIR").unwrap_or_else(|_| artifact_dir.to_string());
+        let registry = aeon_engine::registry::ProcessorRegistry::new(&dir)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let pipelines = aeon_engine::pipeline_manager::PipelineManager::new();
+        let identities = aeon_engine::identity_store::ProcessorIdentityStore::new();
+
+        let state = Arc::new(aeon_engine::AppState {
+            registry: Arc::new(registry),
+            pipelines: Arc::new(pipelines),
+            delivery_ledgers: dashmap::DashMap::new(),
+            pipeline_controls: dashmap::DashMap::new(),
+            identities: Arc::new(identities),
+            authenticator: None,
+            ws_host: None,
+        });
+
+        let listen_addr =
+            std::env::var("AEON_API_ADDR").unwrap_or_else(|_| addr.to_string());
+        aeon_engine::serve(state, &listen_addr)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    })
 }
 
 // ── Input validation ──────────────────────────────────────────────────
@@ -849,9 +919,9 @@ fn cmd_processor(api: &str, action: &ProcessorAction) -> Result<()> {
             let sha512 = aeon_engine::registry::sha512_hex(&artifact_bytes);
 
             let processor_type = if artifact.extension().is_some_and(|e| e == "wasm") {
-                "Wasm"
+                "wasm"
             } else {
-                "NativeSo"
+                "native-so"
             };
 
             let payload = serde_json::json!({
@@ -863,7 +933,7 @@ fn cmd_processor(api: &str, action: &ProcessorAction) -> Result<()> {
                     "size_bytes": artifact_bytes.len(),
                     "processor_type": processor_type,
                     "platform": platform,
-                    "status": "Available",
+                    "status": "available",
                     "registered_at": now_millis(),
                     "registered_by": "cli",
                 },
@@ -1138,9 +1208,9 @@ fn cmd_deploy(
 
     let sha512 = aeon_engine::registry::sha512_hex(&artifact_bytes);
     let processor_type = if artifact.extension().is_some_and(|e| e == "wasm") {
-        "Wasm"
+        "wasm"
     } else {
-        "NativeSo"
+        "native-so"
     };
 
     // Step 1: Register processor
@@ -1154,7 +1224,7 @@ fn cmd_deploy(
             "size_bytes": artifact_bytes.len(),
             "processor_type": processor_type,
             "platform": "wasm32",
-            "status": "Available",
+            "status": "available",
             "registered_at": now_millis(),
             "registered_by": "cli",
         },
@@ -1248,26 +1318,174 @@ fn cmd_top(api: &str) -> Result<()> {
 
 // ── aeon verify ───────────────────────────────────────────────────────
 
-fn cmd_verify(target: &str, _api: &str) -> Result<()> {
-    // Placeholder for PoH/Merkle verification.
-    // In production, this would:
-    // 1. Fetch the PoH chain for the target pipeline(s)
-    // 2. Verify each entry's hash links to the previous
-    // 3. Verify Merkle proofs for event batches
-    // 4. Report any integrity violations
+fn cmd_verify(target: &str, api: &str) -> Result<()> {
+    use aeon_crypto::hash::sha512;
+    use aeon_crypto::merkle::MerkleTree;
+    use aeon_crypto::mmr::MerkleMountainRange;
+    use aeon_crypto::poh::PohChain;
+    use aeon_types::PartitionId;
+
     println!("Aeon Integrity Verification");
-    println!("{}", "=".repeat(50));
+    println!("{}", "=".repeat(60));
     println!("Target: {target}");
+    println!("API:    {api}");
     println!();
-    println!("PoH chain verification is not yet connected to the runtime.");
-    println!("This command will verify Proof-of-History and Merkle tree");
-    println!("integrity once pipeline event tracing is wired in Phase 14.");
+
+    // Step 1: Validate local crypto modules are functional
+    println!("Local module validation:");
+
+    // PoH chain: create, append, verify
+    let mut chain = PohChain::new(PartitionId::new(0), 64);
+    chain.append_batch(&[b"test-event-1", b"test-event-2"], 1_000_000, None);
+    chain.append_batch(&[b"test-event-3"], 2_000_000, None);
+    let poh_ok = chain.verify_recent().is_none(); // None = all valid
+    println!(
+        "  PoH chain:    {} (seq={}, hash={}..)",
+        if poh_ok { "OK" } else { "FAIL" },
+        chain.sequence(),
+        &chain.current_hash().to_hex()[..16],
+    );
+
+    // Merkle tree: build, prove, verify
+    let tree = MerkleTree::from_data(&[b"a", b"b", b"c", b"d"]);
+    let merkle_ok = match &tree {
+        Some(t) => {
+            let proof = t.proof(0);
+            proof.is_some_and(|p: aeon_crypto::merkle::MerkleProof| p.verify())
+        }
+        None => false,
+    };
+    println!(
+        "  Merkle tree:  {} (root={}..)",
+        if merkle_ok { "OK" } else { "FAIL" },
+        tree.as_ref()
+            .map(|t| t.root().to_hex()[..16].to_string())
+            .unwrap_or_else(|| "none".to_string()),
+    );
+
+    // MMR: append, verify root
+    let mut mmr = MerkleMountainRange::new();
+    mmr.append(sha512(b"leaf-0"));
+    mmr.append(sha512(b"leaf-1"));
+    mmr.append(sha512(b"leaf-2"));
+    let mmr_ok = mmr.root() != aeon_crypto::hash::Hash512::ZERO;
+    println!(
+        "  MMR:          {} (leaves={}, root={}..)",
+        if mmr_ok { "OK" } else { "FAIL" },
+        mmr.leaf_count(),
+        &mmr.root().to_hex()[..16],
+    );
+
+    // Signing: generate key, sign, verify
+    let signing_key = aeon_crypto::signing::SigningKey::generate();
+    let msg = b"integrity-check";
+    let sig = signing_key.sign(msg);
+    let vk = signing_key.verifying_key();
+    let sig_ok = vk.verify(msg, &sig);
+    let pubkey_hex = hex::encode(vk.to_bytes());
+    println!(
+        "  Ed25519 sign: {} (pubkey={}..)",
+        if sig_ok { "OK" } else { "FAIL" },
+        &pubkey_hex[..16],
+    );
+
+    let all_local_ok = poh_ok && merkle_ok && mmr_ok && sig_ok;
     println!();
-    println!("Available verification modules:");
-    println!("  - PoH chain continuity (aeon-crypto::poh)");
-    println!("  - Merkle batch proofs (aeon-crypto::merkle)");
-    println!("  - MMR append-only log (aeon-crypto::mmr)");
-    println!("  - Ed25519 signature validation (aeon-crypto::signing)");
+
+    // Step 2: Query the API for pipeline verification state
+    println!("Remote pipeline verification:");
+
+    let url = format!("{api}/api/v1/pipelines/{target}/verify");
+    match ureq::get(&url).call() {
+        Ok(resp) => {
+            let body: serde_json::Value = resp.into_json().context("invalid JSON response")?;
+
+            let poh_active = body["poh_active"].as_bool().unwrap_or(false);
+            let status = body["status"].as_str().unwrap_or("unknown");
+
+            if target == "all" {
+                // System-wide report
+                let pipelines = body["pipelines"].as_array();
+                match pipelines {
+                    Some(arr) if !arr.is_empty() => {
+                        println!("  {:<25} {:<12} {:<10}", "PIPELINE", "STATE", "POH");
+                        println!("  {}", "-".repeat(47));
+                        for p in arr {
+                            let name = p["name"].as_str().unwrap_or("-");
+                            let state = p["state"].as_str().unwrap_or("-");
+                            let active = if p["poh_active"].as_bool().unwrap_or(false) {
+                                "active"
+                            } else {
+                                "pending"
+                            };
+                            println!("  {:<25} {:<12} {:<10}", name, state, active);
+                        }
+                    }
+                    _ => println!("  No pipelines found."),
+                }
+            } else {
+                // Single pipeline report
+                println!("  Pipeline:   {target}");
+                println!("  Status:     {status}");
+                println!(
+                    "  PoH active: {}",
+                    if poh_active {
+                        "yes"
+                    } else {
+                        "no (pending runtime wiring)"
+                    }
+                );
+
+                // Show chain heads if present
+                if let Some(heads) = body["chain_heads"].as_array() {
+                    if !heads.is_empty() {
+                        println!();
+                        println!(
+                            "  {:<12} {:<10} {:<34}",
+                            "PARTITION", "SEQUENCE", "HEAD HASH"
+                        );
+                        println!("  {}", "-".repeat(56));
+                        for head in heads {
+                            let part = head["partition"].as_u64().unwrap_or(0);
+                            let seq = head["sequence"].as_u64().unwrap_or(0);
+                            let hash = head["hash"].as_str().unwrap_or("-");
+                            let hash_short = if hash.len() > 32 { &hash[..32] } else { hash };
+                            println!("  {:<12} {:<10} {}...", part, seq, hash_short);
+                        }
+                    }
+                }
+
+                if let Some(agg) = body["aggregate_hash"].as_str() {
+                    println!("  Aggregate:  {}...", &agg[..32.min(agg.len())]);
+                }
+            }
+
+            // Module availability
+            if let Some(modules) = body["modules"].as_object() {
+                println!();
+                println!("  Crypto modules:");
+                for (name, status) in modules {
+                    println!("    {:<10} {}", name, status.as_str().unwrap_or("unknown"));
+                }
+            }
+        }
+        Err(ureq::Error::Status(404, _)) => {
+            println!("  Pipeline '{target}' not found on {api}");
+        }
+        Err(e) => {
+            println!("  Could not reach API at {api}: {e}");
+            println!("  (Run `aeon verify` while the Aeon server is running)");
+        }
+    }
+
+    println!();
+    println!("Result:");
+    if all_local_ok {
+        println!("  All local crypto modules operational.");
+    } else {
+        println!("  WARNING: One or more crypto modules failed self-test!");
+    }
+
     Ok(())
 }
 
@@ -1639,6 +1857,9 @@ fn cmd_dev(action: &DevAction) -> Result<()> {
             }
             Ok(())
         }
+        // Watch is handled before cmd_dev is called (needs async runtime)
+        #[cfg(feature = "rest-api")]
+        DevAction::Watch { .. } => unreachable!("watch handled in main dispatch"),
     }
 }
 
@@ -1661,6 +1882,217 @@ fn find_compose_file() -> Result<PathBuf> {
         "could not find {target}. Run `aeon dev` from within the Aeon workspace, \
          or ensure docker/docker-compose.dev.yml exists."
     )
+}
+
+// ── aeon dev watch ─────────────────────────────────────────────────────
+
+#[cfg(feature = "rest-api")]
+async fn cmd_dev_watch(artifact: &Path) -> Result<()> {
+    use aeon_connectors::StdoutSink;
+    use aeon_engine::{PipelineConfig, PipelineControl, PipelineMetrics, run_buffered_managed};
+    use aeon_types::{AeonError, Event, Processor, Source};
+    use notify::{RecommendedWatcher, RecursiveMode, Watcher, EventKind};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    // Validate artifact exists
+    if !artifact.exists() {
+        bail!("artifact not found: {}", artifact.display());
+    }
+
+    // Load the initial processor
+    let load_processor = |path: &Path| -> Result<Box<dyn Processor + Send + Sync>> {
+        let bytes = std::fs::read(path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        match path.extension().and_then(|e| e.to_str()).unwrap_or("") {
+            "wasm" | "wat" => {
+                let module = aeon_wasm::WasmModule::from_bytes(
+                    &bytes,
+                    aeon_wasm::WasmConfig::default(),
+                )
+                .map_err(|e| anyhow::anyhow!("failed to compile Wasm: {e}"))?;
+                let proc = aeon_wasm::WasmProcessor::new(Arc::new(module))
+                    .map_err(|e| anyhow::anyhow!("failed to instantiate Wasm processor: {e}"))?;
+                Ok(Box::new(proc))
+            }
+            "so" | "dylib" | "dll" => {
+                let proc = aeon_engine::native_loader::NativeProcessor::load(path, &[])
+                    .map_err(|e| anyhow::anyhow!("failed to load native processor: {e}"))?;
+                Ok(Box::new(proc))
+            }
+            other => bail!("unsupported artifact extension: .{other} (expected .wasm, .so, .dll)"),
+        }
+    };
+
+    let processor = load_processor(artifact)?;
+    println!("Loaded processor from {}", artifact.display());
+
+    // Create a tick source that produces one synthetic event per second.
+    struct TickSource {
+        counter: u64,
+        shutdown: Arc<AtomicBool>,
+    }
+    impl Source for TickSource {
+        async fn next_batch(&mut self) -> Result<Vec<Event>, AeonError> {
+            if self.shutdown.load(Ordering::Relaxed) {
+                return Ok(Vec::new());
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            if self.shutdown.load(Ordering::Relaxed) {
+                return Ok(Vec::new());
+            }
+            self.counter += 1;
+            let source: Arc<str> = Arc::from("dev-tick");
+            let event = Event::new(
+                ::uuid::Uuid::new_v4(),
+                chrono_now_nanos(),
+                source,
+                aeon_types::PartitionId::new(0),
+                bytes::Bytes::from(format!("{{\"tick\":{}}}", self.counter)),
+            );
+            Ok(vec![event])
+        }
+        async fn pause(&mut self) {}
+        async fn resume(&mut self) {}
+    }
+
+    fn chrono_now_nanos() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as i64
+    }
+
+    let source_shutdown = Arc::new(AtomicBool::new(false));
+    let source = TickSource {
+        counter: 0,
+        shutdown: Arc::clone(&source_shutdown),
+    };
+    let sink = StdoutSink::new();
+    let config = PipelineConfig::default();
+    let metrics = Arc::new(PipelineMetrics::default());
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let control = PipelineControl::new();
+
+    let control_watcher = Arc::clone(&control);
+    let shutdown_watcher = Arc::clone(&shutdown);
+    let artifact_path = artifact.to_path_buf();
+
+    // Spawn the pipeline
+    let control_pipeline = Arc::clone(&control);
+    let metrics_pipeline = Arc::clone(&metrics);
+    let shutdown_pipeline = Arc::clone(&shutdown);
+    let pipeline_handle = tokio::spawn(async move {
+        run_buffered_managed(
+            source,
+            processor,
+            sink,
+            config,
+            metrics_pipeline,
+            shutdown_pipeline,
+            None,
+            control_pipeline,
+        )
+        .await
+    });
+
+    println!();
+    println!("Pipeline running (1 event/sec → processor → stdout)");
+    println!("Watching: {}", artifact.display());
+    println!("Press Ctrl+C to stop.");
+    println!();
+
+    // Set up file watcher with debounce
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut watcher = RecommendedWatcher::new(tx, notify::Config::default())
+        .context("failed to create file watcher")?;
+
+    // Watch the parent directory (some editors delete+recreate files)
+    let watch_dir = artifact.parent().unwrap_or(Path::new("."));
+    watcher
+        .watch(watch_dir, RecursiveMode::NonRecursive)
+        .with_context(|| format!("failed to watch {}", watch_dir.display()))?;
+
+    let artifact_canonical = artifact.canonicalize().unwrap_or(artifact.to_path_buf());
+
+    // Ctrl+C handler
+    let shutdown_ctrlc = Arc::clone(&shutdown);
+    let source_shutdown_ctrlc = Arc::clone(&source_shutdown);
+    tokio::spawn(async move {
+        tokio::signal::ctrl_c().await.ok();
+        println!("\nShutting down...");
+        source_shutdown_ctrlc.store(true, Ordering::Release);
+        shutdown_ctrlc.store(true, Ordering::Release);
+    });
+
+    // File watcher loop (runs on blocking thread to not block tokio)
+    let watcher_handle = tokio::task::spawn_blocking(move || {
+        let mut last_reload = std::time::Instant::now();
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                Ok(Ok(event)) => {
+                    // Only react to Create/Modify for our artifact
+                    let dominated = matches!(
+                        event.kind,
+                        EventKind::Create(_) | EventKind::Modify(_)
+                    );
+                    let is_our_file = event.paths.iter().any(|p| {
+                        p.canonicalize().unwrap_or(p.clone()) == artifact_canonical
+                    });
+                    if !dominated || !is_our_file {
+                        continue;
+                    }
+
+                    // Debounce: skip if last reload was <500ms ago
+                    if last_reload.elapsed() < std::time::Duration::from_millis(500) {
+                        continue;
+                    }
+
+                    // Small delay to let writes complete
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+
+                    match load_processor(&artifact_path) {
+                        Ok(new_processor) => {
+                            println!("\n--- Reloading processor ---");
+                            let ctrl = Arc::clone(&control_watcher);
+                            // Use a new tokio runtime for the async swap
+                            // (we're in a blocking thread)
+                            let rt = tokio::runtime::Handle::current();
+                            match rt.block_on(ctrl.drain_and_swap(new_processor)) {
+                                Ok(()) => {
+                                    println!("--- Processor reloaded ---\n");
+                                    last_reload = std::time::Instant::now();
+                                }
+                                Err(e) => {
+                                    eprintln!("Failed to swap processor: {e}");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to load updated artifact: {e}");
+                        }
+                    }
+                }
+                Ok(Err(e)) => {
+                    eprintln!("File watcher error: {e}");
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if shutdown_watcher.load(Ordering::Relaxed) {
+                        break;
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+    });
+
+    // Wait for pipeline to finish (Ctrl+C triggers shutdown)
+    let _ = pipeline_handle.await;
+    let _ = watcher_handle.await;
+
+    let processed = metrics.events_processed.load(Ordering::Relaxed);
+    println!("Dev session complete. Processed {processed} events.");
+    Ok(())
 }
 
 // ── aeon tls ──────────────────────────────────────────────────────────

@@ -14,6 +14,9 @@ mod inner {
     use crate::config::ClusterConfig;
     use crate::raft_config::AeonRaftConfig;
     use crate::store::{MemLogStore, StateMachineStore};
+    use crate::transport::endpoint::QuicEndpoint;
+    use crate::transport::network::QuicNetworkFactory;
+    use crate::transport::server;
     use crate::types::{ClusterRequest, ClusterResponse, NodeAddress, NodeId};
 
     /// A stub RaftNetworkFactory that does nothing (for single-node clusters).
@@ -111,9 +114,14 @@ mod inner {
     ///
     /// Wraps a Raft instance with partition management. In single-node mode,
     /// no QUIC listeners are started and commits are instant (quorum=1).
+    /// In multi-node mode, a QUIC endpoint runs for Raft RPCs.
     pub struct ClusterNode {
         raft: Raft<AeonRaftConfig>,
         config: ClusterConfig,
+        /// QUIC endpoint (None in single-node stub mode).
+        endpoint: Option<Arc<QuicEndpoint>>,
+        /// Shutdown signal for the QUIC server task.
+        shutdown: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl ClusterNode {
@@ -160,7 +168,13 @@ mod inner {
                     source: None,
                 })?;
 
-            let node = Self { raft, config };
+            let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let node = Self {
+                raft,
+                config,
+                endpoint: None,
+                shutdown,
+            };
 
             // Assign all partitions to self
             for i in 0..node.config.num_partitions {
@@ -176,6 +190,162 @@ mod inner {
                 partitions = node.config.num_partitions,
                 "Single-node cluster bootstrapped"
             );
+
+            Ok(node)
+        }
+
+        /// Bootstrap a multi-node cluster with QUIC transport.
+        ///
+        /// Creates a QUIC endpoint, starts the Raft RPC server, and initializes
+        /// the cluster with the configured peers. The initializing node becomes
+        /// the first leader candidate; Raft election determines the actual leader.
+        pub async fn bootstrap_multi(
+            config: ClusterConfig,
+            endpoint: Arc<QuicEndpoint>,
+        ) -> Result<Self, AeonError> {
+            config.validate()?;
+
+            let raft_config = Arc::new(Config {
+                cluster_name: "aeon".to_string(),
+                heartbeat_interval: 500,
+                election_timeout_min: 1500,
+                election_timeout_max: 3000,
+                ..Config::default()
+            });
+
+            let log_store = MemLogStore::new();
+            let state_machine = StateMachineStore::new();
+            let network = QuicNetworkFactory::new(Arc::clone(&endpoint));
+
+            let raft = Raft::new(
+                config.node_id,
+                raft_config,
+                network,
+                log_store,
+                state_machine,
+            )
+            .await
+            .map_err(|e| AeonError::Cluster {
+                message: format!("failed to create Raft node: {e}"),
+                source: None,
+            })?;
+
+            // Start the QUIC RPC server
+            let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let server_ep = Arc::clone(&endpoint);
+            let server_raft = raft.clone();
+            let server_shutdown = Arc::clone(&shutdown);
+            tokio::spawn(async move {
+                server::serve(server_ep, server_raft, server_shutdown).await;
+            });
+
+            // Build membership from self + peers
+            let local_addr = endpoint.local_addr().map_err(|e| AeonError::Cluster {
+                message: format!("failed to get local QUIC address: {e}"),
+                source: None,
+            })?;
+
+            let mut members = BTreeMap::new();
+            members.insert(
+                config.node_id,
+                NodeAddress::new(local_addr.ip().to_string(), local_addr.port()),
+            );
+            for (i, peer) in config.peers.iter().enumerate() {
+                // Peer node IDs are assigned sequentially starting after self
+                let peer_id = config.node_id + (i as u64) + 1;
+                members.insert(peer_id, peer.clone());
+            }
+
+            raft.initialize(members)
+                .await
+                .map_err(|e| AeonError::Cluster {
+                    message: format!("failed to initialize Raft cluster: {e}"),
+                    source: None,
+                })?;
+
+            let node = Self {
+                raft,
+                config,
+                endpoint: Some(endpoint),
+                shutdown,
+            };
+
+            tracing::info!(
+                node_id = node.config.node_id,
+                peers = node.config.peers.len(),
+                partitions = node.config.num_partitions,
+                "Multi-node cluster bootstrapped with QUIC transport"
+            );
+
+            Ok(node)
+        }
+
+        /// Join an existing cluster via seed nodes.
+        ///
+        /// Connects to a seed node, fetches the current cluster membership,
+        /// and adds this node to the cluster. The QUIC server is started
+        /// before joining so peers can reach this node.
+        pub async fn join(
+            config: ClusterConfig,
+            endpoint: Arc<QuicEndpoint>,
+        ) -> Result<Self, AeonError> {
+            config.validate()?;
+
+            if config.seed_nodes.is_empty() {
+                return Err(AeonError::Config {
+                    message: "join requires at least one seed node".to_string(),
+                });
+            }
+
+            let raft_config = Arc::new(Config {
+                cluster_name: "aeon".to_string(),
+                heartbeat_interval: 500,
+                election_timeout_min: 1500,
+                election_timeout_max: 3000,
+                ..Config::default()
+            });
+
+            let log_store = MemLogStore::new();
+            let state_machine = StateMachineStore::new();
+            let network = QuicNetworkFactory::new(Arc::clone(&endpoint));
+
+            let raft = Raft::new(
+                config.node_id,
+                raft_config,
+                network,
+                log_store,
+                state_machine,
+            )
+            .await
+            .map_err(|e| AeonError::Cluster {
+                message: format!("failed to create Raft node: {e}"),
+                source: None,
+            })?;
+
+            // Start the QUIC RPC server so peers can reach us
+            let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let server_ep = Arc::clone(&endpoint);
+            let server_raft = raft.clone();
+            let server_shutdown = Arc::clone(&shutdown);
+            tokio::spawn(async move {
+                server::serve(server_ep, server_raft, server_shutdown).await;
+            });
+
+            // TODO: Contact seed nodes to add ourselves to the cluster.
+            // This requires a cluster management RPC (AddLearner + ChangeMembership)
+            // that is not yet implemented. For now, log the intent.
+            tracing::info!(
+                node_id = config.node_id,
+                seed_nodes = ?config.seed_nodes,
+                "Node started with QUIC transport, awaiting cluster join (seed-based join is Phase 2)"
+            );
+
+            let node = Self {
+                raft,
+                config,
+                endpoint: Some(endpoint),
+                shutdown,
+            };
 
             Ok(node)
         }
@@ -209,13 +379,29 @@ mod inner {
             &self.raft
         }
 
-        /// Shut down the Raft node gracefully.
+        /// Shut down the Raft node and QUIC transport gracefully.
         pub async fn shutdown(&self) -> Result<(), AeonError> {
+            // Signal the QUIC server to stop accepting connections
+            self.shutdown
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+
+            // Shut down Raft
             self.raft.shutdown().await.map_err(|e| AeonError::Cluster {
                 message: format!("Raft shutdown failed: {e}"),
                 source: None,
             })?;
+
+            // Close the QUIC endpoint
+            if let Some(ep) = &self.endpoint {
+                ep.close();
+            }
+
             Ok(())
+        }
+
+        /// Get the QUIC endpoint (if running in multi-node mode).
+        pub fn endpoint(&self) -> Option<&Arc<QuicEndpoint>> {
+            self.endpoint.as_ref()
         }
     }
 

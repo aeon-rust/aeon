@@ -10,6 +10,7 @@ pub struct MemorySource {
     events: Vec<Event>,
     position: usize,
     batch_size: usize,
+    paused: bool,
 }
 
 impl MemorySource {
@@ -19,6 +20,7 @@ impl MemorySource {
             events,
             position: 0,
             batch_size,
+            paused: false,
         }
     }
 
@@ -40,7 +42,7 @@ impl MemorySource {
 
 impl Source for MemorySource {
     async fn next_batch(&mut self) -> Result<Vec<Event>, AeonError> {
-        if self.position >= self.events.len() {
+        if self.paused || self.position >= self.events.len() {
             return Ok(Vec::new());
         }
 
@@ -48,6 +50,14 @@ impl Source for MemorySource {
         let batch = self.events[self.position..end].to_vec();
         self.position = end;
         Ok(batch)
+    }
+
+    async fn pause(&mut self) {
+        self.paused = true;
+    }
+
+    async fn resume(&mut self) {
+        self.paused = false;
     }
 }
 

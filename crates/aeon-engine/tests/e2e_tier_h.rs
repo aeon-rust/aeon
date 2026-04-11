@@ -337,16 +337,15 @@ async fn h4_php_workerman() {
         return;
     }
 
-    let project_dir = match e2e_ws_harness::setup_composer_project(
-        "h4-workerman",
-        &["workerman/workerman:^5.0"],
-    ) {
-        Some(d) => d,
-        None => {
-            eprintln!("SKIP H4: composer install failed");
-            return;
-        }
-    };
+    let project_dir =
+        match e2e_ws_harness::setup_composer_project("h4-workerman", &["workerman/workerman:^5.0"])
+        {
+            Some(d) => d,
+            None => {
+                eprintln!("SKIP H4: composer install failed");
+                return;
+            }
+        };
     let autoload = project_dir.join("vendor").join("autoload.php");
     if !autoload.exists() {
         eprintln!("SKIP H4: vendor/autoload.php missing after composer install");

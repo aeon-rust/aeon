@@ -1,3 +1,6 @@
+// Gate the entire harness behind the webtransport-host feature.
+// Without it, wtransport and the WT host types are not available.
+#![cfg(feature = "webtransport-host")]
 //! T3 WebTransport Test Harness
 //!
 //! Provides reusable infrastructure for T3 E2E tests:
@@ -94,8 +97,8 @@ pub async fn start_wt_test_server(pipeline_name: &str) -> WtTestServer {
 
     // Self-signed cert covering `localhost` — the WT client trusts it via
     // the `webtransport-insecure` feature (no-cert-validation).
-    let identity = wtransport::Identity::self_signed(["localhost"])
-        .expect("wtransport self-signed identity");
+    let identity =
+        wtransport::Identity::self_signed(["localhost"]).expect("wtransport self-signed identity");
 
     let server_config = wtransport::ServerConfig::builder()
         .with_bind_address(SocketAddr::from(([127, 0, 0, 1], 0)))
@@ -251,7 +254,10 @@ pub async fn drive_events_through_transport(
 /// client SDK.
 pub fn write_seed_file(identity: &TestIdentity) -> std::path::PathBuf {
     let dir = std::env::temp_dir();
-    let path = dir.join(format!("aeon-e2e-wt-key-{}.bin", &identity.fingerprint[7..23]));
+    let path = dir.join(format!(
+        "aeon-e2e-wt-key-{}.bin",
+        &identity.fingerprint[7..23]
+    ));
     std::fs::write(&path, identity.signing_key.as_bytes()).expect("write WT seed file");
     path
 }

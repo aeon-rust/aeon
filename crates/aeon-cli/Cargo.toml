@@ -5,6 +5,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/aeon-cli"
+keywords = ["stream-processing", "cli", "pipeline", "devops"]
+categories = ["command-line-utilities"]
 
 [[bin]]
 name = "aeon"
@@ -13,7 +18,7 @@ path = "src/main.rs"
 [features]
 default = ["native-validate"]
 native-validate = ["aeon-engine/native-loader"]
-rest-api = ["aeon-engine/rest-api"]
+rest-api = ["aeon-engine/rest-api", "dep:tokio", "dep:tracing", "dep:tracing-subscriber", "dep:dashmap", "dep:notify", "dep:aeon-wasm", "dep:aeon-connectors", "dep:uuid", "dep:bytes"]
 
 [dependencies]
 aeon-types = { workspace = true }
@@ -25,5 +30,15 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = "0.9"
 ureq = { version = "2", features = ["json"] }
+hex = { workspace = true }
 wasmtime = { workspace = true }
 rustls-pemfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"], optional = true }
+tracing = { workspace = true, optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"], optional = true }
+dashmap = { workspace = true, optional = true }
+notify = { workspace = true, optional = true }
+aeon-wasm = { workspace = true, optional = true }
+aeon-connectors = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }

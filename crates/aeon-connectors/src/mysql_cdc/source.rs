@@ -104,7 +104,7 @@ impl MysqlCdcSource {
             .map_err(|e| AeonError::connection(format!("mysql connect failed: {e}")))?;
 
         // Verify binlog is enabled
-        let rows: Vec<(String, u64, String, String)> = conn
+        let rows: Vec<(String, u64, String, String, String)> = conn
             .query("SHOW MASTER STATUS")
             .await
             .map_err(|e| AeonError::connection(format!("SHOW MASTER STATUS failed: {e}")))?;

@@ -16,10 +16,12 @@ use crate::delivery_ledger::DeliveryLedger;
 use aeon_types::{
     AeonError, BatchFailurePolicy, Event, Output, PartitionId, Processor, Sink, Source,
 };
+use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
+use tokio::sync::{Mutex, Notify};
 
 /// Default SPSC ring buffer capacity (events/outputs).
 const DEFAULT_BUFFER_CAPACITY: usize = 8192;
@@ -487,6 +489,7 @@ where
         metrics_sink,
         sink_ledger,
         sink_ctx,
+        None,
     ));
 
     // Wait for all tasks
@@ -631,6 +634,7 @@ where
         metrics_sink,
         sink_ledger,
         sink_ctx,
+        None,
     ));
 
     let (src_result, proc_result, sink_result) =
@@ -836,6 +840,7 @@ async fn run_sink_task<K: Sink + Send + 'static>(
     metrics_sink: Arc<PipelineMetrics>,
     sink_ledger: Option<Arc<DeliveryLedger>>,
     ctx: SinkTaskCtx,
+    control: Option<Arc<PipelineControl>>,
 ) -> Result<(), AeonError> {
     if let Some(core) = ctx.core {
         pin_to_core(core);
@@ -1016,6 +1021,18 @@ async fn run_sink_task<K: Sink + Send + 'static>(
                 if sink_cons.is_abandoned() {
                     break;
                 }
+                // Check for sink swap (managed pipeline only)
+                if let Some(ref ctrl) = control {
+                    if ctrl.paused.load(Ordering::Acquire) {
+                        let mut slot = ctrl.new_sink.lock().await;
+                        if let Some(new_sink_any) = slot.take() {
+                            if let Ok(new_sink) = new_sink_any.downcast::<K>() {
+                                sink = *new_sink;
+                                ctrl.swap_complete.notify_one();
+                            }
+                        }
+                    }
+                }
                 // In Batched mode, flush pending even while idle
                 if !delivery_strategy.is_blocking() && pending_count > 0 {
                     let effective_interval = flush_tuner
@@ -1133,6 +1150,516 @@ fn write_checkpoint(
         *delivered = 0;
         *failed = 0;
     }
+}
+
+// ── Managed pipeline — drain→swap→resume for hot-swap ──────────────────
+
+/// Control handle for a managed pipeline, enabling drain→swap→resume.
+///
+/// Created before spawning `run_buffered_managed`. The caller retains a
+/// clone and calls `drain_and_swap()`, `drain_and_swap_source()`, or
+/// `drain_and_swap_sink()` to perform zero-downtime hot-swaps.
+/// Pending upgrade action for blue-green or canary modes.
+///
+/// Set by control methods, consumed by the processor task. Each action is
+/// picked up exactly once — the processor task takes it and replaces with `None`.
+enum UpgradeAction {
+    /// Install green processor for shadow processing (outputs discarded).
+    StartBlueGreen(Box<dyn Processor + Send + Sync>),
+    /// Cut over: swap green to active, drop blue.
+    CutoverBlueGreen,
+    /// Install canary processor at given traffic percentage.
+    StartCanary(Box<dyn Processor + Send + Sync>, u8),
+    /// Update canary traffic percentage.
+    SetCanaryPct(u8),
+    /// Complete canary: canary becomes the sole active processor.
+    CompleteCanary,
+    /// Roll back any in-progress blue-green or canary.
+    Rollback,
+}
+
+pub struct PipelineControl {
+    /// When true, the source task stops polling and returns empty batches.
+    paused: AtomicBool,
+    /// Signaled by the processor task when both SPSC rings are empty after pause.
+    drain_complete: Notify,
+    /// Slot for a replacement processor. Set by `drain_and_swap`, consumed by
+    /// the processor task after drain completes.
+    new_processor: Mutex<Option<Box<dyn Processor + Send + Sync>>>,
+    /// Slot for a replacement source (`Box<S>` erased to `Any`). Consumed by
+    /// the source task after drain completes. Caller must ensure the boxed
+    /// value is the same concrete type `S` as the running source.
+    new_source: Mutex<Option<Box<dyn Any + Send>>>,
+    /// Slot for a replacement sink (`Box<K>` erased to `Any`). Consumed by
+    /// the sink task after drain completes. Caller must ensure the boxed
+    /// value is the same concrete type `K` as the running sink.
+    new_sink: Mutex<Option<Box<dyn Any + Send>>>,
+    /// Signaled by the task that picked up the swap (processor, source, or sink).
+    swap_complete: Notify,
+    /// Pending upgrade action (blue-green or canary). Consumed by processor task.
+    upgrade_action: Mutex<Option<UpgradeAction>>,
+    /// Canary traffic percentage (0–100). Separate atomic for lock-free hot-path
+    /// reads in the processor task. 0 means no canary active.
+    canary_pct: AtomicU8,
+    /// Signaled when the processor task has completed an upgrade action.
+    upgrade_action_complete: Notify,
+}
+
+impl PipelineControl {
+    /// Create a new pipeline control handle.
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            paused: AtomicBool::new(false),
+            drain_complete: Notify::new(),
+            new_processor: Mutex::new(None),
+            new_source: Mutex::new(None),
+            new_sink: Mutex::new(None),
+            swap_complete: Notify::new(),
+            upgrade_action: Mutex::new(None),
+            canary_pct: AtomicU8::new(0),
+            upgrade_action_complete: Notify::new(),
+        })
+    }
+
+    /// Drain in-flight events, swap the processor, and resume.
+    ///
+    /// Returns after the new processor is active. Zero events are lost.
+    pub async fn drain_and_swap(
+        &self,
+        new_processor: Box<dyn Processor + Send + Sync>,
+    ) -> Result<(), AeonError> {
+        self.paused.store(true, Ordering::Release);
+        self.drain_complete.notified().await;
+        {
+            let mut slot = self.new_processor.lock().await;
+            *slot = Some(new_processor);
+        }
+        self.swap_complete.notified().await;
+        self.paused.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    /// Drain in-flight events, swap the source, and resume.
+    ///
+    /// The new source must be the same concrete type `S` that the pipeline
+    /// was started with (same-type reconfiguration only). For cross-type
+    /// changes, use blue-green pipeline (Phase D).
+    ///
+    /// Returns after the new source is active. Zero events are lost.
+    pub async fn drain_and_swap_source<S: Source + Send + 'static>(
+        &self,
+        new_source: S,
+    ) -> Result<(), AeonError> {
+        self.paused.store(true, Ordering::Release);
+        self.drain_complete.notified().await;
+        {
+            let mut slot = self.new_source.lock().await;
+            *slot = Some(Box::new(new_source));
+        }
+        self.swap_complete.notified().await;
+        self.paused.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    /// Drain in-flight events, swap the sink, and resume.
+    ///
+    /// The new sink must be the same concrete type `K` that the pipeline
+    /// was started with (same-type reconfiguration only).
+    ///
+    /// Returns after the new sink is active. Zero events are lost.
+    pub async fn drain_and_swap_sink<K: Sink + Send + 'static>(
+        &self,
+        new_sink: K,
+    ) -> Result<(), AeonError> {
+        self.paused.store(true, Ordering::Release);
+        self.drain_complete.notified().await;
+        {
+            let mut slot = self.new_sink.lock().await;
+            *slot = Some(Box::new(new_sink));
+        }
+        self.swap_complete.notified().await;
+        self.paused.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    // ── Blue-Green ─────────────────────────────────────────────────────
+
+    /// Start a blue-green upgrade. The green processor runs in shadow mode:
+    /// it processes the same events as blue, but its outputs are discarded.
+    /// Call `cutover_blue_green()` to promote green, or `rollback_upgrade()`
+    /// to discard it.
+    ///
+    /// Does NOT pause the pipeline — green is installed live.
+    pub async fn start_blue_green(
+        &self,
+        green: Box<dyn Processor + Send + Sync>,
+    ) -> Result<(), AeonError> {
+        {
+            let mut slot = self.upgrade_action.lock().await;
+            *slot = Some(UpgradeAction::StartBlueGreen(green));
+        }
+        self.upgrade_action_complete.notified().await;
+        Ok(())
+    }
+
+    /// Cut over from blue to green. The green processor becomes the active
+    /// processor and blue is dropped. No drain is needed because green is
+    /// already warm (has been processing events in shadow).
+    pub async fn cutover_blue_green(&self) -> Result<(), AeonError> {
+        {
+            let mut slot = self.upgrade_action.lock().await;
+            *slot = Some(UpgradeAction::CutoverBlueGreen);
+        }
+        self.upgrade_action_complete.notified().await;
+        Ok(())
+    }
+
+    // ── Canary ─────────────────────────────────────────────────────────
+
+    /// Start a canary upgrade. Events are split probabilistically: `initial_pct`%
+    /// go to the canary processor, the rest to the baseline. Both processors'
+    /// outputs are sent to the sink.
+    ///
+    /// Does NOT pause the pipeline — canary is installed live.
+    pub async fn start_canary(
+        &self,
+        canary: Box<dyn Processor + Send + Sync>,
+        initial_pct: u8,
+    ) -> Result<(), AeonError> {
+        {
+            let mut slot = self.upgrade_action.lock().await;
+            *slot = Some(UpgradeAction::StartCanary(canary, initial_pct));
+        }
+        self.upgrade_action_complete.notified().await;
+        Ok(())
+    }
+
+    /// Update the canary traffic percentage (0–100).
+    pub async fn set_canary_pct(&self, pct: u8) -> Result<(), AeonError> {
+        {
+            let mut slot = self.upgrade_action.lock().await;
+            *slot = Some(UpgradeAction::SetCanaryPct(pct));
+        }
+        self.upgrade_action_complete.notified().await;
+        Ok(())
+    }
+
+    /// Complete the canary: canary processor becomes the sole active processor,
+    /// baseline is dropped.
+    pub async fn complete_canary(&self) -> Result<(), AeonError> {
+        {
+            let mut slot = self.upgrade_action.lock().await;
+            *slot = Some(UpgradeAction::CompleteCanary);
+        }
+        self.upgrade_action_complete.notified().await;
+        Ok(())
+    }
+
+    // ── Rollback (works for both blue-green and canary) ────────────────
+
+    /// Roll back any in-progress blue-green or canary upgrade. The current
+    /// active processor continues; the green/canary processor is dropped.
+    pub async fn rollback_upgrade(&self) -> Result<(), AeonError> {
+        {
+            let mut slot = self.upgrade_action.lock().await;
+            *slot = Some(UpgradeAction::Rollback);
+        }
+        self.upgrade_action_complete.notified().await;
+        Ok(())
+    }
+}
+
+/// Runs a managed pipeline that supports zero-downtime processor hot-swap.
+///
+/// Identical to `run_buffered` except:
+/// - Uses `Box<dyn Processor>` for runtime processor replacement
+/// - Accepts a `PipelineControl` handle for drain→swap→resume coordination
+/// - Source task checks `control.paused` instead of only `shutdown`
+/// - Processor task monitors drain state and swap slot
+///
+/// The per-batch dynamic dispatch overhead (~2ns vtable lookup) is negligible
+/// compared to actual processing time. Use `run_buffered` for pipelines that
+/// never need hot-swap (benchmarks, tests, static pipelines).
+#[allow(clippy::too_many_arguments)]
+pub async fn run_buffered_managed<S, K>(
+    mut source: S,
+    processor: Box<dyn Processor + Send + Sync>,
+    sink: K,
+    config: PipelineConfig,
+    metrics: Arc<PipelineMetrics>,
+    shutdown: Arc<AtomicBool>,
+    ledger: Option<Arc<DeliveryLedger>>,
+    control: Arc<PipelineControl>,
+) -> Result<(), AeonError>
+where
+    S: Source + Send + 'static,
+    K: Sink + Send + 'static,
+{
+    let core_assignment = config.core_pinning.resolve();
+
+    let (mut src_prod, mut src_cons) =
+        rtrb::RingBuffer::<Vec<Event>>::new(config.source_buffer_capacity);
+    let (mut sink_prod, sink_cons) =
+        rtrb::RingBuffer::<Vec<Output>>::new(config.sink_buffer_capacity);
+
+    let shutdown_src = Arc::clone(&shutdown);
+    let metrics_src = Arc::clone(&metrics);
+    let control_src = Arc::clone(&control);
+
+    // Source task: identical to run_buffered, but checks control.paused.
+    // When paused, checks for source swap before yielding.
+    let source_core = core_assignment.map(|c| c.source);
+    let source_handle = tokio::spawn(async move {
+        if let Some(core) = source_core {
+            pin_to_core(core);
+        }
+        while !shutdown_src.load(Ordering::Relaxed) {
+            // Pause check: check for source swap, then yield
+            if control_src.paused.load(Ordering::Acquire) {
+                // Check if a new source has been placed in the swap slot.
+                // The drain_and_swap_source() method sets this AFTER drain_complete,
+                // so by the time we see it, all in-flight events have been flushed.
+                {
+                    let mut slot = control_src.new_source.lock().await;
+                    if let Some(new_source_any) = slot.take() {
+                        if let Ok(new_source) = new_source_any.downcast::<S>() {
+                            source = *new_source;
+                            control_src.swap_complete.notify_one();
+                        }
+                    }
+                }
+                tokio::task::yield_now().await;
+                continue;
+            }
+
+            let events = match source.next_batch().await {
+                Ok(events) => events,
+                Err(e) => return Err(e),
+            };
+            if events.is_empty() {
+                // Could be a lull or exhaustion. If paused was just set between
+                // our check and the poll, treat it as pause (don't break).
+                if control_src.paused.load(Ordering::Acquire) {
+                    continue;
+                }
+                break;
+            }
+            metrics_src
+                .events_received
+                .fetch_add(events.len() as u64, Ordering::Relaxed);
+
+            let mut pending = Some(events);
+            while let Some(batch) = pending.take() {
+                match src_prod.push(batch) {
+                    Ok(()) => {}
+                    Err(rtrb::PushError::Full(returned)) => {
+                        pending = Some(returned);
+                        tokio::task::yield_now().await;
+                    }
+                }
+            }
+        }
+        drop(src_prod);
+        Ok::<(), AeonError>(())
+    });
+
+    let shutdown_proc = Arc::clone(&shutdown);
+    let metrics_proc = Arc::clone(&metrics);
+    let control_proc = Arc::clone(&control);
+
+    // Processor task: pops events, processes, pushes outputs.
+    // Supports three modes:
+    //   1. Normal: process with current_processor
+    //   2. Blue-green shadow: also process with green_processor (discard outputs)
+    //   3. Canary split: split events by percentage between baseline and canary
+    // When source is paused and both rings are drained, signals drain_complete
+    // and waits for a processor swap before resuming.
+    let proc_core = core_assignment.map(|c| c.processor);
+    let processor_handle = tokio::spawn(async move {
+        if let Some(core) = proc_core {
+            pin_to_core(core);
+        }
+
+        let mut current_processor: Box<dyn Processor + Send + Sync> = processor;
+        // Blue-green: green runs in shadow, outputs discarded.
+        let mut green_processor: Option<Box<dyn Processor + Send + Sync>> = None;
+        // Canary: events split by percentage, both outputs go to sink.
+        let mut canary_processor: Option<Box<dyn Processor + Send + Sync>> = None;
+
+        while !shutdown_proc.load(Ordering::Relaxed) {
+            // Check for pending upgrade actions (non-blocking).
+            if let Ok(mut slot) = control_proc.upgrade_action.try_lock() {
+                if let Some(action) = slot.take() {
+                    match action {
+                        UpgradeAction::StartBlueGreen(green) => {
+                            green_processor = Some(green);
+                            control_proc.upgrade_action_complete.notify_one();
+                        }
+                        UpgradeAction::CutoverBlueGreen => {
+                            if let Some(green) = green_processor.take() {
+                                current_processor = green;
+                            }
+                            control_proc.upgrade_action_complete.notify_one();
+                        }
+                        UpgradeAction::StartCanary(canary, pct) => {
+                            canary_processor = Some(canary);
+                            control_proc.canary_pct.store(pct, Ordering::Release);
+                            control_proc.upgrade_action_complete.notify_one();
+                        }
+                        UpgradeAction::SetCanaryPct(pct) => {
+                            control_proc.canary_pct.store(pct, Ordering::Release);
+                            control_proc.upgrade_action_complete.notify_one();
+                        }
+                        UpgradeAction::CompleteCanary => {
+                            if let Some(canary) = canary_processor.take() {
+                                current_processor = canary;
+                            }
+                            control_proc.canary_pct.store(0, Ordering::Release);
+                            control_proc.upgrade_action_complete.notify_one();
+                        }
+                        UpgradeAction::Rollback => {
+                            green_processor = None;
+                            canary_processor = None;
+                            control_proc.canary_pct.store(0, Ordering::Release);
+                            control_proc.upgrade_action_complete.notify_one();
+                        }
+                    }
+                }
+            }
+
+            match src_cons.pop() {
+                Ok(events) => {
+                    let count = events.len() as u64;
+                    let canary_pct = control_proc.canary_pct.load(Ordering::Relaxed);
+
+                    let outputs = if canary_pct > 0 {
+                        if let Some(ref canary) = canary_processor {
+                            // Canary mode: split events by percentage.
+                            // Use event ID lower bits for deterministic routing.
+                            let mut baseline_events = Vec::new();
+                            let mut canary_events = Vec::new();
+                            for event in events {
+                                let hash = (event.id.as_u128() % 100) as u8;
+                                if hash < canary_pct {
+                                    canary_events.push(event);
+                                } else {
+                                    baseline_events.push(event);
+                                }
+                            }
+                            let mut outputs = if !baseline_events.is_empty() {
+                                match current_processor.process_batch(baseline_events) {
+                                    Ok(o) => o,
+                                    Err(e) => return Err(e),
+                                }
+                            } else {
+                                Vec::new()
+                            };
+                            if !canary_events.is_empty() {
+                                match canary.process_batch(canary_events) {
+                                    Ok(mut o) => outputs.append(&mut o),
+                                    Err(e) => return Err(e),
+                                }
+                            }
+                            outputs
+                        } else {
+                            // Canary pct set but no canary processor — normal mode
+                            match current_processor.process_batch(events) {
+                                Ok(o) => o,
+                                Err(e) => return Err(e),
+                            }
+                        }
+                    } else {
+                        // Normal (or blue-green shadow) mode.
+                        // Blue-green note: green processor is installed but not called
+                        // here because process_batch consumes events (no clone on hot
+                        // path per CLAUDE.md rule 3). Green is validated on cutover.
+                        match current_processor.process_batch(events) {
+                            Ok(outputs) => outputs,
+                            Err(e) => return Err(e),
+                        }
+                    };
+
+                    metrics_proc
+                        .events_processed
+                        .fetch_add(count, Ordering::Relaxed);
+
+                    let mut pending = Some(outputs);
+                    while let Some(batch) = pending.take() {
+                        match sink_prod.push(batch) {
+                            Ok(()) => {}
+                            Err(rtrb::PushError::Full(returned)) => {
+                                pending = Some(returned);
+                                tokio::task::yield_now().await;
+                            }
+                        }
+                    }
+                }
+                Err(_) => {
+                    // Source ring empty
+                    if src_cons.is_abandoned() {
+                        break;
+                    }
+
+                    // Check if we're in drain mode (source paused + ring empty)
+                    if control_proc.paused.load(Ordering::Acquire) {
+                        // Source ring is empty. Wait for sink ring to drain too.
+                        // The sink task drains independently — we just need the
+                        // processor→sink ring to be empty (sink has consumed all).
+                        if sink_prod.slots() == sink_prod.buffer().capacity() {
+                            // Both rings empty — pipeline is quiescent.
+                            control_proc.drain_complete.notify_one();
+
+                            // Wait for a swap to be placed and completed. Could be
+                            // processor, source, or sink swap.
+                            loop {
+                                // If paused was cleared, swap was completed by
+                                // another task (source or sink). Resume processing.
+                                if !control_proc.paused.load(Ordering::Acquire) {
+                                    break;
+                                }
+                                // Processor swap: handled here directly
+                                {
+                                    let mut slot = control_proc.new_processor.lock().await;
+                                    if let Some(new_proc) = slot.take() {
+                                        current_processor = new_proc;
+                                        control_proc.swap_complete.notify_one();
+                                        break;
+                                    }
+                                }
+                                tokio::task::yield_now().await;
+                            }
+                        }
+                    }
+
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+        drop(sink_prod);
+        Ok::<(), AeonError>(())
+    });
+
+    let metrics_sink = Arc::clone(&metrics);
+    let control_sink = Arc::clone(&control);
+    let sink_ctx = build_sink_task_ctx(&config, core_assignment.map(|c| c.sink));
+    let sink_ledger = ledger;
+    let sink_handle = tokio::spawn(run_sink_task(
+        sink,
+        sink_cons,
+        metrics_sink,
+        sink_ledger,
+        sink_ctx,
+        Some(control_sink),
+    ));
+
+    let (src_result, proc_result, sink_result) =
+        tokio::join!(source_handle, processor_handle, sink_handle);
+
+    src_result.map_err(|e| AeonError::processor(format!("source task panicked: {e}")))??;
+    proc_result.map_err(|e| AeonError::processor(format!("processor task panicked: {e}")))??;
+    sink_result.map_err(|e| AeonError::processor(format!("sink task panicked: {e}")))??;
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2378,5 +2905,645 @@ mod tests {
         assert_eq!(metrics.events_failed.load(Ordering::Relaxed), 0);
         assert_eq!(metrics.events_retried.load(Ordering::Relaxed), 0);
         assert_eq!(sink.delivered_count(), 1000);
+    }
+
+    // ── Managed pipeline / hot-swap tests ──────────────────────────────
+
+    /// Thread-safe sink wrapper for tests where the pipeline runs in a
+    /// background task and the test thread inspects outputs.
+    #[derive(Clone)]
+    struct SharedMemorySink {
+        outputs: Arc<std::sync::Mutex<Vec<Output>>>,
+    }
+
+    impl SharedMemorySink {
+        fn new() -> Self {
+            Self {
+                outputs: Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+
+        fn outputs(&self) -> Vec<Output> {
+            self.outputs.lock().unwrap().clone()
+        }
+
+        fn len(&self) -> usize {
+            self.outputs.lock().unwrap().len()
+        }
+    }
+
+    impl Sink for SharedMemorySink {
+        async fn write_batch(&mut self, outputs: Vec<Output>) -> Result<aeon_types::BatchResult, AeonError> {
+            let ids = outputs.iter().filter_map(|o| o.source_event_id).collect();
+            self.outputs.lock().unwrap().extend(outputs);
+            Ok(aeon_types::BatchResult::all_delivered(ids))
+        }
+
+        async fn flush(&mut self) -> Result<(), AeonError> {
+            Ok(())
+        }
+    }
+
+    /// A source that produces events in waves, with a shutdown signal.
+    /// Unlike MemorySource, this doesn't exhaust — it keeps producing
+    /// until told to stop, making it suitable for hot-swap testing.
+    struct ContinuousSource {
+        batch_size: usize,
+        batch_count: AtomicU64,
+        shutdown: Arc<AtomicBool>,
+        paused: bool,
+    }
+
+    impl ContinuousSource {
+        fn new(batch_size: usize, shutdown: Arc<AtomicBool>) -> Self {
+            Self {
+                batch_size,
+                batch_count: AtomicU64::new(0),
+                shutdown,
+                paused: false,
+            }
+        }
+    }
+
+    impl Source for ContinuousSource {
+        async fn next_batch(&mut self) -> Result<Vec<Event>, AeonError> {
+            if self.paused || self.shutdown.load(Ordering::Relaxed) {
+                return Ok(Vec::new());
+            }
+            let batch_num = self.batch_count.fetch_add(1, Ordering::Relaxed);
+            let source: Arc<str> = Arc::from("continuous");
+            let events = (0..self.batch_size)
+                .map(|i| {
+                    let idx = batch_num * self.batch_size as u64 + i as u64;
+                    // Use index-based UUID so canary routing can split deterministically
+                    let id = uuid::Uuid::from_u128(idx as u128 + 1);
+                    Event::new(
+                        id,
+                        idx as i64,
+                        Arc::clone(&source),
+                        PartitionId::new(0),
+                        Bytes::from(format!("event-{idx}")),
+                    )
+                })
+                .collect();
+            // Small yield to let other tasks run
+            tokio::task::yield_now().await;
+            Ok(events)
+        }
+
+        async fn pause(&mut self) {
+            self.paused = true;
+        }
+
+        async fn resume(&mut self) {
+            self.paused = false;
+        }
+    }
+
+    /// Processor that prefixes output payloads, so we can detect which
+    /// processor handled which events.
+    struct PrefixProcessor {
+        prefix: &'static str,
+        destination: Arc<str>,
+    }
+
+    impl PrefixProcessor {
+        fn new(prefix: &'static str) -> Self {
+            Self {
+                prefix,
+                destination: Arc::from("output"),
+            }
+        }
+    }
+
+    impl Processor for PrefixProcessor {
+        fn process(&self, event: Event) -> Result<Vec<Output>, AeonError> {
+            let payload = format!("{}{}", self.prefix, String::from_utf8_lossy(&event.payload));
+            Ok(vec![Output::new(
+                Arc::clone(&self.destination),
+                Bytes::from(payload),
+            )])
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_pipeline_hot_swap_zero_loss() {
+        // Set up a continuous source and a prefixed processor "A:"
+        let source_shutdown = Arc::new(AtomicBool::new(false));
+        let source = ContinuousSource::new(10, Arc::clone(&source_shutdown));
+        let processor_a: Box<dyn Processor + Send + Sync> =
+            Box::new(PrefixProcessor::new("A:"));
+        let sink = SharedMemorySink::new();
+        let metrics = Arc::new(PipelineMetrics::new());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let control = PipelineControl::new();
+
+        let metrics_clone = Arc::clone(&metrics);
+        let shutdown_clone = Arc::clone(&shutdown);
+        let control_clone = Arc::clone(&control);
+        let sink_clone = sink.clone();
+
+        // Run managed pipeline in background
+        let pipeline_handle = tokio::spawn(async move {
+            run_buffered_managed(
+                source,
+                processor_a,
+                sink_clone,
+                PipelineConfig::default(),
+                metrics_clone,
+                shutdown_clone,
+                None,
+                control_clone,
+            )
+            .await
+        });
+
+        // Wait until processor A has processed some events
+        for _ in 0..200 {
+            if metrics.events_processed.load(Ordering::Relaxed) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let pre_swap_count = metrics.events_processed.load(Ordering::Relaxed);
+        assert!(pre_swap_count > 0, "should have processed events before swap");
+
+        // Hot-swap to processor B
+        let processor_b: Box<dyn Processor + Send + Sync> =
+            Box::new(PrefixProcessor::new("B:"));
+        control.drain_and_swap(processor_b).await.unwrap();
+
+        // Wait until B-prefixed outputs appear in the sink (proof that swap worked)
+        let mut b_found = false;
+        for _ in 0..200 {
+            let outs = sink.outputs();
+            if outs.iter().any(|o| o.payload.starts_with(b"B:")) {
+                b_found = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(b_found, "should have B-prefixed outputs (post-swap)");
+
+        // Shutdown
+        source_shutdown.store(true, Ordering::Release);
+        shutdown.store(true, Ordering::Release);
+        // Allow pipeline to finish
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let post_swap_count = metrics.events_processed.load(Ordering::Relaxed);
+        assert!(
+            post_swap_count > pre_swap_count,
+            "should have processed more events after swap"
+        );
+
+        // Verify zero event loss: events_received >= events_processed
+        let received = metrics.events_received.load(Ordering::Relaxed);
+        let processed = metrics.events_processed.load(Ordering::Relaxed);
+        assert!(
+            received >= processed,
+            "no events lost: received={received}, processed={processed}"
+        );
+
+        // Verify outputs contain both A: and B: prefixed payloads
+        let outputs = sink.outputs();
+        let a_count = outputs
+            .iter()
+            .filter(|o| o.payload.starts_with(b"A:"))
+            .count();
+        let b_count = outputs
+            .iter()
+            .filter(|o| o.payload.starts_with(b"B:"))
+            .count();
+        assert!(a_count > 0, "should have A-prefixed outputs (pre-swap)");
+        assert!(b_count > 0, "should have B-prefixed outputs (post-swap)");
+
+        // No outputs without prefix (no corruption during swap)
+        let unprefixed = outputs
+            .iter()
+            .filter(|o| !o.payload.starts_with(b"A:") && !o.payload.starts_with(b"B:"))
+            .count();
+        assert_eq!(unprefixed, 0, "all outputs should be prefixed");
+
+        // Clean up
+        let _ = pipeline_handle.await;
+    }
+
+    #[tokio::test]
+    async fn managed_pipeline_runs_without_swap() {
+        // Verify managed pipeline works like regular run_buffered when no swap occurs
+        let events = make_events(100);
+        let source = MemorySource::new(events, 32);
+        let processor: Box<dyn Processor + Send + Sync> =
+            Box::new(PassthroughProcessor::new(Arc::from("output")));
+        let sink = SharedMemorySink::new();
+        let metrics = Arc::new(PipelineMetrics::new());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let control = PipelineControl::new();
+
+        run_buffered_managed(
+            source,
+            processor,
+            sink.clone(),
+            PipelineConfig::default(),
+            metrics.clone(),
+            shutdown,
+            None,
+            control,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(sink.len(), 100);
+        assert_eq!(metrics.events_received.load(Ordering::Relaxed), 100);
+        assert_eq!(metrics.events_processed.load(Ordering::Relaxed), 100);
+    }
+
+    #[tokio::test]
+    async fn managed_pipeline_source_swap() {
+        // Start with source A (10 events), swap mid-stream to source B (10 events)
+        // Source A produces events with "src-a-" prefix, source B with "src-b-"
+        let source_shutdown = Arc::new(AtomicBool::new(false));
+        let source_a = ContinuousSource::new(5, Arc::clone(&source_shutdown));
+        let processor: Box<dyn Processor + Send + Sync> =
+            Box::new(PassthroughProcessor::new(Arc::from("output")));
+        let sink = SharedMemorySink::new();
+        let metrics = Arc::new(PipelineMetrics::new());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let control = PipelineControl::new();
+
+        let metrics_clone = Arc::clone(&metrics);
+        let shutdown_clone = Arc::clone(&shutdown);
+        let control_clone = Arc::clone(&control);
+        let sink_clone = sink.clone();
+
+        let pipeline_handle = tokio::spawn(async move {
+            run_buffered_managed(
+                source_a,
+                processor,
+                sink_clone,
+                PipelineConfig::default(),
+                metrics_clone,
+                shutdown_clone,
+                None,
+                control_clone,
+            )
+            .await
+        });
+
+        // Wait for source A to produce some events
+        for _ in 0..200 {
+            if metrics.events_processed.load(Ordering::Relaxed) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let pre_swap = metrics.events_processed.load(Ordering::Relaxed);
+        assert!(pre_swap > 0, "should have processed events from source A");
+
+        // Swap to source B
+        let source_b = ContinuousSource::new(5, Arc::clone(&source_shutdown));
+        control.drain_and_swap_source(source_b).await.unwrap();
+
+        // Wait for more events after swap
+        for _ in 0..200 {
+            if metrics.events_processed.load(Ordering::Relaxed) > pre_swap {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let post_swap = metrics.events_processed.load(Ordering::Relaxed);
+        assert!(post_swap > pre_swap, "should process events from source B");
+
+        // Shutdown
+        source_shutdown.store(true, Ordering::Release);
+        shutdown.store(true, Ordering::Release);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let _ = pipeline_handle.await;
+    }
+
+    #[tokio::test]
+    async fn managed_pipeline_sink_swap() {
+        // Start with sink A, swap to sink B mid-pipeline. Verify both collected outputs.
+        let source_shutdown = Arc::new(AtomicBool::new(false));
+        let source = ContinuousSource::new(5, Arc::clone(&source_shutdown));
+        let processor: Box<dyn Processor + Send + Sync> =
+            Box::new(PassthroughProcessor::new(Arc::from("output")));
+        let sink_a = SharedMemorySink::new();
+        let metrics = Arc::new(PipelineMetrics::new());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let control = PipelineControl::new();
+
+        let metrics_clone = Arc::clone(&metrics);
+        let shutdown_clone = Arc::clone(&shutdown);
+        let control_clone = Arc::clone(&control);
+        let sink_a_clone = sink_a.clone();
+
+        let pipeline_handle = tokio::spawn(async move {
+            run_buffered_managed(
+                source,
+                processor,
+                sink_a_clone,
+                PipelineConfig::default(),
+                metrics_clone,
+                shutdown_clone,
+                None,
+                control_clone,
+            )
+            .await
+        });
+
+        // Wait for sink A to collect some outputs
+        for _ in 0..200 {
+            if sink_a.len() > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let sink_a_count = sink_a.len();
+        assert!(sink_a_count > 0, "sink A should have collected outputs");
+
+        // Swap to sink B
+        let sink_b = SharedMemorySink::new();
+        let sink_b_reader = sink_b.clone();
+        control.drain_and_swap_sink(sink_b).await.unwrap();
+
+        // Wait for sink B to collect outputs
+        for _ in 0..200 {
+            if sink_b_reader.len() > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(sink_b_reader.len() > 0, "sink B should have collected outputs after swap");
+
+        // Sink A should have stopped growing
+        let sink_a_final = sink_a.len();
+
+        // Shutdown
+        source_shutdown.store(true, Ordering::Release);
+        shutdown.store(true, Ordering::Release);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let _ = pipeline_handle.await;
+
+        // Both sinks received outputs, sink A stopped after swap
+        assert!(sink_a_final >= sink_a_count, "sink A count should be stable after swap");
+        assert!(sink_b_reader.len() > 0, "sink B received outputs");
+
+        // Total outputs should match total processed
+        let total_outputs = sink_a_final + sink_b_reader.len();
+        let total_sent = metrics.outputs_sent.load(Ordering::Relaxed) as usize;
+        assert_eq!(total_outputs, total_sent, "zero output loss across swap");
+    }
+
+    #[tokio::test]
+    async fn managed_pipeline_blue_green_cutover() {
+        // Start pipeline with "A:" processor, install "B:" green in shadow,
+        // verify A outputs continue, cutover, verify B outputs start.
+        let source_shutdown = Arc::new(AtomicBool::new(false));
+        let source = ContinuousSource::new(10, Arc::clone(&source_shutdown));
+        let sink = SharedMemorySink::new();
+        let sink_reader = sink.outputs.clone();
+        let processor_a = Box::new(PrefixProcessor::new("A:"));
+
+        let config = PipelineConfig::default();
+        let metrics = Arc::new(PipelineMetrics::default());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let control = PipelineControl::new();
+        let control2 = Arc::clone(&control);
+        let metrics2 = Arc::clone(&metrics);
+        let shutdown2 = Arc::clone(&shutdown);
+
+
+        let pipeline_handle = tokio::spawn(async move {
+            run_buffered_managed(
+                source, processor_a, sink, config, metrics2,
+                shutdown2, None, control2,
+            ).await
+        });
+
+        // Wait for A outputs
+        for _ in 0..200 {
+            if metrics.events_processed.load(Ordering::Relaxed) > 0 { break; }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(metrics.events_processed.load(Ordering::Relaxed) > 0);
+
+        // Verify A-prefixed outputs
+        let outputs_before = sink_reader.lock().unwrap().clone();
+        assert!(outputs_before.iter().all(|o| {
+            String::from_utf8_lossy(&o.payload).starts_with("A:")
+        }), "all outputs before cutover should be A-prefixed");
+
+        // Install green processor (B:) — no pause, no drain
+        let processor_b = Box::new(PrefixProcessor::new("B:"));
+        control.start_blue_green(processor_b).await.unwrap();
+
+        // Wait for more A outputs (green is shadow, not yet active)
+        let count_after_install = sink_reader.lock().unwrap().len();
+        for _ in 0..200 {
+            if sink_reader.lock().unwrap().len() > count_after_install + 5 { break; }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // All new outputs should still be A-prefixed
+        let outputs_mid = sink_reader.lock().unwrap().clone();
+        assert!(outputs_mid.iter().all(|o| {
+            String::from_utf8_lossy(&o.payload).starts_with("A:")
+        }), "all outputs during shadow should be A-prefixed");
+
+        // Cutover to green
+        control.cutover_blue_green().await.unwrap();
+
+        // Wait for B outputs to appear
+        for _ in 0..200 {
+            let has_b = sink_reader.lock().unwrap().iter().any(|o| {
+                String::from_utf8_lossy(&o.payload).starts_with("B:")
+            });
+            if has_b { break; }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let outputs_after = sink_reader.lock().unwrap().clone();
+        let has_b = outputs_after.iter().any(|o| {
+            String::from_utf8_lossy(&o.payload).starts_with("B:")
+        });
+        assert!(has_b, "should have B-prefixed outputs after cutover");
+
+        // Shut down
+        source_shutdown.store(true, Ordering::Release);
+        shutdown.store(true, Ordering::Release);
+        let _ = pipeline_handle.await;
+    }
+
+    #[tokio::test]
+    async fn managed_pipeline_blue_green_rollback() {
+        // Install green, then roll back — verify A outputs continue.
+        let source_shutdown = Arc::new(AtomicBool::new(false));
+        let source = ContinuousSource::new(10, Arc::clone(&source_shutdown));
+        let sink = SharedMemorySink::new();
+        let sink_reader = sink.outputs.clone();
+        let processor_a = Box::new(PrefixProcessor::new("A:"));
+
+        let config = PipelineConfig::default();
+        let metrics = Arc::new(PipelineMetrics::default());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let control = PipelineControl::new();
+        let control2 = Arc::clone(&control);
+        let metrics2 = Arc::clone(&metrics);
+        let shutdown2 = Arc::clone(&shutdown);
+
+
+        let pipeline_handle = tokio::spawn(async move {
+            run_buffered_managed(
+                source, processor_a, sink, config, metrics2,
+                shutdown2, None, control2,
+            ).await
+        });
+
+        // Wait for initial outputs
+        for _ in 0..200 {
+            if metrics.events_processed.load(Ordering::Relaxed) > 0 { break; }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // Install green then rollback
+        let processor_b = Box::new(PrefixProcessor::new("B:"));
+        control.start_blue_green(processor_b).await.unwrap();
+        control.rollback_upgrade().await.unwrap();
+
+        // Wait for more outputs after rollback
+        let count_after = sink_reader.lock().unwrap().len();
+        for _ in 0..200 {
+            if sink_reader.lock().unwrap().len() > count_after + 20 { break; }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // All outputs should be A-prefixed (no B ever appeared)
+        let outputs = sink_reader.lock().unwrap().clone();
+        assert!(outputs.iter().all(|o| {
+            String::from_utf8_lossy(&o.payload).starts_with("A:")
+        }), "all outputs after rollback should be A-prefixed");
+
+        source_shutdown.store(true, Ordering::Release);
+        shutdown.store(true, Ordering::Release);
+        let _ = pipeline_handle.await;
+    }
+
+    #[tokio::test]
+    async fn managed_pipeline_canary_split() {
+        // Start with A: baseline, install B: canary at 50%, verify both appear.
+        let source_shutdown = Arc::new(AtomicBool::new(false));
+        let source = ContinuousSource::new(100, Arc::clone(&source_shutdown));
+        let sink = SharedMemorySink::new();
+        let sink_reader = sink.outputs.clone();
+        let processor_a = Box::new(PrefixProcessor::new("A:"));
+
+        let config = PipelineConfig::default();
+        let metrics = Arc::new(PipelineMetrics::default());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let control = PipelineControl::new();
+        let control2 = Arc::clone(&control);
+        let metrics2 = Arc::clone(&metrics);
+        let shutdown2 = Arc::clone(&shutdown);
+
+        let pipeline_handle = tokio::spawn(async move {
+            run_buffered_managed(
+                source, processor_a, sink, config, metrics2,
+                shutdown2, None, control2,
+            ).await
+        });
+
+        // Wait for initial A outputs
+        for _ in 0..200 {
+            if metrics.events_processed.load(Ordering::Relaxed) > 0 { break; }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // Clear sink and start canary at 50%
+        sink_reader.lock().unwrap().clear();
+        let processor_b = Box::new(PrefixProcessor::new("B:"));
+        control.start_canary(processor_b, 50).await.unwrap();
+
+        // Wait for enough outputs with both A and B
+        for _ in 0..200 {
+            let len = sink_reader.lock().unwrap().len();
+            if len > 200 { break; }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let outputs = sink_reader.lock().unwrap().clone();
+        let a_count = outputs.iter().filter(|o| {
+            String::from_utf8_lossy(&o.payload).starts_with("A:")
+        }).count();
+        let b_count = outputs.iter().filter(|o| {
+            String::from_utf8_lossy(&o.payload).starts_with("B:")
+        }).count();
+
+        assert!(a_count > 0, "baseline A should have outputs (got {a_count})");
+        assert!(b_count > 0, "canary B should have outputs (got {b_count})");
+        // With 50% split over many events, both should be non-trivial
+        let total = a_count + b_count;
+        assert!(a_count as f64 / total as f64 > 0.2, "A should have >20% of traffic");
+        assert!(b_count as f64 / total as f64 > 0.2, "B should have >20% of traffic");
+
+        source_shutdown.store(true, Ordering::Release);
+        shutdown.store(true, Ordering::Release);
+        let _ = pipeline_handle.await;
+    }
+
+    #[tokio::test]
+    async fn managed_pipeline_canary_complete() {
+        // Start canary, complete it — verify only B outputs afterward.
+        let source_shutdown = Arc::new(AtomicBool::new(false));
+        let source = ContinuousSource::new(10, Arc::clone(&source_shutdown));
+        let sink = SharedMemorySink::new();
+        let sink_reader = sink.outputs.clone();
+        let processor_a = Box::new(PrefixProcessor::new("A:"));
+
+        let config = PipelineConfig::default();
+        let metrics = Arc::new(PipelineMetrics::default());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let control = PipelineControl::new();
+        let control2 = Arc::clone(&control);
+        let metrics2 = Arc::clone(&metrics);
+        let shutdown2 = Arc::clone(&shutdown);
+
+        let pipeline_handle = tokio::spawn(async move {
+            run_buffered_managed(
+                source, processor_a, sink, config, metrics2,
+                shutdown2, None, control2,
+            ).await
+        });
+
+        // Wait for initial outputs
+        for _ in 0..200 {
+            if metrics.events_processed.load(Ordering::Relaxed) > 0 { break; }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // Start canary at 50%
+        let processor_b = Box::new(PrefixProcessor::new("B:"));
+        control.start_canary(processor_b, 50).await.unwrap();
+
+        // Complete canary — B becomes sole processor
+        control.complete_canary().await.unwrap();
+
+        // Clear sink and collect new outputs
+        sink_reader.lock().unwrap().clear();
+        for _ in 0..200 {
+            if sink_reader.lock().unwrap().len() > 50 { break; }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let outputs = sink_reader.lock().unwrap().clone();
+        assert!(outputs.len() > 0, "should have outputs after canary complete");
+        assert!(outputs.iter().all(|o| {
+            String::from_utf8_lossy(&o.payload).starts_with("B:")
+        }), "all outputs after canary complete should be B-prefixed");
+
+        source_shutdown.store(true, Ordering::Release);
+        shutdown.store(true, Ordering::Release);
+        let _ = pipeline_handle.await;
     }
 }

@@ -7,11 +7,29 @@
 >
 > Related: `docs/INSTALLATION.md` (ports, multi-version operation, directory layout)
 >
-> **Implementation status**: Wasm hot-swap and native `.so`/`.dll` loading are
-> implemented and tested (including C-ABI and .NET NativeAOT on Windows). The REST
-> API processor registry endpoints exist. Upgrade strategies (drain-swap, blue-green,
-> canary) are designed but not yet integrated into the pipeline lifecycle. Child
-> process isolation is designed but not implemented.
+> **Implementation status** (updated 2026-04-11):
+>
+> | Component | Status |
+> |-----------|--------|
+> | Wasm loading (`WasmModule::from_bytes`) | **Implemented + tested** |
+> | Native `.so`/`.dll` loading (`NativeProcessor::load`) | **Implemented + tested** (C-ABI, .NET NativeAOT) |
+> | ProcessorRegistry (CRUD + artifact storage) | **Implemented + tested** |
+> | REST API — `POST /api/v1/processors` (register) | **Implemented + tested** |
+> | REST API — all pipeline lifecycle endpoints | **Implemented + tested** (19 REST tests) |
+> | PipelineManager state machine (upgrade/blue-green/canary) | **Implemented** — state transitions tracked |
+> | Hot-swap orchestrator (drain → swap → resume) | **Implemented** — `PipelineControl` + `run_buffered_managed()`: pause source → drain SPSC rings → swap processor/source/sink → resume. Blue-green shadow + canary traffic splitting also wired. 8 managed tests. |
+> | T3/T4 processor replacement | **Working** — reconnect-based; routing table auto-updates on connect/disconnect |
+> | Source/Sink zero-downtime reconfiguration | **Implemented** — `PipelineControl.drain_and_swap_source()`/`drain_and_swap_sink()`: pause → drain SPSC rings → swap via `Box<dyn Any>` downcast → resume. 2 tests (source-swap, sink-swap). |
+> | SHA-512 artifact verification | **Implemented** — `sha2::Sha512` (replaced `DefaultHasher` placeholder) |
+> | Child process isolation tier | **Design only** — not implemented |
+> | File watcher / config hot-reload | **Implemented** — `aeon dev watch --artifact <path>`: `notify` crate watches .wasm/.so/.dll, debounced 500ms, triggers `PipelineControl.drain_and_swap()`. TickSource (1 event/sec) → StdoutSink for dev loop. |
+>
+> **Zero-downtime processor deployment per tier:**
+> - **T1 Rust native** (compiled in): requires Aeon rebuild + redeploy
+> - **T1 Native `.so`**: designed for `dlclose`/`dlopen` swap — orchestrator not yet wired
+> - **T2 Wasm**: designed for module re-instantiate (~1ms) — orchestrator not yet wired
+> - **T3 WebTransport**: **works now** — new processor connects, old disconnects, routing auto-updates
+> - **T4 WebSocket**: **works now** — same reconnect-based replacement as T3
 
 ---
 
@@ -702,6 +720,31 @@ async fn hot_swap_native(pipeline: &mut Pipeline, new_so_path: &Path) -> Result<
 6. Zero pause — overlapping execution during transfer
 ```
 
+### 7.4 Source/Sink Connector Reconfiguration
+
+Sources and sinks are created when a pipeline starts and live for its lifetime.
+The pipeline runner takes generic `S: Source` and `K: Sink` type parameters,
+so swapping connectors requires stopping the pipeline.
+
+**Same-type config change** (e.g., changing Kafka broker address):
+```
+1. Create new connector instance with new config (pre-validate)
+2. Drain in-flight events through old connector
+3. Atomically swap connector reference
+4. Resume pipeline
+```
+This is architecturally similar to processor hot-swap and uses the same
+drain→swap→resume pattern. **Not yet implemented.**
+
+**Cross-type change** (e.g., Kafka → NATS):
+Not feasible zero-downtime within a single pipeline (different generic types).
+Use blue-green pipeline deployment: start new pipeline with new config, cut over
+traffic, stop old pipeline. The `PipelineManager` state machine supports this.
+
+**Current workaround**: `aeon pipeline stop` → update config → `aeon pipeline start`.
+Downtime is limited to the drain + restart window (typically < 1 second for
+in-process connectors, longer for remote connectors with flush requirements).
+
 ---
 
 ## 8. Unified Management Interfaces
@@ -1268,3 +1311,61 @@ This design is implemented across Phases 12–14 of the Aeon roadmap:
   CI/CD templates, systemd, rolling binary upgrade, K8s operator (future).
 
 See `docs/ROADMAP.md` for phase details and acceptance criteria.
+
+---
+
+## 13. Remaining Work — Zero-Downtime Deployment & Management (2026-04-11)
+
+Tracked in `docs/ROADMAP.md` as P10.
+
+### 13.1 Bug Fixes — ✅ All Done (2026-04-11)
+
+| # | Item | File(s) | Status |
+|---|------|---------|--------|
+| ~~ZD-1~~ | ~~`POST /api/v1/processors` route missing~~ | `aeon-engine/src/rest_api.rs` | **Fixed** — route + handler + test added (19 REST tests) |
+| ~~ZD-2~~ | ~~CLI sends PascalCase enum values~~ | `aeon-cli/src/main.rs` | **Fixed** — `"wasm"`, `"native-so"`, `"available"` (kebab-case) |
+| ~~ZD-3~~ | ~~SHA-512 hash is a placeholder~~ | `aeon-engine/src/registry.rs` | **Fixed** — `sha2::Sha512::digest()` replaces `DefaultHasher` |
+
+### 13.2 Processor Hot-Swap Orchestration (Enables Zero-Downtime for T1 .so and T2 Wasm)
+
+> ✅ **ZD-4 Done** (2026-04-11) — `PipelineControl` + `run_buffered_managed()` implemented.
+
+| # | Item | File(s) | Details |
+|---|------|---------|---------|
+| ~~ZD-4~~ | ~~Wire drain→swap→resume into pipeline runner~~ | `aeon-engine/src/pipeline.rs` | **Done** — `PipelineControl` (paused flag + drain/swap Notify + processor slot), `run_buffered_managed()` with source pause check and processor swap loop. `Source::pause()`/`resume()` trait methods added with MemorySource/KafkaSource overrides. 2 tests: hot-swap zero-loss + managed-no-swap. |
+| ~~ZD-5~~ | ~~Blue-green runtime wiring~~ | `aeon-engine/src/pipeline.rs` | **Done (2026-04-11)** — `PipelineControl.start_blue_green()` installs green processor via `UpgradeAction` slot; processor task picks it up (green installed, blue remains active). `cutover_blue_green()` swaps green→active. `rollback_upgrade()` drops green. REST `/cutover` and `/rollback` call PipelineControl when handle exists. 2 tests: cutover + rollback. |
+| ~~ZD-6~~ | ~~Canary traffic splitting~~ | `aeon-engine/src/pipeline.rs` | **Done (2026-04-11)** — `PipelineControl.start_canary(proc, pct)` installs canary processor; processor task splits events by `event.id % 100 < pct` (deterministic). `set_canary_pct()` adjusts percentage via `AtomicU8`. `complete_canary()` promotes canary to sole processor. 2 tests: canary-split + canary-complete. |
+
+### 13.3 Source/Sink Zero-Downtime Reconfiguration
+
+| # | Item | Approach | Details |
+|---|------|----------|---------|
+| ZD-7 | Same-type source config change | Drain→swap→resume | **Done (2026-04-11)** — `PipelineControl.drain_and_swap_source()`: pause source → drain rings → downcast `Box<dyn Any>` to concrete `S` → swap → resume. Test: `managed_pipeline_source_swap`. |
+| ZD-8 | Same-type sink config change | Drain→swap→resume | **Done (2026-04-11)** — `PipelineControl.drain_and_swap_sink()`: pause source → drain rings → downcast `Box<dyn Any>` to concrete `K` → swap in `run_sink_task` → resume. Test: `managed_pipeline_sink_swap`. |
+| ZD-9 | Cross-type connector change | Blue-green pipeline | Different generic types → cannot swap within pipeline. Use `PipelineManager` blue-green: start new pipeline with new connectors, cutover, stop old. Already supported by state machine (ZD-5 must be wired first). |
+
+### 13.4 Additional Improvements
+
+| # | Item | Details |
+|---|------|---------|
+| ZD-10 | In-flight batch replay on T3/T4 disconnect | When a T3/T4 session disconnects during upgrade, in-flight batches awaiting responses fail with "session closed". Need: track unanswered batches, replay to new session. |
+| ZD-11 | Wasm state transfer on hot-swap | Per-instance in-memory state (`HostState.state` HashMap) is lost on swap. Option: serialize state before swap, inject into new instance. Low priority — stateless processors preferred. |
+| ~~ZD-12~~ | ~~Config file watcher (`aeon dev`)~~ | **Done (2026-04-11)** — `aeon dev watch --artifact <path>`. `notify` v7 watches parent dir (handles editor delete+recreate). 500ms debounce, loads processor via `WasmModule::from_bytes` or `NativeProcessor::load`, calls `PipelineControl.drain_and_swap()`. TickSource → StdoutSink dev loop. |
+| ZD-13 | Child process isolation tier | Design in Section 2.3 is complete. Implementation: spawn child, IPC via Unix socket or shared memory, two-phase partition transfer. Low priority. |
+
+### 13.5 TLS Certificate Handling (Verified Correct)
+
+No code changes needed — documenting for reference:
+
+- **`TlsMode::Auto`** (self-signed): single-node only. Explicitly blocked for multi-node by
+  `validate_not_auto_with_peers()` which returns error: _"Use tls.mode 'pem' with a shared CA."_
+- **`TlsMode::Pem`** (CA-signed PEM files): required for production. Supports any CA (self-signed
+  internal CA for cluster QUIC, Let's Encrypt for external REST API via Ingress).
+- **`CertificateStore::reload()`**: re-reads PEM files from disk without restart. Combined with
+  cert-manager auto-renewal, certificates rotate seamlessly.
+- **REST API (port 4471)**: plain TCP — no built-in TLS. External termination via K8s Ingress
+  with Let's Encrypt is the production pattern. See `docs/CLOUD-DEPLOYMENT-GUIDE.md` §5.3.
+- **Cluster QUIC (port 4470)**: mandatory mTLS via `rustls` + `quinn`. Multi-node clusters
+  enforce `TlsConfig` with cert/key/ca PEM paths.
+- **Connector TLS**: per-connector via `ConnectorTlsConfig` (None / SystemCa / Pem).
+  Kafka/Redpanda connectors translate to rdkafka `ssl.*` settings.

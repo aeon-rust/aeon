@@ -124,6 +124,8 @@ pub struct KafkaSource {
     /// Per-source UUIDv7 generator (SPSC pool, ~1-2ns per UUID).
     /// Mutex for Sync (Source: Send + Sync), only accessed in next_batch.
     uuid_gen: Mutex<CoreLocalUuidGenerator>,
+    /// When true, next_batch() returns empty immediately (drain mechanism).
+    paused: bool,
 }
 
 impl KafkaSource {
@@ -180,6 +182,7 @@ impl KafkaSource {
             consecutive_empty_polls: 0,
             max_empty_polls,
             uuid_gen: Mutex::new(uuid_gen),
+            paused: false,
         })
     }
 
@@ -238,6 +241,10 @@ impl KafkaSource {
 
 impl Source for KafkaSource {
     async fn next_batch(&mut self) -> Result<Vec<Event>, AeonError> {
+        if self.paused {
+            return Ok(Vec::new());
+        }
+
         let mut events = Vec::with_capacity(self.config.batch_max_messages);
 
         // Step 1: Wait for the first message with full timeout.
@@ -279,6 +286,14 @@ impl Source for KafkaSource {
         }
 
         Ok(events)
+    }
+
+    async fn pause(&mut self) {
+        self.paused = true;
+    }
+
+    async fn resume(&mut self) {
+        self.paused = false;
     }
 }
 

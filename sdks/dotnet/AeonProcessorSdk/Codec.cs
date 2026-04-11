@@ -100,10 +100,10 @@ public sealed class Codec
             var dict = new Dictionary<string, object?>
             {
                 ["destination"] = o.Destination,
-                ["payload"] = Convert.ToBase64String(o.Payload),
+                ["payload"] = PayloadToJsonArray(o.Payload),
                 ["headers"] = o.Headers,
             };
-            if (o.Key != null) dict["key"] = Convert.ToBase64String(o.Key);
+            if (o.Key != null) dict["key"] = PayloadToJsonArray(o.Key);
             if (o.SourceEventId != null) dict["source_event_id"] = o.SourceEventId;
             if (o.SourcePartition.HasValue) dict["source_partition"] = o.SourcePartition.Value;
             if (o.SourceOffset.HasValue) dict["source_offset"] = o.SourceOffset.Value;
@@ -169,8 +169,17 @@ public sealed class Codec
     {
         byte[] b => b,
         string s => Convert.FromBase64String(s),
+        object?[] arr => ArrayToBytes(arr),
         _ => Array.Empty<byte>(),
     };
+
+    private static byte[] ArrayToBytes(object?[] arr)
+    {
+        var result = new byte[arr.Length];
+        for (int i = 0; i < arr.Length; i++)
+            result[i] = (byte)Convert.ToInt32(arr[i]);
+        return result;
+    }
 
     private static List<string[]> ToMetadata(object val)
     {
@@ -196,7 +205,7 @@ public sealed class Codec
             Timestamp = root.GetProperty("timestamp").GetInt64(),
             Source = root.GetProperty("source").GetString() ?? "",
             Partition = root.GetProperty("partition").GetInt32(),
-            Payload = Convert.FromBase64String(root.GetProperty("payload").GetString() ?? ""),
+            Payload = DecodeJsonPayload(root.GetProperty("payload")),
         };
         if (root.TryGetProperty("metadata", out var meta))
         {
@@ -217,7 +226,7 @@ public sealed class Codec
         var o = new Output
         {
             Destination = root.GetProperty("destination").GetString() ?? "",
-            Payload = Convert.FromBase64String(root.GetProperty("payload").GetString() ?? ""),
+            Payload = DecodeJsonPayload(root.GetProperty("payload")),
         };
         if (root.TryGetProperty("headers", out var h))
         {
@@ -229,7 +238,7 @@ public sealed class Codec
             }
         }
         if (root.TryGetProperty("key", out var k) && k.ValueKind != JsonValueKind.Null)
-            o.Key = Convert.FromBase64String(k.GetString() ?? "");
+            o.Key = DecodeJsonPayload(k);
         if (root.TryGetProperty("source_event_id", out var sei) && sei.ValueKind != JsonValueKind.Null)
             o.SourceEventId = sei.GetString();
         if (root.TryGetProperty("source_partition", out var sp) && sp.ValueKind != JsonValueKind.Null)
@@ -237,5 +246,33 @@ public sealed class Codec
         if (root.TryGetProperty("source_offset", out var soff) && soff.ValueKind != JsonValueKind.Null)
             o.SourceOffset = soff.GetInt64();
         return o;
+    }
+
+    /// <summary>
+    /// Decode a JSON payload that may be either a base64 string (SDK encoding)
+    /// or a JSON array of byte values (engine's serde encoding for Bytes/Vec&lt;u8&gt;).
+    /// </summary>
+    private static byte[] DecodeJsonPayload(JsonElement el)
+    {
+        if (el.ValueKind == JsonValueKind.String)
+            return Convert.FromBase64String(el.GetString() ?? "");
+        if (el.ValueKind == JsonValueKind.Array)
+        {
+            var arr = el.EnumerateArray().ToArray();
+            var result = new byte[arr.Length];
+            for (int i = 0; i < arr.Length; i++)
+                result[i] = (byte)arr[i].GetInt32();
+            return result;
+        }
+        return Array.Empty<byte>();
+    }
+
+    /// <summary>Convert a byte array to an int array for JSON serialization (matches serde format).</summary>
+    private static int[] PayloadToJsonArray(byte[] data)
+    {
+        var arr = new int[data.Length];
+        for (int i = 0; i < data.Length; i++)
+            arr[i] = data[i] & 0xFF;
+        return arr;
     }
 }

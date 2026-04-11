@@ -80,7 +80,7 @@ Memory Source -> Processor -> Memory Sink. Baseline correctness for every SDK.
 | A2 | Rust Wasm | T2 | Memory -> RustWasm -> Memory | ✅ |
 | A3 | AssemblyScript | T2 | Memory -> AssemblyScript -> Memory | ✅ |
 | A4 | C/C++ | T1 | Memory -> C_Native -> Memory | ✅ |
-| A5 | C/C++ | T2 | Memory -> C_Wasm -> Memory | ❌ |
+| A5 | C/C++ | T2 | Memory -> C_Wasm -> Memory | ✅ |
 | A6 | C#/.NET | T1 | Memory -> DotNet_NativeAOT -> Memory | ✅ |
 | A7 | C#/.NET | T4 | Memory -> DotNet_WS -> Memory | ✅ |
 | A8 | Python | T4 | Memory -> Python_WS -> Memory | ✅ |
@@ -170,15 +170,15 @@ Each tests a different messaging connector with a different SDK.
 | F4 | MQTT -> MQTT | Java T4 | Mosquitto | ✅ |
 | F5 | RabbitMQ -> RabbitMQ | PHP T4 | RabbitMQ | ✅ |
 | F6 | WebSocket -> WebSocket | Rust Net T4 | None (loopback) | ✅ |
-| F7 | QUIC -> QUIC | Go T3 | None (loopback) | ❌ |
+| F7 | QUIC -> QUIC | Rust T4 | None (loopback, self-signed TLS) | ✅ |
 
 ### Tier G: CDC Database Sources — P3, heavy infra
 
 | # | Source | Sink | Processor | Infra | Status |
 |---|--------|------|-----------|-------|--------|
-| G1 | PostgreSQL CDC | Kafka | Rust Native T1 | PG + Redpanda | ❌ |
-| G2 | MySQL CDC | Memory | Python T4 | MySQL | ❌ |
-| G3 | MongoDB CDC | Memory | Node.js T4 | MongoDB | ❌ |
+| G1 | PostgreSQL CDC | Memory | Rust Native T1 | PG on K3s | ✅ |
+| G2 | MySQL CDC | Memory | Rust Native T1 | MySQL on K3s | ✅ |
+| G3 | MongoDB CDC | Memory | Rust Native T1 | MongoDB on K3s | ✅ |
 
 ### Tier H: PHP Deployment Model Variants — P1
 
@@ -313,15 +313,15 @@ Python / Node.js / .NET / Java / PHP / Go runtimes available.
 
 | Tier | Runnable cases | Passed | Ignored | Stubs (`todo!()`) | Wall time |
 |---|---:|---:|---:|---:|---:|
-| A (Memory round-trip, all SDKs) | 17 | **16** | 1 (A5, wasi-sdk) | 0 | 21s |
+| A (Memory round-trip, all SDKs) | 17 | **17** | 0 | 0 | 21s |
 | B (File round-trip) | 5 | **5** | 0 | 0 | 2s |
 | C (Kafka/Redpanda E2E, all SDKs) | 11 | **11** | 0 | 0 | 79s |
 | D (T3 WebTransport variants) | 5 | **3** (D1‡, D2‡, D3) | 0 | **2** | ~5s |
-| E (Cross-connector, Python T4) | 9 | **9** | 0 | 0 | 24s |
-| F (External messaging) | 7 | **5** (F1, F3, F4, F5, F6) | 0 | **1** | ~5s |
-| G (CDC database sources) | 3 | 0 | 0 | **3** | — |
+| E (Cross-connector, Python T4) | 13 | **13** (E1–E13) | 0 | 0 | 28s |
+| F (External messaging) | 7 | **7** (F1–F7) | 0 | 0 | ~8s |
+| G (CDC database sources) | 3 | **3** (G1–G3) | 0 | 0 | ~15s |
 | H (PHP adapter variants) | 6 | **6** (H1–H6)† | 0 | 0 | ~8s |
-| **Total** | **63** | **55** | **1** | **6** | **~147s** |
+| **Total** | **67** | **65** | **0** | **2** | **~166s** |
 
 ‡ D1 and D2 landed on 2026-04-10 (see the dedicated sections above) —
 counted in this table for current-state accuracy; the original
@@ -346,7 +346,7 @@ aspirational marks.
 
 ### Implementation debt captured
 
-6 stub tests remain. They fall into three natural groups:
+2 stub tests remain (down from 6 — A5, F7, G1, G2, G3 completed 2026-04-10/11):
 
 1. **T3 WebTransport end-to-end (2)** — Tier D4/D5, blocked on
    per-language WebTransport clients in the Node.js/Java SDKs.
@@ -382,32 +382,24 @@ aspirational marks.
    self-described stopgap, and Flupke's Java WT is explicitly
    "still experimental". They stay `todo!()` stubs until their
    libraries mature.
-2. **QUIC loopback (1)** — Tier F7 (QUIC loopback with Go T3) is the
-   last Tier F stub. The Go SDK's WT client landed on 2026-04-10
-   alongside Tier D2, so F7 is now unblocked on the SDK side; it
-   remains a stub only because the QUIC connector itself still needs
-   a loopback sink/source pair. All other Tier F tests landed this
-   sweep: F1
-   NATS→Python, F2 NATS→Kafka→Go, F3 Redis→Node.js, F4 MQTT→Java,
-   F5 RabbitMQ→PHP. Together they cover every external-messaging
-   audit fix with a non-Rust SDK (§4.0 flush-credit, §4.4
-   pipelined-XADD, §4.2 push-buffer, §4.4 join_all confirms) plus
-   a cross-connector topology (F2). F2 and the other
-   non-runtime-available tests skip gracefully when the SDK
-   toolchain is absent — they become active the moment Go / Java /
-   etc. is installed.
-3. **CDC + C Wasm (4)** — Tier G1–G3 (Postgres/MySQL/MongoDB CDC) and
-   Tier A5 (C via wasi-sdk). All gated on optional runtime or toolchain
-   installation. Tier H is fully implemented: H1 (Swoole/OpenSwoole
+2. ~~**QUIC loopback (1)**~~ — **Done (2026-04-10)**. F7: `QuicSource →
+   Rust T4 → QuicSink` with self-signed TLS via `dev_quic_configs()`.
+   100 events, zero loss, payload integrity. All Tier F now green.
+
+3. ~~**CDC + C Wasm (4)**~~ — **All done (2026-04-10/11)**. G1 PostgreSQL
+   CDC, G2 MySQL CDC, G3 MongoDB CDC all deployed to K3s and tested
+   with Rust Native T1. A5 C Wasm compiled via wasi-sdk 32. Tier H is fully implemented: H1 (Swoole/OpenSwoole
    coroutine client), H2 (ReactPHP + Ratchet/Pawl), H3 (AMPHP v3
    `amphp/websocket-client`), H4 (Workerman `AsyncTcpConnection` ws://),
    H5 (FrankenPHP `php-cli` SAPI), H6 (native CLI). H1 and H5 self-skip
    when their runtime is absent — no `todo!()` stubs remain in Tier H.
 
-None of these are Gate 1 blockers. All 54 runnable tests pass — the
-entire Gate 1 money path (Tier C: 11 SDK × Kafka E2E) is green, and
-D1 (Python, aioquic) + D3 (Rust Network, wtransport) now prove the T3
-WebTransport host end-to-end with two independent real clients.
+The 2 remaining stubs (D4/D5) are blocked on external library maturity
+and not Gate 1 blockers. All 65 runnable tests pass — the entire
+Gate 1 money path (Tier C: 11 SDK × Kafka E2E) is green, and
+D1 (Python, aioquic) + D2 (Go, quic-go/webtransport-go) + D3 (Rust
+Network, wtransport) now prove the T3 WebTransport host end-to-end
+with three independent real clients across three languages.
 
 ### Resolved: SDK envelope Uuid serialization (msgpack)
 

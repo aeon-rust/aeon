@@ -108,6 +108,9 @@ opentelemetry = "0.27"
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.27", features = ["tonic", "logs"] }
 
+# Dev experience
+notify = { version = "7", default-features = false, features = ["macos_kqueue"] }
+
 # Testing
 criterion = { version = "0.5", features = ["html_reports"] }
 tempfile = "3"

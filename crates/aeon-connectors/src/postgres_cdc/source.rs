@@ -103,10 +103,13 @@ impl PostgresCdcSource {
             }
         });
 
-        // Create logical replication slot if configured
+        // Create logical replication slot if configured.
+        // Uses 'test_decoding' plugin for SQL-level polling via
+        // pg_logical_slot_get_changes(). The 'pgoutput' plugin is
+        // designed for streaming replication protocol, not SQL queries.
         if config.create_slot {
             let create_sql = format!(
-                "SELECT pg_create_logical_replication_slot('{}', 'pgoutput')",
+                "SELECT pg_create_logical_replication_slot('{}', 'test_decoding')",
                 config.slot_name
             );
             match client.simple_query(&create_sql).await {
@@ -140,11 +143,12 @@ impl PostgresCdcSource {
 
 impl Source for PostgresCdcSource {
     async fn next_batch(&mut self) -> Result<Vec<Event>, AeonError> {
-        // Use pg_logical_slot_get_changes to consume changes
-        // This returns text-format changes from the pgoutput plugin
+        // Use pg_logical_slot_get_changes with test_decoding plugin.
+        // Returns text-format change descriptions (BEGIN, COMMIT,
+        // table ... INSERT/UPDATE/DELETE with column values).
         let query = format!(
-            "SELECT lsn::text, xid, data FROM pg_logical_slot_get_changes('{}', NULL, {}, 'proto_version', '1', 'publication_names', '{}')",
-            self.config.slot_name, self.config.batch_size, self.config.publication,
+            "SELECT lsn::text, xid, data FROM pg_logical_slot_get_changes('{}', NULL, {})",
+            self.config.slot_name, self.config.batch_size,
         );
 
         let rows = self.client.simple_query(&query).await.map_err(|e| {

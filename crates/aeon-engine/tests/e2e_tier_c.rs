@@ -741,12 +741,8 @@ async fn c10_kafka_java_ws_t4() {
         pipeline_name,
         "java-proc",
     );
-    let compile = std::process::Command::new("javac")
-        .arg(java_dir.join("AeonProcessor.java"))
-        .output()
-        .expect("javac");
-    if !compile.status.success() {
-        eprintln!("SKIP C10: javac failed");
+    if let Err(stderr) = e2e_ws_harness::compile_java_with_sdk("javac", &java_dir) {
+        eprintln!("SKIP C10: javac failed: {stderr}");
         return;
     }
     let mut child = std::process::Command::new("java")

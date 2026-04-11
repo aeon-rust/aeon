@@ -194,15 +194,8 @@ async fn run_webtransport_inner(
             let label_pipeline = pipeline_name.clone();
 
             stream_tasks.spawn(async move {
-                if let Err(e) = run_data_stream(
-                    send,
-                    recv,
-                    codec,
-                    batch_signing,
-                    signing_key,
-                    process_fn,
-                )
-                .await
+                if let Err(e) =
+                    run_data_stream(send, recv, codec, batch_signing, signing_key, process_fn).await
                 {
                     tracing::debug!(
                         pipeline = %label_pipeline,
@@ -270,13 +263,8 @@ async fn run_data_stream(
         // Decode → process → encode.
         let (batch_id, events) = wire::decode_batch_request(&frame, &codec)?;
         let outputs = process_fn(events);
-        let response = wire::encode_batch_response(
-            batch_id,
-            &outputs,
-            &codec,
-            &signing_key,
-            batch_signing,
-        )?;
+        let response =
+            wire::encode_batch_response(batch_id, &outputs, &codec, &signing_key, batch_signing)?;
 
         // Write length-prefixed response.
         let resp_len = (response.len() as u32).to_le_bytes();

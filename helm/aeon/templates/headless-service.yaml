@@ -1,0 +1,25 @@
+{{- if .Values.cluster.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-headless
+  labels:
+    app.kubernetes.io/name: aeon
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  type: ClusterIP
+  clusterIP: None
+  ports:
+    - name: quic
+      port: {{ .Values.ports.quic }}
+      targetPort: quic
+      protocol: UDP
+    - name: api
+      port: {{ .Values.ports.api }}
+      targetPort: api
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: aeon
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  publishNotReadyAddresses: true
+{{- end }}

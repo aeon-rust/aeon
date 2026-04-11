@@ -109,6 +109,7 @@ pub async fn start_ws_test_server(pipeline_name: &str) -> WsTestServer {
         registry: Arc::new(ProcessorRegistry::new(&dir).unwrap()),
         pipelines: Arc::new(PipelineManager::new()),
         delivery_ledgers: dashmap::DashMap::new(),
+        pipeline_controls: dashmap::DashMap::new(),
         identities: Arc::clone(&identity_store),
         #[cfg(feature = "processor-auth")]
         authenticator: None,
@@ -359,166 +360,118 @@ pub fn python_passthrough_script(
     pipeline_name: &str,
     processor_name: &str,
 ) -> String {
+    // Locate the in-repo Python SDK so the inline script can import it.
+    let sdk_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("sdks")
+        .join("python");
+    let sdk_path_str = sdk_path.to_string_lossy().replace('\\', "/");
+    let seed_path_fixed = seed_path.replace('\\', "/");
+
+    // Uses the Python SDK's run() directly with @processor decorator.
+    // The SDK's Signer handles hex-decode nonce signing and
+    // "ed25519:<base64>" public key formatting. Uses msgpack codec
+    // which correctly round-trips serde_bytes payloads as binary.
     format!(
         r#"
-import asyncio, json, struct, zlib, base64, sys, traceback
-from nacl.signing import SigningKey
+import sys, traceback
 
-SEED = open(r'{seed_path}', 'rb').read()
-sk = SigningKey(SEED)
-vk = sk.verify_key
-pk_b64 = base64.b64encode(vk.encode()).decode()
-PUBLIC_KEY = f"ed25519:{{pk_b64}}"
+sys.path.insert(0, r"{sdk_path}")
 
-async def main():
-    import websockets
-    url = "ws://127.0.0.1:{port}/api/v1/processors/connect"
-    async with websockets.connect(url, max_size=16*1024*1024) as ws:
-        raw = await ws.recv()
-        msg = json.loads(raw)
-        assert msg["type"] == "challenge"
-        nonce_bytes = bytes.fromhex(msg["nonce"])
-        sig = sk.sign(nonce_bytes).signature.hex()
-        register = {{
-            "type": "register", "protocol": "awpp/1", "transport": "websocket",
-            "name": "{processor_name}", "version": "1.0.0",
-            "public_key": PUBLIC_KEY, "challenge_signature": sig,
-            "capabilities": ["batch"], "transport_codec": "json",
-            "requested_pipelines": ["{pipeline_name}"], "binding": "dedicated",
-        }}
-        await ws.send(json.dumps(register))
-        raw = await ws.recv()
-        msg = json.loads(raw)
-        if msg["type"] == "rejected":
-            print(f"REJECTED: {{msg}}", file=sys.stderr); return
-        assert msg["type"] == "accepted"
-        batch_signing = msg.get("batch_signing", True)
-        async for message in ws:
-            try:
-                if isinstance(message, str):
-                    ctrl = json.loads(message)
-                    if ctrl.get("type") == "drain": break
-                    continue
-                data = message if isinstance(message, bytes) else bytes(message)
-                name_len = struct.unpack_from("<I", data, 0)[0]
-                pipeline = data[4:4+name_len].decode()
-                partition = struct.unpack_from("<H", data, 4+name_len)[0]
-                bd = data[4+name_len+2:]
-                crc_off = len(bd) - 4
-                batch_id = struct.unpack_from("<Q", bd, 0)[0]
-                event_count = struct.unpack_from("<I", bd, 8)[0]
-                off = 12
-                events = []
-                for _ in range(event_count):
-                    elen = struct.unpack_from("<I", bd, off)[0]; off += 4
-                    ev = json.loads(bd[off:off+elen]); off += elen
-                    events.append(ev)
-                rp = [struct.pack("<Q", batch_id), struct.pack("<I", len(events))]
-                for ev in events:
-                    rp.append(struct.pack("<I", 1))
-                    payload = ev.get("payload", [])
-                    out = {{"destination":"output","payload":payload,"headers":[]}}
-                    enc = json.dumps(out, separators=(",",":")).encode()
-                    rp.append(struct.pack("<I", len(enc))); rp.append(enc)
-                body = b"".join(rp)
-                crc = zlib.crc32(body) & 0xFFFFFFFF
-                bwc = body + struct.pack("<I", crc)
-                sig_b = sk.sign(bwc).signature if batch_signing else b"\x00"*64
-                rw = bwc + sig_b
-                nb = pipeline.encode()
-                frame = struct.pack("<I", len(nb)) + nb + struct.pack("<H", partition) + rw
-                await ws.send(frame)
-            except Exception as e:
-                print(f"ERROR: {{e}}", file=sys.stderr); traceback.print_exc(file=sys.stderr); break
+try:
+    from aeon_transport import processor, Output, run
 
-asyncio.run(main())
-"#
+    @processor
+    def passthrough(event):
+        return [Output(
+            destination="output",
+            payload=event.payload,
+            headers=list(event.metadata),
+        )]
+
+    run(
+        "ws://127.0.0.1:{port}/api/v1/processors/connect",
+        name="{processor_name}",
+        version="1.0.0",
+        private_key_path=r"{seed_path}",
+        pipelines=["{pipeline_name}"],
+        codec="msgpack",
+    )
+except SystemExit:
+    raise
+except BaseException as e:
+    print("PYTHON_ERROR: " + repr(e), file=sys.stderr)
+    traceback.print_exc(file=sys.stderr)
+    sys.exit(1)
+"#,
+        sdk_path = sdk_path_str,
+        port = port,
+        processor_name = processor_name,
+        seed_path = seed_path_fixed,
+        pipeline_name = pipeline_name,
     )
 }
 
 /// Generate inline Node.js passthrough processor script.
-/// Requires: Node.js 22+ (built-in WebSocket + crypto ed25519 + zlib.crc32).
+/// Requires: Node.js 18+ with `npm install` run in sdks/nodejs/.
+/// Uses the Node.js SDK's run() directly with processor() decorator.
+/// The SDK's Signer handles hex-decode nonce signing and
+/// "ed25519:<base64>" public key formatting. Uses msgpack codec
+/// which correctly round-trips serde_bytes payloads as binary.
 pub fn nodejs_passthrough_script(
     port: u16,
     seed_path: &str,
-    pub_key: &str,
+    _pub_key: &str,
     pipeline_name: &str,
     processor_name: &str,
 ) -> String {
+    // Locate the in-repo Node.js SDK so the inline script can require it.
+    let sdk_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("sdks")
+        .join("nodejs");
+    let sdk_path_str = sdk_path.to_string_lossy().replace('\\', "/");
+    let seed_path_fixed = seed_path.replace('\\', "/");
+
     format!(
         r#"
-const fs = require('fs');
-const crypto = require('crypto');
-const zlib = require('zlib');
-const seed = fs.readFileSync('{seed_path}');
-const privKey = crypto.createPrivateKey({{
-    key: Buffer.concat([Buffer.from('302e020100300506032b657004220420', 'hex'), seed]),
-    format: 'der', type: 'pkcs8'
+const aeon = require('{sdk_path}/aeon.js');
+
+const passthrough = aeon.processor((event) => [{{
+    destination: 'output',
+    payload: event.payload,
+    headers: event.metadata || [],
+}}]);
+
+aeon.run('ws://127.0.0.1:{port}/api/v1/processors/connect', {{
+    name: '{processor_name}',
+    version: '1.0.0',
+    privateKeyPath: '{seed_path}',
+    pipelines: ['{pipeline_name}'],
+    codec: 'msgpack',
+    processor: passthrough,
+}}).catch((err) => {{
+    console.error('NODEJS_ERROR:', err);
+    process.exit(1);
 }});
-function signBytes(data) {{ return crypto.sign(null, Buffer.from(data), privKey); }}
-const ws = new WebSocket(`ws://127.0.0.1:{port}/api/v1/processors/connect`);
-ws.binaryType = 'arraybuffer';
-let state = 0, batchSigning = true;
-ws.onmessage = (evt) => {{
-    if (typeof evt.data === 'string') {{
-        const msg = JSON.parse(evt.data);
-        if (state === 0 && msg.type === 'challenge') {{
-            const sig = signBytes(Buffer.from(msg.nonce, 'hex'));
-            ws.send(JSON.stringify({{
-                type:'register', protocol:'awpp/1', transport:'websocket',
-                name:'{processor_name}', version:'1.0.0',
-                public_key:'{pub_key}', challenge_signature:sig.toString('hex'),
-                capabilities:['batch'], transport_codec:'json',
-                requested_pipelines:['{pipeline_name}'], binding:'dedicated',
-            }}));
-            state = 1;
-        }} else if (state === 1 && msg.type === 'accepted') {{
-            batchSigning = msg.batch_signing !== false; state = 2;
-        }} else if (msg.type === 'drain') {{ ws.close(); }}
-    }} else {{
-        const buf = Buffer.from(evt.data);
-        const nl = buf.readUInt32LE(0);
-        const pipeline = buf.toString('utf8', 4, 4+nl);
-        const partition = buf.readUInt16LE(4+nl);
-        const bd = buf.subarray(4+nl+2);
-        const batchId = bd.readBigUInt64LE(0);
-        const ec = bd.readUInt32LE(8);
-        let off = 12; const events = [];
-        for (let i=0;i<ec;i++) {{
-            const el = bd.readUInt32LE(off); off+=4;
-            events.push(JSON.parse(bd.toString('utf8',off,off+el))); off+=el;
-        }}
-        const parts = [];
-        const bidBuf = Buffer.alloc(8); bidBuf.writeBigUInt64LE(batchId); parts.push(bidBuf);
-        const cntBuf = Buffer.alloc(4); cntBuf.writeUInt32LE(events.length); parts.push(cntBuf);
-        for (const ev of events) {{
-            const ocBuf = Buffer.alloc(4); ocBuf.writeUInt32LE(1); parts.push(ocBuf);
-            const out = JSON.stringify({{destination:'output',payload:ev.payload||[],headers:[]}});
-            const outBuf = Buffer.from(out);
-            const olBuf = Buffer.alloc(4); olBuf.writeUInt32LE(outBuf.length); parts.push(olBuf);
-            parts.push(outBuf);
-        }}
-        const body = Buffer.concat(parts);
-        const crc = Buffer.alloc(4); crc.writeUInt32LE(zlib.crc32(body)>>>0);
-        const bwc = Buffer.concat([body, crc]);
-        const sig = batchSigning ? signBytes(bwc) : Buffer.alloc(64);
-        const rw = Buffer.concat([bwc, sig]);
-        const nameB = Buffer.from(pipeline);
-        const hdr = Buffer.alloc(4+nameB.length+2);
-        hdr.writeUInt32LE(nameB.length,0); nameB.copy(hdr,4);
-        hdr.writeUInt16LE(partition,4+nameB.length);
-        ws.send(Buffer.concat([hdr, rw]));
-    }}
-}};
-ws.onerror = (e) => {{ console.error('WS error:', e.message); process.exit(1); }};
-ws.onclose = () => {{ process.exit(0); }};
-"#
+"#,
+        sdk_path = sdk_path_str,
+        port = port,
+        processor_name = processor_name,
+        seed_path = seed_path_fixed,
+        pipeline_name = pipeline_name,
     )
 }
 
 /// Generate a Go passthrough processor project in a temp directory.
 /// Returns the path to the temp directory (caller must `go run .` from there).
-/// Requires: Go 1.21+ with gorilla/websocket available via local SDK module.
+/// Requires: Go 1.23+ (uses the in-repo Go SDK's `aeon.Run()` directly).
 pub fn go_passthrough_project(
     port: u16,
     seed_path: &str,
@@ -540,11 +493,11 @@ pub fn go_passthrough_project(
         .join("go");
     let sdk_path_str = sdk_path.to_string_lossy().replace('\\', "/");
 
-    // go.mod
+    // go.mod — pin Go 1.23 to match the SDK's requirement.
     let go_mod = format!(
         r#"module aeon-e2e-go-test
 
-go 1.21
+go 1.23
 
 require github.com/aeon-rust/aeon/sdks/go v0.0.0
 
@@ -556,171 +509,57 @@ replace github.com/aeon-rust/aeon/sdks/go => {sdk_path_str}
     // Fix: seed_path on Windows may have backslashes
     let seed_path_fixed = seed_path.replace('\\', "/");
 
-    // main.go — uses the Go SDK's Run() but with correct hex-decoded challenge signing
-    // The SDK signs []byte(nonce) (hex string) but engine expects signing hex-decoded bytes.
-    // So we use the SDK directly but patch the signing by using a custom main that does
-    // the handshake correctly.
+    // main.go — uses the Go SDK's Run() directly.
+    // The SDK's AWPPPublicKey() returns "ed25519:<base64>" and
+    // SignChallenge() hex-decodes the nonce before signing, matching
+    // the engine's verification. Uses msgpack codec (SDK default)
+    // which correctly round-trips serde_bytes payloads as binary.
     let main_go = format!(
         r#"package main
 
 import (
-	"context"
-	"crypto/ed25519"
-	"encoding/base64"
-	"encoding/binary"
-	"encoding/hex"
-	"encoding/json"
-	"fmt"
-	"hash/crc32"
 	"log"
-	"os"
-	"os/signal"
-	"syscall"
 
-	"github.com/gorilla/websocket"
+	aeon "github.com/aeon-rust/aeon/sdks/go"
 )
 
-// Minimal inline AWPP client with correct challenge signing (hex-decode nonce)
-
 func main() {{
-	seed, err := os.ReadFile("{seed_path_fixed}")
-	if err != nil {{ log.Fatal("read seed:", err) }}
-	privKey := ed25519.NewKeyFromSeed(seed)
-	pubKey := privKey.Public().(ed25519.PublicKey)
-
-	url := "ws://127.0.0.1:{port}/api/v1/processors/connect"
-	conn, _, err := websocket.DefaultDialer.Dial(url, nil)
-	if err != nil {{ log.Fatal("connect:", err) }}
-	defer conn.Close()
-
-	// Read challenge
-	_, raw, err := conn.ReadMessage()
-	if err != nil {{ log.Fatal("read challenge:", err) }}
-	var challenge map[string]interface{{}}
-	json.Unmarshal(raw, &challenge)
-	nonce := challenge["nonce"].(string)
-
-	// Sign hex-decoded nonce bytes (NOT the hex string)
-	nonceBytes, _ := hex.DecodeString(nonce)
-	sig := ed25519.Sign(privKey, nonceBytes)
-
-	// Send register
-	register := map[string]interface{{}}{{
-		"type": "register", "protocol": "awpp/1", "transport": "websocket",
-		"name": "{processor_name}", "version": "1.0.0",
-		"public_key": fmt.Sprintf("ed25519:%s", base64.StdEncoding.EncodeToString(pubKey)),
-		"challenge_signature": hex.EncodeToString(sig),
-		"capabilities": []string{{"batch"}},
-		"transport_codec": "json",
-		"requested_pipelines": []string{{"{pipeline_name}"}},
-		"binding": "dedicated",
-	}}
-	regJSON, _ := json.Marshal(register)
-	conn.WriteMessage(websocket.TextMessage, regJSON)
-
-	// Read accepted
-	_, raw, err = conn.ReadMessage()
-	if err != nil {{ log.Fatal("read accepted:", err) }}
-	var accepted map[string]interface{{}}
-	json.Unmarshal(raw, &accepted)
-	if accepted["type"] != "accepted" {{
-		log.Fatalf("not accepted: %v", accepted)
-	}}
-	batchSigning := true
-	if v, ok := accepted["batch_signing"].(bool); ok {{ batchSigning = v }}
-
-	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer cancel()
-
-	// Message loop
-	for {{
-		select {{
-		case <-ctx.Done():
-			return
-		default:
-		}}
-
-		msgType, data, err := conn.ReadMessage()
-		if err != nil {{ return }}
-
-		if msgType == websocket.TextMessage {{
-			var ctrl map[string]interface{{}}
-			json.Unmarshal(data, &ctrl)
-			if ctrl["type"] == "drain" {{ return }}
-			continue
-		}}
-
-		// Parse data frame
-		if len(data) < 7 {{ continue }}
-		nameLen := int(binary.LittleEndian.Uint32(data[0:4]))
-		pipeline := string(data[4 : 4+nameLen])
-		partition := binary.LittleEndian.Uint16(data[4+nameLen : 4+nameLen+2])
-		bd := data[4+nameLen+2:]
-
-		batchID := binary.LittleEndian.Uint64(bd[0:8])
-		eventCount := binary.LittleEndian.Uint32(bd[8:12])
-
-		// Decode events
-		off := 12
-		type wireEvent struct {{
-			ID        string     `json:"id"`
-			Timestamp int64      `json:"timestamp"`
-			Source    string     `json:"source"`
-			Partition int        `json:"partition"`
-			Metadata  [][]string `json:"metadata"`
-			Payload   json.RawMessage `json:"payload"`
-		}}
-		events := make([]wireEvent, 0, eventCount)
-		for i := uint32(0); i < eventCount; i++ {{
-			eLen := int(binary.LittleEndian.Uint32(bd[off:off+4])); off += 4
-			var ev wireEvent
-			json.Unmarshal(bd[off:off+eLen], &ev); off += eLen
-			events = append(events, ev)
-		}}
-
-		// Build response
-		var buf []byte
-		tmp := make([]byte, 8)
-		binary.LittleEndian.PutUint64(tmp, batchID)
-		buf = append(buf, tmp...)
-		binary.LittleEndian.PutUint32(tmp[:4], uint32(len(events)))
-		buf = append(buf, tmp[:4]...)
-		for _, ev := range events {{
-			binary.LittleEndian.PutUint32(tmp[:4], 1) // 1 output per event
-			buf = append(buf, tmp[:4]...)
-			out := fmt.Sprintf(`{{"destination":"output","payload":%s,"headers":[]}}`, string(ev.Payload))
-			binary.LittleEndian.PutUint32(tmp[:4], uint32(len(out)))
-			buf = append(buf, tmp[:4]...)
-			buf = append(buf, []byte(out)...)
-		}}
-		crcVal := crc32.ChecksumIEEE(buf)
-		binary.LittleEndian.PutUint32(tmp[:4], crcVal)
-		buf = append(buf, tmp[:4]...)
-
-		var sigBytes []byte
-		if batchSigning {{
-			sigBytes = ed25519.Sign(privKey, buf)
-		}} else {{
-			sigBytes = make([]byte, 64)
-		}}
-		buf = append(buf, sigBytes...)
-
-		// Build data frame
-		nameB := []byte(pipeline)
-		hdr := make([]byte, 4+len(nameB)+2)
-		binary.LittleEndian.PutUint32(hdr[0:4], uint32(len(nameB)))
-		copy(hdr[4:], nameB)
-		binary.LittleEndian.PutUint16(hdr[4+len(nameB):], partition)
-		frame := append(hdr, buf...)
-		conn.WriteMessage(websocket.BinaryMessage, frame)
+	err := aeon.Run(aeon.Config{{
+		URL:            "ws://127.0.0.1:{port}/api/v1/processors/connect",
+		Name:           "{processor_name}",
+		Version:        "1.0.0",
+		PrivateKeyPath: "{seed_path}",
+		Pipelines:      []string{{"{pipeline_name}"}},
+		Codec:          "msgpack",
+		Processor: func(e aeon.Event) []aeon.Output {{
+			return []aeon.Output{{{{
+				Destination: "output",
+				Payload:     e.Payload,
+				Headers:     e.Metadata,
+			}}}}
+		}},
+	}})
+	if err != nil {{
+		log.Fatalf("Run: %v", err)
 	}}
 }}
-"#
+"#,
+        port = port,
+        processor_name = processor_name,
+        seed_path = seed_path_fixed,
+        pipeline_name = pipeline_name,
     );
 
     std::fs::write(tmp_dir.join("main.go"), &main_go).expect("write main.go");
 
-    // Run go mod tidy to fetch deps
+    // Copy go.sum from the SDK so `go mod tidy` doesn't need to fetch
+    // checksums over the network (same pattern as go_wt_passthrough_project).
+    let sdk_go_sum = sdk_path.join("go.sum");
+    if sdk_go_sum.exists() {
+        std::fs::copy(&sdk_go_sum, tmp_dir.join("go.sum")).expect("copy go.sum");
+    }
+
+    // Run go mod tidy to materialise transitive deps
     let output = std::process::Command::new("go")
         .args(["mod", "tidy"])
         .current_dir(&tmp_dir)
@@ -746,7 +585,10 @@ func main() {{
 
 /// Generate a .NET passthrough processor project in a temp directory.
 /// Returns the path to the temp directory (caller must `dotnet run` from there).
-/// Requires: .NET 8+ SDK with NuGet access (downloads NSec.Cryptography).
+/// Requires: .NET 8+ SDK with NuGet access (downloads NSec.Cryptography + MessagePack).
+/// Uses the in-repo C# SDK's Runner.RunAsync() directly with ProcessorRegistration.PerEvent().
+/// The SDK's Signer handles hex-decode nonce signing and
+/// "ed25519:<base64>" public key formatting.
 pub fn dotnet_passthrough_project(
     port: u16,
     seed_path: &str,
@@ -760,156 +602,57 @@ pub fn dotnet_passthrough_project(
 
     let seed_path_fixed = seed_path.replace('\\', "/");
 
-    // Create project
-    let output = std::process::Command::new("dotnet")
-        .args(["new", "console", "--force", "-o", "."])
-        .current_dir(&tmp_dir)
-        .output()
-        .expect("dotnet new console");
-    assert!(
-        output.status.success(),
-        "dotnet new console failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    // Locate the in-repo .NET SDK project for ProjectReference
+    let sdk_csproj = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("sdks")
+        .join("dotnet")
+        .join("AeonProcessorSdk")
+        .join("AeonProcessorSdk.csproj");
+    let sdk_csproj_str = sdk_csproj.to_string_lossy().replace('\\', "/");
 
-    // Add NuGet packages for ED25519 and CRC32
-    let output = std::process::Command::new("dotnet")
-        .args(["add", "package", "NSec.Cryptography"])
-        .current_dir(&tmp_dir)
-        .output()
-        .expect("dotnet add package NSec");
-    assert!(
-        output.status.success(),
-        "dotnet add NSec failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+    // Write csproj with reference to the SDK
+    let csproj = format!(
+        r#"<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="{sdk_csproj_str}" />
+  </ItemGroup>
+</Project>
+"#
     );
-
-    let output = std::process::Command::new("dotnet")
-        .args(["add", "package", "System.IO.Hashing"])
-        .current_dir(&tmp_dir)
-        .output()
-        .expect("dotnet add package Hashing");
-    assert!(
-        output.status.success(),
-        "dotnet add Hashing failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    std::fs::write(tmp_dir.join("AeonE2ETest.csproj"), &csproj).expect("write csproj");
 
     let program_cs = format!(
         r#"
-using System;
-using System.Buffers.Binary;
-using System.IO;
-using System.IO.Hashing;
-using System.Net.WebSockets;
-using System.Text;
-using System.Text.Json;
-using NSec.Cryptography;
+using Aeon.ProcessorSdk;
 
 var seed = File.ReadAllBytes(@"{seed_path_fixed}");
-var algo = SignatureAlgorithm.Ed25519;
-var key = Key.Import(algo, seed, KeyBlobFormat.RawPrivateKey);
-var pubBytes = key.Export(KeyBlobFormat.RawPublicKey);
-var pubKeyStr = "ed25519:" + Convert.ToBase64String(pubBytes);
 
-var ws = new ClientWebSocket();
-await ws.ConnectAsync(new Uri("ws://127.0.0.1:{port}/api/v1/processors/connect"), default);
+var config = new RunnerConfig
+{{
+    Name = "{processor_name}",
+    Version = "1.0.0",
+    PrivateKey = seed,
+    Pipelines = new List<string> {{ "{pipeline_name}" }},
+    CodecName = "json",
+    Processor = ProcessorRegistration.PerEvent(e => new List<Output>
+    {{
+        new Output {{ Destination = "output", Payload = e.Payload, Headers = new() }}
+    }}),
+}};
 
-// Read challenge
-var buf = new byte[65536];
-var result = await ws.ReceiveAsync(buf, default);
-var challenge = JsonDocument.Parse(buf.AsMemory(0, result.Count)).RootElement;
-var nonce = challenge.GetProperty("nonce").GetString()!;
-var nonceBytes = Convert.FromHexString(nonce);
-var sig = algo.Sign(key, nonceBytes);
-
-// Send register
-var register = JsonSerializer.Serialize(new {{
-    type = "register", protocol = "awpp/1", transport = "websocket",
-    name = "{processor_name}", version = "1.0.0",
-    public_key = pubKeyStr,
-    challenge_signature = Convert.ToHexString(sig).ToLower(),
-    capabilities = new[] {{ "batch" }},
-    transport_codec = "json",
-    requested_pipelines = new[] {{ "{pipeline_name}" }},
-    binding = "dedicated",
-}});
-await ws.SendAsync(Encoding.UTF8.GetBytes(register), WebSocketMessageType.Text, true, default);
-
-// Read accepted
-result = await ws.ReceiveAsync(buf, default);
-var accepted = JsonDocument.Parse(buf.AsMemory(0, result.Count)).RootElement;
-if (accepted.GetProperty("type").GetString() != "accepted") {{
-    Console.Error.WriteLine($"Not accepted: {{accepted}}");
-    return;
-}}
-var batchSigning = !accepted.TryGetProperty("batch_signing", out var bs) || bs.GetBoolean();
-
-// Message loop
-while (ws.State == WebSocketState.Open) {{
-    result = await ws.ReceiveAsync(buf, default);
-    if (result.MessageType == WebSocketMessageType.Close) break;
-    if (result.MessageType == WebSocketMessageType.Text) {{
-        var ctrl = JsonDocument.Parse(buf.AsMemory(0, result.Count)).RootElement;
-        if (ctrl.GetProperty("type").GetString() == "drain") break;
-        continue;
-    }}
-    // Binary data frame — extract to byte[] to avoid Span in async
-    var raw = new byte[result.Count];
-    Array.Copy(buf, 0, raw, 0, result.Count);
-    ProcessFrame(raw, batchSigning, algo, key, ws).Wait();
-}}
-
-static async Task ProcessFrame(byte[] raw, bool batchSigning, SignatureAlgorithm algo, Key key, ClientWebSocket ws) {{
-    int nameLen = BitConverter.ToInt32(raw, 0);
-    var pipeline = Encoding.UTF8.GetString(raw, 4, nameLen);
-    ushort partition = BitConverter.ToUInt16(raw, 4 + nameLen);
-    int bdOff = 4 + nameLen + 2;
-
-    long batchId = BitConverter.ToInt64(raw, bdOff);
-    int eventCount = BitConverter.ToInt32(raw, bdOff + 8);
-
-    int off = bdOff + 12;
-    var payloads = new List<string>();
-    for (int i = 0; i < eventCount; i++) {{
-        int eLen = BitConverter.ToInt32(raw, off); off += 4;
-        var evStr = Encoding.UTF8.GetString(raw, off, eLen);
-        var evJson = JsonDocument.Parse(evStr).RootElement;
-        payloads.Add(evJson.GetProperty("payload").GetRawText());
-        off += eLen;
-    }}
-
-    // Build response
-    using var ms = new MemoryStream();
-    ms.Write(BitConverter.GetBytes(batchId));
-    ms.Write(BitConverter.GetBytes((uint)payloads.Count));
-    foreach (var p in payloads) {{
-        ms.Write(BitConverter.GetBytes((uint)1));
-        var outJson = @"{{""destination"":""output"",""payload"":" + p + @",""headers"":[]}}";
-        var outBytes = Encoding.UTF8.GetBytes(outJson);
-        ms.Write(BitConverter.GetBytes((uint)outBytes.Length));
-        ms.Write(outBytes);
-    }}
-    var body = ms.ToArray();
-    var crc = new System.IO.Hashing.Crc32();
-    crc.Append(body);
-    var crcHash = crc.GetCurrentHash();
-    var bwc = new byte[body.Length + 4];
-    Array.Copy(body, 0, bwc, 0, body.Length);
-    Array.Copy(crcHash, 0, bwc, body.Length, 4);
-
-    byte[] sigBytes = batchSigning ? algo.Sign(key, bwc) : new byte[64];
-
-    // Build data frame
-    var nameBytes = Encoding.UTF8.GetBytes(pipeline);
-    using var frame = new MemoryStream();
-    frame.Write(BitConverter.GetBytes((uint)nameBytes.Length));
-    frame.Write(nameBytes);
-    frame.Write(BitConverter.GetBytes(partition));
-    frame.Write(bwc);
-    frame.Write(sigBytes);
-    await ws.SendAsync(frame.ToArray(), WebSocketMessageType.Binary, true, default);
-}}
+await Runner.RunAsync(
+    "ws://127.0.0.1:{port}/api/v1/processors/connect",
+    config);
 "#
     );
 
@@ -931,9 +674,12 @@ static async Task ProcessFrame(byte[] raw, bool batchSigning, SignatureAlgorithm
     tmp_dir
 }
 
-/// Generate inline Java passthrough processor script.
-/// Requires: Java 17+ (built-in HttpClient WebSocket + EdDSA).
-/// Returns the path to the .java source file.
+/// Generate a Java passthrough processor project in a temp directory.
+/// Returns the path to the temp directory (caller must compile and run).
+/// Requires: Java 21+ (uses the in-repo Java SDK's `Runner.run()` directly).
+/// The SDK's Signer handles hex-decode nonce signing and
+/// "ed25519:<base64>" public key formatting. Uses json codec
+/// (Java SDK uses stdlib-only JSON — no msgpack dependency).
 pub fn java_passthrough_project(
     port: u16,
     seed_path: &str,
@@ -947,263 +693,30 @@ pub fn java_passthrough_project(
 
     let seed_path_fixed = seed_path.replace('\\', "/");
 
-    // Java 17 has EdDSA support via java.security and built-in WebSocket via java.net.http
-    // But java.net.http.WebSocket is complex. Use a simpler approach with raw socket + HTTP upgrade.
-    // Actually, Java 15+ has EdDSA, Java 11+ has HttpClient with WebSocket.
+    // Uses the Java SDK's Runner.run() directly with Processor.perEvent().
     let java_src = format!(
         r#"
-import java.io.*;
-import java.net.*;
-import java.net.http.*;
-import java.net.http.WebSocket;
-import java.nio.*;
-import java.security.*;
-import java.security.spec.*;
-import java.util.*;
-import java.util.concurrent.*;
-import java.util.zip.CRC32;
+import io.aeon.processor.*;
+import java.io.FileInputStream;
+import java.util.List;
 
-public class AeonProcessor implements WebSocket.Listener {{
-    private final PrivateKey privKey;
-    private final PublicKey pubKey;
-    private final CompletableFuture<Void> done = new CompletableFuture<>();
-    private boolean batchSigning = true;
-    private int state = 0;
-    private ByteBuffer accum = ByteBuffer.allocate(16 * 1024 * 1024);
-    private WebSocket ws;
-
-    public AeonProcessor(byte[] seed) throws Exception {{
-        // Build ED25519 key from seed
-        var pkcs8 = new byte[48];
-        // PKCS#8 prefix for Ed25519: 302e020100300506032b657004220420
-        byte[] prefix = hexDecode("302e020100300506032b657004220420");
-        System.arraycopy(prefix, 0, pkcs8, 0, 16);
-        System.arraycopy(seed, 0, pkcs8, 16, 32);
-        var keySpec = new PKCS8EncodedKeySpec(pkcs8);
-        var kf = KeyFactory.getInstance("Ed25519");
-        this.privKey = kf.generatePrivate(keySpec);
-
-        // Derive public key from private
-        // X.509 prefix for Ed25519: 302a300506032b6570032100
-        byte[] x509prefix = hexDecode("302a300506032b6570032100");
-        // Sign empty to get public key... or use KeyFactory
-        var sig = Signature.getInstance("Ed25519");
-        sig.initSign(privKey);
-        // Actually, let's extract from the key
-        // Encode private key and derive public
-        var encoded = privKey.getEncoded();
-        // The seed is the last 32 bytes; compute public key
-        // Java 15+ EdDSA: use EdECPrivateKeySpec
-        // Simpler: sign and verify approach, or just compute manually.
-        // Actually in Java 17, we can use NamedParameterSpec
-        var kpg = KeyPairGenerator.getInstance("Ed25519");
-        // We can't easily derive pubkey from seed in Java without BouncyCastle.
-        // Workaround: generate keypair and override. Or use the fact that
-        // Java stores the full key. Let's extract it.
-
-        // Parse the PKCS8 to get the seed, then use EdECPrivateKeySpec
-        // This is complex. Simpler: sign a test value and that proves the key works.
-        // For the public key, we'll recompute it.
-        // Actually, let me just create a keypair from the seed using a hack:
-        // Create a SecureRandom that returns our seed, then generate.
-        var fixedRandom = new FixedRandom(seed);
-        kpg.initialize(255, fixedRandom);
-        var kp = kpg.generateKeyPair();
-        this.pubKey = kp.getPublic();
-        // Override privKey with the generated one
-        // Actually the PKCS8 approach works for signing. We just need pubKey for register.
-    }}
-
-    // A SecureRandom that returns fixed bytes
-    static class FixedRandom extends java.security.SecureRandom {{
-        private final byte[] data;
-        private int pos = 0;
-        FixedRandom(byte[] data) {{ this.data = data; }}
-        @Override public void nextBytes(byte[] bytes) {{
-            System.arraycopy(data, 0, bytes, 0, Math.min(data.length, bytes.length));
-        }}
-    }}
-
-    byte[] sign(byte[] data) throws Exception {{
-        var sig = Signature.getInstance("Ed25519");
-        sig.initSign(privKey);
-        sig.update(data);
-        return sig.sign();
-    }}
-
-    @Override
-    public void onOpen(WebSocket webSocket) {{
-        this.ws = webSocket;
-        webSocket.request(1);
-    }}
-
-    @Override
-    public CompletionStage<?> onText(WebSocket webSocket, CharSequence data, boolean last) {{
-        try {{
-            var json = data.toString();
-            if (state == 0) {{
-                // Challenge
-                var nonce = jsonString(json, "nonce");
-                var nonceBytes = hexDecode(nonce);
-                var sigBytes = sign(nonceBytes);
-                var pubB64 = Base64.getEncoder().encodeToString(pubKey.getEncoded());
-                // Extract raw 32-byte public key from X.509 encoding (last 32 bytes)
-                var pubEncoded = pubKey.getEncoded();
-                var rawPub = new byte[32];
-                System.arraycopy(pubEncoded, pubEncoded.length - 32, rawPub, 0, 32);
-                var pubKeyStr = "ed25519:" + Base64.getEncoder().encodeToString(rawPub);
-                var register = String.format(
-                    "{{\"type\":\"register\",\"protocol\":\"awpp/1\",\"transport\":\"websocket\"," +
-                    "\"name\":\"{processor_name}\",\"version\":\"1.0.0\"," +
-                    "\"public_key\":\"%s\",\"challenge_signature\":\"%s\"," +
-                    "\"capabilities\":[\"batch\"],\"transport_codec\":\"json\"," +
-                    "\"requested_pipelines\":[\"{pipeline_name}\"],\"binding\":\"dedicated\"}}",
-                    pubKeyStr, hexEncode(sigBytes));
-                webSocket.sendText(register, true);
-                state = 1;
-            }} else if (state == 1) {{
-                // Accepted
-                if (json.contains("\"accepted\"")) {{
-                    batchSigning = !json.contains("\"batch_signing\":false");
-                    state = 2;
-                }}
-            }} else {{
-                // Control message
-                if (json.contains("\"drain\"")) {{
-                    done.complete(null);
-                    return null;
-                }}
-            }}
-        }} catch (Exception e) {{
-            e.printStackTrace();
-        }}
-        webSocket.request(1);
-        return null;
-    }}
-
-    @Override
-    public CompletionStage<?> onBinary(WebSocket webSocket, ByteBuffer data, boolean last) {{
-        try {{
-            accum.put(data);
-            if (!last) {{
-                webSocket.request(1);
-                return null;
-            }}
-            accum.flip();
-            var buf = new byte[accum.remaining()];
-            accum.get(buf);
-            accum.clear();
-            processBinaryFrame(buf);
-        }} catch (Exception e) {{
-            e.printStackTrace();
-        }}
-        webSocket.request(1);
-        return null;
-    }}
-
-    void processBinaryFrame(byte[] data) throws Exception {{
-        var bb = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN);
-        int nameLen = bb.getInt();
-        var nameBytes = new byte[nameLen];
-        bb.get(nameBytes);
-        var pipeline = new String(nameBytes);
-        short partition = bb.getShort();
-        var bd = new byte[bb.remaining()];
-        bb.get(bd);
-        var bdb = ByteBuffer.wrap(bd).order(ByteOrder.LITTLE_ENDIAN);
-        long batchId = bdb.getLong();
-        int eventCount = bdb.getInt();
-        var payloads = new ArrayList<String>();
-        for (int i = 0; i < eventCount; i++) {{
-            int eLen = bdb.getInt();
-            var eBytes = new byte[eLen];
-            bdb.get(eBytes);
-            var evJson = new String(eBytes);
-            int pi = evJson.indexOf("\"payload\":");
-            if (pi >= 0) {{
-                int start = pi + 10;
-                int depth = 0; int end = start;
-                for (int j = start; j < evJson.length(); j++) {{
-                    char c = evJson.charAt(j);
-                    if (c == '[') depth++;
-                    else if (c == ']') {{ depth--; if (depth == 0) {{ end = j + 1; break; }} }}
-                }}
-                payloads.add(evJson.substring(start, end));
-            }} else {{
-                payloads.add("[]");
-            }}
-        }}
-        // Build response
-        var baos = new ByteArrayOutputStream();
-        var le = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN);
-        le.putLong(batchId); baos.write(le.array());
-        le.clear(); le.putInt(payloads.size()); baos.write(le.array(), 0, 4);
-        for (var p : payloads) {{
-            le.clear(); le.putInt(1); baos.write(le.array(), 0, 4);
-            var outJson = "{{\"destination\":\"output\",\"payload\":" + p + ",\"headers\":[]}}";
-            var outBytes = outJson.getBytes();
-            le.clear(); le.putInt(outBytes.length); baos.write(le.array(), 0, 4);
-            baos.write(outBytes);
-        }}
-        var body = baos.toByteArray();
-        var crc = new CRC32();
-        crc.update(body);
-        var crcBuf = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN);
-        crcBuf.putInt((int) crc.getValue());
-        var bwc = new byte[body.length + 4];
-        System.arraycopy(body, 0, bwc, 0, body.length);
-        System.arraycopy(crcBuf.array(), 0, bwc, body.length, 4);
-        byte[] sigBytes = batchSigning ? sign(bwc) : new byte[64];
-        // Frame
-        var frame = new ByteArrayOutputStream();
-        var hdr = ByteBuffer.allocate(4 + nameBytes.length + 2).order(ByteOrder.LITTLE_ENDIAN);
-        hdr.putInt(nameBytes.length); hdr.put(nameBytes); hdr.putShort(partition);
-        frame.write(hdr.array());
-        frame.write(bwc);
-        frame.write(sigBytes);
-        ws.sendBinary(ByteBuffer.wrap(frame.toByteArray()), true);
-    }}
-
-    @Override
-    public CompletionStage<?> onClose(WebSocket webSocket, int code, String reason) {{
-        done.complete(null);
-        return null;
-    }}
-
-    @Override
-    public void onError(WebSocket webSocket, Throwable error) {{
-        error.printStackTrace();
-        done.complete(null);
-    }}
-
-    static String hexEncode(byte[] bytes) {{
-        var sb = new StringBuilder();
-        for (var b : bytes) sb.append(String.format("%02x", b & 0xff));
-        return sb.toString();
-    }}
-
-    static byte[] hexDecode(String hex) {{
-        var bytes = new byte[hex.length() / 2];
-        for (int i = 0; i < bytes.length; i++)
-            bytes[i] = (byte) Integer.parseInt(hex.substring(i * 2, i * 2 + 2), 16);
-        return bytes;
-    }}
-
-    static String jsonString(String json, String key) {{
-        var pattern = "\"" + key + "\":\"";
-        int start = json.indexOf(pattern) + pattern.length();
-        int end = json.indexOf("\"", start);
-        return json.substring(start, end);
-    }}
-
+public class AeonProcessor {{
     public static void main(String[] args) throws Exception {{
-        var seed = new FileInputStream("{seed_path_fixed}").readAllBytes();
-        var proc = new AeonProcessor(seed);
-        var client = HttpClient.newHttpClient();
-        var wsBuilder = client.newWebSocketBuilder();
-        var ws = wsBuilder.buildAsync(
-            URI.create("ws://127.0.0.1:{port}/api/v1/processors/connect"), proc).join();
-        proc.done.get();
+        byte[] seed = new FileInputStream("{seed_path_fixed}").readAllBytes();
+
+        var config = new Runner.RunnerConfig(
+            "{processor_name}",
+            "1.0.0",
+            seed,
+            List.of("{pipeline_name}"),
+            "json",
+            Processor.perEvent(event -> List.of(
+                new Output("output", event.payload(), null, List.of(), null, null, null)
+            )),
+            null
+        );
+
+        Runner.run("ws://127.0.0.1:{port}/api/v1/processors/connect", config);
     }}
 }}
 "#
@@ -1211,6 +724,45 @@ public class AeonProcessor implements WebSocket.Listener {{
 
     std::fs::write(tmp_dir.join("AeonProcessor.java"), &java_src).expect("write Java source");
     tmp_dir
+}
+
+/// Compile a Java project that uses the in-repo Java SDK.
+/// `javac_cmd` is the javac binary (e.g. "javac" or an absolute path).
+/// `project_dir` is the directory containing AeonProcessor.java.
+/// Returns Ok(()) on success, Err(stderr) on failure.
+pub fn compile_java_with_sdk(javac_cmd: &str, project_dir: &std::path::Path) -> Result<(), String> {
+    let sdk_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("sdks")
+        .join("java")
+        .join("src")
+        .join("main")
+        .join("java");
+    let sdk_src_str = sdk_src.to_string_lossy().replace('\\', "/");
+    let java_src = project_dir
+        .join("AeonProcessor.java")
+        .to_string_lossy()
+        .replace('\\', "/");
+
+    let compile = std::process::Command::new(javac_cmd)
+        .args([
+            "-d",
+            &project_dir.to_string_lossy(),
+            "-sourcepath",
+            &sdk_src_str,
+            &java_src,
+        ])
+        .output()
+        .map_err(|e| format!("javac spawn failed: {e}"))?;
+
+    if compile.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&compile.stderr).to_string())
+    }
 }
 
 /// Generate inline PHP passthrough processor script.
@@ -1393,7 +945,10 @@ pub fn composer_command() -> Option<Vec<String>> {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .ok()?;
-    let phar = std::path::Path::new(&home).join(".local").join("bin").join("composer");
+    let phar = std::path::Path::new(&home)
+        .join(".local")
+        .join("bin")
+        .join("composer");
     if phar.exists() {
         return Some(vec!["php".to_string(), phar.to_string_lossy().to_string()]);
     }

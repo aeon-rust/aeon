@@ -3,7 +3,7 @@
 replicaCount: 1
 
 image:
-  repository: aeon
+  repository: aeonrust/aeon
   tag: latest
   pullPolicy: IfNotPresent
 
@@ -49,6 +49,26 @@ persistence:
 # Processor artifacts via ConfigMap (for .wasm files)
 processors:
   configMap: ""  # Name of ConfigMap containing .wasm files
+
+# Multi-node cluster mode (StatefulSet + Raft consensus)
+cluster:
+  enabled: false
+  replicas: 3
+  partitions: 16
+  tls:
+    enabled: false
+    secretName: aeon-tls  # K8s Secret with tls.crt, tls.key, ca.crt
+
+# Horizontal Pod Autoscaler
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 4
+  targetCPUUtilization: 70
+  targetMemoryUtilization: ""  # empty = disabled
+  scaleUpStabilization: 60     # seconds before allowing another scale-up
+  scaleDownStabilization: 300  # seconds before allowing scale-down
+  scaleUpMaxPods: 2            # max pods to add per scale-up period
 
 # Node selector / tolerations / affinity
 nodeSelector: {}

@@ -76,12 +76,19 @@ public static class Runner
         {
             while (ws.State == WebSocketState.Open && !ct.IsCancellationRequested)
             {
-                var result = await ws.ReceiveAsync(recvBuf, ct);
+                // Accumulate fragments until EndOfMessage
+                using var msgStream = new MemoryStream();
+                WebSocketReceiveResult result;
+                do
+                {
+                    result = await ws.ReceiveAsync(recvBuf, ct);
+                    msgStream.Write(recvBuf, 0, result.Count);
+                } while (!result.EndOfMessage);
 
                 if (result.MessageType == WebSocketMessageType.Close)
                     break;
 
-                var msgData = new ReadOnlyMemory<byte>(recvBuf, 0, result.Count);
+                var msgData = new ReadOnlyMemory<byte>(msgStream.GetBuffer(), 0, (int)msgStream.Length);
 
                 if (!handshakeComplete || result.MessageType == WebSocketMessageType.Text)
                 {

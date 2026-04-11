@@ -5,6 +5,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/aeon-wasm-sdk"
+keywords = ["wasm", "processor", "stream-processing", "no-std", "sdk"]
+categories = ["wasm", "no-std"]
 
 [dependencies]
 # No external dependencies — this crate is no_std and self-contained

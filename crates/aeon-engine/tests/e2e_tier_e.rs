@@ -296,15 +296,17 @@ async fn e4_file_python_memory() {
 #[tokio::test]
 async fn e5_file_python_kafka() {
     // Needs Redpanda
-    if tokio::time::timeout(
+    match tokio::time::timeout(
         Duration::from_secs(3),
         tokio::net::TcpStream::connect("127.0.0.1:19092"),
     )
     .await
-    .is_err()
     {
-        eprintln!("SKIP E5: Redpanda not available");
-        return;
+        Ok(Ok(_)) => {}
+        _ => {
+            eprintln!("SKIP E5: Redpanda not available");
+            return;
+        }
     }
     if !python_available() {
         return;
@@ -369,15 +371,17 @@ async fn e5_file_python_kafka() {
 #[tokio::test]
 async fn e6_kafka_python_file() {
     // Needs Redpanda
-    if tokio::time::timeout(
+    match tokio::time::timeout(
         Duration::from_secs(3),
         tokio::net::TcpStream::connect("127.0.0.1:19092"),
     )
     .await
-    .is_err()
     {
-        eprintln!("SKIP E6: Redpanda not available");
-        return;
+        Ok(Ok(_)) => {}
+        _ => {
+            eprintln!("SKIP E6: Redpanda not available");
+            return;
+        }
     }
     if !python_available() {
         return;
@@ -461,15 +465,17 @@ async fn e6_kafka_python_file() {
 #[tokio::test]
 async fn e7_kafka_python_blackhole() {
     // Needs Redpanda
-    if tokio::time::timeout(
+    match tokio::time::timeout(
         Duration::from_secs(3),
         tokio::net::TcpStream::connect("127.0.0.1:19092"),
     )
     .await
-    .is_err()
     {
-        eprintln!("SKIP E7: Redpanda not available");
-        return;
+        Ok(Ok(_)) => {}
+        _ => {
+            eprintln!("SKIP E7: Redpanda not available");
+            return;
+        }
     }
     if !python_available() {
         return;
@@ -624,15 +630,17 @@ async fn e8_http_webhook_python_memory() {
 #[tokio::test]
 async fn e9_http_webhook_python_kafka() {
     // Needs Redpanda
-    if tokio::time::timeout(
+    match tokio::time::timeout(
         Duration::from_secs(3),
         tokio::net::TcpStream::connect("127.0.0.1:19092"),
     )
     .await
-    .is_err()
     {
-        eprintln!("SKIP E9: Redpanda not available");
-        return;
+        Ok(Ok(_)) => {}
+        _ => {
+            eprintln!("SKIP E9: Redpanda not available");
+            return;
+        }
     }
     if !python_available() {
         return;
@@ -702,4 +710,344 @@ async fn e9_http_webhook_python_kafka() {
     let _ = child.wait();
     let _ = std::fs::remove_file(&script_path);
     let _ = std::fs::remove_file(&seed_file);
+}
+
+// ===========================================================================
+// E10: HttpPollingSource -> RustNative T1 -> MemorySink
+// ===========================================================================
+
+#[tokio::test]
+async fn e10_http_polling_source_to_memory_sink() {
+    use aeon_connectors::http::{HttpPollingSource, HttpPollingSourceConfig};
+    use aeon_connectors::memory::MemorySink;
+    use aeon_engine::{PassthroughProcessor, PipelineMetrics, run};
+    use std::sync::atomic::AtomicBool;
+
+    // Mock HTTP server that returns different data on each call
+    let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let call_count_clone = Arc::clone(&call_count);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let app = axum::Router::new().route(
+        "/data",
+        axum::routing::get(move || {
+            let cc = Arc::clone(&call_count_clone);
+            async move {
+                let n = cc.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n < 5 {
+                    format!("poll-data-{n:05}")
+                } else {
+                    String::new() // empty → skipped
+                }
+            }
+        }),
+    );
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let config = HttpPollingSourceConfig::new(format!("http://{addr}/data"))
+        .with_interval(Duration::from_millis(10));
+    let mut source = HttpPollingSource::new(config).unwrap();
+    let processor = PassthroughProcessor::new(Arc::from("output"));
+    let mut sink = MemorySink::new();
+    let metrics = PipelineMetrics::new();
+    let shutdown = Arc::new(AtomicBool::new(false));
+
+    // Run with a timeout — polling source never ends naturally
+    let shutdown_clone = Arc::clone(&shutdown);
+    let timer = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        shutdown_clone.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
+
+    run(&mut source, &processor, &mut sink, &metrics, &shutdown).await.unwrap();
+    timer.abort();
+
+    let outputs = sink.outputs();
+    assert!(
+        outputs.len() >= 5,
+        "E10 C1: expected at least 5 outputs, got {}",
+        outputs.len(),
+    );
+
+    // C2: Payload integrity
+    for (i, output) in outputs.iter().take(5).enumerate() {
+        let expected = format!("poll-data-{i:05}");
+        assert_eq!(
+            std::str::from_utf8(output.payload.as_ref()).unwrap(),
+            expected,
+            "E10 C2: payload mismatch at index {i}",
+        );
+    }
+}
+
+// ===========================================================================
+// E11: MemorySource -> RustNative T1 -> HttpSink
+// ===========================================================================
+
+#[tokio::test]
+async fn e11_memory_source_to_http_sink() {
+    use aeon_connectors::http::{HttpSink, HttpSinkConfig};
+    use aeon_connectors::memory::MemorySource;
+    use aeon_engine::{PassthroughProcessor, PipelineMetrics, run};
+    use std::sync::atomic::AtomicBool;
+
+    let received_payloads = Arc::new(tokio::sync::Mutex::new(Vec::<Bytes>::new()));
+    let received_clone = Arc::clone(&received_payloads);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let app = axum::Router::new().route(
+        "/ingest",
+        axum::routing::post(move |body: Bytes| {
+            let received = Arc::clone(&received_clone);
+            async move {
+                received.lock().await.push(body);
+                "ok"
+            }
+        }),
+    );
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let msg_count = 50;
+    let events = make_test_events("e11-payload", msg_count);
+
+    let mut source = MemorySource::new(events, 32);
+    let processor = PassthroughProcessor::new(Arc::from("output"));
+    let config = HttpSinkConfig::new(format!("http://{addr}/ingest"));
+    let mut sink = HttpSink::new(config).unwrap();
+    let metrics = PipelineMetrics::new();
+    let shutdown = AtomicBool::new(false);
+
+    run(&mut source, &processor, &mut sink, &metrics, &shutdown)
+        .await
+        .unwrap();
+
+    let received = received_payloads.lock().await;
+    assert_eq!(
+        received.len(),
+        msg_count,
+        "E11 C1: received {} payloads, expected {}",
+        received.len(),
+        msg_count,
+    );
+
+    // C2: Payload integrity
+    for (i, payload) in received.iter().enumerate() {
+        let expected = format!("e11-payload-{i:05}");
+        assert_eq!(
+            std::str::from_utf8(payload.as_ref()).unwrap(),
+            expected,
+            "E11 C2: payload mismatch at index {i}",
+        );
+    }
+}
+
+// ===========================================================================
+// E12: WebTransportSource -> RustNative T1 -> MemorySink
+// ===========================================================================
+
+#[tokio::test]
+async fn e12_webtransport_source_to_memory_sink() {
+    use aeon_connectors::webtransport::{WebTransportSource, WebTransportSourceConfig};
+    use aeon_connectors::memory::MemorySink;
+    use aeon_engine::{PassthroughProcessor, PipelineMetrics, run};
+    use std::sync::atomic::AtomicBool;
+
+    let msg_count = 20;
+
+    // Get a free port by binding a UDP socket (QUIC uses UDP)
+    let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let port = udp.local_addr().unwrap().port();
+    drop(udp);
+
+    let identity =
+        wtransport::Identity::self_signed(["localhost"]).expect("self-signed identity");
+
+    let server_config = wtransport::ServerConfig::builder()
+        .with_bind_address(std::net::SocketAddr::from(([127, 0, 0, 1], port)))
+        .with_identity(identity)
+        .build();
+
+    let source_config = WebTransportSourceConfig::new(
+        std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        server_config,
+    )
+    .with_poll_timeout(Duration::from_millis(200));
+
+    let mut source = WebTransportSource::new(source_config).await.unwrap();
+    let processor = PassthroughProcessor::new(Arc::from("output"));
+    let mut sink = MemorySink::new();
+    let metrics = PipelineMetrics::new();
+    let shutdown = Arc::new(AtomicBool::new(false));
+
+    // Spawn a WT client that sends data to the source
+    let client_handle = tokio::spawn(async move {
+        // Brief delay for server to be ready
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let client_config = wtransport::ClientConfig::builder()
+            .with_bind_default()
+            .with_no_cert_validation()
+            .build();
+
+        let client = wtransport::Endpoint::client(client_config).expect("wt client");
+        let connection = client
+            .connect(format!("https://127.0.0.1:{port}"))
+            .await
+            .expect("wt connect");
+
+        for i in 0..msg_count {
+            let opening = connection.open_bi().await.expect("open bi stream");
+            let (mut send, _recv) = opening.await.expect("bi stream opened");
+
+            let payload = format!("wt-data-{i:05}");
+            let len = payload.len() as u32;
+            send.write_all(&len.to_le_bytes()).await.unwrap();
+            send.write_all(payload.as_bytes()).await.unwrap();
+            send.finish().await.unwrap();
+        }
+
+        // Brief delay so source can drain
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    });
+
+    // Run pipeline with shutdown timer
+    let shutdown_clone = Arc::clone(&shutdown);
+    let timer = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        shutdown_clone.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
+
+    run(&mut source, &processor, &mut sink, &metrics, &shutdown).await.unwrap();
+    timer.abort();
+    let _ = client_handle.await;
+
+    let outputs = sink.outputs();
+    assert_eq!(
+        outputs.len(),
+        msg_count,
+        "E12 C1: expected {msg_count} outputs, got {}",
+        outputs.len(),
+    );
+
+    for (i, output) in outputs.iter().enumerate() {
+        let expected = format!("wt-data-{i:05}");
+        assert_eq!(
+            std::str::from_utf8(output.payload.as_ref()).unwrap(),
+            expected,
+            "E12 C2: payload mismatch at index {i}",
+        );
+    }
+}
+
+// ===========================================================================
+// E13: MemorySource -> RustNative T1 -> WebTransportSink
+// ===========================================================================
+
+#[tokio::test]
+async fn e13_memory_source_to_webtransport_sink() {
+    use aeon_connectors::webtransport::{WebTransportSink, WebTransportSinkConfig};
+    use aeon_connectors::memory::MemorySource;
+    use aeon_engine::{PassthroughProcessor, PipelineMetrics, run};
+    use std::sync::atomic::AtomicBool;
+
+    let msg_count = 20;
+
+    // Set up a WT server to receive data (mock WT server)
+    let identity =
+        wtransport::Identity::self_signed(["localhost"]).expect("self-signed identity");
+
+    let server_config = wtransport::ServerConfig::builder()
+        .with_bind_address(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+        .with_identity(identity)
+        .build();
+
+    let server_endpoint =
+        wtransport::Endpoint::server(server_config).expect("wt server endpoint");
+    let port = server_endpoint.local_addr().unwrap().port();
+
+    let received = Arc::new(tokio::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+    let received_clone = Arc::clone(&received);
+
+    // Spawn mock WT server that reads incoming data
+    let server_handle = tokio::spawn(async move {
+        let incoming = server_endpoint.accept().await;
+        let session_request = incoming.await.expect("session request");
+        let session = session_request.accept().await.expect("accept session");
+
+        loop {
+            let stream = match session.accept_bi().await {
+                Ok(stream) => stream,
+                Err(_) => break,
+            };
+            let (_send, mut recv) = stream;
+
+            loop {
+                // Read length-prefixed messages
+                let mut len_buf = [0u8; 4];
+                if recv.read_exact(&mut len_buf).await.is_err() {
+                    break;
+                }
+                let len = u32::from_le_bytes(len_buf) as usize;
+                if len == 0 {
+                    continue;
+                }
+                let mut buf = vec![0u8; len];
+                if recv.read_exact(&mut buf).await.is_err() {
+                    break;
+                }
+                received_clone.lock().await.push(buf);
+            }
+        }
+    });
+
+    // Build pipeline
+    let events = make_test_events("e13-payload", msg_count);
+    let mut source = MemorySource::new(events, 32);
+    let processor = PassthroughProcessor::new(Arc::from("output"));
+
+    let client_config = wtransport::ClientConfig::builder()
+        .with_bind_default()
+        .with_no_cert_validation()
+        .build();
+
+    let sink_config =
+        WebTransportSinkConfig::new(format!("https://127.0.0.1:{port}"), client_config);
+    let mut sink = WebTransportSink::new(sink_config).await.unwrap();
+    let metrics = PipelineMetrics::new();
+    let shutdown = AtomicBool::new(false);
+
+    run(&mut source, &processor, &mut sink, &metrics, &shutdown)
+        .await
+        .unwrap();
+
+    // Give server time to process
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    server_handle.abort();
+
+    let received = received.lock().await;
+    assert_eq!(
+        received.len(),
+        msg_count,
+        "E13 C1: expected {msg_count} payloads, got {}",
+        received.len(),
+    );
+
+    for (i, payload) in received.iter().enumerate() {
+        let expected = format!("e13-payload-{i:05}");
+        assert_eq!(
+            std::str::from_utf8(payload).unwrap(),
+            expected,
+            "E13 C2: payload mismatch at index {i}",
+        );
+    }
 }

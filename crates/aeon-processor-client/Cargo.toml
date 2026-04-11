@@ -5,6 +5,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/aeon-processor-client"
+keywords = ["websocket", "webtransport", "processor", "stream-processing", "sdk"]
+categories = ["network-programming"]
 
 [features]
 default = ["websocket"]

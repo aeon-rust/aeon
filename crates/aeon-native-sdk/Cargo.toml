@@ -5,6 +5,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/aeon-native-sdk"
+keywords = ["ffi", "processor", "sdk", "stream-processing", "native"]
+categories = ["api-bindings"]
 
 [dependencies]
 aeon-types = { workspace = true }

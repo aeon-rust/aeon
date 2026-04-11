@@ -23,6 +23,27 @@ pub trait Source: Send + Sync {
     fn next_batch(
         &mut self,
     ) -> impl std::future::Future<Output = Result<Vec<Event>, AeonError>> + Send;
+
+    /// Pause the source — stop producing new events.
+    ///
+    /// After `pause()`, subsequent `next_batch()` calls should return empty
+    /// batches (or block) until `resume()` is called. This allows the pipeline
+    /// drain mechanism to quiesce in-flight events before a processor hot-swap.
+    ///
+    /// Default: no-op (source continues producing). Override for sources that
+    /// can meaningfully pause (e.g., KafkaSource stops polling, push-sources
+    /// stop draining their internal buffer).
+    fn pause(&mut self) -> impl std::future::Future<Output = ()> + Send {
+        async {}
+    }
+
+    /// Resume the source after a pause.
+    ///
+    /// Resumes normal event production. Called after a processor swap completes.
+    /// Default: no-op (matches the default no-op pause).
+    fn resume(&mut self) -> impl std::future::Future<Output = ()> + Send {
+        async {}
+    }
 }
 
 /// Event delivery sink. Batch-first: accepts `Vec<Output>` per flush.

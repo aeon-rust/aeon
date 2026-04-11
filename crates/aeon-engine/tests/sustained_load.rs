@@ -10,6 +10,9 @@
 //!
 //! Uses MemorySource (in-memory) to avoid Redpanda dependency for this test.
 //! The Redpanda sustained test is a separate benchmark (requires 10+ min with broker).
+//!
+//! Duration is configurable via `AEON_SUSTAINED_SECS` env var (default: 30).
+//! For long-running stability tests, set to 86400 (24h) or 259200 (72h).
 
 use aeon_connectors::BlackholeSink;
 use aeon_engine::{PassthroughProcessor, PipelineMetrics, run};
@@ -18,6 +21,13 @@ use bytes::Bytes;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+
+fn sustained_secs() -> u64 {
+    std::env::var("AEON_SUSTAINED_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30)
+}
 
 /// A source that generates events continuously for a given duration.
 /// Reports total events generated for verification.
@@ -73,10 +83,11 @@ impl Source for TimedSource {
 
 #[tokio::test]
 async fn sustained_30s_zero_event_loss() {
-    // 30-second sustained load test (fast enough for CI).
-    // At ~7M events/sec this generates ~210M events.
-    let duration = Duration::from_secs(30);
+    let secs = sustained_secs();
+    let duration = Duration::from_secs(secs);
     let batch_size = 1024;
+
+    eprintln!("Sustained load test: {secs}s (set AEON_SUSTAINED_SECS to change)");
 
     let mut source = TimedSource::new(duration, batch_size);
     let processor = PassthroughProcessor::new(Arc::from("output"));
@@ -96,7 +107,7 @@ async fn sustained_30s_zero_event_loss() {
     let sent = metrics.outputs_sent.load(Ordering::Relaxed);
     let sunk = sink.count();
 
-    eprintln!("Sustained load test: {elapsed:.2?}");
+    eprintln!("Sustained load test complete: {elapsed:.2?}");
     eprintln!("  Generated:  {generated}");
     eprintln!("  Received:   {received}");
     eprintln!("  Processed:  {processed}");
@@ -117,11 +128,13 @@ async fn sustained_30s_zero_event_loss() {
 
 #[tokio::test]
 async fn sustained_30s_buffered_zero_event_loss() {
-    // Same test but with buffered (SPSC) pipeline.
     use aeon_engine::{PipelineConfig, run_buffered};
 
-    let duration = Duration::from_secs(30);
+    let secs = sustained_secs();
+    let duration = Duration::from_secs(secs);
     let batch_size = 1024;
+
+    eprintln!("Sustained buffered load test: {secs}s");
 
     let source = TimedSource::new(duration, batch_size);
     let processor = PassthroughProcessor::new(Arc::from("output"));
@@ -134,6 +147,29 @@ async fn sustained_30s_buffered_zero_event_loss() {
     };
     let metrics = Arc::new(PipelineMetrics::new());
     let shutdown = Arc::new(AtomicBool::new(false));
+
+    // Progress reporter for long-running tests
+    let report_interval = if secs > 60 { 30 } else { 10 };
+    let progress_metrics = Arc::clone(&metrics);
+    let progress_handle = tokio::spawn(async move {
+        let start = Instant::now();
+        let mut last_count = 0u64;
+        loop {
+            tokio::time::sleep(Duration::from_secs(report_interval)).await;
+            let elapsed = start.elapsed();
+            if elapsed >= Duration::from_secs(secs) {
+                break;
+            }
+            let current = progress_metrics.events_received.load(Ordering::Relaxed);
+            let delta = current - last_count;
+            let rate = delta as f64 / report_interval as f64;
+            eprintln!(
+                "  [{:.0}s/{secs}s] received: {current}, interval rate: {rate:.0}/s",
+                elapsed.as_secs_f64(),
+            );
+            last_count = current;
+        }
+    });
 
     let start = Instant::now();
     run_buffered(
@@ -149,11 +185,13 @@ async fn sustained_30s_buffered_zero_event_loss() {
     .unwrap();
     let elapsed = start.elapsed();
 
+    progress_handle.abort();
+
     let received = metrics.events_received.load(Ordering::Relaxed);
     let processed = metrics.events_processed.load(Ordering::Relaxed);
     let sent = metrics.outputs_sent.load(Ordering::Relaxed);
 
-    eprintln!("Sustained buffered load test: {elapsed:.2?}");
+    eprintln!("Sustained buffered load test complete: {elapsed:.2?}");
     eprintln!("  Received:   {received}");
     eprintln!("  Processed:  {processed}");
     eprintln!("  Sent:       {sent}");

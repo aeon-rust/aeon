@@ -5,11 +5,16 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/aeon-engine"
+keywords = ["stream-processing", "pipeline", "orchestration", "spsc"]
+categories = ["concurrency", "asynchronous"]
 
 [features]
 default = ["native-loader", "rest-api", "processor-auth", "websocket-host"]
 native-loader = ["libloading", "aeon-native-sdk", "sha2", "hex"]
-rest-api = ["axum", "tower-http"]
+rest-api = ["axum", "tower-http", "sha2", "hex"]
 processor-auth = ["aeon-crypto", "rand", "sha2", "hex", "base64"]
 webtransport-host = ["wtransport", "rustls", "processor-auth"]
 websocket-host = ["processor-auth", "rest-api", "axum/ws"]
@@ -52,7 +57,7 @@ rustls = { workspace = true, optional = true }
 # T4 WebSocket uses axum (via rest-api feature) — no extra deps needed
 
 [dev-dependencies]
-aeon-connectors = { workspace = true, features = ["kafka", "file", "http", "websocket", "redis-streams", "nats", "rabbitmq", "mqtt"] }
+aeon-connectors = { workspace = true, features = ["kafka", "file", "http", "websocket", "redis-streams", "nats", "rabbitmq", "mqtt", "quic", "webtransport", "postgres-cdc", "mysql-cdc", "mongodb-cdc"] }
 aeon-observability = { path = "../aeon-observability" }
 aeon-wasm = { workspace = true }
 tempfile = "3"
@@ -74,10 +79,15 @@ base64 = { workspace = true }
 hex = { workspace = true }
 sha2 = { workspace = true }
 futures-util = { workspace = true }
+quinn = { workspace = true }
 reqwest = { workspace = true }
 redis = { workspace = true }
+wtransport = { workspace = true }
 async-nats = { workspace = true }
 lapin = { workspace = true }
+tokio-postgres = { workspace = true }
+mysql_async = { workspace = true }
+mongodb = { workspace = true }
 
 [[bench]]
 name = "blackhole_bench"
@@ -117,6 +127,10 @@ harness = false
 
 [[bench]]
 name = "kafka_sink_isolation"
+harness = false
+
+[[bench]]
+name = "large_message_bench"
 harness = false
 
 [[bench]]

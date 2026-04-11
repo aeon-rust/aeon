@@ -1,15 +1,15 @@
-{{- if not .Values.cluster.enabled }}
+{{- if .Values.cluster.enabled }}
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: {{ .Release.Name }}
   labels:
     app.kubernetes.io/name: aeon
     app.kubernetes.io/instance: {{ .Release.Name }}
 spec:
-  {{- if not .Values.autoscaling.enabled }}
-  replicas: {{ .Values.replicaCount }}
-  {{- end }}
+  serviceName: {{ .Release.Name }}-headless
+  replicas: {{ .Values.cluster.replicas }}
+  podManagementPolicy: Parallel
   selector:
     matchLabels:
       app.kubernetes.io/name: aeon
@@ -37,6 +37,25 @@ spec:
               value: {{ .Values.config.brokers | quote }}
             - name: AEON_ARTIFACT_DIR
               value: {{ .Values.config.artifactDir | quote }}
+            # Cluster identity — derived from pod name (aeon-0, aeon-1, etc.)
+            - name: AEON_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: AEON_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: AEON_CLUSTER_ENABLED
+              value: "true"
+            - name: AEON_CLUSTER_REPLICAS
+              value: {{ .Values.cluster.replicas | quote }}
+            - name: AEON_CLUSTER_SERVICE
+              value: "{{ .Release.Name }}-headless"
+            - name: AEON_CLUSTER_PARTITIONS
+              value: {{ .Values.cluster.partitions | quote }}
+            - name: AEON_CLUSTER_QUIC_PORT
+              value: {{ .Values.ports.quic | quote }}
           ports:
             - name: quic
               containerPort: {{ .Values.ports.quic }}
@@ -51,13 +70,13 @@ spec:
             httpGet:
               path: /health
               port: api
-            initialDelaySeconds: 5
+            initialDelaySeconds: 10
             periodSeconds: 15
           readinessProbe:
             httpGet:
               path: /ready
               port: api
-            initialDelaySeconds: 3
+            initialDelaySeconds: 5
             periodSeconds: 10
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
@@ -71,25 +90,21 @@ spec:
               mountPath: /app/processors
               readOnly: true
             {{- end }}
+            {{- if .Values.cluster.tls.enabled }}
+            - name: tls
+              mountPath: /app/tls
+              readOnly: true
+            {{- end }}
       volumes:
-        - name: data
-          {{- if .Values.persistence.enabled }}
-          persistentVolumeClaim:
-            claimName: {{ .Release.Name }}-data
-          {{- else }}
-          emptyDir: {}
-          {{- end }}
-        - name: artifacts
-          {{- if .Values.persistence.enabled }}
-          persistentVolumeClaim:
-            claimName: {{ .Release.Name }}-artifacts
-          {{- else }}
-          emptyDir: {}
-          {{- end }}
         {{- if .Values.processors.configMap }}
         - name: processors
           configMap:
             name: {{ .Values.processors.configMap }}
+        {{- end }}
+        {{- if .Values.cluster.tls.enabled }}
+        - name: tls
+          secret:
+            secretName: {{ .Values.cluster.tls.secretName }}
         {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
@@ -99,8 +114,41 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.affinity }}
+      # Anti-affinity: spread pods across nodes for fault tolerance
       affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: aeon
+                    app.kubernetes.io/instance: {{ .Release.Name }}
+                topologyKey: kubernetes.io/hostname
+        {{- with .Values.affinity }}
         {{- toYaml . | nindent 8 }}
-      {{- end }}
+        {{- end }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        {{- if .Values.persistence.storageClass }}
+        storageClassName: {{ .Values.persistence.storageClass }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size }}
+    - metadata:
+        name: artifacts
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        {{- if .Values.persistence.storageClass }}
+        storageClassName: {{ .Values.persistence.storageClass }}
+        {{- end }}
+        resources:
+          requests:
+            storage: 5Gi
 {{- end }}

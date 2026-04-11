@@ -18,26 +18,14 @@ const BROKERS: &str = "localhost:19092";
 
 /// Check if Redpanda is reachable. Skip test if not.
 async fn require_redpanda() -> bool {
-    let result: Result<FutureProducer, _> = ClientConfig::new()
-        .set("bootstrap.servers", BROKERS)
-        .set("message.timeout.ms", "5000")
-        .create();
-
-    match result {
-        Ok(producer) => {
-            // Try a metadata request to verify connectivity.
-            // Even if send fails (e.g. auth), the producer was created — Redpanda is there.
-            let _ = tokio::time::timeout(
-                Duration::from_secs(5),
-                producer.send(
-                    FutureRecord::<(), [u8]>::to("__consumer_offsets").payload(&[]),
-                    Duration::from_secs(1),
-                ),
-            )
-            .await;
-            true
-        }
-        Err(_) => {
+    match tokio::time::timeout(
+        Duration::from_secs(3),
+        tokio::net::TcpStream::connect("127.0.0.1:19092"),
+    )
+    .await
+    {
+        Ok(Ok(_)) => true,
+        _ => {
             eprintln!("SKIP: Redpanda not available at {BROKERS}");
             false
         }
