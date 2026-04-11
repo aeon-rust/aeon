@@ -50,8 +50,8 @@ pub use health::{HealthState, serve_health};
 pub use identity_store::ProcessorIdentityStore;
 pub use metrics_server::{MetricsConfig, serve_metrics, serve_metrics_with_config};
 pub use pipeline::{
-    CorePinning, MultiPartitionConfig, PipelineConfig, PipelineMetrics, run, run_buffered,
-    run_multi_partition, run_with_delivery,
+    CorePinning, MultiPartitionConfig, PipelineConfig, PipelineControl, PipelineMetrics, run,
+    run_buffered, run_buffered_managed, run_multi_partition, run_with_delivery,
 };
 pub use pipeline_manager::PipelineManager;
 pub use processor::PassthroughProcessor;

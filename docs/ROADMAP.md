@@ -1020,8 +1020,10 @@ placeholders). Test counts updated to reflect current state.
     - 4 new tests: blue-green-cutover, blue-green-rollback, canary-split, canary-complete.
       Total managed pipeline tests: 8. 263 engine tests pass.
 
-    **Phase E — Deferred (low priority):**
-    - ZD-10 through ZD-13: batch replay, Wasm state, file watcher, child process tier
+    **Phase E — Partial ✅ (2026-04-11):**
+    - ZD-12: `aeon dev watch --artifact <path>` — `notify` crate watches file, debounced 500ms,
+      reloads Wasm/Native processor via `PipelineControl.drain_and_swap()`. TickSource → StdoutSink dev loop.
+    - ZD-10 (batch replay), ZD-11 (Wasm state), ZD-13 (child process tier): deferred
 
     **Already working (no code changes needed):**
     - T3/T4 processor replacement (reconnect-based, routing auto-updates)

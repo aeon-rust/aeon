@@ -506,7 +506,7 @@ Full to-do list with item IDs: `docs/PROCESSOR-DEPLOYMENT.md` Section 13.
 | ~~**High**~~ | ~~ZD-4 (hot-swap orchestrator)~~ | ~~Zero-downtime Wasm and Native .so processor upgrades~~ **Done (2026-04-11)** — `PipelineControl` + `run_buffered_managed()` |
 | ~~**Medium**~~ | ~~ZD-5 (blue-green runtime), ZD-6 (canary traffic split)~~ | ~~Advanced upgrade strategies~~ **Done (2026-04-11)** — Blue-green shadow + cutover, canary probabilistic split via `PipelineControl` |
 | ~~**Medium**~~ | ~~ZD-7, ZD-8 (same-type source/sink reconfig)~~ | ~~Connector config changes without pipeline restart~~ **Done (2026-04-11)** — `drain_and_swap_source()`/`drain_and_swap_sink()` via `Box<dyn Any>` downcast |
-| **Low** | ZD-9 (cross-type via blue-green pipeline), ZD-10 (batch replay), ZD-11 (Wasm state), ZD-12 (file watcher), ZD-13 (child process) | Edge cases, dev experience, full isolation |
+| **Low** | ZD-9 (cross-type via blue-green pipeline), ZD-10 (batch replay), ZD-11 (Wasm state), ~~ZD-12 (file watcher)~~ **Done**, ZD-13 (child process) | Edge cases, dev experience, full isolation |
 
 ### 7.3 Deployment Environments — What Changes Where
 

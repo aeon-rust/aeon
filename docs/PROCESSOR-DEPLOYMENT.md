@@ -22,7 +22,7 @@
 > | Source/Sink zero-downtime reconfiguration | **Implemented** — `PipelineControl.drain_and_swap_source()`/`drain_and_swap_sink()`: pause → drain SPSC rings → swap via `Box<dyn Any>` downcast → resume. 2 tests (source-swap, sink-swap). |
 > | SHA-512 artifact verification | **Implemented** — `sha2::Sha512` (replaced `DefaultHasher` placeholder) |
 > | Child process isolation tier | **Design only** — not implemented |
-> | File watcher / config hot-reload | **Not implemented** — no `notify` crate; config changes via REST API |
+> | File watcher / config hot-reload | **Implemented** — `aeon dev watch --artifact <path>`: `notify` crate watches .wasm/.so/.dll, debounced 500ms, triggers `PipelineControl.drain_and_swap()`. TickSource (1 event/sec) → StdoutSink for dev loop. |
 >
 > **Zero-downtime processor deployment per tier:**
 > - **T1 Rust native** (compiled in): requires Aeon rebuild + redeploy
@@ -1350,7 +1350,7 @@ Tracked in `docs/ROADMAP.md` as P10.
 |---|------|---------|
 | ZD-10 | In-flight batch replay on T3/T4 disconnect | When a T3/T4 session disconnects during upgrade, in-flight batches awaiting responses fail with "session closed". Need: track unanswered batches, replay to new session. |
 | ZD-11 | Wasm state transfer on hot-swap | Per-instance in-memory state (`HostState.state` HashMap) is lost on swap. Option: serialize state before swap, inject into new instance. Low priority — stateless processors preferred. |
-| ZD-12 | Config file watcher (`aeon dev`) | No `notify`/`inotify`/`kqueue` crate in deps. `aeon dev` hot-reload planned for Phase 13 but not implemented. Add `notify` crate, watch `.wasm`/`.so` + pipeline YAML. |
+| ~~ZD-12~~ | ~~Config file watcher (`aeon dev`)~~ | **Done (2026-04-11)** — `aeon dev watch --artifact <path>`. `notify` v7 watches parent dir (handles editor delete+recreate). 500ms debounce, loads processor via `WasmModule::from_bytes` or `NativeProcessor::load`, calls `PipelineControl.drain_and_swap()`. TickSource → StdoutSink dev loop. |
 | ZD-13 | Child process isolation tier | Design in Section 2.3 is complete. Implementation: spawn child, IPC via Unix socket or shared memory, two-phase partition transfer. Low priority. |
 
 ### 13.5 TLS Certificate Handling (Verified Correct)
