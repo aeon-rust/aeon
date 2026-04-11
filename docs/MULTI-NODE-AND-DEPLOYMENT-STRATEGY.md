@@ -438,16 +438,43 @@ without needing a Kafka topic as an intermediary.
 
 ---
 
-## 6. Next Steps
+## 6. Execution Plan — Local-First, Then Cloud
 
-1. **Short-term** (current infra): Fill remaining connector test gaps
-   (HttpPollingSource, WebTransportSource/Sink)
-2. **Medium-term** (DigitalOcean DOKS): Wire `QuicNetworkFactory` into
-   `ClusterNode`, create StatefulSet Helm template, validate 3-node Raft
-3. **Long-term** (production): Sustained load on multi-node, PoH chain
-   transfer, partition rebalancing, node failure recovery
+Strategy: maximize work on Rancher Desktop (single-node K3s on Windows)
+before provisioning cloud. Avoids unplanned costs from development delays.
 
-Cloud access needed:
-- 3-node DOKS cluster (c-series CPU-optimized, 8 vCPU per node)
-- Managed Redpanda or self-hosted 3-broker cluster
-- CI/CD pipeline for automated multi-node tests
+### Phase 1: Local (Rancher Desktop) — see ROADMAP.md P4a-P4e, P7
+
+| Step | Roadmap | What | Validates |
+|------|---------|------|-----------|
+| 1 | P4a | Dockerfile + container image | `docker run aeonrust/aeon aeon --version` |
+| 2 | P4b | Wire QuicNetworkFactory into ClusterNode | `multi_node.rs` tests pass with real QUIC |
+| 3 | P4c | StatefulSet + headless Service Helm templates | `helm template --dry-run` clean |
+| 4 | P4d | Peer discovery module (DNS SRV + static seed) | Unit tests with mock DNS |
+| 5 | P4e | Full Helm deploy→run→verify cycle on K3s | Single-pod pipeline via REST API |
+| 6 | P7a | HttpPollingSource E2E test | Polling + backoff logic validated |
+| 7 | P7b | WebTransportSource/Sink E2E tests | Raw WT stream path validated |
+| 8 | P7c | HttpSink connector | Aeon→webhook/Lambda fan-out path |
+
+### Phase 2: Cloud (DigitalOcean DOKS) — see ROADMAP.md P4f
+
+Triggered when cloud access is provisioned. All code is ready from Phase 1.
+
+| Step | What | Validates |
+|------|------|-----------|
+| 1 | `helm install` with `replicas: 3` | 3-node Raft leader election |
+| 2 | Partition assignment via Raft | Leader distributes partitions |
+| 3 | Kill aeon-1 pod | Partition reassignment to survivors |
+| 4 | PoH chain transfer | Chain continues on new node |
+| 5 | Network partition test | Split-brain recovery |
+| 6 | Multi-broker Redpanda sustained load | 30s→5min→1hr across 3 nodes |
+| 7 | CPU pinning validation | `taskset -pc` confirms exclusive cores |
+| 8 | Cross-node QUIC latency | Raft RPC round-trip measurement |
+
+### Cloud infrastructure needed (when ready)
+
+- 3-node DOKS cluster: `c-8` (8 dedicated vCPU, $80/mo each = $240/mo)
+  - Or `c-4` (4 dedicated vCPU, $40/mo each = $120/mo) for initial validation
+- Managed Redpanda (Redpanda Cloud) or self-hosted 3-broker on same cluster
+- Estimated cloud cost: $120-$300/mo during active development
+- Can spin down between sessions to minimize cost

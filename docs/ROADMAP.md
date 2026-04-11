@@ -918,11 +918,53 @@ placeholders). Test counts updated to reflect current state.
      MongoDB 7 deployed to K3s as single-node replica set (`rs0`).
      Test opens change stream, inserts 10 documents, verifies 10
      change events with `mongodb.op` and `mongodb.collection` metadata.
-4. **P4 — Raft multi-node networking** (biggest architectural gap):
-   - `StubNetworkFactory` in `aeon-cluster/src/node.rs` returns errors
-     for all RPCs — single-node Raft works, multi-node is a stub.
-     Needs a QUIC-based `RaftNetwork` implementation. Deferred per
-     `project_gate2_deferred.md` (Rancher Desktop is single-node K3s).
+4. **P4 — Multi-node cluster preparation** (local-first, then cloud):
+   Split into local (Rancher Desktop) and cloud (DigitalOcean DOKS) phases.
+   All code, Helm templates, and single-node validation done locally first
+   to avoid unplanned cloud costs.
+
+   **P4a — Containerize Aeon** (local, not started):
+   - Multi-stage Dockerfile (builder + runtime)
+   - Build aeon-cli binary with all features
+   - Push to local registry or Docker Hub (`aeonrust/aeon`)
+   - Validate: `docker run aeonrust/aeon aeon --version`
+
+   **P4b — Wire QuicNetworkFactory into ClusterNode** (local, not started):
+   - Replace `StubNetworkFactory` in `ClusterNode::new()` with
+     `QuicNetworkFactory` from `aeon-cluster/src/transport/network.rs`
+   - Add config option to select stub vs QUIC network factory
+   - Validate: existing `multi_node.rs` tests pass with real QUIC loopback
+   - Single-node Raft with real QUIC transport (not stub)
+
+   **P4c — StatefulSet + headless Service Helm template** (local, not started):
+   - `helm/aeon/templates/statefulset.yaml` — replaces Deployment for
+     multi-node; stable pod names (aeon-0, aeon-1, aeon-2)
+   - `helm/aeon/templates/headless-service.yaml` — DNS-based peer discovery
+   - `helm/aeon/templates/service.yaml` — ClusterIP for REST API + metrics
+   - ConfigMap for cluster seed list / peer discovery
+   - Validate: `helm template --dry-run` + single-pod deploy on K3s
+
+   **P4d — Peer discovery module** (local, not started):
+   - DNS SRV resolution for headless service
+     (`aeon-0.aeon-headless.ns.svc.cluster.local`)
+   - Static seed list from env / ConfigMap as fallback
+   - Unit tests with mock DNS responses
+
+   **P4e — Helm chart end-to-end on K3s** (local, not started):
+   - Deploy single-node Aeon via Helm on Rancher Desktop
+   - Hit REST API from host (`localhost:NodePort`)
+   - Create pipeline via `aeon pipeline create`, start, verify
+   - Run `aeon verify` against live API
+   - Validate: full deploy→configure→run→verify cycle locally
+
+   **P4f — Multi-node Raft on cloud** (DigitalOcean DOKS, blocked on cloud access):
+   - 3-node DOKS cluster (c-series CPU-optimized, 8 vCPU/node)
+   - `helm install` with `replicas: 3`, pod anti-affinity
+   - Validate: leader election, partition assignment, node failure,
+     PoH chain transfer, split-brain recovery
+   - Multi-broker Redpanda sustained load
+   - CPU pinning with `cpu-manager-policy=static`
+
 5. **P5 — Operational hardening** (done, 2026-04-11):
    - K8s HPA template, large message benchmark (256B→1MB sweep), parameterized
      sustained load test (AEON_SUSTAINED_SECS env), chaos/fault-injection tests
@@ -933,10 +975,15 @@ placeholders). Test counts updated to reflect current state.
    - CLI `aeon verify [target] --api <url>` runs local crypto self-tests
      (PoH chain, Merkle proof, MMR, Ed25519 sign/verify) then queries API
      for pipeline integrity status. Supports single pipeline and "all".
-7. **P7 — New language SDKs** (demand-driven, not started):
+7. **P7 — Fill remaining connector gaps** (local, not started):
+   - P7a: HttpPollingSource E2E test
+   - P7b: WebTransportSource/Sink E2E tests
+   - P7c: Build HttpSink connector (POST outputs to external endpoints,
+     enables Aeon→serverless fan-out pattern)
+8. **P8 — New language SDKs** (demand-driven, not started):
    - Swift, Elixir, Ruby, Scala, Haskell — start when user demand or
      community contribution appears.
-8. **P8 — User-facing documentation** (nice-to-have):
+9. **P9 — User-facing documentation** (nice-to-have):
    - Getting-started processor dev guide, multi-node ops guide,
      performance tuning guide, troubleshooting guide.
 
