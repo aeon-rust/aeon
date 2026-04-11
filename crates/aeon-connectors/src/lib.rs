@@ -91,7 +91,7 @@ pub use kafka::{KafkaSink, KafkaSource};
 pub use file::{FileSink, FileSource};
 
 #[cfg(feature = "http")]
-pub use http::{HttpPollingSource, HttpWebhookSource};
+pub use http::{HttpPollingSource, HttpSink, HttpWebhookSource};
 
 #[cfg(feature = "websocket")]
 pub use websocket::{WebSocketSink, WebSocketSource};
