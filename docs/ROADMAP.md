@@ -868,13 +868,13 @@ reason, and every phase claimed complete is backed by real code (not
 placeholders). Test counts updated to reflect current state.
 
 **Test counts (verified 2026-04-11)**:
-- Rust workspace: **807 passed**, 15 ignored, 0 failed
+- Rust workspace: **821 passed**, 15 ignored, 0 failed
 - Go SDK: **23 tests** (19 core + 4 WT wire helpers)
 - Python SDK: **47 tests** (39 transport + 8 wire)
-- **Total: 877 tests**
+- **Total: 891 tests**
 
-**E2E test matrix** (60 tests across 8 tiers + integration):
-- 55 implemented and passing (including 7 that self-skip when infra absent)
+**E2E test matrix** (64 tests across 8 tiers + integration):
+- 59 implemented and passing (including 7 that self-skip when infra absent)
 - 5 stubs: D1-D5 (WT T3 tests — D1/D2 Python/Go pass, D3-D5
   C#/Node.js/Java deferred on library maturity)
 - Tier G: all 3 CDC tests implemented (PostgreSQL, MySQL, MongoDB)
@@ -923,39 +923,37 @@ placeholders). Test counts updated to reflect current state.
    All code, Helm templates, and single-node validation done locally first
    to avoid unplanned cloud costs.
 
-   **P4a — Containerize Aeon** (local, not started):
-   - Multi-stage Dockerfile (builder + runtime)
-   - Build aeon-cli binary with all features
-   - Push to local registry or Docker Hub (`aeonrust/aeon`)
-   - Validate: `docker run aeonrust/aeon aeon --version`
+   **P4a — Containerize Aeon** (done, 2026-04-10):
+   - Multi-stage Dockerfile (rust-builder + wasm-builder + runtime)
+   - Build aeon-cli binary with `--features rest-api`, 173MB image
+   - Published to `aeonrust/aeon:latest`
+   - Validated: `docker run aeonrust/aeon --version` → `aeon 0.1.0`
 
-   **P4b — Wire QuicNetworkFactory into ClusterNode** (local, not started):
-   - Replace `StubNetworkFactory` in `ClusterNode::new()` with
-     `QuicNetworkFactory` from `aeon-cluster/src/transport/network.rs`
-   - Add config option to select stub vs QUIC network factory
-   - Validate: existing `multi_node.rs` tests pass with real QUIC loopback
-   - Single-node Raft with real QUIC transport (not stub)
+   **P4b — Wire QuicNetworkFactory into ClusterNode** (done, 2026-04-10):
+   - `ClusterNode::bootstrap_multi()` uses `QuicNetworkFactory`
+   - `ClusterNode::join()` for seed-based joining (Phase 2 runtime)
+   - Shutdown stops QUIC server and closes endpoint
+   - Zero-overhead `StubNetworkFactory` preserved for single-node
 
-   **P4c — StatefulSet + headless Service Helm template** (local, not started):
-   - `helm/aeon/templates/statefulset.yaml` — replaces Deployment for
-     multi-node; stable pod names (aeon-0, aeon-1, aeon-2)
-   - `helm/aeon/templates/headless-service.yaml` — DNS-based peer discovery
-   - `helm/aeon/templates/service.yaml` — ClusterIP for REST API + metrics
-   - ConfigMap for cluster seed list / peer discovery
-   - Validate: `helm template --dry-run` + single-pod deploy on K3s
+   **P4c — StatefulSet + headless Service Helm template** (done, 2026-04-10):
+   - `statefulset.yaml` — renders when `cluster.enabled=true`, pod anti-affinity
+   - `headless-service.yaml` — `clusterIP: None`, `publishNotReadyAddresses: true`
+   - `deployment.yaml` — conditional on `not cluster.enabled`
+   - `values.yaml` — cluster section: replicas, partitions, TLS secret
 
-   **P4d — Peer discovery module** (local, not started):
-   - DNS SRV resolution for headless service
-     (`aeon-0.aeon-headless.ns.svc.cluster.local`)
-   - Static seed list from env / ConfigMap as fallback
-   - Unit tests with mock DNS responses
+   **P4d — Peer discovery module** (done, 2026-04-11):
+   - `node_id_from_pod_name` — ordinal+1 Raft node ID from StatefulSet pods
+   - `k8s_peers` / `k8s_members` — FQDN addresses via headless Service DNS
+   - `from_k8s_env` — parses AEON_* env vars set by StatefulSet template
+   - `K8sDiscovery` struct with `members()`, `peers()`, `to_cluster_config()`
+   - 8 unit tests passing
 
-   **P4e — Helm chart end-to-end on K3s** (local, not started):
-   - Deploy single-node Aeon via Helm on Rancher Desktop
-   - Hit REST API from host (`localhost:NodePort`)
-   - Create pipeline via `aeon pipeline create`, start, verify
-   - Run `aeon verify` against live API
-   - Validate: full deploy→configure→run→verify cycle locally
+   **P4e — Helm chart end-to-end on K3s** (done, 2026-04-11):
+   - `aeon serve` command added (behind `rest-api` feature)
+   - Dockerfile CMD changed from `--help` to `serve`
+   - Deployed via `helm install` on Rancher Desktop K3s
+   - Validated: pod Running 1/1, `/health` → 200, `/ready` → 200,
+     `/api/v1/pipelines` → `[]`, `/api/v1/processors` → `[]`
 
    **P4f — Multi-node Raft on cloud** (DigitalOcean DOKS, blocked on cloud access):
    - 3-node DOKS cluster (c-series CPU-optimized, 8 vCPU/node)
@@ -975,11 +973,13 @@ placeholders). Test counts updated to reflect current state.
    - CLI `aeon verify [target] --api <url>` runs local crypto self-tests
      (PoH chain, Merkle proof, MMR, Ed25519 sign/verify) then queries API
      for pipeline integrity status. Supports single pipeline and "all".
-7. **P7 — Fill remaining connector gaps** (local, not started):
-   - P7a: HttpPollingSource E2E test
-   - P7b: WebTransportSource/Sink E2E tests
-   - P7c: Build HttpSink connector (POST outputs to external endpoints,
-     enables Aeon→serverless fan-out pattern)
+7. **P7 — Fill remaining connector gaps** (done, 2026-04-11):
+   - P7a: HttpPollingSource E2E test (E10) — mock server → poll → passthrough → memory
+   - P7b: WebTransportSource/Sink E2E tests (E12, E13) — self-signed TLS,
+     length-prefixed framing, 20 messages each
+   - P7c: HttpSink connector — POST outputs to external HTTP endpoints,
+     2 unit tests (success + error), E2E test (E11)
+   - All 4 E2E tests + 2 unit tests passing
 8. **P8 — New language SDKs** (demand-driven, not started):
    - Swift, Elixir, Ruby, Scala, Haskell — start when user demand or
      community contribution appears.
@@ -995,6 +995,23 @@ placeholders). Test counts updated to reflect current state.
 - Delivery architecture proven (41.6K/s batched E2E, Kafka→Kafka)
 - Full observability (OTLP, Prometheus, Grafana, Jaeger, Loki)
 - Production infra (Docker, Helm, CI/CD, systemd)
+
+### Latest updates (2026-04-11, session 2)
+
+- **P4a-P4e complete — Aeon running on Kubernetes**:
+  - Production Dockerfile (173MB, `aeon serve` entrypoint)
+  - QuicNetworkFactory wired into ClusterNode
+  - StatefulSet + headless Service Helm templates (dual-mode: Deployment vs StatefulSet)
+  - K8s peer discovery module (8 tests: pod name → node ID, DNS FQDN, env parsing)
+  - Helm chart validated on K3s: pod Running 1/1, REST API `/health` → 200
+- **P7a-c complete — all connector gaps filled**:
+  - HttpSink connector (POST outputs to external endpoints, serverless fan-out)
+  - E10: HttpPollingSource → Passthrough → MemorySink
+  - E11: MemorySource → Passthrough → HttpSink
+  - E12: WebTransportSource → Passthrough → MemorySink (self-signed TLS)
+  - E13: MemorySource → Passthrough → WebTransportSink
+  - 4 new E2E tests + 2 unit tests + 8 discovery tests = +14 tests
+- **Test count**: 821 Rust + 47 Python + 23 Go = **891 total**
 
 ### Latest updates (2026-04-11)
 

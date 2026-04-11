@@ -10,8 +10,8 @@
 
 ### Current State
 
-**Source Connectors**: 16 implemented, 13 tested, 3 untested
-**Sink Connectors**: 12 implemented, 11 tested, 1 untested
+**Source Connectors**: 16 implemented, 15 tested, 1 untested (WebTransportDatagramSource)
+**Sink Connectors**: 13 implemented (HttpSink added), 13 tested, 0 untested
 **Processor Types**: T1 (Rust native), T2 (Wasm), T3 (WebTransport), T4 (WebSocket)
 **Languages**: Rust, Python, Go, Node.js, Java, C#/.NET, PHP, C/AssemblyScript
 
@@ -33,9 +33,9 @@ Source
 ├── PostgresCdcSource      G1         —          —           —
 ├── MysqlCdcSource         G2         —          —           —
 ├── MongoDbCdcSource       G3         —          —           —
-├── HttpPollingSource      ✗          ✗          ✗           ✗        ← NO TESTS
-├── WebTransportSource     ✗          ✗          ✗           ✗        ← NO TESTS
-└── WebTransportDgSource   ✗          ✗          ✗           ✗        ← NO TESTS
+├── HttpPollingSource      E10        —          —           —
+├── WebTransportSource     E12        —          —           —
+└── WebTransportDgSource   ✗          ✗          ✗           ✗        ← NO TESTS (niche)
 
 Sink
 ├── BlackholeSink          C1,G1-G3   C2         —           E3,E7,F1-F5
@@ -49,7 +49,8 @@ Sink
 ├── MqttSink               —          —          —           F3
 ├── RabbitMqSink           —          —          —           F4
 ├── QuicSink               —          —          —           F7
-└── WebTransportSink       ✗          ✗          ✗           ✗        ← NO TESTS
+├── WebTransportSink       E13        —          —           —
+└── HttpSink               E11        —          —           —        ← NEW
 ```
 
 ### What's Proven
@@ -61,14 +62,14 @@ Sink
 - **Cross-connector mixing** validated in Tier E (9 combinations with Python T4)
 - **PHP async models**: all 6 patterns tested (Swoole, ReactPHP, AMPHP, Workerman, FrankenPHP, Native CLI)
 
-### Coverage Gaps
+### Coverage Gaps (updated 2026-04-11)
 
-| Gap | Severity | Reason |
+| Gap | Severity | Status |
 |-----|----------|--------|
-| HttpPollingSource — no test | Medium | Polling + backoff logic untested; webhook variant tested |
-| WebTransportSource/Sink — no test | Low | Raw WT streams; T3 processor transport tests cover the protocol |
-| WebTransportDatagramSource — no test | Low | Unreliable datagram path; niche use case |
-| No HttpSink exists | Medium | Can POST via webhook, but no dedicated outbound HTTP sink |
+| ~~HttpPollingSource — no test~~ | ~~Medium~~ | **Fixed**: E10 test |
+| ~~WebTransportSource/Sink — no test~~ | ~~Low~~ | **Fixed**: E12, E13 tests |
+| WebTransportDatagramSource — no test | Low | Niche unreliable datagram path; deferred |
+| ~~No HttpSink exists~~ | ~~Medium~~ | **Fixed**: HttpSink + E11 test |
 | Broker sources only with T4 WS | Low | Core path (Kafka) covers T1+T2; broker internals are connector-level |
 | CDC only with MemorySink | Low | CDC→Kafka not tested; CDC correctness is source-side |
 
