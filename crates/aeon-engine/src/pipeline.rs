@@ -188,6 +188,47 @@ pub fn create_poh_state(config: &PipelineConfig) -> Option<PohState> {
     })
 }
 
+/// TR-2: Transfer host-side state from an outgoing processor into an
+/// incoming one on hot-swap (drain-and-swap / blue-green cutover / canary
+/// completion). No-op for stateless processors — the default trait impls
+/// return an empty snapshot and accept an empty restore.
+///
+/// Errors are logged and swallowed: we never want a snapshot/restore failure
+/// to kill the processor task loop, because that would stall the whole
+/// pipeline on what should be a best-effort state copy. Guest state loss is
+/// strictly worse than no transfer at all — but pipeline death is worse
+/// again.
+fn transfer_processor_state(
+    from: &(dyn Processor + Send + Sync),
+    to: &(dyn Processor + Send + Sync),
+) {
+    match from.snapshot_state() {
+        Ok(snap) => {
+            if snap.is_empty() {
+                // Stateless — skip the restore call entirely to avoid the
+                // (equally no-op) trait-default work.
+                return;
+            }
+            let key_count = snap.len();
+            if let Err(e) = to.restore_state(snap) {
+                tracing::warn!(
+                    error = %e,
+                    key_count,
+                    "TR-2 processor state restore failed during swap; new instance starts fresh"
+                );
+            } else {
+                tracing::info!(key_count, "TR-2 transferred processor state on swap");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "TR-2 processor state snapshot failed during swap; new instance starts fresh"
+            );
+        }
+    }
+}
+
 /// Append a batch of output payloads to the PoH chain.
 ///
 /// Called in the processor task after `process_batch()`. Extracts payload bytes
@@ -1668,6 +1709,11 @@ where
                         }
                         UpgradeAction::CutoverBlueGreen => {
                             if let Some(green) = green_processor.take() {
+                                // TR-2: transfer host-side state from blue → green.
+                                transfer_processor_state(
+                                    current_processor.as_ref(),
+                                    green.as_ref(),
+                                );
                                 current_processor = green;
                             }
                             control_proc.upgrade_action_complete.notify_one();
@@ -1683,6 +1729,11 @@ where
                         }
                         UpgradeAction::CompleteCanary => {
                             if let Some(canary) = canary_processor.take() {
+                                // TR-2: transfer host-side state from baseline → canary.
+                                transfer_processor_state(
+                                    current_processor.as_ref(),
+                                    canary.as_ref(),
+                                );
                                 current_processor = canary;
                             }
                             control_proc.canary_pct.store(0, Ordering::Release);
@@ -1798,6 +1849,14 @@ where
                                 {
                                     let mut slot = control_proc.new_processor.lock().await;
                                     if let Some(new_proc) = slot.take() {
+                                        // TR-2: transfer host-side state from
+                                        // old → new. Pipeline is already quiesced
+                                        // (paused + both rings empty) so no
+                                        // events race the snapshot.
+                                        transfer_processor_state(
+                                            current_processor.as_ref(),
+                                            new_proc.as_ref(),
+                                        );
                                         current_processor = new_proc;
                                         control_proc.swap_complete.notify_one();
                                         break;

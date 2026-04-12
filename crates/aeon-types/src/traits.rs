@@ -90,6 +90,33 @@ pub trait Processor: Send + Sync {
         }
         Ok(outputs)
     }
+
+    /// Export host-side state so it can be transferred into the next processor
+    /// instance on a hot-swap (TR-2).
+    ///
+    /// The engine calls this on the *outgoing* processor immediately before
+    /// replacing it with a new one (drain-and-swap, blue-green cutover, canary
+    /// completion). The returned `Vec<(key, value)>` is handed to the new
+    /// processor's `restore_state()` so guest state survives the swap.
+    ///
+    /// Default: empty vec — processors are stateless by contract. Override
+    /// only for runtimes that hold state on the host side (e.g. the Wasm
+    /// runtime's per-instance `HostState.state` HashMap).
+    #[allow(clippy::type_complexity)]
+    fn snapshot_state(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, AeonError> {
+        Ok(Vec::new())
+    }
+
+    /// Import host-side state produced by a prior processor's `snapshot_state()`
+    /// (TR-2). The engine calls this on the *incoming* processor right after it
+    /// becomes active and before the first event is processed.
+    ///
+    /// Default: no-op. Override for stateful runtimes; implementations should
+    /// replace existing state rather than merge, so that a fresh instance
+    /// matches the outgoing one bit-for-bit.
+    fn restore_state(&self, _snapshot: Vec<(Vec<u8>, Vec<u8>)>) -> Result<(), AeonError> {
+        Ok(())
+    }
 }
 
 /// Key-value state operations. Backed by the multi-tier state store.
