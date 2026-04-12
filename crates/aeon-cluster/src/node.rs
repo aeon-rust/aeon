@@ -8,10 +8,11 @@ mod inner {
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
-    use aeon_types::{AeonError, PartitionId};
+    use aeon_types::{AeonError, L3Store, PartitionId};
     use openraft::{Config, Raft};
 
     use crate::config::ClusterConfig;
+    use crate::log_store::L3RaftLogStore;
     use crate::raft_config::AeonRaftConfig;
     use crate::store::{MemLogStore, StateMachineStore};
     use crate::transport::endpoint::QuicEndpoint;
@@ -193,6 +194,123 @@ mod inner {
                 node_id = node.config.node_id,
                 partitions = node.config.num_partitions,
                 "Single-node cluster bootstrapped"
+            );
+
+            Ok(node)
+        }
+
+        /// Bootstrap a single-node cluster backed by a persistent Raft log (FT-1).
+        ///
+        /// Identical to [`Self::bootstrap_single`] but uses [`L3RaftLogStore`]
+        /// over the caller-supplied `Arc<dyn L3Store>` instead of the in-memory
+        /// `MemLogStore`. The caller owns the L3 handle (typically a
+        /// `RedbStore` from `aeon-state`) so the same backing file can be
+        /// reopened after a restart to recover log + vote state.
+        ///
+        /// Partition-initialization is skipped when the state machine reports
+        /// partitions already assigned, so a restarted node doesn't duplicate
+        /// the bootstrap proposals.
+        pub async fn bootstrap_single_persistent(
+            config: ClusterConfig,
+            log_backend: Arc<dyn L3Store>,
+        ) -> Result<Self, AeonError> {
+            config.validate()?;
+
+            let raft_config = Arc::new(Config {
+                cluster_name: "aeon".to_string(),
+                heartbeat_interval: config.raft_timing.heartbeat_ms,
+                election_timeout_min: config.raft_timing.election_min_ms,
+                election_timeout_max: config.raft_timing.election_max_ms,
+                ..Config::default()
+            });
+
+            let log_store =
+                L3RaftLogStore::open(log_backend)
+                    .await
+                    .map_err(|e| AeonError::Cluster {
+                        message: format!("failed to open persistent Raft log: {e}"),
+                        source: None,
+                    })?;
+            let state_machine = StateMachineStore::new();
+            let shared_state = state_machine.shared_state();
+            let network = StubNetworkFactory;
+
+            let raft = Raft::new(
+                config.node_id,
+                raft_config,
+                network,
+                log_store,
+                state_machine,
+            )
+            .await
+            .map_err(|e| AeonError::Cluster {
+                message: format!("failed to create Raft node: {e}"),
+                source: None,
+            })?;
+
+            // initialize() is idempotent for single-node — safe to call on
+            // both first boot and restart. If the log already contains an
+            // initialization entry, openraft returns AlreadyInitialized,
+            // which we treat as success.
+            let mut members = BTreeMap::new();
+            members.insert(
+                config.node_id,
+                NodeAddress::new(config.bind.ip().to_string(), config.bind.port()),
+            );
+            match raft.initialize(members).await {
+                Ok(()) => {}
+                Err(openraft::error::RaftError::APIError(
+                    openraft::error::InitializeError::NotAllowed(_),
+                )) => {
+                    // Already initialized — restart path, no action needed.
+                    tracing::info!(
+                        node_id = config.node_id,
+                        "Raft log recovered from persistent store — skipping initialize"
+                    );
+                }
+                Err(e) => {
+                    return Err(AeonError::Cluster {
+                        message: format!("failed to initialize Raft: {e}"),
+                        source: None,
+                    });
+                }
+            }
+
+            let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let node = Self {
+                raft,
+                config,
+                endpoint: None,
+                shutdown,
+                shared_state,
+            };
+
+            // Skip partition assignment on restart — the applied state machine
+            // (rebuilt from the persisted log) already has the assignments.
+            // On first boot the partition_table is empty, so we assign.
+            let already_assigned = node
+                .shared_state
+                .read()
+                .await
+                .partition_table
+                .iter()
+                .next()
+                .is_some();
+            if !already_assigned {
+                for i in 0..node.config.num_partitions {
+                    node.propose(ClusterRequest::AssignPartition {
+                        partition: PartitionId::new(i),
+                        node: node.config.node_id,
+                    })
+                    .await?;
+                }
+            }
+
+            tracing::info!(
+                node_id = node.config.node_id,
+                partitions = node.config.num_partitions,
+                restart = already_assigned,
+                "Single-node cluster bootstrapped with persistent Raft log"
             );
 
             Ok(node)

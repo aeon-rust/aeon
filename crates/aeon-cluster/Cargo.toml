@@ -45,6 +45,8 @@ rcgen = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 rcgen = { workspace = true }
 serde_json = { workspace = true }
+aeon-state = { workspace = true, features = ["redb"] }
+tempfile = { workspace = true }
 
 [[bench]]
 name = "cluster_bench"
