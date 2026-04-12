@@ -1052,6 +1052,49 @@ placeholders). Test counts updated to reflect current state.
 - Full observability (OTLP, Prometheus, Grafana, Jaeger, Loki)
 - Production infra (Docker, Helm, CI/CD, systemd)
 
+### Latest updates (2026-04-12, session 5)
+
+- **TR-3 connection backoff rollout continued**:
+  - MQTT sink eventloop poller: `sleep(1s)` → `BackoffPolicy` (`config.backoff`,
+    `with_backoff()` builder).
+  - MongoDB CDC source: `sleep(1s)` on change-stream error → `BackoffPolicy`
+    (`config.backoff`, `with_backoff()` builder). Resets on each successful
+    `ChangeStreamEvent`.
+  - Cluster `QuicEndpoint::connect_with_backoff(policy, max_attempts)` — new
+    opt-in retry variant for bootstrap/join.
+  - FT-4 (openraft pre-vote): **Mitigated**. Two new `RaftTiming` presets —
+    `prod_recommended()` (500/2000/6000 ms, ~15% split-vote probability,
+    ~6 s failover) and `flaky_network()` (500/3000/12000 ms, ~7% probability,
+    ~12 s failover) — widen the election-timeout jitter window in lieu of
+    upstream pre-vote. Documented in CLUSTERING.md §2 with the probability
+    math `P(split_vote) ≈ N·(N-1)·(RTT/W)`.
+  - DOC-5 staleness sweep: CLUSTERING.md header reflects DOKS 3-node
+    validation; MULTI-NODE-AND-DEPLOYMENT-STRATEGY cross-references
+    FAULT-TOLERANCE-ANALYSIS.
+- **Design decision captured — Retry layering**:
+  See "Retry Layering" architectural note below. Summary: **backoff lives
+  at bootstrap/join and connector layers, NEVER inside the openraft
+  RaftNetwork RPC path**. Adding retries there would block the Raft client
+  task long enough to delay heartbeats and trigger spurious elections.
+  openraft has its own protocol-level retry; Aeon does not second-guess it.
+
+### Architectural Note: Retry Layering
+
+Connection-retry logic in Aeon is explicitly layered. Not every failing
+call should retry, and not every layer should be aware of retries.
+
+| Layer | Retry policy | Rationale |
+|-------|--------------|-----------|
+| **Connectors** (source/sink error handlers) | `BackoffPolicy` with reset on success (TR-3) | External brokers go down; the engine must not spin at 100% CPU re-failing. Exponential + jitter dampens reconnect storms. |
+| **Cluster bootstrap/join** (`QuicEndpoint::connect_with_backoff`) | `BackoffPolicy` with explicit `max_attempts` | Seed nodes may still be starting; DNS may not have propagated. Bounded retry is user-friendly. |
+| **openraft RaftNetwork RPC path** (`QuicEndpoint::connect` plain) | **Fail-fast** — no retry inside Aeon | openraft drives its own replication/election state machine and has protocol-level retry semantics. Adding retries here would: (a) block the `append_entries` / `vote` call long enough that the leader's heartbeat timer expires, causing spurious elections; (b) double-retry the same request at two different layers; (c) conflict with openraft's own retryable/unretryable error classification. |
+| **Engine pipeline runner** | Application-level; `BatchFailurePolicy` controls sink retry | Decoupled from transport — the pipeline decides what to do with a failed batch (retry, skip, DLQ) independently of whether the transport itself is flaky. |
+
+**Rule of thumb:** if a call is on a hot-path driven by a consensus
+algorithm, a scheduler, or a heartbeat loop — do not add retry. If it is
+on the user-visible startup path or a background reconnect loop — use
+`BackoffPolicy`.
+
 ### Latest updates (2026-04-12, session 4)
 
 - **PoH integrated into pipeline runner** (Phase 9 → Phase 14 bridge):
@@ -2974,7 +3017,7 @@ developer experience, and deferred work into 7 pillars with clear dependency cha
 | 1. Persistence & Durability + Security | 12 | **Highest** | FT-9 (L3Store to aeon-types) -> FT-7 (generics) -> FT-1 (Raft log) -> FT-2 (snapshots) -> FT-3 (checkpoint via L3). FT-8 (mTLS), FT-10 (unwrap audit for zero-event-loss), FT-11 (zero-copy blocker), FT-12 (refcount perf tuning) in parallel. |
 | 2. Zero-Downtime Deployment | 7 | High | ZD-1/2/3 (bug fixes) then ZD-4/5/6 (drain/swap/reconfig) |
 | 3. Cluster Operations | 9 | Medium | Gate 2 acceptance, partition reassignment, PoH transfer, cluster metrics (CL-4), CL-6a/b/c/d (partition transfer data movement), raft-aware auto-scaling (CL-5, depends on CL-6) |
-| 4. Transport Resilience | 3 | Mixed | TR-3 (connection backoff with jitter) actionable; TR-1/2 deferred |
+| 4. Transport Resilience | 3 | Mixed | TR-3 (connection backoff with jitter): shipped for MQTT source+sink, MongoDB CDC, and `QuicEndpoint::connect_with_backoff()` (bootstrap/join path only — openraft RPC path stays fail-fast; see "Retry layering" below). Remaining connectors need reconnect loops introduced first. TR-1/2 deferred. |
 | 5. Exactly-Once Delivery | 3 | Future | EO-1 (Kafka IdempotentSink) -> EO-2 (atomic checkpoint+commit) -> EO-3 (other sinks) |
 | 6. Developer Experience & Adoption-Readiness | 5 | Medium | DX-1 (CLI tests), DX-2 (aeon doctor), DX-3 (hot-reload), DX-4 (error polish), DX-5 (cargo xtask) |
 | 7. Blocked / Demand-Driven | 6 | Blocked | T3 WT SDKs (5 languages blocked on library maturity), T5 isolation tier. T1/T2 inherently language-limited (see FT analysis §10) |

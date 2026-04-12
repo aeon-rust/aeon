@@ -219,6 +219,25 @@ If you see frequent leadership changes without actual node failures,
 move up to `prod_recommended`. Only use `flaky_network` if your latency
 distribution has multi-second tails.
 
+### Connection retry and backoff — layering
+
+Aeon uses connection-retry with exponential backoff + jitter
+(`aeon_types::BackoffPolicy`), but the retry policy is layered
+intentionally. Understanding which layer retries is important when
+debugging slow failover or spurious elections.
+
+| Layer | Retries? | Notes |
+|-------|----------|-------|
+| **Connectors** (Kafka, MQTT, MongoDB CDC, NATS, RabbitMQ, …) | Yes | On transport error, back off and reconnect. Resets on any successful message/event so the next outage starts again at `initial_ms`. |
+| **Cluster bootstrap / join RPC** (`QuicEndpoint::connect_with_backoff`) | Yes (opt-in, bounded) | Seed node may still be starting; callers pass `BackoffPolicy` + `max_attempts`. |
+| **openraft Raft RPC path** (`QuicEndpoint::connect` plain) | **No — fail-fast** | openraft has its own protocol-level retry. Adding another retry layer here would block the Raft client task long enough to delay heartbeats and trigger spurious elections. This is a deliberate design decision. |
+| **Pipeline / sink writes** | Controlled by `BatchFailurePolicy` | Application concern (retry / skip / DLQ), decoupled from transport. |
+
+**If you see spurious leadership changes**, first check the Raft timing
+(above — widen the jitter window). Do **not** be tempted to add retries
+to `QuicNetworkConnection::append_entries` etc.; that will make the
+problem worse, not better.
+
 ### Starting a single-node instance
 
 ```bash

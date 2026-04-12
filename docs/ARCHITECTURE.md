@@ -156,6 +156,28 @@ All error handling uses `Result<T, AeonError>`. Error categories:
 
 `thiserror` for all library crates (typed, matchable). `anyhow` only in `aeon-cli`.
 
+### Retry layering (where `BackoffPolicy` applies)
+
+"Retryable" in the table above means *a retry is semantically safe* — it
+does **not** mean Aeon automatically retries at that layer. Retries are
+layered intentionally:
+
+- **Connector source/sink** — retries with `BackoffPolicy` on
+  `Connection` / `Timeout` errors. Resets on first success.
+- **Cluster bootstrap/join** — `QuicEndpoint::connect_with_backoff` is
+  the opt-in retry path; bounded `max_attempts`.
+- **openraft RaftNetwork RPC** — **fail-fast**. openraft drives its own
+  protocol-level retry. Adding another retry layer here would block a
+  Raft client task long enough to delay heartbeats and trigger spurious
+  elections. Plain `QuicEndpoint::connect` is used on this path for
+  exactly this reason.
+- **Pipeline sink writes** — governed by `BatchFailurePolicy` (retry /
+  skip / DLQ), an application concern decoupled from transport retries.
+
+See `docs/FAULT-TOLERANCE-ANALYSIS.md §5 Connection 5` for the full
+rationale; `docs/CLUSTERING.md §2 Connection retry and backoff` for the
+operator-facing summary.
+
 ---
 
 ## 5. Performance Architecture (20M Events/Sec Target)

@@ -292,6 +292,29 @@ Currently `TieredStore` is hardcoded to `Option<RedbStore>`. Making it generic o
 (or using `Box<dyn L3Store>`) allows runtime backend selection via config. This must be done
 first — FT-1 and FT-3 then work with any configured L3 backend.
 
+### Connection 5: Retry layering — where `BackoffPolicy` does and does NOT apply
+
+`BackoffPolicy` (TR-3) is not a blanket "retry everything" policy. It
+lives at specific layers and is deliberately absent from others:
+
+| Layer | `BackoffPolicy` applies? | Why |
+|-------|--------------------------|-----|
+| Connector source/sink error handlers | **Yes** (TR-3) | External systems fail; reconnect storms must be dampened. |
+| `QuicEndpoint::connect_with_backoff` (bootstrap/join) | **Yes** (opt-in, bounded) | Seed node may still be starting. |
+| `QuicEndpoint::connect` on the openraft RaftNetwork path | **No — fail-fast** | openraft has its own retry at the Raft protocol layer. Blocking a client task here delays heartbeats → leader step-down → spurious elections. Adding backoff here interferes with FT-4 (split-vote mitigation) and FT-5 (election timing). |
+| `QuinnTransport::send` / per-frame writes | **No** | Below Raft-protocol layer; errors propagate up to openraft which decides policy. |
+| Sink `write_batch` failures | Controlled by `BatchFailurePolicy` (application-level), not `BackoffPolicy` | Application semantics — retry / skip / DLQ. |
+
+**Consequence for Gate 2 stress testing**: if we see leadership churn
+under load, the fix is RaftTiming widening (FT-5) or waiting for
+openraft 0.10 pre-vote (FT-4) — **not** adding more retries. This is
+the single most important thing to get right when tuning a Raft-backed
+system; inverting the layering is a common failure mode.
+
+See also: `docs/CLUSTERING.md §2 Connection retry and backoff — layering`
+(operator-facing version of this note), `docs/ROADMAP.md Architectural
+Note: Retry Layering` (changelog/context version).
+
 ---
 
 ## 6. Automatic vs Manual Recovery
