@@ -1,5 +1,11 @@
 //! Pipeline orchestrator, SPSC wiring, and backpressure management.
 
+// FT-10: no-panic policy. Production code in this crate must not use
+// `.unwrap()` or `.expect()` except for explicitly-documented startup-time
+// invariants, which must carry an `#[allow(...)]` attribute with rationale.
+// Test modules and benches are exempt (`cfg(not(test))`).
+#![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::expect_used))]
+
 pub mod affinity;
 pub mod batch_tuner;
 pub mod batch_wire;
@@ -53,6 +59,8 @@ pub use pipeline::{
     CorePinning, MultiPartitionConfig, PipelineConfig, PipelineControl, PipelineMetrics, run,
     run_buffered, run_buffered_managed, run_multi_partition, run_with_delivery,
 };
+#[cfg(feature = "processor-auth")]
+pub use pipeline::{PohConfig, PohState, create_poh_state};
 pub use pipeline_manager::PipelineManager;
 pub use processor::PassthroughProcessor;
 pub use registry::ProcessorRegistry;

@@ -62,6 +62,41 @@ impl CorePinning {
     }
 }
 
+/// Proof-of-History configuration for a pipeline.
+///
+/// When enabled, the processor task appends each processed batch to a
+/// per-partition PoH chain (SHA-512 hash chain + Merkle tree of payloads).
+/// This provides cryptographic ordering proof and integrity for all events
+/// passing through the pipeline.
+#[cfg(feature = "processor-auth")]
+#[derive(Clone)]
+pub struct PohConfig {
+    /// Partition ID for this pipeline's PoH chain.
+    pub partition: PartitionId,
+    /// Maximum number of recent PoH entries kept in memory for verification.
+    /// Older entries are still tracked in the MMR (Merkle Mountain Range).
+    pub max_recent_entries: usize,
+    /// Optional Ed25519 signing key for signing Merkle roots.
+    /// Wrapped in Arc because SigningKey intentionally does not implement Clone
+    /// (it zeroizes on drop). Shared across processor task and config references.
+    pub signing_key: Option<Arc<aeon_crypto::signing::SigningKey>>,
+}
+
+#[cfg(feature = "processor-auth")]
+impl Default for PohConfig {
+    fn default() -> Self {
+        Self {
+            partition: PartitionId::new(0),
+            max_recent_entries: 1024,
+            signing_key: None,
+        }
+    }
+}
+
+/// Shared PoH chain state — accessible from the processor task and REST API.
+#[cfg(feature = "processor-auth")]
+pub type PohState = Arc<Mutex<aeon_crypto::poh::PohChain>>;
+
 /// Pipeline configuration.
 pub struct PipelineConfig {
     /// SPSC buffer capacity between source and processor.
@@ -76,6 +111,10 @@ pub struct PipelineConfig {
     /// Delivery configuration: strategy, semantics, failure policy, flush strategy, checkpoint.
     /// Default: OrderedBatch strategy, AtLeastOnce, RetryFailed, 1s flush, WAL checkpoint.
     pub delivery: DeliveryConfig,
+    /// Proof-of-History configuration. When `Some`, the processor task records
+    /// a hash chain of all processed batches for integrity verification.
+    #[cfg(feature = "processor-auth")]
+    pub poh: Option<PohConfig>,
 }
 
 impl Default for PipelineConfig {
@@ -86,6 +125,8 @@ impl Default for PipelineConfig {
             max_batch_size: 1024,
             core_pinning: CorePinning::Disabled,
             delivery: DeliveryConfig::default(),
+            #[cfg(feature = "processor-auth")]
+            poh: None,
         }
     }
 }
@@ -101,6 +142,8 @@ pub struct PipelineMetrics {
     pub events_failed: AtomicU64,
     /// Individual retry attempts (each retry of a failed output counts as 1).
     pub events_retried: AtomicU64,
+    /// Number of PoH entries appended (one per processed batch when PoH is enabled).
+    pub poh_entries: AtomicU64,
 }
 
 impl PipelineMetrics {
@@ -112,6 +155,7 @@ impl PipelineMetrics {
             checkpoints_written: AtomicU64::new(0),
             events_failed: AtomicU64::new(0),
             events_retried: AtomicU64::new(0),
+            poh_entries: AtomicU64::new(0),
         }
     }
 }
@@ -119,6 +163,50 @@ impl PipelineMetrics {
 impl Default for PipelineMetrics {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Create a shared PoH chain from pipeline config.
+/// Returns `None` if PoH is disabled or the feature is not compiled.
+#[cfg(feature = "processor-auth")]
+pub fn create_poh_state(config: &PipelineConfig) -> Option<PohState> {
+    config.poh.as_ref().map(|poh_config| {
+        Arc::new(Mutex::new(aeon_crypto::poh::PohChain::new(
+            poh_config.partition,
+            poh_config.max_recent_entries,
+        )))
+    })
+}
+
+/// Append a batch of output payloads to the PoH chain.
+///
+/// Called in the processor task after `process_batch()`. Extracts payload bytes
+/// from each output, builds a Merkle tree, and extends the hash chain.
+#[cfg(feature = "processor-auth")]
+async fn poh_append_batch(
+    poh_state: &PohState,
+    outputs: &[Output],
+    signing_key: &Option<Arc<aeon_crypto::signing::SigningKey>>,
+    metrics: &PipelineMetrics,
+) {
+    if outputs.is_empty() {
+        return;
+    }
+    let payload_refs: Vec<&[u8]> = outputs.iter().map(|o| o.payload.as_ref()).collect();
+    let timestamp_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as i64;
+    let mut chain = poh_state.lock().await;
+    if chain
+        .append_batch(
+            &payload_refs,
+            timestamp_nanos,
+            signing_key.as_ref().map(|k| k.as_ref()),
+        )
+        .is_some()
+    {
+        metrics.poh_entries.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -381,6 +469,12 @@ where
 {
     let core_assignment = config.core_pinning.resolve();
 
+    // Initialize PoH chain if configured
+    #[cfg(feature = "processor-auth")]
+    let poh_state = create_poh_state(&config);
+    #[cfg(feature = "processor-auth")]
+    let poh_signing_key = config.poh.as_ref().and_then(|c| c.signing_key.clone());
+
     let (mut src_prod, mut src_cons) =
         rtrb::RingBuffer::<Vec<Event>>::new(config.source_buffer_capacity);
     let (mut sink_prod, sink_cons) =
@@ -427,6 +521,10 @@ where
     let shutdown_proc = Arc::clone(&shutdown);
     let metrics_proc = Arc::clone(&metrics);
     let processor = Arc::new(processor);
+    #[cfg(feature = "processor-auth")]
+    let poh_proc = poh_state.clone();
+    #[cfg(feature = "processor-auth")]
+    let poh_key_proc = poh_signing_key.clone();
 
     // Processor task: pop events, process, push outputs
     let proc_core = core_assignment.map(|c| c.processor);
@@ -445,6 +543,12 @@ where
                     metrics_proc
                         .events_processed
                         .fetch_add(count, Ordering::Relaxed);
+
+                    // PoH: append batch to hash chain if enabled
+                    #[cfg(feature = "processor-auth")]
+                    if let Some(ref poh) = poh_proc {
+                        poh_append_batch(poh, &outputs, &poh_key_proc, &metrics_proc).await;
+                    }
 
                     // Push outputs into sink buffer
                     let mut pending = Some(outputs);
@@ -536,6 +640,12 @@ where
 {
     let core_assignment = config.core_pinning.resolve();
 
+    // Initialize PoH chain if configured
+    #[cfg(feature = "processor-auth")]
+    let poh_state = create_poh_state(&config);
+    #[cfg(feature = "processor-auth")]
+    let poh_signing_key = config.poh.as_ref().and_then(|c| c.signing_key.clone());
+
     let (mut src_prod, mut src_cons) =
         rtrb::RingBuffer::<Vec<Event>>::new(config.source_buffer_capacity);
     let (mut sink_prod, sink_cons) =
@@ -579,6 +689,10 @@ where
 
     let shutdown_proc = Arc::clone(&shutdown);
     let metrics_proc = Arc::clone(&metrics);
+    #[cfg(feature = "processor-auth")]
+    let poh_proc = poh_state.clone();
+    #[cfg(feature = "processor-auth")]
+    let poh_key_proc = poh_signing_key.clone();
 
     // Processor task — the single difference from run_buffered. Calls
     // `transport.call_batch(events).await` instead of the synchronous
@@ -601,6 +715,12 @@ where
                     metrics_proc
                         .events_processed
                         .fetch_add(count, Ordering::Relaxed);
+
+                    // PoH: append batch to hash chain if enabled
+                    #[cfg(feature = "processor-auth")]
+                    if let Some(ref poh) = poh_proc {
+                        poh_append_batch(poh, &outputs, &poh_key_proc, &metrics_proc).await;
+                    }
 
                     let mut pending = Some(outputs);
                     while let Some(batch) = pending.take() {
@@ -756,6 +876,8 @@ where
             max_batch_size: config.pipeline.max_batch_size,
             core_pinning: CorePinning::Disabled,
             delivery: config.pipeline.delivery.clone(),
+            #[cfg(feature = "processor-auth")]
+            poh: config.pipeline.poh.clone(),
         };
 
         if let Some(ref assignments) = core_assignments {
@@ -1397,6 +1519,12 @@ where
 {
     let core_assignment = config.core_pinning.resolve();
 
+    // Initialize PoH chain if configured
+    #[cfg(feature = "processor-auth")]
+    let poh_state = create_poh_state(&config);
+    #[cfg(feature = "processor-auth")]
+    let poh_signing_key = config.poh.as_ref().and_then(|c| c.signing_key.clone());
+
     let (mut src_prod, mut src_cons) =
         rtrb::RingBuffer::<Vec<Event>>::new(config.source_buffer_capacity);
     let (mut sink_prod, sink_cons) =
@@ -1466,6 +1594,10 @@ where
     let shutdown_proc = Arc::clone(&shutdown);
     let metrics_proc = Arc::clone(&metrics);
     let control_proc = Arc::clone(&control);
+    #[cfg(feature = "processor-auth")]
+    let poh_proc = poh_state.clone();
+    #[cfg(feature = "processor-auth")]
+    let poh_key_proc = poh_signing_key.clone();
 
     // Processor task: pops events, processes, pushes outputs.
     // Supports three modes:
@@ -1582,6 +1714,12 @@ where
                     metrics_proc
                         .events_processed
                         .fetch_add(count, Ordering::Relaxed);
+
+                    // PoH: append batch to hash chain if enabled
+                    #[cfg(feature = "processor-auth")]
+                    if let Some(ref poh) = poh_proc {
+                        poh_append_batch(poh, &outputs, &poh_key_proc, &metrics_proc).await;
+                    }
 
                     let mut pending = Some(outputs);
                     while let Some(batch) = pending.take() {
@@ -3545,5 +3683,225 @@ mod tests {
         source_shutdown.store(true, Ordering::Release);
         shutdown.store(true, Ordering::Release);
         let _ = pipeline_handle.await;
+    }
+
+    // ── PoH integration tests ────────────────────────────────────────────
+
+    #[cfg(feature = "processor-auth")]
+    mod poh_tests {
+        use super::*;
+        use crate::delivery_ledger::DeliveryLedger;
+
+        type Ledger = Option<Arc<DeliveryLedger>>;
+        const NO_LEDGER: Ledger = None;
+
+        #[tokio::test]
+        async fn run_buffered_with_poh_records_chain() {
+            let events = make_events(50);
+            let source = MemorySource::new(events, 16);
+            let processor = PassthroughProcessor::new(Arc::from("output"));
+            let sink = BlackholeSink::new();
+            let config = PipelineConfig {
+                poh: Some(PohConfig {
+                    partition: PartitionId::new(7),
+                    max_recent_entries: 256,
+                    signing_key: None,
+                }),
+                ..PipelineConfig::default()
+            };
+            let metrics = Arc::new(PipelineMetrics::new());
+            let shutdown = Arc::new(AtomicBool::new(false));
+
+            run_buffered(
+                source,
+                processor,
+                sink,
+                config,
+                Arc::clone(&metrics),
+                shutdown,
+                NO_LEDGER,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(metrics.events_processed.load(Ordering::Relaxed), 50);
+            assert!(
+                metrics.poh_entries.load(Ordering::Relaxed) > 0,
+                "poh_entries should be > 0 after processing with PoH enabled"
+            );
+        }
+
+        #[tokio::test]
+        async fn run_buffered_without_poh_no_entries() {
+            let events = make_events(50);
+            let source = MemorySource::new(events, 16);
+            let processor = PassthroughProcessor::new(Arc::from("output"));
+            let sink = BlackholeSink::new();
+            let config = PipelineConfig::default(); // poh: None
+            let metrics = Arc::new(PipelineMetrics::new());
+            let shutdown = Arc::new(AtomicBool::new(false));
+
+            run_buffered(
+                source,
+                processor,
+                sink,
+                config,
+                Arc::clone(&metrics),
+                shutdown,
+                NO_LEDGER,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(metrics.events_processed.load(Ordering::Relaxed), 50);
+            assert_eq!(
+                metrics.poh_entries.load(Ordering::Relaxed),
+                0,
+                "poh_entries should be 0 when PoH is disabled"
+            );
+        }
+
+        #[tokio::test]
+        async fn poh_chain_integrity_after_pipeline() {
+            let events = make_events(100);
+            let source = MemorySource::new(events, 10);
+            let processor = PassthroughProcessor::new(Arc::from("output"));
+            let sink = BlackholeSink::new();
+
+            let config = PipelineConfig {
+                poh: Some(PohConfig {
+                    partition: PartitionId::new(3),
+                    max_recent_entries: 256,
+                    signing_key: None,
+                }),
+                ..PipelineConfig::default()
+            };
+            let metrics = Arc::new(PipelineMetrics::new());
+            let shutdown = Arc::new(AtomicBool::new(false));
+
+            run_buffered(
+                source,
+                processor,
+                sink,
+                config,
+                Arc::clone(&metrics),
+                shutdown,
+                NO_LEDGER,
+            )
+            .await
+            .unwrap();
+
+            let poh_count = metrics.poh_entries.load(Ordering::Relaxed);
+            assert!(poh_count > 0, "should have PoH entries, got {poh_count}");
+        }
+
+        #[tokio::test]
+        async fn poh_with_signing_key() {
+            let signing_key = aeon_crypto::signing::SigningKey::generate();
+            let events = make_events(20);
+            let source = MemorySource::new(events, 10);
+            let processor = PassthroughProcessor::new(Arc::from("output"));
+            let sink = BlackholeSink::new();
+
+            let config = PipelineConfig {
+                poh: Some(PohConfig {
+                    partition: PartitionId::new(0),
+                    max_recent_entries: 64,
+                    signing_key: Some(Arc::new(signing_key)),
+                }),
+                ..PipelineConfig::default()
+            };
+            let metrics = Arc::new(PipelineMetrics::new());
+            let shutdown = Arc::new(AtomicBool::new(false));
+
+            run_buffered(
+                source,
+                processor,
+                sink,
+                config,
+                Arc::clone(&metrics),
+                shutdown,
+                NO_LEDGER,
+            )
+            .await
+            .unwrap();
+
+            assert!(metrics.poh_entries.load(Ordering::Relaxed) > 0);
+        }
+
+        #[tokio::test]
+        async fn create_poh_state_returns_none_when_disabled() {
+            let config = PipelineConfig::default();
+            assert!(create_poh_state(&config).is_none());
+        }
+
+        #[tokio::test]
+        async fn create_poh_state_returns_some_when_enabled() {
+            let config = PipelineConfig {
+                poh: Some(PohConfig::default()),
+                ..PipelineConfig::default()
+            };
+            let state = create_poh_state(&config);
+            assert!(state.is_some());
+
+            let binding = state.unwrap();
+            let chain = binding.lock().await;
+            assert_eq!(chain.partition(), PartitionId::new(0));
+            assert_eq!(chain.sequence(), 0);
+        }
+
+        #[tokio::test]
+        async fn poh_append_batch_helper_works() {
+            let poh = Arc::new(Mutex::new(
+                aeon_crypto::poh::PohChain::new(PartitionId::new(0), 64),
+            ));
+            let metrics = PipelineMetrics::new();
+
+            let dest: Arc<str> = Arc::from("output");
+            let outputs = vec![
+                Output {
+                    destination: Arc::clone(&dest),
+                    key: None,
+                    payload: Bytes::from("hello"),
+                    headers: smallvec::smallvec![],
+                    source_ts: None,
+                    source_event_id: None,
+                    source_partition: None,
+                    source_offset: None,
+                },
+                Output {
+                    destination: Arc::clone(&dest),
+                    key: None,
+                    payload: Bytes::from("world"),
+                    headers: smallvec::smallvec![],
+                    source_ts: None,
+                    source_event_id: None,
+                    source_partition: None,
+                    source_offset: None,
+                },
+            ];
+
+            poh_append_batch(&poh, &outputs, &None, &metrics).await;
+            assert_eq!(metrics.poh_entries.load(Ordering::Relaxed), 1);
+
+            let chain = poh.lock().await;
+            assert_eq!(chain.sequence(), 1);
+            assert_eq!(chain.recent_entries().len(), 1);
+            assert_eq!(chain.recent_entries()[0].batch_size, 2);
+        }
+
+        #[tokio::test]
+        async fn poh_append_empty_batch_noop() {
+            let poh = Arc::new(Mutex::new(
+                aeon_crypto::poh::PohChain::new(PartitionId::new(0), 64),
+            ));
+            let metrics = PipelineMetrics::new();
+
+            poh_append_batch(&poh, &[], &None, &metrics).await;
+            assert_eq!(metrics.poh_entries.load(Ordering::Relaxed), 0);
+
+            let chain = poh.lock().await;
+            assert_eq!(chain.sequence(), 0);
+        }
     }
 }

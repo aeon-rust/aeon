@@ -13,7 +13,7 @@ use aeon_types::AeonError;
 use aeon_types::registry::{
     BlueGreenActive, BlueGreenState, CanaryState, CanaryThresholds, PipelineAction,
     PipelineDefinition, PipelineHistoryEntry, PipelineState, ProcessorRef, RegistryCommand,
-    RegistryResponse, UpgradeInfo,
+    RegistryResponse, SinkConfig, SourceConfig, UpgradeInfo,
 };
 use tokio::sync::RwLock;
 
@@ -503,6 +503,114 @@ impl PipelineManager {
             Some(UpgradeInfo::Canary(cs)) => Some(cs.clone()),
             _ => None,
         }
+    }
+
+    /// Reconfigure the source of a running pipeline.
+    ///
+    /// Updates the pipeline's source config metadata. The caller (REST API or
+    /// pipeline runner) is responsible for actually swapping the source instance
+    /// via `PipelineControl::drain_and_swap_source()`.
+    pub async fn reconfigure_source(
+        &self,
+        name: &str,
+        new_source: SourceConfig,
+        actor: &str,
+    ) -> Result<(), AeonError> {
+        let mut pipelines = self.pipelines.write().await;
+        let pipeline = pipelines
+            .get_mut(name)
+            .ok_or_else(|| AeonError::not_found(format!("pipeline '{name}'")))?;
+
+        if pipeline.state != PipelineState::Running {
+            return Err(AeonError::Config {
+                message: format!(
+                    "cannot reconfigure source — pipeline is '{}', not Running",
+                    pipeline.state
+                ),
+            });
+        }
+
+        let old_type = pipeline.source.source_type.clone();
+        if new_source.source_type != old_type {
+            return Err(AeonError::Config {
+                message: format!(
+                    "cross-type source swap not supported via reconfigure \
+                     ('{old_type}' → '{}'). Use blue-green pipeline instead.",
+                    new_source.source_type
+                ),
+            });
+        }
+
+        pipeline.source = new_source;
+        pipeline.updated_at = now_millis();
+
+        // Drop lock before recording history (needs write lock on history)
+        drop(pipelines);
+        self.record_history(
+            name,
+            PipelineAction::Reconfigured,
+            actor,
+            PipelineState::Running,
+            PipelineState::Running,
+            Some("source reconfigured".into()),
+        )
+        .await;
+        tracing::info!(pipeline = name, "source reconfigured");
+        Ok(())
+    }
+
+    /// Reconfigure the sink of a running pipeline.
+    ///
+    /// Updates the pipeline's sink config metadata. The caller (REST API or
+    /// pipeline runner) is responsible for actually swapping the sink instance
+    /// via `PipelineControl::drain_and_swap_sink()`.
+    pub async fn reconfigure_sink(
+        &self,
+        name: &str,
+        new_sink: SinkConfig,
+        actor: &str,
+    ) -> Result<(), AeonError> {
+        let mut pipelines = self.pipelines.write().await;
+        let pipeline = pipelines
+            .get_mut(name)
+            .ok_or_else(|| AeonError::not_found(format!("pipeline '{name}'")))?;
+
+        if pipeline.state != PipelineState::Running {
+            return Err(AeonError::Config {
+                message: format!(
+                    "cannot reconfigure sink — pipeline is '{}', not Running",
+                    pipeline.state
+                ),
+            });
+        }
+
+        let old_type = pipeline.sink.sink_type.clone();
+        if new_sink.sink_type != old_type {
+            return Err(AeonError::Config {
+                message: format!(
+                    "cross-type sink swap not supported via reconfigure \
+                     ('{old_type}' → '{}'). Use blue-green pipeline instead.",
+                    new_sink.sink_type
+                ),
+            });
+        }
+
+        pipeline.sink = new_sink;
+        pipeline.updated_at = now_millis();
+
+        // Drop lock before recording history (needs write lock on history)
+        drop(pipelines);
+        self.record_history(
+            name,
+            PipelineAction::Reconfigured,
+            actor,
+            PipelineState::Running,
+            PipelineState::Running,
+            Some("sink reconfigured".into()),
+        )
+        .await;
+        tracing::info!(pipeline = name, "sink reconfigured");
+        Ok(())
     }
 
     /// Delete a pipeline.
@@ -1030,5 +1138,125 @@ mod tests {
         let history = mgr.history("can-hist").await;
         // created + started + canary-started + promoted(100%) + completed
         assert_eq!(history.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn reconfigure_source_same_type() {
+        let mgr = PipelineManager::new();
+        mgr.create(make_pipeline("reconf-src")).await.unwrap();
+        mgr.start("reconf-src", "test").await.unwrap();
+
+        let new_source = SourceConfig {
+            source_type: "kafka".into(),
+            topic: Some("new-input-topic".into()),
+            partitions: vec![0, 1, 2, 3],
+            config: BTreeMap::new(),
+        };
+        mgr.reconfigure_source("reconf-src", new_source, "test")
+            .await
+            .unwrap();
+
+        let p = mgr.get("reconf-src").await.unwrap();
+        assert_eq!(p.source.topic.as_deref(), Some("new-input-topic"));
+        assert_eq!(p.source.partitions, vec![0, 1, 2, 3]);
+        assert_eq!(p.state, PipelineState::Running);
+    }
+
+    #[tokio::test]
+    async fn reconfigure_source_cross_type_rejected() {
+        let mgr = PipelineManager::new();
+        mgr.create(make_pipeline("reconf-cross")).await.unwrap();
+        mgr.start("reconf-cross", "test").await.unwrap();
+
+        let new_source = SourceConfig {
+            source_type: "nats".into(),
+            topic: Some("stream".into()),
+            partitions: vec![],
+            config: BTreeMap::new(),
+        };
+        let result = mgr
+            .reconfigure_source("reconf-cross", new_source, "test")
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn reconfigure_source_not_running_rejected() {
+        let mgr = PipelineManager::new();
+        mgr.create(make_pipeline("reconf-stop")).await.unwrap();
+        // Pipeline is Created, not Running
+
+        let new_source = SourceConfig {
+            source_type: "kafka".into(),
+            topic: Some("new-topic".into()),
+            partitions: vec![],
+            config: BTreeMap::new(),
+        };
+        let result = mgr
+            .reconfigure_source("reconf-stop", new_source, "test")
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn reconfigure_sink_same_type() {
+        let mgr = PipelineManager::new();
+        mgr.create(make_pipeline("reconf-sink")).await.unwrap();
+        mgr.start("reconf-sink", "test").await.unwrap();
+
+        let new_sink = SinkConfig {
+            sink_type: "kafka".into(),
+            topic: Some("new-output-topic".into()),
+            config: BTreeMap::new(),
+        };
+        mgr.reconfigure_sink("reconf-sink", new_sink, "test")
+            .await
+            .unwrap();
+
+        let p = mgr.get("reconf-sink").await.unwrap();
+        assert_eq!(p.sink.topic.as_deref(), Some("new-output-topic"));
+        assert_eq!(p.state, PipelineState::Running);
+    }
+
+    #[tokio::test]
+    async fn reconfigure_sink_cross_type_rejected() {
+        let mgr = PipelineManager::new();
+        mgr.create(make_pipeline("reconf-sink-cross")).await.unwrap();
+        mgr.start("reconf-sink-cross", "test").await.unwrap();
+
+        let new_sink = SinkConfig {
+            sink_type: "redis".into(),
+            topic: None,
+            config: BTreeMap::new(),
+        };
+        let result = mgr
+            .reconfigure_sink("reconf-sink-cross", new_sink, "test")
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn reconfigure_records_history() {
+        let mgr = PipelineManager::new();
+        mgr.create(make_pipeline("reconf-hist")).await.unwrap();
+        mgr.start("reconf-hist", "test").await.unwrap();
+
+        let new_source = SourceConfig {
+            source_type: "kafka".into(),
+            topic: Some("new-topic".into()),
+            partitions: vec![],
+            config: BTreeMap::new(),
+        };
+        mgr.reconfigure_source("reconf-hist", new_source, "test")
+            .await
+            .unwrap();
+
+        let history = mgr.history("reconf-hist").await;
+        // created + started + reconfigured
+        assert_eq!(history.len(), 3);
+        assert_eq!(
+            history.last().unwrap().action,
+            PipelineAction::Reconfigured
+        );
     }
 }

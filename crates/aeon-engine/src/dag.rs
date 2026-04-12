@@ -135,7 +135,11 @@ impl DagGraph {
             visited += 1;
             if let Some(neighbors) = adjacency.get(node) {
                 for &neighbor in neighbors {
-                    let deg = in_degree.get_mut(neighbor).expect("node exists");
+                    // FT-10: `neighbor` comes from `adjacency`, whose keys
+                    // are a subset of `in_degree`'s keys (both populated from
+                    // `self.nodes`). Guaranteed Some.
+                    #[allow(clippy::expect_used)]
+                    let deg = in_degree.get_mut(neighbor).expect("invariant: adjacency targets are in in_degree");
                     *deg -= 1;
                     if *deg == 0 {
                         queue.push_back(neighbor);

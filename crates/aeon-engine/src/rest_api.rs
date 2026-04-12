@@ -69,6 +69,13 @@ pub struct AppState {
     /// Per-pipeline control handles for drain→swap→resume hot-swap.
     /// Registered when a managed pipeline starts, removed when it stops.
     pub pipeline_controls: dashmap::DashMap<String, Arc<PipelineControl>>,
+    /// Per-pipeline metrics handles for live-tail streaming.
+    /// Registered when a managed pipeline starts, removed when it stops.
+    pub pipeline_metrics: dashmap::DashMap<String, Arc<crate::pipeline::PipelineMetrics>>,
+    /// Per-pipeline PoH chain state. Populated when a pipeline runs with
+    /// `poh_enabled` in its config. Used by the verify endpoint.
+    #[cfg(feature = "processor-auth")]
+    pub poh_chains: dashmap::DashMap<String, crate::pipeline::PohState>,
     /// Processor identity store (ED25519 public keys for T3/T4 auth).
     pub identities: Arc<ProcessorIdentityStore>,
     /// API key authenticator for Bearer token auth. `None` disables auth (dev mode).
@@ -81,6 +88,10 @@ pub struct AppState {
     /// T4 WebSocket processor host (feature-gated).
     #[cfg(feature = "websocket-host")]
     pub ws_host: Option<Arc<crate::transport::websocket_host::WebSocketProcessorHost>>,
+    /// Cluster node reference for cluster status queries.
+    /// `None` in standalone (non-cluster) mode.
+    #[cfg(feature = "cluster")]
+    pub cluster_node: Option<Arc<aeon_cluster::ClusterNode>>,
 }
 
 /// Build the axum Router with all API routes.
@@ -134,6 +145,15 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/pipelines/{name}/promote", post(promote_canary))
         .route("/api/v1/pipelines/{name}/canary-status", get(canary_status))
         .route("/api/v1/pipelines/{name}/history", get(pipeline_history))
+        // Reconfiguration (same-type source/sink swap)
+        .route(
+            "/api/v1/pipelines/{name}/reconfigure/source",
+            post(reconfigure_source),
+        )
+        .route(
+            "/api/v1/pipelines/{name}/reconfigure/sink",
+            post(reconfigure_sink),
+        )
         // Identities
         .route(
             "/api/v1/processors/{name}/identities",
@@ -151,6 +171,8 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         )
         // Integrity verification
         .route("/api/v1/pipelines/{name}/verify", get(verify_pipeline))
+        // Cluster status
+        .route("/api/v1/cluster/status", get(cluster_status))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -158,8 +180,9 @@ pub fn api_router(state: Arc<AppState>) -> Router {
 
     // WebSocket processor connect — no Bearer auth (AWPP handshake handles auth)
     #[cfg(feature = "websocket-host")]
-    let health_routes =
-        health_routes.route("/api/v1/processors/connect", get(ws_processor_connect));
+    let health_routes = health_routes
+        .route("/api/v1/processors/connect", get(ws_processor_connect))
+        .route("/api/v1/pipelines/{name}/tail", get(pipeline_tail));
 
     health_routes
         .merge(api_routes)
@@ -365,6 +388,71 @@ async fn ready() -> Json<HealthResponse> {
     })
 }
 
+// ── Cluster status endpoint ───────────────────────────────────────────
+
+/// Returns cluster status: node ID, leader, partition assignments.
+/// In standalone mode, returns a minimal response indicating no cluster.
+async fn cluster_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    #[cfg(feature = "cluster")]
+    {
+        if let Some(ref node) = state.cluster_node {
+            let leader = node.current_leader().await;
+            let config = node.config();
+            let pt = node.partition_table_snapshot().await;
+
+            // Build partition assignment map: partition_id → owner_node_id
+            let mut partitions = serde_json::Map::new();
+            for (pid, ownership) in pt.iter() {
+                let owner_str = match ownership {
+                    aeon_cluster::types::PartitionOwnership::Owned(n) => {
+                        serde_json::json!({ "owner": n, "status": "owned" })
+                    }
+                    aeon_cluster::types::PartitionOwnership::Transferring {
+                        source, target, ..
+                    } => {
+                        serde_json::json!({
+                            "source": source,
+                            "target": target,
+                            "status": "transferring"
+                        })
+                    }
+                };
+                partitions.insert(pid.as_u16().to_string(), owner_str);
+            }
+
+            let metrics = node.raft().metrics().borrow().clone();
+
+            Json(serde_json::json!({
+                "mode": "cluster",
+                "node_id": config.node_id,
+                "leader_id": leader,
+                "num_partitions": config.num_partitions,
+                "partitions": partitions,
+                "raft": {
+                    "state": format!("{:?}", metrics.state),
+                    "current_term": metrics.current_term,
+                    "last_applied": metrics.last_applied.map(|l| l.index),
+                    "last_log_index": metrics.last_log_index,
+                    "membership": format!("{:?}", metrics.membership_config.membership()),
+                }
+            }))
+        } else {
+            Json(serde_json::json!({
+                "mode": "standalone",
+                "message": "no cluster node configured"
+            }))
+        }
+    }
+    #[cfg(not(feature = "cluster"))]
+    {
+        let _ = state;
+        Json(serde_json::json!({
+            "mode": "standalone",
+            "message": "cluster feature not enabled"
+        }))
+    }
+}
+
 // ── Processor endpoints ────────────────────────────────────────────────
 
 #[derive(Serialize)]
@@ -557,34 +645,145 @@ struct UpgradeRequest {
     processor_version: String,
 }
 
+/// Load a processor artifact from the registry and instantiate it.
+///
+/// Returns the boxed processor on success, or an HTTP error response on failure.
+/// Supports Wasm and NativeSo types; T3/T4 (WebTransport/WebSocket) processors
+/// are managed externally and cannot be instantiated here.
+async fn instantiate_processor(
+    state: &AppState,
+    processor_name: &str,
+    processor_version: &str,
+) -> Result<Box<dyn aeon_types::Processor + Send + Sync>, axum::response::Response> {
+    // Load artifact from registry
+    let artifact_bytes = state
+        .registry
+        .load_artifact(processor_name, processor_version)
+        .await
+        .map_err(|e| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                format!("failed to load artifact: {e}"),
+            )
+            .into_response()
+        })?;
+
+    // Determine processor type from registry metadata
+    let proc_type = match state.registry.get(processor_name).await {
+        Some(record) => match record.get_version(processor_version) {
+            Some(ver) => ver.processor_type,
+            None => {
+                return Err(api_error(
+                    StatusCode::NOT_FOUND,
+                    format!("version {processor_name}:{processor_version} not found"),
+                )
+                .into_response());
+            }
+        },
+        None => {
+            return Err(api_error(
+                StatusCode::NOT_FOUND,
+                format!("processor '{processor_name}' not found"),
+            )
+            .into_response());
+        }
+    };
+
+    // Instantiate based on type
+    match proc_type {
+        aeon_types::registry::ProcessorType::Wasm => {
+            let module = aeon_wasm::WasmModule::from_bytes(
+                &artifact_bytes,
+                aeon_wasm::WasmConfig::default(),
+            )
+            .map_err(|e| {
+                api_error(
+                    StatusCode::BAD_REQUEST,
+                    format!("failed to compile Wasm module: {e}"),
+                )
+                .into_response()
+            })?;
+            let p = aeon_wasm::WasmProcessor::new(std::sync::Arc::new(module)).map_err(|e| {
+                api_error(
+                    StatusCode::BAD_REQUEST,
+                    format!("failed to create Wasm processor: {e}"),
+                )
+                .into_response()
+            })?;
+            Ok(Box::new(p))
+        }
+        #[cfg(feature = "native-loader")]
+        aeon_types::registry::ProcessorType::NativeSo => {
+            let artifact_path =
+                state
+                    .registry
+                    .artifact_path_for(processor_name, processor_version);
+            let p = crate::native_loader::NativeProcessor::load(&artifact_path, &[]).map_err(
+                |e| {
+                    api_error(
+                        StatusCode::BAD_REQUEST,
+                        format!("failed to load native processor: {e}"),
+                    )
+                    .into_response()
+                },
+            )?;
+            Ok(Box::new(p))
+        }
+        other => Err(api_error(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "hot-swap not supported for processor type '{other}' — \
+                 T3/T4 processors are managed externally"
+            ),
+        )
+        .into_response()),
+    }
+}
+
 async fn upgrade_pipeline(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
     Json(req): Json<UpgradeRequest>,
 ) -> impl IntoResponse {
-    let proc_ref =
-        aeon_types::registry::ProcessorRef::new(req.processor_name, req.processor_version);
+    let proc_ref = aeon_types::registry::ProcessorRef::new(
+        req.processor_name.clone(),
+        req.processor_version.clone(),
+    );
 
-    // If a PipelineControl handle exists and a replacement processor is
-    // provided, perform a real drain→swap→resume. The caller must have
-    // pre-registered a PipelineControl via `pipeline_controls.insert()`
-    // when starting the managed pipeline.
-    //
-    // Processor instantiation (Wasm from_bytes, native dlopen) is handled
-    // by the caller or a future middleware — this endpoint focuses on the
-    // PipelineManager metadata upgrade. When pipeline_controls gains a
-    // processor factory, the full hot-swap path will be:
-    //   load artifact → instantiate → drain_and_swap → update metadata.
-    match state.pipelines.upgrade(&name, proc_ref, "api").await {
-        Ok(()) => {
-            let method = if state.pipeline_controls.contains_key(&name) {
-                "managed"
-            } else {
-                "metadata"
+    // If a PipelineControl handle exists, perform a real drain→swap→resume.
+    // Otherwise, fall back to metadata-only upgrade.
+    if let Some(control) = state.pipeline_controls.get(&name) {
+        let new_processor =
+            match instantiate_processor(&state, &req.processor_name, &req.processor_version).await
+            {
+                Ok(p) => p,
+                Err(resp) => return resp,
             };
-            Json(serde_json::json!({"status": "upgraded", "method": method})).into_response()
+
+        // Drain→swap→resume
+        if let Err(e) = control.drain_and_swap(new_processor).await {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("drain-and-swap failed: {e}"),
+            )
+            .into_response();
         }
-        Err(e) => api_error(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+
+        // Update metadata
+        if let Err(e) = state.pipelines.upgrade(&name, proc_ref, "api").await {
+            tracing::warn!(pipeline = %name, "processor swapped but metadata update failed: {e}");
+        }
+
+        Json(serde_json::json!({"status": "upgraded", "method": "hot-swap"})).into_response()
+    } else {
+        // No PipelineControl — metadata-only upgrade
+        match state.pipelines.upgrade(&name, proc_ref, "api").await {
+            Ok(()) => {
+                Json(serde_json::json!({"status": "upgraded", "method": "metadata"}))
+                    .into_response()
+            }
+            Err(e) => api_error(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        }
     }
 }
 
@@ -595,27 +794,39 @@ async fn upgrade_blue_green(
     Path(name): Path<String>,
     Json(req): Json<UpgradeRequest>,
 ) -> impl IntoResponse {
-    let proc_ref =
-        aeon_types::registry::ProcessorRef::new(req.processor_name, req.processor_version);
-    match state
+    let proc_ref = aeon_types::registry::ProcessorRef::new(
+        req.processor_name.clone(),
+        req.processor_version.clone(),
+    );
+    if let Err(e) = state
         .pipelines
         .upgrade_blue_green(&name, proc_ref, "api")
         .await
     {
-        Ok(()) => {
-            // Note: actual PipelineControl.start_blue_green() requires a processor
-            // instance (Box<dyn Processor>). Without a processor factory, the REST
-            // layer can only update metadata. The caller must provide a processor
-            // instance via PipelineControl directly for real blue-green shadow mode.
-            let method = if state.pipeline_controls.contains_key(&name) {
-                "managed"
-            } else {
-                "metadata"
+        return api_error(StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+
+    // If a managed pipeline control exists, instantiate the green processor
+    // and start real blue-green shadow mode.
+    if let Some(ctrl) = state.pipeline_controls.get(&name) {
+        let green =
+            match instantiate_processor(&state, &req.processor_name, &req.processor_version).await
+            {
+                Ok(p) => p,
+                Err(resp) => return resp,
             };
-            Json(serde_json::json!({"status": "blue-green-started", "method": method}))
-                .into_response()
+        if let Err(e) = ctrl.start_blue_green(green).await {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to start blue-green: {e}"),
+            )
+            .into_response();
         }
-        Err(e) => api_error(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        Json(serde_json::json!({"status": "blue-green-started", "method": "managed"}))
+            .into_response()
+    } else {
+        Json(serde_json::json!({"status": "blue-green-started", "method": "metadata"}))
+            .into_response()
     }
 }
 
@@ -638,15 +849,38 @@ async fn upgrade_canary(
     Path(name): Path<String>,
     Json(req): Json<CanaryUpgradeRequest>,
 ) -> impl IntoResponse {
-    let proc_ref =
-        aeon_types::registry::ProcessorRef::new(req.processor_name, req.processor_version);
-    match state
+    let proc_ref = aeon_types::registry::ProcessorRef::new(
+        req.processor_name.clone(),
+        req.processor_version.clone(),
+    );
+    let initial_pct = req.steps.first().copied().unwrap_or(10);
+    if let Err(e) = state
         .pipelines
         .upgrade_canary(&name, proc_ref, req.steps, req.thresholds, "api")
         .await
     {
-        Ok(()) => Json(serde_json::json!({"status": "canary-started"})).into_response(),
-        Err(e) => api_error(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        return api_error(StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+
+    // If a managed pipeline control exists, instantiate the canary processor
+    // and start real traffic splitting.
+    if let Some(ctrl) = state.pipeline_controls.get(&name) {
+        let canary =
+            match instantiate_processor(&state, &req.processor_name, &req.processor_version).await
+            {
+                Ok(p) => p,
+                Err(resp) => return resp,
+            };
+        if let Err(e) = ctrl.start_canary(canary, initial_pct).await {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to start canary: {e}"),
+            )
+            .into_response();
+        }
+        Json(serde_json::json!({"status": "canary-started", "method": "managed"})).into_response()
+    } else {
+        Json(serde_json::json!({"status": "canary-started", "method": "metadata"})).into_response()
     }
 }
 
@@ -697,7 +931,17 @@ async fn promote_canary(
 ) -> impl IntoResponse {
     match state.pipelines.promote_canary(&name, "api").await {
         Ok(()) => {
-            let method = if state.pipeline_controls.contains_key(&name) {
+            // If managed, check whether the canary is now at 100% and complete it,
+            // or just advance the canary percentage to the next step.
+            let method = if let Some(ctrl) = state.pipeline_controls.get(&name) {
+                // Check if canary is complete (promoted to 100%)
+                if let Some(cs) = state.pipelines.canary_status(&name).await {
+                    if cs.traffic_pct >= 100 {
+                        let _ = ctrl.complete_canary().await;
+                    } else {
+                        let _ = ctrl.set_canary_pct(cs.traffic_pct).await;
+                    }
+                }
                 "managed"
             } else {
                 "metadata"
@@ -733,6 +977,42 @@ async fn pipeline_history(
     let history = state.pipelines.history(&name).await;
     let json = serde_json::to_value(&history).unwrap_or_default();
     Json(json)
+}
+
+// ── Source/Sink Reconfiguration endpoints ──────────────────────────────
+
+async fn reconfigure_source(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(new_source): Json<aeon_types::registry::SourceConfig>,
+) -> impl IntoResponse {
+    match state
+        .pipelines
+        .reconfigure_source(&name, new_source, "api")
+        .await
+    {
+        Ok(()) => {
+            Json(serde_json::json!({"status": "source-reconfigured"})).into_response()
+        }
+        Err(e) => api_error(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    }
+}
+
+async fn reconfigure_sink(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(new_sink): Json<aeon_types::registry::SinkConfig>,
+) -> impl IntoResponse {
+    match state
+        .pipelines
+        .reconfigure_sink(&name, new_sink, "api")
+        .await
+    {
+        Ok(()) => {
+            Json(serde_json::json!({"status": "sink-reconfigured"})).into_response()
+        }
+        Err(e) => api_error(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    }
 }
 
 async fn delete_pipeline(
@@ -853,14 +1133,43 @@ async fn verify_pipeline(
     // Check pipeline exists
     match state.pipelines.get(&name).await {
         Some(_pipeline) => {
-            // PoH chains are not yet wired into the pipeline runtime.
-            // Return a structured response so the CLI can display meaningful output
-            // and detect when PoH becomes active.
+            // Check if this pipeline has an active PoH chain
+            #[cfg(feature = "processor-auth")]
+            {
+                if let Some(poh_ref) = state.poh_chains.get(&name) {
+                    let chain = poh_ref.value().lock().await;
+                    let chain_state = chain.export_state();
+                    let verification = chain.verify_recent();
+                    let json = serde_json::json!({
+                        "pipeline": name,
+                        "poh_active": true,
+                        "status": "ok",
+                        "chain": {
+                            "partition": chain_state.partition.as_u16(),
+                            "sequence": chain_state.sequence,
+                            "current_hash": hex::encode(chain_state.current_hash),
+                            "mmr_root": hex::encode(chain.mmr_root()),
+                            "recent_entries": chain.recent_entries().len(),
+                            "verification": if verification.is_none() { "valid" } else { "invalid" },
+                            "invalid_at_index": verification,
+                        },
+                        "modules": {
+                            "poh": "active",
+                            "merkle": "active",
+                            "mmr": "active",
+                            "signing": if chain.recent_entries().iter().any(|e| e.signed_root.is_some()) { "active" } else { "available" },
+                        },
+                    });
+                    return (StatusCode::OK, Json(json)).into_response();
+                }
+            }
+
+            // PoH not active for this pipeline
             let json = serde_json::json!({
                 "pipeline": name,
                 "poh_active": false,
                 "status": "ok",
-                "message": "Pipeline exists. PoH chain tracking activates when the pipeline runs with integrity verification enabled.",
+                "message": "Pipeline exists. PoH chain tracking activates when the pipeline runs with poh config enabled.",
                 "modules": {
                     "poh": "available",
                     "merkle": "available",
@@ -879,17 +1188,20 @@ async fn verify_pipeline(
                 let pipeline_statuses: Vec<serde_json::Value> = pipelines
                     .into_iter()
                     .map(|(pname, pstate)| {
+                        #[cfg(feature = "processor-auth")]
+                        let poh_active = state.poh_chains.contains_key(&pname);
+                        #[cfg(not(feature = "processor-auth"))]
+                        let poh_active = false;
                         serde_json::json!({
                             "name": pname,
                             "state": pstate.to_string(),
-                            "poh_active": false,
+                            "poh_active": poh_active,
                         })
                     })
                     .collect();
 
                 let json = serde_json::json!({
                     "status": "ok",
-                    "poh_active": false,
                     "pipelines": pipeline_statuses,
                     "modules": {
                         "poh": "available",
@@ -1066,6 +1378,88 @@ async fn ws_processor_connect(
     .into_response()
 }
 
+// ── WebSocket Pipeline Live-Tail ─────────────────────────────────────────
+
+/// WebSocket endpoint that streams pipeline metrics at ~1 Hz.
+///
+/// Sends JSON frames with current event counts, error rates, and pipeline state.
+/// Requires `websocket-host` feature (which enables `axum/ws`).
+#[cfg(feature = "websocket-host")]
+async fn pipeline_tail(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    ws: axum::extract::ws::WebSocketUpgrade,
+) -> impl IntoResponse {
+    // Verify pipeline exists before upgrading
+    if state.pipelines.get(&name).await.is_none() {
+        return api_error(StatusCode::NOT_FOUND, format!("pipeline '{name}' not found"))
+            .into_response();
+    }
+
+    let pipelines = state.pipelines.clone();
+    let metrics_map = state.pipeline_metrics.clone();
+    ws.on_upgrade(move |mut socket| async move {
+        use axum::extract::ws::Message;
+        use std::sync::atomic::Ordering;
+
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+
+            // Build metrics snapshot
+            let pipeline_state = pipelines.get(&name).await;
+            let state_str = pipeline_state
+                .as_ref()
+                .map(|p| format!("{}", p.state))
+                .unwrap_or_else(|| "unknown".into());
+
+            let metrics_json = if let Some(m) = metrics_map.get(&name) {
+                serde_json::json!({
+                    "pipeline": name,
+                    "state": state_str,
+                    "events_received": m.events_received.load(Ordering::Relaxed),
+                    "events_processed": m.events_processed.load(Ordering::Relaxed),
+                    "outputs_sent": m.outputs_sent.load(Ordering::Relaxed),
+                    "checkpoints_written": m.checkpoints_written.load(Ordering::Relaxed),
+                    "events_failed": m.events_failed.load(Ordering::Relaxed),
+                    "events_retried": m.events_retried.load(Ordering::Relaxed),
+                    "timestamp": std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as i64,
+                })
+            } else {
+                serde_json::json!({
+                    "pipeline": name,
+                    "state": state_str,
+                    "message": "no metrics available (pipeline not running with metrics registration)",
+                    "timestamp": std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as i64,
+                })
+            };
+
+            let msg = Message::Text(metrics_json.to_string().into());
+            if socket.send(msg).await.is_err() {
+                break; // Client disconnected
+            }
+
+            // Check for close frame from client
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                socket.recv(),
+            )
+            .await
+            {
+                Ok(Some(Ok(Message::Close(_)))) | Ok(None) => break,
+                _ => {} // No message or timeout — continue
+            }
+        }
+    })
+    .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1088,6 +1482,9 @@ mod tests {
             pipelines: Arc::new(PipelineManager::new()),
             delivery_ledgers: dashmap::DashMap::new(),
             pipeline_controls: dashmap::DashMap::new(),
+            pipeline_metrics: dashmap::DashMap::new(),
+            #[cfg(feature = "processor-auth")]
+            poh_chains: dashmap::DashMap::new(),
             identities: Arc::new(ProcessorIdentityStore::new()),
             #[cfg(feature = "processor-auth")]
             authenticator: None,
@@ -1095,6 +1492,8 @@ mod tests {
             api_token: None,
             #[cfg(feature = "websocket-host")]
             ws_host: None,
+            #[cfg(feature = "cluster")]
+            cluster_node: None,
         })
     }
 
@@ -1123,6 +1522,9 @@ mod tests {
             pipelines: Arc::new(PipelineManager::new()),
             delivery_ledgers: dashmap::DashMap::new(),
             pipeline_controls: dashmap::DashMap::new(),
+            pipeline_metrics: dashmap::DashMap::new(),
+            #[cfg(feature = "processor-auth")]
+            poh_chains: dashmap::DashMap::new(),
             identities: Arc::new(ProcessorIdentityStore::new()),
             #[cfg(feature = "processor-auth")]
             authenticator: Some(
@@ -1138,6 +1540,8 @@ mod tests {
             api_token: Some(token.to_string()),
             #[cfg(feature = "websocket-host")]
             ws_host: None,
+            #[cfg(feature = "cluster")]
+            cluster_node: None,
         })
     }
 
@@ -1695,5 +2099,115 @@ mod tests {
         );
         assert_eq!(resp.headers().get("x-frame-options").unwrap(), "DENY");
         assert_eq!(resp.headers().get("cache-control").unwrap(), "no-store");
+    }
+
+    // ── Reconfigure endpoint tests ────────────────────────────────────
+
+    #[tokio::test]
+    async fn reconfigure_source_via_api() {
+        let state = test_state();
+        create_running_pipeline(&state, "reconf-src-api").await;
+
+        let app = api_router(state.clone());
+        let resp = app
+            .oneshot(
+                Request::post("/api/v1/pipelines/reconf-src-api/reconfigure/source")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"type":"kafka","topic":"new-input","partitions":[0,1,2]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let p = state.pipelines.get("reconf-src-api").await.unwrap();
+        assert_eq!(p.source.topic.as_deref(), Some("new-input"));
+        assert_eq!(p.source.partitions, vec![0, 1, 2]);
+    }
+
+    #[tokio::test]
+    async fn reconfigure_sink_via_api() {
+        let state = test_state();
+        create_running_pipeline(&state, "reconf-sink-api").await;
+
+        let app = api_router(state.clone());
+        let resp = app
+            .oneshot(
+                Request::post("/api/v1/pipelines/reconf-sink-api/reconfigure/sink")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"type":"kafka","topic":"new-output"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let p = state.pipelines.get("reconf-sink-api").await.unwrap();
+        assert_eq!(p.sink.topic.as_deref(), Some("new-output"));
+    }
+
+    #[tokio::test]
+    async fn reconfigure_cross_type_rejected_via_api() {
+        let state = test_state();
+        create_running_pipeline(&state, "reconf-cross-api").await;
+
+        let app = api_router(state.clone());
+        let resp = app
+            .oneshot(
+                Request::post("/api/v1/pipelines/reconf-cross-api/reconfigure/source")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"type":"nats","topic":"stream"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn reconfigure_nonexistent_pipeline() {
+        let state = test_state();
+        let app = api_router(state);
+
+        let resp = app
+            .oneshot(
+                Request::post("/api/v1/pipelines/ghost/reconfigure/source")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"type":"kafka","topic":"t"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn cluster_status_standalone() {
+        let state = test_state();
+        let app = api_router(state);
+
+        let resp = app
+            .oneshot(
+                Request::get("/api/v1/cluster/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["mode"].as_str().is_some());
     }
 }
