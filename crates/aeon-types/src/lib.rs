@@ -15,6 +15,7 @@ pub mod processor_identity;
 pub mod processor_transport;
 pub mod registry;
 pub mod scanner;
+pub mod state;
 pub mod traits;
 pub mod transport_codec;
 pub mod uuid;
@@ -39,6 +40,10 @@ pub use registry::{
 pub use scanner::{
     BytesFinder, contains_byte, contains_bytes, find_byte, find_bytes, json_field_value,
 };
-pub use traits::{IdempotentSink, Processor, ProcessorTransport, Seekable, Sink, Source, StateOps};
+pub use state::{BatchEntry, BatchOp, KvPairs, L3Backend, L3Store};
+pub use traits::{
+    CheckpointReplicator, IdempotentSink, Processor, ProcessorTransport, Seekable, Sink, Source,
+    StateOps,
+};
 pub use transport_codec::{TransportCodec, WireEvent, WireOutput};
 pub use uuid::CoreLocalUuidGenerator;
