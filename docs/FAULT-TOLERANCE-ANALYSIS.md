@@ -370,7 +370,7 @@ is retained for historical reference.
 |----|------|--------|--------|
 | **TR-1** | In-flight batch replay on T3/T4 disconnect | ZD-10 in old list | Medium |
 | **TR-2** | Wasm state transfer on hot-swap | ZD-11 in old list | Medium |
-| **TR-3** | Connection backoff with jitter across all connectors — **In progress**. ✅ Shared `BackoffPolicy { initial_ms, max_ms, multiplier, jitter_pct }` + stateful `Backoff` iterator added to `aeon-types` (defaults 100 ms → 30 s cap, ×2, ±20% jitter; 11 tests). ✅ Wired into **MQTT source** (`mqtt_reader` replaces hardcoded `sleep(1s)`; resets on successful Publish or ConnAck). **Follow-ups (deferred):** wire into Postgres CDC poll loop, HTTP polling source, cluster `QuicEndpoint::connect` reconnect, WebSocket/NATS/RabbitMQ/Redis Streams once they land, WebTransport T3 SDK layer. | GAP H | Medium |
+| **TR-3** | Connection backoff with jitter across all connectors — **In progress**. ✅ Shared `BackoffPolicy { initial_ms, max_ms, multiplier, jitter_pct }` + stateful `Backoff` iterator added to `aeon-types` (defaults 100 ms → 30 s cap, ×2, ±20% jitter; 11 tests). ✅ Wired into **MQTT source** (`mqtt_reader` replaces hardcoded `sleep(1s)`; resets on successful Publish or ConnAck). ✅ Wired into **MQTT sink** (eventloop poller resets on successful poll). ✅ Wired into **MongoDB CDC source** (`mongodb_reader` resets on successful ChangeStreamEvent). **Follow-ups (deferred):** wire into Postgres CDC poll loop, HTTP polling source, cluster `QuicEndpoint::connect` reconnect, WebSocket/NATS/RabbitMQ/Redis Streams once they land, WebTransport T3 SDK layer. | GAP H | Medium |
 
 ### Pillar 5: Exactly-Once Delivery (Future)
 
