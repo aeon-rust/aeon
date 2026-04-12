@@ -6,49 +6,81 @@ use aeon_types::{AeonError, Event, Source};
 ///
 /// Returns events in configurable batch sizes. Once exhausted, returns
 /// empty batches. Used for testing and benchmarking.
+///
+/// **FT-12 (Gate 1 perf)**: events are consumed by move — `next_batch()`
+/// drains them out of the internal iterator rather than cloning a slice.
+/// This removes an `Event::clone` per event (Arc/Bytes refcount bumps +
+/// 128 B memcpy) from the pipeline's hot path, so benchmarks measure real
+/// pipeline overhead rather than test-fixture cloning. The original event
+/// vec is retained only when `reset()` is enabled.
 pub struct MemorySource {
-    events: Vec<Event>,
-    position: usize,
+    /// Active iterator — events are moved out by `next_batch`.
+    iter: std::vec::IntoIter<Event>,
+    /// Original vec kept only if `reset()` may be called later.
+    /// `None` in the hot benchmark path (no reset ⇒ no retained copy).
+    original: Option<Vec<Event>>,
     batch_size: usize,
     paused: bool,
+    remaining_hint: usize,
 }
 
 impl MemorySource {
-    /// Create a new `MemorySource` from a vec of events.
+    /// Create a new `MemorySource` from a vec of events. The source consumes
+    /// the events by move; `reset()` is disabled (the iterator, once drained,
+    /// cannot be rewound).
     pub fn new(events: Vec<Event>, batch_size: usize) -> Self {
+        let remaining_hint = events.len();
         Self {
-            events,
-            position: 0,
+            iter: events.into_iter(),
+            original: None,
             batch_size,
             paused: false,
+            remaining_hint,
+        }
+    }
+
+    /// Create a `MemorySource` that supports `reset()` — the events are kept
+    /// alive via an internal `Clone` and re-seeded on reset. Prefer `new()`
+    /// in benchmarks to avoid the extra `Vec<Event>` clone on construction.
+    pub fn new_resetable(events: Vec<Event>, batch_size: usize) -> Self {
+        let remaining_hint = events.len();
+        Self {
+            iter: events.clone().into_iter(),
+            original: Some(events),
+            batch_size,
+            paused: false,
+            remaining_hint,
         }
     }
 
     /// Number of events remaining.
     pub fn remaining(&self) -> usize {
-        self.events.len().saturating_sub(self.position)
+        self.remaining_hint
     }
 
     /// Whether all events have been consumed.
     pub fn is_exhausted(&self) -> bool {
-        self.position >= self.events.len()
+        self.remaining_hint == 0
     }
 
-    /// Reset position to beginning (for repeated benchmarks).
+    /// Reset position to beginning. Only supported on sources created via
+    /// `new_resetable()`; a no-op otherwise.
     pub fn reset(&mut self) {
-        self.position = 0;
+        if let Some(ref original) = self.original {
+            self.iter = original.clone().into_iter();
+            self.remaining_hint = original.len();
+        }
     }
 }
 
 impl Source for MemorySource {
     async fn next_batch(&mut self) -> Result<Vec<Event>, AeonError> {
-        if self.paused || self.position >= self.events.len() {
+        if self.paused || self.remaining_hint == 0 {
             return Ok(Vec::new());
         }
-
-        let end = (self.position + self.batch_size).min(self.events.len());
-        let batch = self.events[self.position..end].to_vec();
-        self.position = end;
+        // Moves events out of the iterator — no Event::clone, no shift.
+        let batch: Vec<Event> = self.iter.by_ref().take(self.batch_size).collect();
+        self.remaining_hint = self.remaining_hint.saturating_sub(batch.len());
         Ok(batch)
     }
 
@@ -120,7 +152,7 @@ mod tests {
     #[tokio::test]
     async fn memory_source_reset() {
         let events = make_events(5);
-        let mut source = MemorySource::new(events, 10);
+        let mut source = MemorySource::new_resetable(events, 10);
 
         let _ = source.next_batch().await.unwrap();
         assert!(source.is_exhausted());
@@ -130,5 +162,15 @@ mod tests {
 
         let batch = source.next_batch().await.unwrap();
         assert_eq!(batch.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn memory_source_new_is_not_resetable() {
+        let events = make_events(3);
+        let mut source = MemorySource::new(events, 10);
+        let _ = source.next_batch().await.unwrap();
+        assert!(source.is_exhausted());
+        source.reset(); // No-op for non-resetable source.
+        assert!(source.is_exhausted());
     }
 }
