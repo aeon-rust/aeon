@@ -400,10 +400,12 @@ fn cmd_serve(addr: &str, artifact_dir: &str) -> Result<()> {
     rt.block_on(async {
         // Resolve artifact directory from env or CLI flag
         let dir = std::env::var("AEON_ARTIFACT_DIR").unwrap_or_else(|_| artifact_dir.to_string());
-        let registry = aeon_engine::registry::ProcessorRegistry::new(&dir)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        let pipelines = aeon_engine::pipeline_manager::PipelineManager::new();
-        let identities = aeon_engine::identity_store::ProcessorIdentityStore::new();
+        let registry = Arc::new(
+            aeon_engine::registry::ProcessorRegistry::new(&dir)
+                .map_err(|e| anyhow::anyhow!("{e}"))?,
+        );
+        let pipelines = Arc::new(aeon_engine::pipeline_manager::PipelineManager::new());
+        let identities = Arc::new(aeon_engine::identity_store::ProcessorIdentityStore::new());
 
         // Cluster initialization — detect K8s environment
         let cluster_enabled = std::env::var("AEON_CLUSTER_ENABLED")
@@ -449,6 +451,19 @@ fn cmd_serve(addr: &str, artifact_dir: &str) -> Result<()> {
                         .map_err(|e| anyhow::anyhow!("Cluster bootstrap failed: {e}"))?;
 
                     let node = Arc::new(node);
+
+                    // Install the engine-side RegistryApplier so RegistryCommand
+                    // entries committed through Raft (from any node) dispatch to
+                    // this node's ProcessorRegistry / PipelineManager. Without this,
+                    // pipelines created via REST on one node would replicate but
+                    // never take effect on follower replicas.
+                    node.install_registry_applier(Arc::new(
+                        aeon_engine::ClusterRegistryApplier::new(
+                            Arc::clone(&registry),
+                            Arc::clone(&pipelines),
+                        ),
+                    ))
+                    .await;
 
                     // Spawn background task for leader election + partition assignment.
                     // Retries for up to 120s. Each iteration checks:
@@ -515,13 +530,13 @@ fn cmd_serve(addr: &str, artifact_dir: &str) -> Result<()> {
         };
 
         let state = Arc::new(aeon_engine::AppState {
-            registry: Arc::new(registry),
-            pipelines: Arc::new(pipelines),
+            registry,
+            pipelines,
             delivery_ledgers: dashmap::DashMap::new(),
             pipeline_controls: dashmap::DashMap::new(),
             pipeline_metrics: dashmap::DashMap::new(),
             poh_chains: dashmap::DashMap::new(),
-            identities: Arc::new(identities),
+            identities,
             authenticator: None,
             ws_host: None,
             cluster_node: cluster_node.clone(),

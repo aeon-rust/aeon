@@ -497,6 +497,34 @@ async fn register_processor(
         description: req.description,
         version: req.version,
     };
+
+    // Cluster mode: replicate the register via Raft so every node's local
+    // registry observes the new processor version.
+    #[cfg(feature = "cluster")]
+    if let Some(node) = state.cluster_node.as_ref() {
+        return match node.propose_registry(cmd).await {
+            Ok(aeon_types::RegistryResponse::ProcessorRegistered { name, version }) => (
+                StatusCode::CREATED,
+                Json(serde_json::json!({
+                    "status": "registered",
+                    "name": name,
+                    "version": version,
+                    "replicated": true,
+                })),
+            )
+                .into_response(),
+            Ok(aeon_types::RegistryResponse::Error { message }) => {
+                api_error(StatusCode::BAD_REQUEST, message).into_response()
+            }
+            Ok(other) => (
+                StatusCode::OK,
+                Json(serde_json::to_value(&other).unwrap_or_default()),
+            )
+                .into_response(),
+            Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        };
+    }
+
     let resp = state.registry.apply(cmd).await;
     match resp {
         aeon_types::registry::RegistryResponse::ProcessorRegistered { name, version } => (
@@ -646,6 +674,22 @@ async fn start_pipeline(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
+    #[cfg(feature = "cluster")]
+    if let Some(node) = state.cluster_node.as_ref() {
+        let cmd = aeon_types::RegistryCommand::SetPipelineState {
+            name: name.clone(),
+            state: aeon_types::registry::PipelineState::Running,
+        };
+        return match node.propose_registry(cmd).await {
+            Ok(aeon_types::RegistryResponse::Error { message }) => {
+                api_error(StatusCode::BAD_REQUEST, message).into_response()
+            }
+            Ok(_) => Json(serde_json::json!({"status": "started", "replicated": true}))
+                .into_response(),
+            Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        };
+    }
+
     match state.pipelines.start(&name, "api").await {
         Ok(()) => Json(serde_json::json!({"status": "started"})).into_response(),
         Err(e) => api_error(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
@@ -656,6 +700,22 @@ async fn stop_pipeline(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
+    #[cfg(feature = "cluster")]
+    if let Some(node) = state.cluster_node.as_ref() {
+        let cmd = aeon_types::RegistryCommand::SetPipelineState {
+            name: name.clone(),
+            state: aeon_types::registry::PipelineState::Stopped,
+        };
+        return match node.propose_registry(cmd).await {
+            Ok(aeon_types::RegistryResponse::Error { message }) => {
+                api_error(StatusCode::BAD_REQUEST, message).into_response()
+            }
+            Ok(_) => Json(serde_json::json!({"status": "stopped", "replicated": true}))
+                .into_response(),
+            Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        };
+    }
+
     match state.pipelines.stop(&name, "api").await {
         Ok(()) => Json(serde_json::json!({"status": "stopped"})).into_response(),
         Err(e) => api_error(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
@@ -772,6 +832,21 @@ async fn upgrade_pipeline(
         req.processor_name.clone(),
         req.processor_version.clone(),
     );
+
+    // Cluster mode: replicate the metadata upgrade via Raft so every node's
+    // local PipelineManager reflects the new processor ref. The actual hot-swap
+    // below (drain→swap→resume) still happens per-node — only the node(s) that
+    // own the pipeline's PipelineControl handle can swap the running processor.
+    #[cfg(feature = "cluster")]
+    if let Some(node) = state.cluster_node.as_ref() {
+        let cmd = aeon_types::RegistryCommand::UpgradePipeline {
+            name: name.clone(),
+            new_processor: proc_ref.clone(),
+        };
+        if let Err(e) = node.propose_registry(cmd).await {
+            return api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+    }
 
     // If a PipelineControl handle exists, perform a real drain→swap→resume.
     // Otherwise, fall back to metadata-only upgrade.
@@ -1042,6 +1117,19 @@ async fn delete_pipeline(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
+    #[cfg(feature = "cluster")]
+    if let Some(node) = state.cluster_node.as_ref() {
+        let cmd = aeon_types::RegistryCommand::DeletePipeline { name: name.clone() };
+        return match node.propose_registry(cmd).await {
+            Ok(aeon_types::RegistryResponse::Error { message }) => {
+                api_error(StatusCode::BAD_REQUEST, message).into_response()
+            }
+            Ok(_) => Json(serde_json::json!({"status": "deleted", "replicated": true}))
+                .into_response(),
+            Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        };
+    }
+
     match state.pipelines.delete(&name).await {
         Ok(()) => Json(serde_json::json!({"status": "deleted"})).into_response(),
         Err(e) => api_error(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
