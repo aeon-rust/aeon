@@ -367,9 +367,9 @@ is retained for historical reference.
 | **ZD-1** | ~~Add `POST /api/v1/processors` route + handler~~ | **Done** — `rest_api.rs:113` wires `get(list_processors).post(register_processor)`; handler at `rest_api.rs:597`; integration test `register_processor_via_api` at `rest_api.rs:1926`; CLI-level regression guard in `aeon-cli/tests/cli.rs`. | ✅ |
 | **ZD-2** | ~~Fix CLI serde PascalCase -> kebab-case~~ | **Done** — commit fa10635 (2026-04-11); already using `"wasm"`, `"native-so"`, `"available"`. Now guarded by `processor_register_sends_kebab_case_type_and_available_status` in `aeon-cli/tests/cli.rs`. | ✅ |
 | **ZD-3** | ~~Replace SHA-512 placeholder with real SHA-512~~ | **Done** — `registry.rs:291` now uses `sha2::Sha512::digest(data)`; verified callsites at `:82` (hash comparison on retrieve) and `:324` (hash on store). | ✅ |
-| **ZD-4** | Source `pause()`/`resume()` + pipeline drain mechanism | Plan Phase B1-B2 | Medium |
-| **ZD-5** | Hot-swap orchestrator — drain->swap->resume for Wasm/Native | Plan Phase B3-B4 | Medium |
-| **ZD-6** | Same-type source/sink reconfiguration | Plan Phase C1-C3 | Medium |
+| **ZD-4** | ~~Source `pause()`/`resume()` + pipeline drain mechanism~~ | **Done** — `Source::{pause,resume}` default methods in `aeon-types/src/traits.rs:36,44`; overridden in `connectors/memory/source.rs` and `connectors/kafka/source.rs`; `pipeline::drain_and_swap` at `pipeline.rs:1388` + `drain_and_swap_source/sink` at `:1410/:1431`. | ✅ |
+| **ZD-5** | ~~Hot-swap orchestrator — drain->swap->resume for Wasm/Native~~ | **Done** — `PipelineManager::upgrade_blue_green` at `pipeline_manager.rs:234` (5 tests), REST at `rest_api.rs:996`. Canary upgrade_canary at `:371` (4 tests), REST at `rest_api.rs:1051` with step/threshold config, promote/rollback/cutover endpoints. | ✅ |
+| **ZD-6** | ~~Same-type source/sink reconfiguration~~ | **Done** — `reconfigure_source` at `pipeline_manager.rs:513`, `reconfigure_sink` at `:567` (cross-type rejection + not-running rejection tests); REST endpoints at `rest_api.rs:1188,1205`. | ✅ |
 | **ZD-7** | Cross-type connector swap via blue-green pipeline | Deferred (ZD-9 in old list) | High |
 
 ### Pillar 3: Cluster Operations & Validation
