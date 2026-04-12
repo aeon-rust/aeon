@@ -4,10 +4,13 @@
 > development setups through multi-node production deployments.
 >
 > **Implementation status**: Single-node Raft is implemented and tested. Multi-node
-> cluster validation (3+ nodes, partition transfer, leader failover) is deferred to
-> post-Gate 2 as it requires multi-node infrastructure. The architecture, traits, and
-> QUIC transport code exist but have not been validated in a multi-node deployment.
-> See `docs/ROADMAP.md` for the Gate 2 deferred tasks.
+> cluster validation was completed on a 3-node DigitalOcean Kubernetes (DOKS) cluster
+> on 2026-04-12 — leader failover, log replication, node rejoin, and cross-node QUIC
+> were all validated (all nodes reached consistent state: `log_idx=16, applied=16,
+> term=25`). Remaining multi-node work (Gate 2 acceptance criteria, partition transfer
+> CL-6, cluster metrics) is tracked in `docs/FAULT-TOLERANCE-ANALYSIS.md` Section 7
+> (Pillar 3). Note that local Rancher Desktop K3s is single-node; multi-node testing
+> requires DOKS/EKS/GKE or a real multi-node K3s cluster.
 
 ---
 

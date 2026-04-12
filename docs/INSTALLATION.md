@@ -11,6 +11,9 @@
 > Docker installation methods are designed; `cargo install aeon-cli` and Docker Hub
 > images are not yet published (see `docs/PUBLISHING.md`). Currently, Aeon runs from
 > source via `cargo run` or `cargo build --release`.
+>
+> **Build from source**: See [`docs/BUILD-FROM-SOURCE.md`](BUILD-FROM-SOURCE.md) for
+> per-platform prerequisites, build commands, and verification steps.
 
 ---
 

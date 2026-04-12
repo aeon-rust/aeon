@@ -340,6 +340,24 @@ Currently Wasm-oriented (imports from `env` module). For T3/T4, the wire format 
 | **Delphi / Pascal** | — | — | — | ✓ | T4 |
 | **COBOL** (via FFI) | — | — | — | ✓ | T4 |
 
+**Language limitations by tier:**
+
+- **T1 (Native)** is inherently limited to languages that compile to C-ABI shared libraries
+  (`.so`/`.dll`/`.dylib`): Rust, C/C++, and C# via NativeAOT. Other languages cannot
+  produce T1 processors — this is a runtime constraint, not an Aeon limitation.
+
+- **T2 (Wasm)** is limited to languages with mature `wasm32-unknown-unknown` compilation:
+  Rust, AssemblyScript, C/C++, Zig, Go (TinyGo), Kotlin/Native. Languages like Python,
+  Java, C#, and PHP cannot practically compile to Wasm.
+
+- **T3 (WebTransport)** is architecturally complete on Aeon's side, but client library
+  maturity varies. Currently ready: Python (`aioquic`), Go (`quic-go`), Rust (`wtransport`).
+  Deferred for 5+ languages due to immature WT client libraries. See
+  [`docs/WT-SDK-INTEGRATION-PLAN.md`](WT-SDK-INTEGRATION-PLAN.md) and
+  [`docs/FAULT-TOLERANCE-ANALYSIS.md`](FAULT-TOLERANCE-ANALYSIS.md) Section 10 for details.
+
+- **T4 (WebSocket)** is universally available — any language with a WebSocket client works.
+
 ### 3.3 Performance Comparison
 
 | Metric | T1 Native | T2 Wasm | T3 WebTransport | T4 WebSocket |

@@ -35,7 +35,7 @@ aeon/
 └── crates/
     ├── aeon-types/               # Canonical Event envelope, ALL shared traits, error types
     ├── aeon-io/                  # tokio-uring zero-copy I/O abstraction layer
-    ├── aeon-state/               # L1 DashMap + L2 mmap + L3 RocksDB multi-tier state
+    ├── aeon-state/               # L1 DashMap + L2 mmap + L3 redb/RocksDB multi-tier state
     ├── aeon-wasm/                # Wasmtime host, WIT contracts, fuel metering, multi-language
     ├── aeon-connectors/          # All Source/Sink trait implementations (feature-gated)
     │   └── src/{kafka,redis,nats,mqtt,...}/
@@ -146,7 +146,7 @@ All error handling uses `Result<T, AeonError>`. Error categories:
 |----------|----------|------------|
 | `Connection` | Broker unreachable, TLS handshake failure | Yes (with backoff) |
 | `Serialization` | Malformed event, bincode decode failure | No (send to DLQ) |
-| `State` | RocksDB write failure, mmap error | Depends on cause |
+| `State` | L3 (redb/RocksDB) write failure, mmap error | Depends on cause |
 | `Processor` | Wasm trap, fuel exhausted, guest panic | No (send to DLQ) |
 | `Config` | Invalid manifest, missing field | No (fatal at startup) |
 | `Cluster` | Raft error, partition transfer failure, QUIC disconnect | Yes (Raft retry) |
@@ -413,9 +413,10 @@ L2 (Warm) — memmap2 (mmap) files
             RAM-speed persistence with OS page cache
             Dirty-page tracking + async flush to L3
 
-L3 (Cold) — RocksDB with UUIDv7-ordered column families
-            Durable cold storage
-            Compaction tuned for append-heavy workloads
+L3 (Cold) — Pluggable via L3Store trait (redb default, RocksDB optional)
+            redb: Pure Rust B-tree DB, ACID, zero C dependencies
+            RocksDB: LSM-tree, pluggable via same L3Store trait (future)
+            Backend selected via config: state.l3.backend = redb | rocksdb
 ```
 
 **Interest-based retention**: Buffer entries purged only after explicit Sink Confirmation.
@@ -433,7 +434,7 @@ On node restart, rewind source to last safe offset for exactly-once recovery.
 | SPSC ring buffers | **Lost** (volatile) | N/A (local) | N/A |
 | L1 DashMap state | **Lost** (volatile) | N/A (local) | N/A |
 | L2 mmap state | **Survives** (OS may flush) | N/A (local) | **Survives** |
-| L3 RocksDB state | **Survives** (WAL + fsync) | N/A (local) | **Survives** |
+| L3 state (redb/RocksDB) | **Survives** (ACID transactions) | N/A (local) | **Survives** |
 | Source-Anchor offset | **Survives** (in L3) | N/A (local) | **Survives** |
 | PoH chain | **Survives** (tip in L3) | Paused (no new events) | **Survives** (resumes on rejoin) |
 | Merkle log | **Survives** (in L3) | Paused | **Survives** |
@@ -475,7 +476,7 @@ The sink acknowledgement → Source-Anchor offset write sequence must be ordered
 
 ```
 1. Sink confirms batch delivery (ack from Redpanda/external system)
-2. Write new Source-Anchor offset to L3 (RocksDB WAL, fsync)
+2. Write new Source-Anchor offset to L3 (redb ACID transaction / RocksDB WAL+fsync)
 3. Advance internal offset counter
 ```
 
@@ -1640,7 +1641,7 @@ extends cleanly to non-Kafka sources in the future.
 #### Two-phase partition transfer protocol (over QUIC)
 
 Naive approach (pause → transfer everything → resume) causes unacceptable downtime for
-large L3 state (gigabytes of RocksDB SST files). Instead, use two phases:
+large L3 state (gigabytes of redb/RocksDB data files). Instead, use two phases:
 
 ```
 Source Node                              Target Node
@@ -1649,7 +1650,7 @@ Source Node                              Target Node
      │                                        │
      │──── TransferInit(partition_id) ───────▶│
      │                                        │
-     │──── L3 RocksDB SST files ────────────▶│  (background, can be GBs)
+     │──── L3 state data files ─────────────▶│  (background, can be GBs)
      │──── (source continues processing,     │
      │      new writes go to WAL delta)      │
      │                                        │
@@ -1812,7 +1813,7 @@ aeon cluster rebalance
 | Async runtime | Tokio (+ tokio-uring on Linux 5.11+) | io_uring where available; standard tokio fallback |
 | Wasm runtime | Wasmtime (Component Model) | Best fuel/metering, WIT-based contracts |
 | Event serialization | Bincode (hot path) + JSON (config) | Zero-copy, minimal overhead |
-| Event IDs | UUIDv7 | Time-ordered -> 6x faster RocksDB indexing |
+| Event IDs | UUIDv7 | Time-ordered -> 6x faster L3 indexing (B-tree/LSM) |
 | SIMD | memchr crate | Production-stable, portable (AVX2 + NEON) |
 | QUIC | quinn (not quiche) | Async-native Tokio, no C build deps, natural openraft fit |
 | Consensus | openraft (always-on, even single-node) | Clean 1→3→5 scaling via membership changes |
@@ -1820,7 +1821,7 @@ aeon cluster rebalance
 | Error handling | thiserror + anyhow | No panics; typed errors in libs, anyhow in CLI |
 | L1 State | DashMap + #[repr(align(64))] | Lock-free, false sharing prevention |
 | L2 State | memmap2 | RAM-speed persistence |
-| L3 State | RocksDB | Durable, UUIDv7-optimized |
+| L3 State | redb (default) / RocksDB (pluggable) | Durable, ACID; `L3Store` trait, `L3Backend` config enum |
 | Inter-node framing | bincode + 4-byte LE prefix | Compact, zero-copy-friendly |
 | TLS | rustls + aws-lc-rs | FIPS 140-3 certified, AWS-maintained, rustls default crypto provider |
 | Kafka partition mgmt | Manual assign (not consumer groups) | Decouples Aeon scaling from Kafka rebalance protocol |
