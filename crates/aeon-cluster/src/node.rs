@@ -785,6 +785,110 @@ mod inner {
                 .count()
         }
 
+        /// Format current Raft + cluster metrics as Prometheus exposition text (CL-4).
+        ///
+        /// Emits:
+        /// - `aeon_raft_term` — current term (monotonic; increments on each election attempt)
+        /// - `aeon_raft_last_log_index` — most recent log index
+        /// - `aeon_raft_last_applied_index` — most recent applied log index
+        /// - `aeon_raft_leader_id` — current leader's NodeId (0 if unknown)
+        /// - `aeon_raft_is_leader` — 1 on the leader, 0 elsewhere
+        /// - `aeon_raft_state` — 0=Learner, 1=Follower, 2=Candidate, 3=Leader, 4=Shutdown
+        /// - `aeon_cluster_membership_size` — voter count
+        /// - `aeon_cluster_node_id` — this node's NodeId (label for multi-node scrape)
+        /// - `aeon_raft_millis_since_quorum_ack` — leader-only; elapsed ms since
+        ///   last quorum ack (high values suggest leader partitioned from cluster)
+        /// - `aeon_raft_replication_lag{follower="N"}` — leader-only; per-follower
+        ///   replication lag in log entries (last_log_index - follower_matched_index)
+        ///
+        /// Monitoring hints:
+        /// - A flapping `aeon_raft_term` + low `aeon_raft_is_leader` across the
+        ///   cluster signals election storms (GAP 6 / pre-vote mitigations in FT-4).
+        /// - A sustained non-zero `aeon_raft_replication_lag` on a follower
+        ///   indicates catch-up pressure or follower lag.
+        /// - `aeon_raft_millis_since_quorum_ack` above 2× election_max suggests
+        ///   the leader has lost contact with a quorum.
+        pub fn cluster_metrics_prometheus(&self) -> String {
+            use openraft::ServerState;
+
+            let metrics = self.raft.metrics().borrow().clone();
+
+            let term = metrics.current_term;
+            let last_log = metrics.last_log_index.unwrap_or(0);
+            let last_applied = metrics.last_applied.map(|l| l.index).unwrap_or(0);
+            let leader = metrics.current_leader.unwrap_or(0);
+            let node_id = self.config.node_id;
+            let is_leader: u64 = if metrics.current_leader == Some(node_id) { 1 } else { 0 };
+            let state_code: u64 = match metrics.state {
+                ServerState::Learner => 0,
+                ServerState::Follower => 1,
+                ServerState::Candidate => 2,
+                ServerState::Leader => 3,
+                ServerState::Shutdown => 4,
+            };
+            let membership_size = metrics
+                .membership_config
+                .membership()
+                .voter_ids()
+                .count() as u64;
+
+            let mut out = String::with_capacity(2048);
+
+            out.push_str("# HELP aeon_raft_term Current Raft term (monotonic; +1 on each election attempt)\n");
+            out.push_str("# TYPE aeon_raft_term gauge\n");
+            out.push_str(&format!("aeon_raft_term{{node_id=\"{node_id}\"}} {term}\n"));
+
+            out.push_str("# HELP aeon_raft_last_log_index Most recent Raft log index\n");
+            out.push_str("# TYPE aeon_raft_last_log_index gauge\n");
+            out.push_str(&format!("aeon_raft_last_log_index{{node_id=\"{node_id}\"}} {last_log}\n"));
+
+            out.push_str("# HELP aeon_raft_last_applied_index Most recent applied log index\n");
+            out.push_str("# TYPE aeon_raft_last_applied_index gauge\n");
+            out.push_str(&format!("aeon_raft_last_applied_index{{node_id=\"{node_id}\"}} {last_applied}\n"));
+
+            out.push_str("# HELP aeon_raft_leader_id Current Raft leader NodeId (0 if unknown)\n");
+            out.push_str("# TYPE aeon_raft_leader_id gauge\n");
+            out.push_str(&format!("aeon_raft_leader_id{{node_id=\"{node_id}\"}} {leader}\n"));
+
+            out.push_str("# HELP aeon_raft_is_leader 1 if this node is the current leader, 0 otherwise\n");
+            out.push_str("# TYPE aeon_raft_is_leader gauge\n");
+            out.push_str(&format!("aeon_raft_is_leader{{node_id=\"{node_id}\"}} {is_leader}\n"));
+
+            out.push_str("# HELP aeon_raft_state Raft server state (0=Learner,1=Follower,2=Candidate,3=Leader)\n");
+            out.push_str("# TYPE aeon_raft_state gauge\n");
+            out.push_str(&format!("aeon_raft_state{{node_id=\"{node_id}\"}} {state_code}\n"));
+
+            out.push_str("# HELP aeon_cluster_membership_size Number of voters in the current membership\n");
+            out.push_str("# TYPE aeon_cluster_membership_size gauge\n");
+            out.push_str(&format!("aeon_cluster_membership_size{{node_id=\"{node_id}\"}} {membership_size}\n"));
+
+            out.push_str("# HELP aeon_cluster_node_id This node's configured NodeId\n");
+            out.push_str("# TYPE aeon_cluster_node_id gauge\n");
+            out.push_str(&format!("aeon_cluster_node_id {node_id}\n"));
+
+            if let Some(ms) = metrics.millis_since_quorum_ack {
+                out.push_str("# HELP aeon_raft_millis_since_quorum_ack Elapsed ms since last quorum ack (leader only)\n");
+                out.push_str("# TYPE aeon_raft_millis_since_quorum_ack gauge\n");
+                out.push_str(&format!(
+                    "aeon_raft_millis_since_quorum_ack{{node_id=\"{node_id}\"}} {ms}\n"
+                ));
+            }
+
+            if let Some(repl) = metrics.replication.as_ref() {
+                out.push_str("# HELP aeon_raft_replication_lag Per-follower replication lag in log entries (leader only)\n");
+                out.push_str("# TYPE aeon_raft_replication_lag gauge\n");
+                for (follower_id, matched) in repl.iter() {
+                    let matched_idx = matched.as_ref().map(|l| l.index).unwrap_or(0);
+                    let lag = last_log.saturating_sub(matched_idx);
+                    out.push_str(&format!(
+                        "aeon_raft_replication_lag{{node_id=\"{node_id}\",follower=\"{follower_id}\"}} {lag}\n"
+                    ));
+                }
+            }
+
+            out
+        }
+
         /// Propose a ClusterRequest through Raft consensus.
         pub async fn propose(&self, request: ClusterRequest) -> Result<ClusterResponse, AeonError> {
             let response =

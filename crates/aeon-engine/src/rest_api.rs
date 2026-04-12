@@ -102,7 +102,8 @@ pub fn api_router(state: Arc<AppState>) -> Router {
     // Health routes — no auth required
     let health_routes = Router::new()
         .route("/health", get(health))
-        .route("/ready", get(ready));
+        .route("/ready", get(ready))
+        .route("/metrics", get(metrics_prometheus));
 
     // API routes — auth required when token is configured
     let api_routes = Router::new()
@@ -386,6 +387,111 @@ async fn ready() -> Json<HealthResponse> {
         status: "ready",
         version: env!("CARGO_PKG_VERSION"),
     })
+}
+
+// ── Prometheus metrics endpoint ───────────────────────────────────────
+
+/// `GET /metrics` — Prometheus exposition for the full Aeon node.
+///
+/// Emits per-pipeline aggregate counters (events received/processed/sent,
+/// checkpoints, failures, retries, PoH entries) plus cluster-level Raft
+/// metrics (term, leader, replication lag, membership size — see
+/// `ClusterNode::cluster_metrics_prometheus` / CL-4) when cluster mode is on.
+///
+/// No auth — Prometheus scrapers are typically deployed inside the cluster
+/// boundary. Sits on the health_routes sub-router which bypasses the Bearer
+/// auth middleware.
+async fn metrics_prometheus(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    use std::sync::atomic::Ordering;
+
+    let mut out = String::with_capacity(4096);
+
+    // Per-pipeline aggregates
+    out.push_str("# HELP aeon_pipeline_events_received_total Events received by a pipeline's source\n");
+    out.push_str("# TYPE aeon_pipeline_events_received_total counter\n");
+    for entry in state.pipeline_metrics.iter() {
+        let (name, m) = (entry.key(), entry.value());
+        out.push_str(&format!(
+            "aeon_pipeline_events_received_total{{pipeline=\"{name}\"}} {}\n",
+            m.events_received.load(Ordering::Relaxed)
+        ));
+    }
+
+    out.push_str("# HELP aeon_pipeline_events_processed_total Events processed by a pipeline's processor\n");
+    out.push_str("# TYPE aeon_pipeline_events_processed_total counter\n");
+    for entry in state.pipeline_metrics.iter() {
+        let (name, m) = (entry.key(), entry.value());
+        out.push_str(&format!(
+            "aeon_pipeline_events_processed_total{{pipeline=\"{name}\"}} {}\n",
+            m.events_processed.load(Ordering::Relaxed)
+        ));
+    }
+
+    out.push_str("# HELP aeon_pipeline_outputs_sent_total Outputs delivered by a pipeline's sink\n");
+    out.push_str("# TYPE aeon_pipeline_outputs_sent_total counter\n");
+    for entry in state.pipeline_metrics.iter() {
+        let (name, m) = (entry.key(), entry.value());
+        out.push_str(&format!(
+            "aeon_pipeline_outputs_sent_total{{pipeline=\"{name}\"}} {}\n",
+            m.outputs_sent.load(Ordering::Relaxed)
+        ));
+    }
+
+    out.push_str("# HELP aeon_pipeline_events_failed_total Events permanently failed (retry-exhausted or skip-to-dlq)\n");
+    out.push_str("# TYPE aeon_pipeline_events_failed_total counter\n");
+    for entry in state.pipeline_metrics.iter() {
+        let (name, m) = (entry.key(), entry.value());
+        out.push_str(&format!(
+            "aeon_pipeline_events_failed_total{{pipeline=\"{name}\"}} {}\n",
+            m.events_failed.load(Ordering::Relaxed)
+        ));
+    }
+
+    out.push_str("# HELP aeon_pipeline_events_retried_total Individual retry attempts\n");
+    out.push_str("# TYPE aeon_pipeline_events_retried_total counter\n");
+    for entry in state.pipeline_metrics.iter() {
+        let (name, m) = (entry.key(), entry.value());
+        out.push_str(&format!(
+            "aeon_pipeline_events_retried_total{{pipeline=\"{name}\"}} {}\n",
+            m.events_retried.load(Ordering::Relaxed)
+        ));
+    }
+
+    out.push_str("# HELP aeon_pipeline_checkpoints_written_total Checkpoint records appended\n");
+    out.push_str("# TYPE aeon_pipeline_checkpoints_written_total counter\n");
+    for entry in state.pipeline_metrics.iter() {
+        let (name, m) = (entry.key(), entry.value());
+        out.push_str(&format!(
+            "aeon_pipeline_checkpoints_written_total{{pipeline=\"{name}\"}} {}\n",
+            m.checkpoints_written.load(Ordering::Relaxed)
+        ));
+    }
+
+    out.push_str("# HELP aeon_pipeline_poh_entries_total PoH chain entries appended (per batch)\n");
+    out.push_str("# TYPE aeon_pipeline_poh_entries_total counter\n");
+    for entry in state.pipeline_metrics.iter() {
+        let (name, m) = (entry.key(), entry.value());
+        out.push_str(&format!(
+            "aeon_pipeline_poh_entries_total{{pipeline=\"{name}\"}} {}\n",
+            m.poh_entries.load(Ordering::Relaxed)
+        ));
+    }
+
+    // Cluster-level Raft metrics (CL-4)
+    #[cfg(feature = "cluster")]
+    if let Some(node) = state.cluster_node.as_ref() {
+        out.push_str(&node.cluster_metrics_prometheus());
+    }
+
+    (
+        StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        out,
+    )
+        .into_response()
 }
 
 // ── Cluster status endpoint ───────────────────────────────────────────
@@ -1654,6 +1760,109 @@ mod tests {
             #[cfg(feature = "cluster")]
             cluster_node: None,
         })
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_exposes_pipeline_counters() {
+        use std::sync::atomic::Ordering;
+
+        let state = test_state();
+
+        // Seed a fake pipeline's metrics so the exposition has something to emit.
+        let m = Arc::new(crate::pipeline::PipelineMetrics::new());
+        m.events_received.store(1234, Ordering::Relaxed);
+        m.events_processed.store(1200, Ordering::Relaxed);
+        m.outputs_sent.store(1180, Ordering::Relaxed);
+        m.events_failed.store(7, Ordering::Relaxed);
+        state.pipeline_metrics.insert("demo".into(), m);
+
+        let app = api_router(state);
+        let resp = app
+            .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .cloned();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+
+        // Content-Type must be Prometheus text (otherwise scrapers reject it)
+        assert!(
+            ct.as_ref()
+                .map(|v| v.to_str().unwrap_or("").contains("text/plain"))
+                .unwrap_or(false),
+            "metrics content-type should be text/plain, got {ct:?}"
+        );
+
+        // Help/type headers + per-pipeline labelled counters
+        assert!(text.contains("# TYPE aeon_pipeline_events_received_total counter"));
+        assert!(text.contains("aeon_pipeline_events_received_total{pipeline=\"demo\"} 1234"));
+        assert!(text.contains("aeon_pipeline_events_processed_total{pipeline=\"demo\"} 1200"));
+        assert!(text.contains("aeon_pipeline_outputs_sent_total{pipeline=\"demo\"} 1180"));
+        assert!(text.contains("aeon_pipeline_events_failed_total{pipeline=\"demo\"} 7"));
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn metrics_endpoint_includes_cluster_metrics_when_clustered() {
+        use std::sync::atomic::Ordering;
+
+        // Build a single-node cluster and plug it into AppState so the /metrics
+        // handler reaches cluster_metrics_prometheus().
+        let cfg = aeon_cluster::ClusterConfig::single_node(42, 4);
+        let node = Arc::new(aeon_cluster::ClusterNode::bootstrap_single(cfg).await.unwrap());
+
+        // Start from a standard test_state() but swap in the cluster_node field.
+        let base = test_state();
+        let state = Arc::new(AppState {
+            registry: base.registry.clone(),
+            pipelines: base.pipelines.clone(),
+            delivery_ledgers: dashmap::DashMap::new(),
+            pipeline_controls: dashmap::DashMap::new(),
+            pipeline_metrics: dashmap::DashMap::new(),
+            #[cfg(feature = "processor-auth")]
+            poh_chains: dashmap::DashMap::new(),
+            identities: base.identities.clone(),
+            #[cfg(feature = "processor-auth")]
+            authenticator: None,
+            #[cfg(not(feature = "processor-auth"))]
+            api_token: None,
+            #[cfg(feature = "websocket-host")]
+            ws_host: None,
+            cluster_node: Some(Arc::clone(&node)),
+        });
+
+        // Touch a pipeline metric so the pipeline section is non-empty too.
+        let m = Arc::new(crate::pipeline::PipelineMetrics::new());
+        m.events_received.store(5, Ordering::Relaxed);
+        state.pipeline_metrics.insert("demo".into(), m);
+
+        let app = api_router(state);
+        let resp = app
+            .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+
+        // Cluster gauges carry the node_id label and the configured NodeId (42)
+        assert!(text.contains("aeon_raft_term{node_id=\"42\"}"));
+        assert!(text.contains("aeon_raft_is_leader{node_id=\"42\"} 1"));
+        assert!(text.contains("aeon_cluster_membership_size{node_id=\"42\"} 1"));
+        assert!(text.contains("aeon_cluster_node_id 42"));
+        // And the pipeline section is still emitted alongside
+        assert!(text.contains("aeon_pipeline_events_received_total{pipeline=\"demo\"} 5"));
+
+        node.shutdown().await.unwrap();
     }
 
     #[tokio::test]
