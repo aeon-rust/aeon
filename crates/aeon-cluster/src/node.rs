@@ -224,14 +224,16 @@ mod inner {
                 ..Config::default()
             });
 
-            let log_store =
-                L3RaftLogStore::open(log_backend)
-                    .await
-                    .map_err(|e| AeonError::Cluster {
-                        message: format!("failed to open persistent Raft log: {e}"),
-                        source: None,
-                    })?;
-            let state_machine = StateMachineStore::new();
+            let log_store = L3RaftLogStore::open(Arc::clone(&log_backend))
+                .await
+                .map_err(|e| AeonError::Cluster {
+                    message: format!("failed to open persistent Raft log: {e}"),
+                    source: None,
+                })?;
+            // FT-2: share the same L3 backend for persistent snapshots so a
+            // restart can recover from snapshot + tail log rather than full
+            // log replay.
+            let state_machine = StateMachineStore::new_persistent(log_backend)?;
             let shared_state = state_machine.shared_state();
             let network = StubNetworkFactory;
 

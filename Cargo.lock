@@ -50,6 +50,7 @@ name = "aeon-cluster"
 version = "0.1.0"
 dependencies = [
  "aeon-crypto",
+ "aeon-state",
  "aeon-types",
  "bincode",
  "dashmap",
@@ -60,6 +61,7 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",

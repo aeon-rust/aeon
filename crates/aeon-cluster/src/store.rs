@@ -13,12 +13,19 @@ mod inner {
     use std::ops::RangeBounds;
     use std::sync::Arc;
 
+    use aeon_types::{BatchOp, L3Store};
     use openraft::storage::{
         LogFlushed, LogState, RaftLogReader, RaftLogStorage, RaftStateMachine,
     };
     use openraft::storage::{RaftSnapshotBuilder, Snapshot, SnapshotMeta};
     use openraft::{Entry, LogId, StorageError, StoredMembership, Vote};
     use tokio::sync::RwLock;
+
+    // ── FT-2: Raft snapshot persistence keys ──────────────────────────
+    /// Serialized `SnapshotMeta<u64, NodeAddress>` for the most recent snapshot.
+    const SNAPSHOT_META_KEY: &[u8] = b"raft/snapshot/meta";
+    /// Raw snapshot payload (encrypted if encryption-at-rest is configured).
+    const SNAPSHOT_DATA_KEY: &[u8] = b"raft/snapshot/data";
 
     use crate::partition_manager;
     use crate::raft_config::AeonRaftConfig;
@@ -171,6 +178,11 @@ mod inner {
         /// External consumers (REST API, ClusterNode) can read from this
         /// without accessing the Raft internals.
         shared_state: Arc<tokio::sync::RwLock<ClusterSnapshot>>,
+        /// FT-2: optional L3 backend for persistent snapshots. When set,
+        /// [`build_snapshot`] and [`install_snapshot`] write the snapshot
+        /// to `raft/snapshot/{meta,data}` so it survives restart and lets
+        /// a rebooted node skip full log replay.
+        snapshot_store: Option<Arc<dyn L3Store>>,
     }
 
     /// Read-only handle to the cluster state machine snapshot.
@@ -198,7 +210,85 @@ mod inner {
                 #[cfg(feature = "encryption-at-rest")]
                 encryption_key: None,
                 shared_state: Arc::new(tokio::sync::RwLock::new(ClusterSnapshot::default())),
+                snapshot_store: None,
             }
+        }
+
+        /// FT-2: create a state machine backed by a persistent L3 snapshot store.
+        ///
+        /// On construction, reads `raft/snapshot/{meta,data}` from `l3`. If both
+        /// keys are present, deserializes the snapshot and hydrates `state`,
+        /// `last_applied_log`, and `last_membership` so the rebooted node can
+        /// skip the bulk of log replay.
+        ///
+        /// Returns an `AeonError::Cluster` if decoding fails — a corrupt snapshot
+        /// is a fatal startup error rather than a silent fallback.
+        pub fn new_persistent(l3: Arc<dyn L3Store>) -> Result<Self, aeon_types::AeonError> {
+            let mut sm = Self::new();
+            sm.hydrate_from_l3(&l3)?;
+            sm.snapshot_store = Some(l3);
+            Ok(sm)
+        }
+
+        /// FT-2: as [`new_persistent`], but additionally configures encryption
+        /// at rest for the snapshot payload.
+        #[cfg(feature = "encryption-at-rest")]
+        pub fn new_persistent_encrypted(
+            l3: Arc<dyn L3Store>,
+            key: aeon_crypto::encryption::EtmKey,
+        ) -> Result<Self, aeon_types::AeonError> {
+            let mut sm = Self::with_encryption_key(key);
+            sm.hydrate_from_l3(&l3)?;
+            sm.snapshot_store = Some(l3);
+            Ok(sm)
+        }
+
+        /// FT-2: internal hydration helper — reads and decodes a snapshot
+        /// previously written via [`persist_snapshot_bytes`].
+        fn hydrate_from_l3(&mut self, l3: &Arc<dyn L3Store>) -> Result<(), aeon_types::AeonError> {
+            let meta_bytes = l3.get(SNAPSHOT_META_KEY)?;
+            let data_bytes = l3.get(SNAPSHOT_DATA_KEY)?;
+            #[allow(unused_mut)]
+            let (Some(meta_bytes), Some(mut data_bytes)) = (meta_bytes, data_bytes) else {
+                return Ok(()); // no snapshot persisted yet — fresh start
+            };
+
+            let meta: SnapshotMeta<u64, NodeAddress> = bincode::deserialize(&meta_bytes)
+                .map_err(|e| aeon_types::AeonError::Cluster {
+                    message: format!("corrupt raft snapshot meta: {e}"),
+                    source: None,
+                })?;
+
+            // Decrypt payload if encryption-at-rest is configured.
+            #[cfg(feature = "encryption-at-rest")]
+            if let Some(ref k) = self.encryption_key {
+                data_bytes = k.decrypt(&data_bytes).map_err(|e| {
+                    aeon_types::AeonError::Cluster {
+                        message: format!("raft snapshot decryption failed: {e}"),
+                        source: None,
+                    }
+                })?;
+            }
+
+            let state = ClusterSnapshot::from_bytes(&data_bytes).map_err(|e| {
+                aeon_types::AeonError::Cluster {
+                    message: format!("corrupt raft snapshot data: {e}"),
+                    source: None,
+                }
+            })?;
+
+            // `shared_state` is a brand-new `Arc<RwLock<_>>` created in
+            // `Self::new()` above with no other clones yet, so `try_write`
+            // always succeeds here; fall back to blocking_write defensively.
+            if let Ok(mut guard) = self.shared_state.try_write() {
+                *guard = state.clone();
+            } else {
+                *self.shared_state.blocking_write() = state.clone();
+            }
+            self.state = state;
+            self.last_applied_log = meta.last_log_id;
+            self.last_membership = meta.last_membership;
+            Ok(())
         }
 
         /// Get a shared read handle to the cluster state.
@@ -220,6 +310,7 @@ mod inner {
                 snapshot_idx: 0,
                 encryption_key: Some(key),
                 shared_state: Arc::new(tokio::sync::RwLock::new(ClusterSnapshot::default())),
+                snapshot_store: None,
             }
         }
 
@@ -373,17 +464,55 @@ mod inner {
                 })?;
             }
 
+            let meta = SnapshotMeta {
+                last_log_id: self.last_applied_log,
+                last_membership: self.last_membership.clone(),
+                snapshot_id,
+            };
+
+            // FT-2: persist snapshot to L3 if a backend is configured.
+            // `data` is already encrypted (if encryption-at-rest is on), so we
+            // write it verbatim.
+            if let Some(ref l3) = self.snapshot_store {
+                persist_snapshot_bytes(l3, &meta, &data).map_err(|e| {
+                    StorageError::from_io_error(
+                        openraft::ErrorSubject::Snapshot(Some(meta.signature())),
+                        openraft::ErrorVerb::Write,
+                        std::io::Error::other(format!("snapshot persistence failed: {e}")),
+                    )
+                })?;
+            }
+
             let snapshot = Snapshot {
-                meta: SnapshotMeta {
-                    last_log_id: self.last_applied_log,
-                    last_membership: self.last_membership.clone(),
-                    snapshot_id,
-                },
+                meta,
                 snapshot: Box::new(Cursor::new(data)),
             };
 
             Ok(snapshot)
         }
+    }
+
+    /// FT-2: atomically write snapshot meta + data to L3.
+    ///
+    /// Both keys are written in a single `write_batch` so the meta and data
+    /// never disagree on disk. `data_bytes` is stored as-is — the caller is
+    /// responsible for any encryption-at-rest transformation before this call.
+    fn persist_snapshot_bytes(
+        l3: &Arc<dyn L3Store>,
+        meta: &SnapshotMeta<u64, NodeAddress>,
+        data_bytes: &[u8],
+    ) -> Result<(), aeon_types::AeonError> {
+        let meta_bytes = bincode::serialize(meta).map_err(|e| aeon_types::AeonError::Cluster {
+            message: format!("snapshot meta serialization failed: {e}"),
+            source: None,
+        })?;
+        let ops = vec![
+            (BatchOp::Put, SNAPSHOT_META_KEY.to_vec(), Some(meta_bytes)),
+            (BatchOp::Put, SNAPSHOT_DATA_KEY.to_vec(), Some(data_bytes.to_vec())),
+        ];
+        l3.write_batch(&ops)?;
+        l3.flush()?;
+        Ok(())
     }
 
     impl RaftStateMachine<AeonRaftConfig> for StateMachineStore {
@@ -442,6 +571,7 @@ mod inner {
                 #[cfg(feature = "encryption-at-rest")]
                 encryption_key: self.encryption_key.clone(),
                 shared_state: Arc::clone(&self.shared_state),
+                snapshot_store: self.snapshot_store.clone(),
             })
         }
 
@@ -456,8 +586,9 @@ mod inner {
             meta: &SnapshotMeta<u64, NodeAddress>,
             snapshot: Box<Cursor<Vec<u8>>>,
         ) -> Result<(), StorageError<u64>> {
+            let raw = snapshot.into_inner();
             #[allow(unused_mut)]
-            let mut data = snapshot.into_inner();
+            let mut data = raw.clone();
 
             // Decrypt snapshot if encryption-at-rest is configured
             #[cfg(feature = "encryption-at-rest")]
@@ -467,6 +598,18 @@ mod inner {
                         openraft::ErrorSubject::StateMachine,
                         openraft::ErrorVerb::Read,
                         std::io::Error::other(format!("snapshot decryption failed: {e}")),
+                    )
+                })?;
+            }
+
+            // FT-2: persist the on-wire (encrypted-if-applicable) bytes to L3
+            // so the restart path can hydrate without log replay.
+            if let Some(ref l3) = self.snapshot_store {
+                persist_snapshot_bytes(l3, meta, &raw).map_err(|e| {
+                    StorageError::from_io_error(
+                        openraft::ErrorSubject::Snapshot(Some(meta.signature())),
+                        openraft::ErrorVerb::Write,
+                        std::io::Error::other(format!("snapshot persistence failed: {e}")),
                     )
                 })?;
             }
@@ -711,6 +854,110 @@ mod inner {
                 sm2.state.partition_table.get(PartitionId::new(1)),
                 Some(&PartitionOwnership::Owned(2))
             );
+        }
+
+        // ─── FT-2: persistent snapshot tests ────────────────────────────
+        #[derive(Default)]
+        struct MemL3 {
+            data: std::sync::Mutex<std::collections::BTreeMap<Vec<u8>, Vec<u8>>>,
+        }
+
+        impl aeon_types::L3Store for MemL3 {
+            fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, aeon_types::AeonError> {
+                Ok(self.data.lock().unwrap().get(key).cloned())
+            }
+            fn put(&self, key: &[u8], value: &[u8]) -> Result<(), aeon_types::AeonError> {
+                self.data
+                    .lock()
+                    .unwrap()
+                    .insert(key.to_vec(), value.to_vec());
+                Ok(())
+            }
+            fn delete(&self, key: &[u8]) -> Result<(), aeon_types::AeonError> {
+                self.data.lock().unwrap().remove(key);
+                Ok(())
+            }
+            fn write_batch(
+                &self,
+                ops: &[aeon_types::BatchEntry],
+            ) -> Result<(), aeon_types::AeonError> {
+                let mut d = self.data.lock().unwrap();
+                for (op, k, v) in ops {
+                    match op {
+                        aeon_types::BatchOp::Put => {
+                            d.insert(k.clone(), v.clone().unwrap_or_default());
+                        }
+                        aeon_types::BatchOp::Delete => {
+                            d.remove(k);
+                        }
+                    }
+                }
+                Ok(())
+            }
+            fn scan_prefix(
+                &self,
+                prefix: &[u8],
+            ) -> Result<aeon_types::KvPairs, aeon_types::AeonError> {
+                let d = self.data.lock().unwrap();
+                Ok(d.range(prefix.to_vec()..)
+                    .take_while(|(k, _)| k.starts_with(prefix))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect())
+            }
+            fn flush(&self) -> Result<(), aeon_types::AeonError> {
+                Ok(())
+            }
+            fn len(&self) -> Result<usize, aeon_types::AeonError> {
+                Ok(self.data.lock().unwrap().len())
+            }
+        }
+
+        #[tokio::test]
+        async fn persistent_snapshot_roundtrip_across_reopen() {
+            let l3: Arc<dyn L3Store> = Arc::new(MemL3::default());
+
+            // Boot a persistent state machine, apply a few requests,
+            // and build a snapshot — which should persist to `l3`.
+            {
+                let mut sm = StateMachineStore::new_persistent(Arc::clone(&l3)).unwrap();
+                sm.apply_request(&ClusterRequest::AssignPartition {
+                    partition: PartitionId::new(0),
+                    node: 1,
+                });
+                sm.apply_request(&ClusterRequest::UpdateConfig {
+                    key: "k".into(),
+                    value: "v".into(),
+                });
+                // Set last_applied_log so the snapshot meta is non-empty.
+                sm.last_applied_log = Some(openraft::LogId::new(
+                    openraft::CommittedLeaderId::new(1, 0),
+                    7,
+                ));
+
+                let mut builder = sm.get_snapshot_builder().await;
+                let _snap = builder.build_snapshot().await.unwrap();
+            }
+
+            // L3 must now contain both snapshot keys.
+            assert!(l3.get(SNAPSHOT_META_KEY).unwrap().is_some());
+            assert!(l3.get(SNAPSHOT_DATA_KEY).unwrap().is_some());
+
+            // Re-open from the same L3 — state should be hydrated.
+            let sm2 = StateMachineStore::new_persistent(Arc::clone(&l3)).unwrap();
+            assert_eq!(
+                sm2.state.partition_table.get(PartitionId::new(0)),
+                Some(&PartitionOwnership::Owned(1))
+            );
+            assert_eq!(sm2.state.config_overrides.get("k"), Some(&"v".to_string()));
+            assert_eq!(sm2.last_applied_log.map(|l| l.index), Some(7));
+        }
+
+        #[tokio::test]
+        async fn persistent_new_on_empty_l3_is_fresh() {
+            let l3: Arc<dyn L3Store> = Arc::new(MemL3::default());
+            let sm = StateMachineStore::new_persistent(l3).unwrap();
+            assert!(sm.last_applied_log.is_none());
+            assert_eq!(sm.state.partition_table.iter().count(), 0);
         }
 
         #[tokio::test]
