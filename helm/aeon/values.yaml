@@ -7,6 +7,10 @@ image:
   tag: latest
   pullPolicy: IfNotPresent
 
+# Pull secrets for private registries (e.g. DOCR)
+imagePullSecrets: []
+#  - name: rust-proxy-registry
+
 # Aeon configuration
 config:
   # REST API listen address

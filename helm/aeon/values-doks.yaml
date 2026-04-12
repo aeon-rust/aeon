@@ -6,6 +6,9 @@ image:
   tag: latest
   pullPolicy: Always
 
+imagePullSecrets:
+  - name: rust-proxy-registry
+
 config:
   logLevel: info
   apiAddr: "0.0.0.0:4471"
@@ -19,14 +22,15 @@ cluster:
   tls:
     enabled: false  # Start without TLS for initial validation
 
-# Resource limits — sized for 2 vCPU / 8 GiB nodes
+# Resource limits — sized for 2 vCPU / 8 GiB nodes (DOKS system pods
+# already consume ~2 CPU per node, so requests must be modest to fit).
 resources:
   requests:
-    cpu: "1"
-    memory: 2Gi
+    cpu: "200m"
+    memory: 512Mi
   limits:
     cpu: "1500m"
-    memory: 4Gi
+    memory: 2Gi
 
 # Smaller PVCs for initial testing
 persistence:

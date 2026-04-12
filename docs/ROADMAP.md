@@ -955,13 +955,18 @@ placeholders). Test counts updated to reflect current state.
    - Validated: pod Running 1/1, `/health` → 200, `/ready` → 200,
      `/api/v1/pipelines` → `[]`, `/api/v1/processors` → `[]`
 
-   **P4f — Multi-node Raft on cloud** (DigitalOcean DOKS, blocked on cloud access):
-   - 3-node DOKS cluster (c-series CPU-optimized, 8 vCPU/node)
-   - `helm install` with `replicas: 3`, pod anti-affinity
-   - Validate: leader election, partition assignment, node failure,
-     PoH chain transfer, split-brain recovery
-   - Multi-broker Redpanda sustained load
-   - CPU pinning with `cpu-manager-policy=static`
+   **P4f — Multi-node Raft on cloud** (DigitalOcean DOKS, **partial 2026-04-12**):
+   - ✅ 3-node DOKS cluster (`aeon-cluster` in blr1, 3 × 2-vCPU / 8 GiB nodes, k8s 1.35.1)
+   - ✅ `helm install aeon ./helm/aeon -n aeon -f helm/aeon/values-doks.yaml` — 3 pods 1/1 Ready, one per node via podAntiAffinity
+   - ✅ Helm chart extended with `imagePullSecrets` support (DOCR auto-inject)
+   - ✅ Leader election: N2 elected ~1 s after startup, partition table populated
+   - ✅ Failover: killed leader pod (aeon-1, N2) at T0 → new leader N1 (aeon-0) committed at T0+5 s → cluster stable, 3/3 Ready, 0 restarts
+   - ❌ **Gap found**: pipeline CRUD is **not Raft-replicated** — `PipelineManager::create()` writes local state only, so a pipeline POSTed to aeon-0 is invisible from aeon-1 / aeon-2. Needs either Raft-backed pipeline registry or sticky routing to leader.
+   - ⬜ PoH chain transfer real-network testing (CL-6b)
+   - ⬜ Split-brain recovery (network partition test — needs Chaos Mesh or manual iptables)
+   - ⬜ Multi-broker Redpanda sustained load
+   - ⬜ CPU pinning with `cpu-manager-policy=static` — current node pool lacks the feature-gate
+   - ⬜ DOKS nodes run at CPU ceiling: system DaemonSets already use ~2 / 2 vCPU per node; pod requests had to be shrunk from 1 CPU → 200 m to schedule. Load testing here will be CPU-bound by node size, not Aeon.
 
 5. **P5 — Operational hardening** (done, 2026-04-11):
    - K8s HPA template, large message benchmark (256B→1MB sweep), parameterized
