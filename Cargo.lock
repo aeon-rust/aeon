@@ -146,6 +146,7 @@ dependencies = [
  "aeon-native-sdk",
  "aeon-observability",
  "aeon-processor-client",
+ "aeon-state",
  "aeon-types",
  "aeon-wasm",
  "async-nats",
