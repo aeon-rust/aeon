@@ -42,8 +42,8 @@ pub use processor_transport::{
 pub use registry::{
     BlueGreenActive, BlueGreenState, CanaryState, CanaryThresholds, PipelineAction,
     PipelineDefinition, PipelineHistoryEntry, PipelineState, ProcessorRecord, ProcessorRef,
-    ProcessorType, ProcessorVersion, RegistryCommand, RegistryResponse, SinkConfig, SourceConfig,
-    UpgradeInfo, UpgradeStrategy, VersionStatus,
+    ProcessorType, ProcessorVersion, RegistryApplier, RegistryCommand, RegistryResponse,
+    SinkConfig, SourceConfig, UpgradeInfo, UpgradeStrategy, VersionStatus,
 };
 pub use scanner::{
     BytesFinder, contains_byte, contains_bytes, find_byte, find_bytes, json_field_value,

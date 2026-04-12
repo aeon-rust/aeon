@@ -469,6 +469,27 @@ pub enum RegistryResponse {
     Error { message: String },
 }
 
+/// Pluggable applier for Raft-replicated RegistryCommand entries.
+///
+/// The cluster state machine replicates registry commands across all nodes but
+/// does not itself own PipelineManager / ProcessorRegistry (avoiding a cyclic
+/// `aeon-cluster → aeon-engine` dependency). Instead, `aeon-engine` registers
+/// an implementation of this trait on the cluster node; the state machine then
+/// dispatches `ClusterRequest::Registry(cmd)` entries through it after the log
+/// entry is committed, so every node converges on the same local state.
+pub trait RegistryApplier: Send + Sync {
+    /// Apply a replicated command to this node's local registry/pipeline state.
+    ///
+    /// Called on every node after Raft commits the entry. Must be deterministic
+    /// w.r.t. the input command + prior applied state.
+    fn apply(
+        &self,
+        cmd: RegistryCommand,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = RegistryResponse> + Send + '_>,
+    >;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -13,7 +13,7 @@ mod inner {
     use std::ops::RangeBounds;
     use std::sync::Arc;
 
-    use aeon_types::{BatchOp, L3Store};
+    use aeon_types::{BatchOp, L3Store, RegistryApplier, RegistryCommand};
     use openraft::storage::{
         LogFlushed, LogState, RaftLogReader, RaftLogStorage, RaftStateMachine,
     };
@@ -183,7 +183,20 @@ mod inner {
         /// to `raft/snapshot/{meta,data}` so it survives restart and lets
         /// a rebooted node skip full log replay.
         snapshot_store: Option<Arc<dyn L3Store>>,
+        /// Shared slot holding the node-local applier for
+        /// `ClusterRequest::Registry` entries. Held behind an `Arc<RwLock>`
+        /// so callers can install/replace the applier **after** the state
+        /// machine has been handed to `Raft::new` (which takes ownership).
+        ///
+        /// When the slot is `None`, committed Registry entries are replicated
+        /// silently — nodes that wire an applier later will converge via
+        /// snapshot replay or via rebuilding state from stored definitions.
+        registry_applier: RegistryApplierSlot,
     }
+
+    /// Cloneable handle to the state machine's registry applier slot.
+    /// Install an applier via `*slot.write().await = Some(applier)`.
+    pub type RegistryApplierSlot = Arc<tokio::sync::RwLock<Option<Arc<dyn RegistryApplier>>>>;
 
     /// Read-only handle to the cluster state machine snapshot.
     /// Can be cheaply cloned and shared across threads.
@@ -211,7 +224,16 @@ mod inner {
                 encryption_key: None,
                 shared_state: Arc::new(tokio::sync::RwLock::new(ClusterSnapshot::default())),
                 snapshot_store: None,
+                registry_applier: Arc::new(tokio::sync::RwLock::new(None)),
             }
+        }
+
+        /// Returns a cloneable handle to the applier slot. External callers
+        /// (typically `ClusterNode`) hold this handle and write an applier
+        /// into it post-construction, since `Raft::new` takes ownership of
+        /// the state machine itself.
+        pub fn applier_slot(&self) -> RegistryApplierSlot {
+            Arc::clone(&self.registry_applier)
         }
 
         /// FT-2: create a state machine backed by a persistent L3 snapshot store.
@@ -311,6 +333,7 @@ mod inner {
                 encryption_key: Some(key),
                 shared_state: Arc::new(tokio::sync::RwLock::new(ClusterSnapshot::default())),
                 snapshot_store: None,
+                registry_applier: Arc::new(tokio::sync::RwLock::new(None)),
             }
         }
 
@@ -408,6 +431,14 @@ mod inner {
                         self.state.partition_table.assign(*partition, *to);
                     }
                     ClusterResponse::Ok
+                }
+                ClusterRequest::Registry { .. } => {
+                    // Handled upstream in the async `apply()` dispatcher, not
+                    // here. This sync helper is preserved for entries that
+                    // only touch the in-cluster ClusterSnapshot.
+                    ClusterResponse::Error(
+                        "ClusterRequest::Registry must be dispatched via async apply".into(),
+                    )
                 }
                 ClusterRequest::InitialAssignment {
                     num_partitions,
@@ -542,7 +573,30 @@ mod inner {
                         responses.push(ClusterResponse::Ok);
                     }
                     openraft::EntryPayload::Normal(req) => {
-                        let resp = self.apply_request(&req);
+                        let resp = match &req {
+                            ClusterRequest::Registry { payload } => {
+                                match serde_json::from_slice::<RegistryCommand>(payload) {
+                                    Ok(cmd) => {
+                                        let applier = self.registry_applier.read().await.clone();
+                                        if let Some(applier) = applier {
+                                            let rresp = applier.apply(cmd).await;
+                                            ClusterResponse::registry(&rresp).unwrap_or_else(
+                                                |e| ClusterResponse::Error(e.to_string()),
+                                            )
+                                        } else {
+                                            // No local applier installed — replicate
+                                            // silently. Nodes that wire an applier later
+                                            // will converge via snapshot replay.
+                                            ClusterResponse::Ok
+                                        }
+                                    }
+                                    Err(e) => ClusterResponse::Error(format!(
+                                        "malformed Registry payload: {e}"
+                                    )),
+                                }
+                            }
+                            _ => self.apply_request(&req),
+                        };
                         responses.push(resp);
                     }
                     openraft::EntryPayload::Membership(membership) => {
@@ -572,6 +626,7 @@ mod inner {
                 encryption_key: self.encryption_key.clone(),
                 shared_state: Arc::clone(&self.shared_state),
                 snapshot_store: self.snapshot_store.clone(),
+                registry_applier: self.registry_applier.clone(),
             })
         }
 

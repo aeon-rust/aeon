@@ -961,7 +961,7 @@ placeholders). Test counts updated to reflect current state.
    - ✅ Helm chart extended with `imagePullSecrets` support (DOCR auto-inject)
    - ✅ Leader election: N2 elected ~1 s after startup, partition table populated
    - ✅ Failover: killed leader pod (aeon-1, N2) at T0 → new leader N1 (aeon-0) committed at T0+5 s → cluster stable, 3/3 Ready, 0 restarts
-   - ❌ **Gap found**: pipeline CRUD is **not Raft-replicated** — `PipelineManager::create()` writes local state only, so a pipeline POSTed to aeon-0 is invisible from aeon-1 / aeon-2. Needs either Raft-backed pipeline registry or sticky routing to leader.
+   - ✅ **Pipeline CRUD Raft replication landed (2026-04-12)**: new `RegistryApplier` trait in `aeon-types`, `ClusterRequest::Registry(payload)` / `ClusterResponse::Registry` variants, shared applier slot on `StateMachineStore`, `ClusterNode::install_registry_applier` + `propose_registry`, `ClusterRegistryApplier` in `aeon-engine` fans commands to `ProcessorRegistry` + `PipelineManager`, REST `create_pipeline` branches through Raft when `cluster_node` is present. Two new integration tests on single-node exercise both the replicated-apply path and the silent no-applier path. JSON (not bincode) for the payload since `RegistryCommand` is internally-tagged.
    - ⬜ PoH chain transfer real-network testing (CL-6b)
    - ⬜ Split-brain recovery (network partition test — needs Chaos Mesh or manual iptables)
    - ⬜ Multi-broker Redpanda sustained load

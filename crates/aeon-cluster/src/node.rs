@@ -125,6 +125,10 @@ mod inner {
         shutdown: Arc<std::sync::atomic::AtomicBool>,
         /// Shared read handle to the committed cluster state.
         shared_state: crate::store::SharedClusterState,
+        /// Handle to the state machine's registry applier slot. Used by
+        /// `install_registry_applier` to wire up the node-local engine after
+        /// bootstrap, since openraft takes ownership of the state machine.
+        applier_slot: crate::store::RegistryApplierSlot,
     }
 
     impl ClusterNode {
@@ -143,6 +147,7 @@ mod inner {
             let log_store = MemLogStore::new();
             let state_machine = StateMachineStore::new();
             let shared_state = state_machine.shared_state();
+            let applier_slot = state_machine.applier_slot();
             let network = StubNetworkFactory;
 
             let raft = Raft::new(
@@ -179,6 +184,7 @@ mod inner {
                 endpoint: None,
                 shutdown,
                 shared_state,
+                applier_slot,
             };
 
             // Assign all partitions to self
@@ -235,6 +241,7 @@ mod inner {
             // log replay.
             let state_machine = StateMachineStore::new_persistent(log_backend)?;
             let shared_state = state_machine.shared_state();
+            let applier_slot = state_machine.applier_slot();
             let network = StubNetworkFactory;
 
             let raft = Raft::new(
@@ -285,6 +292,7 @@ mod inner {
                 endpoint: None,
                 shutdown,
                 shared_state,
+                applier_slot,
             };
 
             // Skip partition assignment on restart — the applied state machine
@@ -340,6 +348,7 @@ mod inner {
             let log_store = MemLogStore::new();
             let state_machine = StateMachineStore::new();
             let shared_state = state_machine.shared_state();
+            let applier_slot = state_machine.applier_slot();
             let network = QuicNetworkFactory::new(Arc::clone(&endpoint));
 
             let raft = Raft::new(
@@ -398,6 +407,7 @@ mod inner {
                 endpoint: Some(endpoint),
                 shutdown,
                 shared_state,
+                applier_slot,
             };
 
             // NOTE: InitialAssignment is NOT proposed here — it must happen
@@ -436,6 +446,7 @@ mod inner {
 
             let log_store = MemLogStore::new();
             let state_machine = StateMachineStore::new();
+            let applier_slot = state_machine.applier_slot();
             let network = QuicNetworkFactory::new(Arc::clone(&endpoint));
 
             let raft = Raft::new(
@@ -474,6 +485,7 @@ mod inner {
                 endpoint: Some(endpoint),
                 shutdown,
                 shared_state,
+                applier_slot,
             };
 
             Ok(node)
@@ -506,6 +518,7 @@ mod inner {
 
             let log_store = MemLogStore::new();
             let state_machine = StateMachineStore::new();
+            let applier_slot = state_machine.applier_slot();
             let network = QuicNetworkFactory::new(Arc::clone(&endpoint));
 
             let raft = Raft::new(
@@ -604,6 +617,7 @@ mod inner {
                 endpoint: Some(endpoint),
                 shutdown,
                 shared_state: crate::store::SharedClusterState::default(),
+                applier_slot,
             };
 
             Ok(node)
@@ -783,6 +797,34 @@ mod inner {
                     })?;
 
             Ok(response.data)
+        }
+
+        /// Install (or replace) the registry applier that receives committed
+        /// `ClusterRequest::Registry` entries. Typically called once at
+        /// startup from `aeon-engine` after constructing the local
+        /// PipelineManager / ProcessorRegistry.
+        pub async fn install_registry_applier(
+            &self,
+            applier: Arc<dyn aeon_types::RegistryApplier>,
+        ) {
+            *self.applier_slot.write().await = Some(applier);
+        }
+
+        /// Propose a `RegistryCommand` through Raft and decode the response.
+        ///
+        /// Convenience wrapper that encodes the command into
+        /// `ClusterRequest::Registry`, submits it via [`propose`], and
+        /// decodes the `ClusterResponse::Registry` reply back into a
+        /// `RegistryResponse`. Use this when the caller holds a
+        /// `RegistryCommand` (e.g. REST handlers creating a pipeline) and
+        /// wants the replicated apply to run on every node in the cluster.
+        pub async fn propose_registry(
+            &self,
+            cmd: aeon_types::RegistryCommand,
+        ) -> Result<aeon_types::RegistryResponse, AeonError> {
+            let req = ClusterRequest::registry(&cmd)?;
+            let resp = self.propose(req).await?;
+            resp.into_registry()
         }
 
         /// Get the current leader's NodeId.

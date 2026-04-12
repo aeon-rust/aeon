@@ -592,6 +592,29 @@ async fn create_pipeline(
     if let Err(e) = validate_resource_name(&req.definition.name, "pipeline") {
         return e.into_response();
     }
+
+    // In cluster mode, replicate via Raft so every node observes the new
+    // pipeline definition. Local apply happens on each node via the
+    // registered `ClusterRegistryApplier` after the log entry commits.
+    #[cfg(feature = "cluster")]
+    if let Some(node) = state.cluster_node.as_ref() {
+        let cmd = aeon_types::RegistryCommand::CreatePipeline {
+            definition: Box::new(req.definition),
+        };
+        return match node.propose_registry(cmd).await {
+            Ok(aeon_types::RegistryResponse::Error { message }) => {
+                api_error(StatusCode::BAD_REQUEST, message).into_response()
+            }
+            Ok(_) => (
+                StatusCode::CREATED,
+                Json(serde_json::json!({"status": "created", "replicated": true})),
+            )
+                .into_response(),
+            Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        };
+    }
+
+    // Standalone mode — apply directly to the local PipelineManager.
     match state.pipelines.create(req.definition).await {
         Ok(_) => (
             StatusCode::CREATED,

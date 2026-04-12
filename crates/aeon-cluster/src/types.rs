@@ -5,7 +5,7 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::str::FromStr;
 
-use aeon_types::PartitionId;
+use aeon_types::{AeonError, PartitionId, RegistryCommand, RegistryResponse};
 use serde::{Deserialize, Serialize};
 
 /// Unique identifier for a cluster node.
@@ -99,6 +99,58 @@ pub enum ClusterRequest {
         num_partitions: u16,
         nodes: Vec<NodeId>,
     },
+    /// Replicate a registry / pipeline-manager command across the cluster.
+    ///
+    /// `payload` is a bincode-serialized `aeon_types::RegistryCommand`. The
+    /// state machine deserializes and hands it to the node's registered
+    /// `RegistryApplier` at apply time. Carrying the command as bytes keeps
+    /// `ClusterRequest` free of derives that `RegistryCommand`'s nested types
+    /// (notably `f64` thresholds) cannot satisfy.
+    Registry { payload: Vec<u8> },
+}
+
+impl ClusterRequest {
+    /// Wrap a `RegistryCommand` into a `ClusterRequest::Registry`.
+    ///
+    /// Uses JSON encoding rather than bincode: `RegistryCommand` is an
+    /// internally-tagged enum (`#[serde(tag = "type")]`) which routes through
+    /// `deserialize_any`, and bincode does not support self-describing decode.
+    /// The overhead is negligible — Registry entries are control plane,
+    /// not hot path.
+    pub fn registry(cmd: &RegistryCommand) -> Result<Self, AeonError> {
+        let payload = serde_json::to_vec(cmd).map_err(|e| AeonError::Cluster {
+            message: format!("RegistryCommand serialize failed: {e}"),
+            source: None,
+        })?;
+        Ok(Self::Registry { payload })
+    }
+}
+
+impl ClusterResponse {
+    /// Wrap a `RegistryResponse` into a `ClusterResponse::Registry`.
+    /// See `ClusterRequest::registry` for the JSON-vs-bincode rationale.
+    pub fn registry(resp: &RegistryResponse) -> Result<Self, AeonError> {
+        let bytes = serde_json::to_vec(resp).map_err(|e| AeonError::Cluster {
+            message: format!("RegistryResponse serialize failed: {e}"),
+            source: None,
+        })?;
+        Ok(Self::Registry(bytes))
+    }
+
+    /// Decode a `ClusterResponse::Registry` payload back into `RegistryResponse`.
+    /// Returns `Err` on non-Registry variants or malformed bytes.
+    pub fn into_registry(self) -> Result<RegistryResponse, AeonError> {
+        match self {
+            Self::Registry(bytes) => {
+                serde_json::from_slice(&bytes).map_err(|e| AeonError::Cluster {
+                    message: format!("RegistryResponse deserialize failed: {e}"),
+                    source: None,
+                })
+            }
+            Self::Ok => Ok(RegistryResponse::Ok),
+            Self::Error(msg) => Ok(RegistryResponse::Error { message: msg }),
+        }
+    }
 }
 
 /// Response after applying a ClusterRequest to the state machine.
@@ -108,6 +160,9 @@ pub enum ClusterResponse {
     Ok,
     /// Operation failed with a reason.
     Error(String),
+    /// Bincode-serialized `aeon_types::RegistryResponse` from a
+    /// `ClusterRequest::Registry` apply.
+    Registry(Vec<u8>),
 }
 
 // ── Join protocol messages (over QUIC, not through Raft log) ────────

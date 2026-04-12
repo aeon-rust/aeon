@@ -7,6 +7,8 @@
 #![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod affinity;
+#[cfg(feature = "cluster")]
+pub mod cluster_applier;
 pub mod batch_tuner;
 pub mod batch_wire;
 pub mod checkpoint;
@@ -76,6 +78,9 @@ pub use transport::{
 
 #[cfg(feature = "native-loader")]
 pub use native_loader::NativeProcessor;
+
+#[cfg(feature = "cluster")]
+pub use cluster_applier::ClusterRegistryApplier;
 
 #[cfg(feature = "rest-api")]
 pub use rest_api::{AppState, api_router, serve};
