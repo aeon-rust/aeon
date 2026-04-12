@@ -153,6 +153,72 @@ Rule of thumb: `num_partitions >= max_expected_nodes * 4`.
 Even if you start with a single node, choose a partition count that accommodates your
 maximum expected cluster size. You cannot change it later.
 
+### Raft timing (election timeouts and heartbeats)
+
+Aeon exposes three Raft timing parameters on `ClusterConfig.raft_timing`:
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `heartbeat_ms` | 500 | Leader → follower heartbeat interval. |
+| `election_min_ms` | 1500 | Lower bound of the randomized election timeout. |
+| `election_max_ms` | 3000 | Upper bound of the randomized election timeout. |
+
+When a follower doesn't hear a heartbeat within its per-round randomized
+timeout (drawn uniformly from `[election_min_ms, election_max_ms]`), it
+becomes a candidate and starts an election.
+
+#### Why the jitter window matters
+
+If two followers time out within a few milliseconds of each other, they
+both become candidates, each votes for itself, neither wins, and the
+term is incremented — a **split vote**. With `N` followers and a window
+width `W = election_max_ms - election_min_ms`, the split-vote probability
+per election round is approximately:
+
+```
+P(split_vote) ≈ N · (N-1) · (RTT / W)
+```
+
+A 3-node cluster on a VPC with ~100 ms RTT sees:
+
+| Window W | Split-vote probability | Worst-case failover |
+|----------|------------------------|---------------------|
+| 1500 ms (default) | ~40% | ~3 s |
+| 4000 ms (prod_recommended) | ~15% | ~6 s |
+| 9000 ms (flaky_network) | ~7% | ~12 s |
+
+A wider window is the mitigation for the absence of **pre-vote** in
+openraft 0.9.x (see `docs/FAULT-TOLERANCE-ANALYSIS.md` FT-4). Pre-vote
+would eliminate split votes entirely by running a dry-run round before
+incrementing the term; without it, widening the jitter window is the
+next-best option.
+
+#### Presets
+
+Three builders are provided on `RaftTiming`:
+
+```rust
+RaftTiming::default()           // 500 / 1500 / 3000  — fast failover, dev default
+RaftTiming::prod_recommended()  // 500 / 2000 / 6000  — 3-node VPC, reliable network
+RaftTiming::flaky_network()     // 500 / 3000 / 12000 — cross-region / noisy neighbour
+```
+
+In a YAML manifest:
+
+```yaml
+cluster:
+  raft_timing:
+    heartbeat_ms: 500
+    election_min_ms: 2000
+    election_max_ms: 6000
+```
+
+Pick the preset that matches your network. If DOKS stress tests show
+stable `term` counters (no term churn under load), the default is fine.
+If you see frequent leadership changes without actual node failures,
+move up to `prod_recommended`. Only use `flaky_network` if your latency
+distribution has multi-second tails.
+
 ### Starting a single-node instance
 
 ```bash

@@ -48,6 +48,35 @@ impl Default for RaftTiming {
 }
 
 impl RaftTiming {
+    /// Production-recommended timings for a 3-node cluster on a reliable VPC.
+    ///
+    /// Wider jitter window (2000–6000 ms, W=4000 ms) vs. the default
+    /// (1500–3000 ms, W=1500 ms) reduces split-vote probability by ~60%
+    /// at the cost of ~3 s additional worst-case failover latency.
+    ///
+    /// Mitigation for openraft 0.9.x pre-vote absence (FT-4). See
+    /// `docs/CLUSTERING.md` §Raft timing for the probability math.
+    pub fn prod_recommended() -> Self {
+        Self {
+            heartbeat_ms: 500,
+            election_min_ms: 2000,
+            election_max_ms: 6000,
+        }
+    }
+
+    /// Flaky-network preset — wide jitter window tolerates clock drift and
+    /// packet loss at the cost of slower leader failover (~12 s worst case).
+    ///
+    /// Use when the inter-node network shows occasional multi-second pauses
+    /// (congested VPCs, cross-region clusters, sharing a noisy neighbour).
+    pub fn flaky_network() -> Self {
+        Self {
+            heartbeat_ms: 500,
+            election_min_ms: 3000,
+            election_max_ms: 12000,
+        }
+    }
+
     /// Validate timing constraints: `heartbeat < election_min < election_max`.
     pub fn validate(&self) -> Result<(), AeonError> {
         if self.heartbeat_ms == 0 {
@@ -390,6 +419,33 @@ mod tests {
         assert_eq!(t.election_min_ms, 1500);
         assert_eq!(t.election_max_ms, 3000);
         t.validate().unwrap();
+    }
+
+    #[test]
+    fn raft_timing_prod_recommended_preset() {
+        let t = RaftTiming::prod_recommended();
+        assert_eq!(t.heartbeat_ms, 500);
+        assert_eq!(t.election_min_ms, 2000);
+        assert_eq!(t.election_max_ms, 6000);
+        t.validate().unwrap();
+        // Window must be strictly wider than default to justify the preset.
+        let default_window = RaftTiming::default().election_max_ms - RaftTiming::default().election_min_ms;
+        let prod_window = t.election_max_ms - t.election_min_ms;
+        assert!(prod_window > default_window);
+    }
+
+    #[test]
+    fn raft_timing_flaky_network_preset() {
+        let t = RaftTiming::flaky_network();
+        assert_eq!(t.heartbeat_ms, 500);
+        assert_eq!(t.election_min_ms, 3000);
+        assert_eq!(t.election_max_ms, 12000);
+        t.validate().unwrap();
+        // Flaky preset must be wider than prod-recommended.
+        let prod_window = RaftTiming::prod_recommended().election_max_ms
+            - RaftTiming::prod_recommended().election_min_ms;
+        let flaky_window = t.election_max_ms - t.election_min_ms;
+        assert!(flaky_window > prod_window);
     }
 
     #[test]
