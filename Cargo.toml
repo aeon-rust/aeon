@@ -20,6 +20,7 @@ members = [
     "crates/aeon-cli",
     "samples/processors/rust-native",
     "samples/e2e-pipeline",
+    "xtask",
 ]
 
 [workspace.package]
