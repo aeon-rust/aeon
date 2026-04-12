@@ -37,12 +37,17 @@ impl CoreLocalUuidGenerator {
         let (producer, consumer) = rtrb::RingBuffer::new(DEFAULT_POOL_CAPACITY);
 
         let fill_core_id = core_id;
+        // Startup-time invariant: if the OS refuses a new thread, the
+        // generator can't produce UUIDs and there is no meaningful recovery
+        // — the process must terminate. FT-10: documented `.expect()` for
+        // a genuinely unrecoverable condition, not a hot-path panic.
+        #[allow(clippy::expect_used)]
         let handle = std::thread::Builder::new()
             .name(format!("uuid-fill-{core_id}"))
             .spawn(move || {
                 Self::fill_loop(producer, fill_core_id);
             })
-            .expect("failed to spawn UUID fill thread");
+            .expect("invariant: UUID fill thread spawn at startup");
 
         Self {
             core_id,
@@ -82,10 +87,14 @@ impl CoreLocalUuidGenerator {
     /// Generate a UUIDv7 inline (fallback when pool is empty).
     /// Uses monotonic counter per core — no syscall, no random.
     fn generate_inline(&self) -> uuid::Uuid {
+        // Hot path: `duration_since(UNIX_EPOCH)` can only fail if the system
+        // clock is set before 1970. Saturate to 0 rather than panic — a
+        // panic here would kill the pipeline thread and lose in-flight
+        // events (FT-10, CLAUDE.md rule #2 zero-event-loss).
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("system clock before UNIX epoch")
-            .as_millis() as u64;
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
 
         let prev_ms = self.last_ms.load(Ordering::Relaxed);
         let counter = if now_ms > prev_ms {
@@ -107,10 +116,12 @@ impl CoreLocalUuidGenerator {
         let mut rng_state: u64 = (core_id as u64 + 1) * 6364136223846793005 + 1;
 
         loop {
+            // Hot path in background filler: saturate pre-epoch clocks to 0
+            // rather than panic. See generate_inline() for rationale.
             let now_ms = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .expect("system clock before UNIX epoch")
-                .as_millis() as u64;
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
 
             if now_ms > last_ms {
                 last_ms = now_ms;

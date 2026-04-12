@@ -8,6 +8,7 @@
 //! **Scope**: T3 (WebTransport) and T4 (WebSocket) data streams only.
 //! T1/T2 are in-process and never use this. Control stream always uses JSON.
 
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -54,8 +55,12 @@ pub struct WireEvent {
     /// Key-value metadata headers.
     pub metadata: Vec<(String, String)>,
     /// Payload bytes (opaque user data).
-    #[serde(with = "serde_bytes")]
-    pub payload: Vec<u8>,
+    ///
+    /// FT-11: `bytes::Bytes` with `serde` feature — encoder serializes
+    /// via `&[u8]` (zero-copy refcount borrow); decoder allocates a new
+    /// `Bytes` from the byte stream. Replaces prior `Vec<u8>` which forced
+    /// a full per-event copy on both encode and decode paths.
+    pub payload: Bytes,
     /// Source-system offset for checkpoint resume.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_offset: Option<i64>,
@@ -68,10 +73,9 @@ pub struct WireOutput {
     pub destination: String,
     /// Optional partition key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub key: Option<Vec<u8>>,
-    /// Output payload bytes.
-    #[serde(with = "serde_bytes")]
-    pub payload: Vec<u8>,
+    pub key: Option<Bytes>,
+    /// Output payload bytes (FT-11: zero-copy on encode path).
+    pub payload: Bytes,
     /// Key-value headers.
     pub headers: Vec<(String, String)>,
     /// Source event ID for delivery tracking.
@@ -99,7 +103,8 @@ impl From<&Event> for WireEvent {
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
-            payload: event.payload.to_vec(),
+            // FT-11: Bytes clone = refcount bump, not data copy.
+            payload: event.payload.clone(),
             source_offset: event.source_offset,
         }
     }
@@ -107,7 +112,6 @@ impl From<&Event> for WireEvent {
 
 impl From<WireEvent> for Event {
     fn from(wire: WireEvent) -> Self {
-        use bytes::Bytes;
         use smallvec::SmallVec;
 
         let metadata: SmallVec<[(Arc<str>, Arc<str>); 4]> = wire
@@ -122,7 +126,7 @@ impl From<WireEvent> for Event {
             source: Arc::from(wire.source.as_str()),
             partition: wire.partition,
             metadata,
-            payload: Bytes::from(wire.payload),
+            payload: wire.payload,
             source_ts: None, // Not meaningful over the wire
             source_offset: wire.source_offset,
         }
@@ -133,8 +137,9 @@ impl From<&Output> for WireOutput {
     fn from(output: &Output) -> Self {
         Self {
             destination: output.destination.to_string(),
-            key: output.key.as_ref().map(|k| k.to_vec()),
-            payload: output.payload.to_vec(),
+            // FT-11: Bytes clone = refcount bump.
+            key: output.key.clone(),
+            payload: output.payload.clone(),
             headers: output
                 .headers
                 .iter()
@@ -149,7 +154,6 @@ impl From<&Output> for WireOutput {
 
 impl From<WireOutput> for Output {
     fn from(wire: WireOutput) -> Self {
-        use bytes::Bytes;
         use smallvec::SmallVec;
 
         let headers: SmallVec<[(Arc<str>, Arc<str>); 4]> = wire
@@ -160,8 +164,8 @@ impl From<WireOutput> for Output {
 
         Output {
             destination: Arc::from(wire.destination.as_str()),
-            key: wire.key.map(Bytes::from),
-            payload: Bytes::from(wire.payload),
+            key: wire.key,
+            payload: wire.payload,
             headers,
             source_ts: None,
             source_event_id: wire.source_event_id,
@@ -306,7 +310,7 @@ mod tests {
         assert_eq!(wire.source, "orders-topic");
         assert_eq!(wire.partition, PartitionId::new(3));
         assert_eq!(wire.metadata.len(), 1);
-        assert_eq!(wire.payload, b"{\"order_id\": 42}");
+        assert_eq!(wire.payload.as_ref(), b"{\"order_id\": 42}");
         assert_eq!(wire.source_offset, Some(1000));
 
         let back = Event::from(wire);
@@ -325,7 +329,7 @@ mod tests {
         let output = make_output();
         let wire = WireOutput::from(&output);
         assert_eq!(wire.destination, "enriched-orders");
-        assert_eq!(wire.key, Some(b"user-123".to_vec()));
+        assert_eq!(wire.key.as_deref(), Some(b"user-123".as_slice()));
         assert_eq!(wire.headers.len(), 1);
         assert_eq!(wire.source_event_id, Some(uuid::Uuid::nil()));
         assert_eq!(wire.source_partition, Some(PartitionId::new(3)));

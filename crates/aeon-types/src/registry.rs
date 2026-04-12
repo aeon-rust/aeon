@@ -302,7 +302,7 @@ pub struct PipelineHistoryEntry {
 }
 
 /// Pipeline lifecycle actions.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PipelineAction {
     Created,
@@ -322,6 +322,8 @@ pub enum PipelineAction {
     CanaryPromoted,
     /// Canary: fully promoted to 100%, canary completed.
     CanaryCompleted,
+    /// Source or sink reconfigured (same connector type, new config).
+    Reconfigured,
 }
 
 // ── Upgrade State Tracking ─────────────────────────────────────────────

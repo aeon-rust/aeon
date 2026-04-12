@@ -163,6 +163,23 @@ pub trait ProcessorTransport: Send + Sync {
     fn info(&self) -> ProcessorInfo;
 }
 
+/// Replicates checkpoint source offsets to a cluster-wide store (e.g., Raft).
+///
+/// Implementations submit per-partition source offsets at checkpoint boundaries.
+/// On failover, the new owner reads the replicated offsets to resume from the
+/// correct position without data loss or duplication.
+pub trait CheckpointReplicator: Send + Sync {
+    /// Submit checkpoint source offsets for cross-node replication.
+    ///
+    /// `source_offsets` maps partition ID (as u16) to the source-anchor offset
+    /// (e.g., Kafka consumer offset). Only offsets ahead of the currently
+    /// replicated value are applied.
+    fn submit_checkpoint(
+        &self,
+        source_offsets: std::collections::HashMap<u16, i64>,
+    ) -> impl std::future::Future<Output = Result<(), AeonError>> + Send;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
