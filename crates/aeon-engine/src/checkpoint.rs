@@ -11,10 +11,11 @@
 //! Each checkpoint is ~100-200 bytes. At 1/sec, 24h ≈ 8-17 MB.
 //! CRC32 integrity check on read — corrupted trailing records are skipped.
 
-use aeon_types::{AeonError, PartitionId};
+use aeon_types::{AeonError, BatchOp, L3Store, PartitionId};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Magic bytes identifying an Aeon checkpoint WAL file.
 const WAL_MAGIC: &[u8; 8] = b"AEON-CKP";
@@ -181,6 +182,151 @@ impl CheckpointReader {
             return Ok(Vec::new());
         }
         read_wal_records(path)
+    }
+}
+
+// ── FT-3: Checkpoint persistence abstraction ───────────────────────────
+//
+// `CheckpointPersist` is the adapter the pipeline sink task uses to write
+// checkpoint records. The two in-tree impls are:
+//
+// * [`WalCheckpointStore`] — wraps the existing append-only WAL writer.
+// * [`L3CheckpointStore`] — writes records as key-value pairs under
+//   `checkpoint/{be_u64:id}` in an `Arc<dyn L3Store>`, so the same
+//   durable backend that serves FT-1 (Raft log) and FT-2 (Raft snapshot)
+//   also serves pipeline checkpoints — one DB handle, one fsync story.
+//
+// The trait is deliberately synchronous + object-safe. The sink task
+// already runs on a dedicated thread; offloading to an executor would
+// just add latency for what is a small (~100-byte) write per checkpoint.
+
+/// Adapter for persisting and recovering checkpoint records.
+///
+/// Implementations must be `Send` — the pipeline sink task owns the persister
+/// as `Box<dyn CheckpointPersist>` and may move it across awaits.
+pub trait CheckpointPersist: Send {
+    /// Append a checkpoint record. The persister assigns the `checkpoint_id`
+    /// (monotonically increasing across reopens), so callers should treat
+    /// `record.checkpoint_id` as an in/out field.
+    fn append(&mut self, record: &mut CheckpointRecord) -> Result<(), AeonError>;
+
+    /// Read the most recent checkpoint, or `None` if the backend is empty.
+    /// Used for crash recovery at pipeline startup.
+    fn read_last(&self) -> Result<Option<CheckpointRecord>, AeonError>;
+
+    /// Next checkpoint ID that will be assigned by `append`.
+    fn next_checkpoint_id(&self) -> u64;
+}
+
+/// Adapter around [`CheckpointWriter`] so the WAL path implements
+/// [`CheckpointPersist`]. The wrapper stores the path so `read_last` can
+/// scan the file without needing an open reader handle.
+pub struct WalCheckpointStore {
+    writer: CheckpointWriter,
+}
+
+impl WalCheckpointStore {
+    /// Open (or create) a WAL-backed checkpoint store at `path`.
+    pub fn open(path: impl Into<PathBuf>) -> Result<Self, AeonError> {
+        Ok(Self {
+            writer: CheckpointWriter::new(path)?,
+        })
+    }
+}
+
+impl CheckpointPersist for WalCheckpointStore {
+    fn append(&mut self, record: &mut CheckpointRecord) -> Result<(), AeonError> {
+        self.writer.append(record)
+    }
+
+    fn read_last(&self) -> Result<Option<CheckpointRecord>, AeonError> {
+        CheckpointReader::read_last(self.writer.path())
+    }
+
+    fn next_checkpoint_id(&self) -> u64 {
+        self.writer.next_checkpoint_id()
+    }
+}
+
+/// FT-3: Checkpoint persister backed by an `L3Store`.
+///
+/// Record layout: `checkpoint/{be_u64 id}` → bincode(`CheckpointRecord`).
+/// Big-endian keys so `scan_prefix` returns records in checkpoint-ID order.
+/// Next-ID is hydrated from the max key at construction time.
+pub struct L3CheckpointStore {
+    l3: Arc<dyn L3Store>,
+    next_checkpoint_id: u64,
+}
+
+/// Prefix used for all L3 checkpoint records. Kept stable to preserve
+/// on-disk compatibility across restarts.
+const L3_CHECKPOINT_PREFIX: &[u8] = b"checkpoint/";
+
+impl L3CheckpointStore {
+    /// Open a checkpoint store backed by `l3`. Scans existing records to
+    /// resume the ID sequence — `next_checkpoint_id` will be `last + 1`.
+    pub fn open(l3: Arc<dyn L3Store>) -> Result<Self, AeonError> {
+        let existing = l3.scan_prefix(L3_CHECKPOINT_PREFIX)?;
+        let next = existing
+            .iter()
+            .filter_map(|(k, _)| parse_checkpoint_key(k))
+            .max()
+            .map_or(0, |max| max + 1);
+        Ok(Self {
+            l3,
+            next_checkpoint_id: next,
+        })
+    }
+
+    fn record_key(id: u64) -> Vec<u8> {
+        let mut k = Vec::with_capacity(L3_CHECKPOINT_PREFIX.len() + 8);
+        k.extend_from_slice(L3_CHECKPOINT_PREFIX);
+        k.extend_from_slice(&id.to_be_bytes());
+        k
+    }
+}
+
+fn parse_checkpoint_key(k: &[u8]) -> Option<u64> {
+    let suffix = k.strip_prefix(L3_CHECKPOINT_PREFIX)?;
+    if suffix.len() != 8 {
+        return None;
+    }
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(suffix);
+    Some(u64::from_be_bytes(buf))
+}
+
+impl CheckpointPersist for L3CheckpointStore {
+    fn append(&mut self, record: &mut CheckpointRecord) -> Result<(), AeonError> {
+        record.checkpoint_id = self.next_checkpoint_id;
+        let value = bincode::serialize(record)
+            .map_err(|e| AeonError::state(format!("checkpoint bincode serialize: {e}")))?;
+        // write_batch for atomicity + flush so crash after return is durable.
+        let ops = vec![(
+            BatchOp::Put,
+            Self::record_key(record.checkpoint_id),
+            Some(value),
+        )];
+        self.l3.write_batch(&ops)?;
+        self.l3.flush()?;
+        self.next_checkpoint_id += 1;
+        Ok(())
+    }
+
+    fn read_last(&self) -> Result<Option<CheckpointRecord>, AeonError> {
+        // scan_prefix yields keys in ascending big-endian order, so the
+        // last entry is the most recent checkpoint.
+        let entries = self.l3.scan_prefix(L3_CHECKPOINT_PREFIX)?;
+        let Some((_, bytes)) = entries.last() else {
+            return Ok(None);
+        };
+        let record: CheckpointRecord = bincode::deserialize(bytes)
+            .map_err(|e| AeonError::state(format!("checkpoint bincode deserialize: {e}")))?;
+        Ok(Some(record))
+    }
+
+    fn next_checkpoint_id(&self) -> u64 {
+        self.next_checkpoint_id
     }
 }
 
@@ -436,6 +582,137 @@ mod tests {
     fn checkpoint_record_timestamp_populated() {
         let record = CheckpointRecord::new(0, HashMap::new(), vec![], 0, 0);
         assert!(record.timestamp_nanos > 0);
+    }
+
+    // ─── FT-3: CheckpointPersist trait tests ────────────────────────────
+
+    /// In-memory `L3Store` stub for unit tests. Thread-safe via `Mutex`,
+    /// mirrors the same stub used elsewhere (aeon-cluster log_store tests).
+    #[derive(Default)]
+    struct MemL3 {
+        data: std::sync::Mutex<std::collections::BTreeMap<Vec<u8>, Vec<u8>>>,
+    }
+
+    impl aeon_types::L3Store for MemL3 {
+        fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, AeonError> {
+            Ok(self.data.lock().unwrap().get(key).cloned())
+        }
+        fn put(&self, key: &[u8], value: &[u8]) -> Result<(), AeonError> {
+            self.data
+                .lock()
+                .unwrap()
+                .insert(key.to_vec(), value.to_vec());
+            Ok(())
+        }
+        fn delete(&self, key: &[u8]) -> Result<(), AeonError> {
+            self.data.lock().unwrap().remove(key);
+            Ok(())
+        }
+        fn write_batch(
+            &self,
+            ops: &[aeon_types::BatchEntry],
+        ) -> Result<(), AeonError> {
+            let mut d = self.data.lock().unwrap();
+            for (op, k, v) in ops {
+                match op {
+                    aeon_types::BatchOp::Put => {
+                        d.insert(k.clone(), v.clone().unwrap_or_default());
+                    }
+                    aeon_types::BatchOp::Delete => {
+                        d.remove(k);
+                    }
+                }
+            }
+            Ok(())
+        }
+        fn scan_prefix(
+            &self,
+            prefix: &[u8],
+        ) -> Result<aeon_types::KvPairs, AeonError> {
+            let d = self.data.lock().unwrap();
+            Ok(d.range(prefix.to_vec()..)
+                .take_while(|(k, _)| k.starts_with(prefix))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect())
+        }
+        fn flush(&self) -> Result<(), AeonError> {
+            Ok(())
+        }
+        fn len(&self) -> Result<usize, AeonError> {
+            Ok(self.data.lock().unwrap().len())
+        }
+    }
+
+    #[test]
+    fn l3_checkpoint_store_roundtrip() {
+        let l3: Arc<dyn L3Store> = Arc::new(MemL3::default());
+        let mut store = L3CheckpointStore::open(Arc::clone(&l3)).unwrap();
+
+        let mut offsets = HashMap::new();
+        offsets.insert(PartitionId::new(0), 100i64);
+        offsets.insert(PartitionId::new(1), 200i64);
+        let mut record = CheckpointRecord::new(0, offsets, vec![], 10, 1);
+        store.append(&mut record).unwrap();
+        assert_eq!(record.checkpoint_id, 0);
+
+        let last = store.read_last().unwrap().unwrap();
+        assert_eq!(last.delivered_count, 10);
+        assert_eq!(last.failed_count, 1);
+        assert_eq!(last.partition_offsets()[&PartitionId::new(0)], 100);
+    }
+
+    #[test]
+    fn l3_checkpoint_store_resumes_id_sequence_across_reopen() {
+        let l3: Arc<dyn L3Store> = Arc::new(MemL3::default());
+
+        // First session: write 3 checkpoints → IDs 0, 1, 2.
+        {
+            let mut store = L3CheckpointStore::open(Arc::clone(&l3)).unwrap();
+            for _ in 0..3 {
+                let mut rec = CheckpointRecord::new(0, HashMap::new(), vec![], 0, 0);
+                store.append(&mut rec).unwrap();
+            }
+        }
+
+        // Reopen — next ID must be 3 and we must see the newest record.
+        let mut store = L3CheckpointStore::open(Arc::clone(&l3)).unwrap();
+        assert_eq!(store.next_checkpoint_id(), 3);
+        let mut rec = CheckpointRecord::new(0, HashMap::new(), vec![], 42, 0);
+        store.append(&mut rec).unwrap();
+        assert_eq!(rec.checkpoint_id, 3);
+
+        let last = store.read_last().unwrap().unwrap();
+        assert_eq!(last.checkpoint_id, 3);
+        assert_eq!(last.delivered_count, 42);
+    }
+
+    #[test]
+    fn l3_checkpoint_store_empty_reads_none() {
+        let l3: Arc<dyn L3Store> = Arc::new(MemL3::default());
+        let store = L3CheckpointStore::open(l3).unwrap();
+        assert!(store.read_last().unwrap().is_none());
+        assert_eq!(store.next_checkpoint_id(), 0);
+    }
+
+    #[test]
+    fn l3_checkpoint_keys_sort_big_endian() {
+        // Guard against regressions where the ID encoding is accidentally
+        // changed to little-endian — scan_prefix ordering would then be
+        // wrong for IDs that span a byte boundary (e.g. 255 vs 256).
+        assert!(L3CheckpointStore::record_key(255) < L3CheckpointStore::record_key(256));
+        assert!(L3CheckpointStore::record_key(1) < L3CheckpointStore::record_key(1 << 40));
+    }
+
+    #[test]
+    fn wal_store_impls_checkpoint_persist() {
+        // Smoke test that the WAL path still works through the trait.
+        let path = temp_wal_path();
+        let mut store = WalCheckpointStore::open(&path).unwrap();
+        let mut rec = CheckpointRecord::new(0, HashMap::new(), vec![], 7, 0);
+        store.append(&mut rec).unwrap();
+        let last = store.read_last().unwrap().unwrap();
+        assert_eq!(last.delivered_count, 7);
+        assert_eq!(store.next_checkpoint_id(), 1);
     }
 
     #[test]

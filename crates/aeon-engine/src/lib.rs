@@ -46,7 +46,10 @@ pub use batch_wire::{
     encode_batch_response, serialize_batch_request, serialize_batch_response,
 };
 
-pub use checkpoint::{CheckpointReader, CheckpointRecord, CheckpointWriter};
+pub use checkpoint::{
+    CheckpointPersist, CheckpointReader, CheckpointRecord, CheckpointWriter, L3CheckpointStore,
+    WalCheckpointStore,
+};
 pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitState};
 pub use dag::{DagGraph, NodeKind, run_chain, run_fan_in, run_fan_out, run_routed};
 pub use delivery::{CheckpointBackend, CheckpointConfig, DeliveryConfig, FlushStrategy};

@@ -10,7 +10,9 @@
 
 use crate::affinity::{PipelineCores, pin_to_core, pipeline_core_assignment};
 use crate::batch_tuner::FlushTuner;
-use crate::checkpoint::{CheckpointRecord, CheckpointWriter};
+use crate::checkpoint::{
+    CheckpointPersist, CheckpointRecord, L3CheckpointStore, WalCheckpointStore,
+};
 use crate::delivery::{CheckpointBackend, DeliveryConfig};
 use crate::delivery_ledger::DeliveryLedger;
 use aeon_types::{
@@ -115,6 +117,13 @@ pub struct PipelineConfig {
     /// a hash chain of all processed batches for integrity verification.
     #[cfg(feature = "processor-auth")]
     pub poh: Option<PohConfig>,
+    /// FT-3: Optional L3 backend for `CheckpointBackend::StateStore`.
+    /// When `delivery.checkpoint.backend == StateStore`, the sink task
+    /// persists checkpoint records into this store under the `checkpoint/`
+    /// key prefix. Ignored for other backends. Typically the same
+    /// `Arc<dyn L3Store>` used for Raft log/snapshot (FT-1/FT-2), so the
+    /// whole node shares one durable handle.
+    pub l3_checkpoint_store: Option<Arc<dyn aeon_types::L3Store>>,
 }
 
 impl Default for PipelineConfig {
@@ -127,6 +136,7 @@ impl Default for PipelineConfig {
             delivery: DeliveryConfig::default(),
             #[cfg(feature = "processor-auth")]
             poh: None,
+            l3_checkpoint_store: None,
         }
     }
 }
@@ -772,26 +782,54 @@ where
 /// `run_buffered_transport` so the two call sites can spawn `run_sink_task`
 /// with identical setup.
 fn build_sink_task_ctx(config: &PipelineConfig, core: Option<usize>) -> SinkTaskCtx {
-    // Initialize checkpoint writer if WAL backend is configured.
-    let checkpoint_writer = if config.delivery.checkpoint.backend == CheckpointBackend::Wal {
-        let dir = config.delivery.checkpoint.dir.clone().unwrap_or_else(|| {
-            std::env::var("AEON_CHECKPOINT_DIR")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|_| std::env::temp_dir().join("aeon-checkpoints"))
-        });
-        let wal_path = dir.join("pipeline.wal");
-        match CheckpointWriter::new(&wal_path) {
-            Ok(writer) => {
-                tracing::info!(path = %wal_path.display(), "Checkpoint WAL initialized");
-                Some(writer)
-            }
-            Err(e) => {
-                tracing::warn!("Checkpoint WAL init failed: {e}, continuing without checkpoints");
-                None
+    // Initialize the checkpoint persister. FT-3: the concrete backend is
+    // chosen by `CheckpointBackend`; `None`/`Kafka` yield no persister for
+    // now (Kafka-topic checkpointing is a separate follow-up).
+    let checkpoint_writer: Option<Box<dyn CheckpointPersist>> = match config
+        .delivery
+        .checkpoint
+        .backend
+    {
+        CheckpointBackend::Wal => {
+            let dir = config.delivery.checkpoint.dir.clone().unwrap_or_else(|| {
+                std::env::var("AEON_CHECKPOINT_DIR")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|_| std::env::temp_dir().join("aeon-checkpoints"))
+            });
+            let wal_path = dir.join("pipeline.wal");
+            match WalCheckpointStore::open(&wal_path) {
+                Ok(writer) => {
+                    tracing::info!(path = %wal_path.display(), "Checkpoint WAL initialized");
+                    Some(Box::new(writer) as Box<dyn CheckpointPersist>)
+                }
+                Err(e) => {
+                    tracing::warn!("Checkpoint WAL init failed: {e}, continuing without checkpoints");
+                    None
+                }
             }
         }
-    } else {
-        None
+        CheckpointBackend::StateStore => match &config.l3_checkpoint_store {
+            Some(l3) => match L3CheckpointStore::open(Arc::clone(l3)) {
+                Ok(store) => {
+                    tracing::info!("Checkpoint L3 store initialized");
+                    Some(Box::new(store) as Box<dyn CheckpointPersist>)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Checkpoint L3 store init failed: {e}, continuing without checkpoints"
+                    );
+                    None
+                }
+            },
+            None => {
+                tracing::warn!(
+                    "CheckpointBackend::StateStore configured but no l3_checkpoint_store provided; \
+                     continuing without checkpoints"
+                );
+                None
+            }
+        },
+        CheckpointBackend::Kafka | CheckpointBackend::None => None,
     };
 
     SinkTaskCtx {
@@ -878,6 +916,7 @@ where
             delivery: config.pipeline.delivery.clone(),
             #[cfg(feature = "processor-auth")]
             poh: config.pipeline.poh.clone(),
+            l3_checkpoint_store: config.pipeline.l3_checkpoint_store.clone(),
         };
 
         if let Some(ref assignments) = core_assignments {
@@ -947,7 +986,7 @@ struct SinkTaskCtx {
     failure_policy: BatchFailurePolicy,
     max_retries: u32,
     retry_backoff: Duration,
-    checkpoint_writer: Option<CheckpointWriter>,
+    checkpoint_writer: Option<Box<dyn CheckpointPersist>>,
 }
 
 /// Shared sink task body for `run_buffered` / `run_buffered_transport`.
@@ -1244,7 +1283,7 @@ fn credit_pending_on_flush(
 
 /// Write a checkpoint record with ledger-populated offsets and pending IDs.
 fn write_checkpoint(
-    ckpt_writer: &mut Option<CheckpointWriter>,
+    ckpt_writer: &mut Option<Box<dyn CheckpointPersist>>,
     ledger: &Option<Arc<DeliveryLedger>>,
     metrics: &Arc<PipelineMetrics>,
     delivered: &mut u64,
