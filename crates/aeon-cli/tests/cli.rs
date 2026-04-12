@@ -76,7 +76,43 @@ fn validate_missing_file_fails_cleanly() {
         .unwrap()
         .args(["validate", "/definitely/does/not/exist.wasm"])
         .assert()
-        .failure();
+        .failure()
+        .stderr(predicates::str::contains("error:"))
+        .stderr(predicates::str::contains("file not found"));
+}
+
+#[test]
+fn validate_unknown_extension_gives_hint() {
+    // DX-4: a clear error + actionable hint for wrong artifact type.
+    let tmp = tempfile::tempdir().unwrap();
+    let bogus = tmp.path().join("processor.exe");
+    std::fs::write(&bogus, b"not a real binary").unwrap();
+
+    Command::cargo_bin("aeon")
+        .unwrap()
+        .args(["validate", bogus.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("unknown file extension"))
+        .stderr(predicates::str::contains("hint:"));
+}
+
+#[test]
+fn processor_list_against_unreachable_server_hints_at_server() {
+    // DX-4: connection refused → hint to run `aeon serve` / `aeon doctor`.
+    // Bind then drop to get a guaranteed-closed port.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+
+    Command::cargo_bin("aeon")
+        .unwrap()
+        .args(["processor", "--api", &format!("http://{addr}"), "list"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("error:"))
+        .stderr(predicates::str::contains("hint:"))
+        .stderr(predicates::str::contains("aeon doctor"));
 }
 
 // ── REST-talking commands use a tiny TCP mock ───────────────────────────

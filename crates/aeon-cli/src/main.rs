@@ -329,9 +329,96 @@ enum Lang {
     Typescript,
 }
 
-fn main() -> Result<()> {
+fn main() {
     let cli = Cli::parse();
+    if let Err(err) = run(cli) {
+        print_pretty_error(&err);
+        std::process::exit(1);
+    }
+}
 
+/// Pretty-print an `anyhow::Error` with a human-readable summary, full context
+/// chain, and (when we can recognise the pattern) an actionable hint.
+///
+/// anyhow's default Debug output is information-dense but reads like a stack
+/// trace; end users typically want "what broke" + "what to try next" on two
+/// lines. DX-4.
+fn print_pretty_error(err: &anyhow::Error) {
+    // Top-level message
+    eprintln!("error: {err}");
+
+    // Context chain (skip the top which we already printed)
+    let mut causes = err.chain().skip(1).peekable();
+    if causes.peek().is_some() {
+        for cause in causes {
+            eprintln!("  caused by: {cause}");
+        }
+    }
+
+    if let Some(hint) = error_hint(err) {
+        eprintln!();
+        eprintln!("hint: {hint}");
+    }
+}
+
+/// Map common error shapes to actionable remediation hints. Matching happens
+/// on the flattened error chain text — cheap, string-based, and easy to extend.
+fn error_hint(err: &anyhow::Error) -> Option<&'static str> {
+    // Build a lowercased haystack of the full chain once.
+    let haystack: String = err
+        .chain()
+        .map(|c| c.to_string().to_lowercase())
+        .collect::<Vec<_>>()
+        .join(" | ");
+
+    // Order matters: more specific patterns first.
+    if haystack.contains("connection refused")
+        || haystack.contains("failed to reach aeon api")
+        || haystack.contains("tcp connect error")
+    {
+        return Some(
+            "Aeon server unreachable. Is `aeon serve` running? Run `aeon doctor` to diagnose, or set AEON_API_URL to a reachable address.",
+        );
+    }
+    if haystack.contains("status code 401") || haystack.contains("unauthorized") {
+        return Some("authentication failed. Check AEON_API_TOKEN or your pipeline identity key (`aeon processor identity list <name>`).");
+    }
+    if haystack.contains("status code 403") || haystack.contains("forbidden") {
+        return Some("access denied. The caller has no permission for this resource — check identity scope (allowed_pipelines).");
+    }
+    if haystack.contains("status code 404") {
+        return Some("resource not found. Run `aeon processor list` / `aeon pipeline list` to see what exists.");
+    }
+    if haystack.contains("failed to run npm") {
+        return Some("Node.js is required. Install from https://nodejs.org or your OS package manager.");
+    }
+    if haystack.contains("failed to run cargo build") || haystack.contains("cargo build failed") {
+        return Some("Rust toolchain build failed. Ensure `rustup target add wasm32-unknown-unknown` for Wasm processors.");
+    }
+    if haystack.contains("unknown file extension") {
+        return Some("supported artifacts: .wasm (guest) or .so/.dll/.dylib (native). Run `aeon build` to produce one.");
+    }
+    if haystack.contains("wasm validation failed") || haystack.contains("failed to compile wasm") {
+        return Some("artifact is not a valid Aeon Wasm component. Rebuild with `aeon build --release` and re-run `aeon validate`.");
+    }
+    if haystack.contains("native validation requires the 'native-validate' feature") {
+        return Some("rebuild the CLI with `--features native-validate` (enabled by default in release builds).");
+    }
+    if haystack.contains("directory '") && haystack.contains("already exists") {
+        return Some("remove the existing directory or pick a different project name.");
+    }
+    if haystack.contains("file not found") || haystack.contains("no such file") {
+        return Some("check the path spelling and current working directory. Use an absolute path if unsure.");
+    }
+    if haystack.contains("invalid json response") || haystack.contains("expected array") {
+        return Some(
+            "unexpected response shape from the API. Check that the Aeon server version matches this CLI — run `aeon --version` and compare with the server banner.",
+        );
+    }
+    None
+}
+
+fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Some(Commands::New {
             name,

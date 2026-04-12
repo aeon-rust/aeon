@@ -364,9 +364,9 @@ is retained for historical reference.
 
 | ID | Task | Source | Effort |
 |----|------|--------|--------|
-| **ZD-1** | Add `POST /api/v1/processors` route + handler | Plan Phase A1 | Low |
-| **ZD-2** | ~~Fix CLI serde PascalCase -> kebab-case~~ | **Done** — commit fa10635 (2026-04-11), already using `"wasm"`, `"native-so"`, `"available"` | — |
-| **ZD-3** | Replace SHA-512 placeholder with real SHA-512 in `registry.rs` | Plan Phase A3 | Low |
+| **ZD-1** | ~~Add `POST /api/v1/processors` route + handler~~ | **Done** — `rest_api.rs:113` wires `get(list_processors).post(register_processor)`; handler at `rest_api.rs:597`; integration test `register_processor_via_api` at `rest_api.rs:1926`; CLI-level regression guard in `aeon-cli/tests/cli.rs`. | ✅ |
+| **ZD-2** | ~~Fix CLI serde PascalCase -> kebab-case~~ | **Done** — commit fa10635 (2026-04-11); already using `"wasm"`, `"native-so"`, `"available"`. Now guarded by `processor_register_sends_kebab_case_type_and_available_status` in `aeon-cli/tests/cli.rs`. | ✅ |
+| **ZD-3** | ~~Replace SHA-512 placeholder with real SHA-512~~ | **Done** — `registry.rs:291` now uses `sha2::Sha512::digest(data)`; verified callsites at `:82` (hash comparison on retrieve) and `:324` (hash on store). | ✅ |
 | **ZD-4** | Source `pause()`/`resume()` + pipeline drain mechanism | Plan Phase B1-B2 | Medium |
 | **ZD-5** | Hot-swap orchestrator — drain->swap->resume for Wasm/Native | Plan Phase B3-B4 | Medium |
 | **ZD-6** | Same-type source/sink reconfiguration | Plan Phase C1-C3 | Medium |
@@ -414,7 +414,7 @@ integrating, testing, deploying, and operating against Aeon is friction-free.
 | **DX-1** | ~~CLI integration test suite~~ — **Done (2026-04-12)**. Added `crates/aeon-cli/tests/cli.rs` with 9 integration tests covering: `--version` / `--help` smoke; `aeon new --runtime wasm --lang rust` scaffolding (Cargo.toml, src/lib.rs, .cargo/config.toml); path-traversal rejection in project names; `aeon validate` on missing file; `aeon processor register` with `.wasm` and `.so` artifacts (asserts kebab-case `processor_type` / `status` — this is the regression guard that would have caught ZD-2); `aeon processor list` empty and populated response rendering. Uses `assert_cmd` + `predicates` for process orchestration and a zero-dependency `TcpListener`-based single-shot HTTP mock for REST-hitting commands — avoids adding `httpmock`/`wiremock`. | GAP D | ✅ Done |
 | **DX-2** | ~~`aeon doctor` command~~ — **Done**. New subcommand `aeon doctor [--api --kafka --state-dir --manifest]` runs environment readiness checks: (a) compiled features (native-validate, rest-api); (b) default ports 4460/4461/4462/4471 bindable; (c) REST API `/health` reachable; (d) Kafka/Redpanda TCP reachability; (e) state dir exists + writable (touch-file probe); (f) optional manifest YAML schema-check + recursive artifact-path extraction + per-artifact existence/extension check. Each check emits `[PASS]`/`[WARN]`/`[FAIL]` + an actionable `fix:` line. Exit code 1 on any FAIL. Implementation is dependency-free (std::net TCP probe, existing `ureq` for HTTP, existing `serde_yaml` for manifest). | GAP G | Low | ✅ Done |
 | **DX-3** | Hot-reload in `aeon dev` via `notify` crate — watch processor artifact file, trigger drain→swap on change. Reuses ZD-5 hot-swap orchestrator, adds filesystem watcher. Formerly deferred as ZD-12; promoted because it dramatically improves the Wasm/native dev loop. | GAP G, formerly ZD-12 | Medium |
-| **DX-4** | CLI error message polish — map `AeonError` variants to user-friendly messages in the CLI output layer (Rust `Debug` output is unreadable for end users). Each error kind gets a short human message + a "try this" hint. E.g., `AeonError::Config(...)` → `"Config error in line 23: field 'bootstrap' is required. Try: bootstrap: localhost:9092"`. | GAP G | Low |
+| **DX-4** | ~~CLI error message polish~~ — **Done (2026-04-12)**. `aeon-cli/src/main.rs` wraps `run()` with a pretty-printer: prints `error: <top>` + indented `caused by:` chain + an actionable `hint:` line when the error shape matches a known pattern (connection refused → `aeon doctor`/`aeon serve`; 401/403/404 → identity/scope/listing hints; unknown artifact extension → supported types; Wasm validation → `aeon build --release`; `failed to run npm`/`cargo build` → toolchain install). Pattern matching is cheap string scanning over the full anyhow chain. Guarded by 3 new tests in `aeon-cli/tests/cli.rs` (`validate_missing_file_fails_cleanly`, `validate_unknown_extension_gives_hint`, `processor_list_against_unreachable_server_hints_at_server`). | GAP G | ✅ Done |
 | **DX-5** | `cargo xtask` for dev workflows — one-liner entrypoints for: running the full Gate 1 validation suite, comparing benchmarks between branches, preparing a release (version bump + changelog entry + tag), regenerating SDK wire protocol examples. Reduces "remembered CLI incantations" barrier for contributors. | GAP G | Low |
 
 ### Pillar 7: Blocked / Demand-Driven (No Action Now)
@@ -463,7 +463,7 @@ limitation. See Section 10 for the full per-language × per-tier matrix.
 | Cluster validation (Pillar 3) | 9 items | **Partially done** — DOKS deployed; Gate 2 criteria, cluster metrics, auto-scaling, and CL-6 partition transfer (4 sub-tasks) remain |
 | Transport resilience (Pillar 4) | 3 items | **Mixed** — TR-3 (connection backoff) is actionable; TR-1/TR-2 deferred |
 | Exactly-once delivery (Pillar 5) | 3 items | **Future** — depends on FT-3; Kafka transactions first |
-| Developer experience (Pillar 6) | 5 items | **Partially done** — DX-1 (CLI tests) ✅ and DX-2 (aeon doctor) ✅ shipped; DX-3 (hot-reload), DX-4 (error polish), DX-5 (cargo xtask) pending |
+| Developer experience (Pillar 6) | 5 items | **Majority done** — DX-1 (CLI tests) ✅, DX-2 (aeon doctor) ✅, DX-4 (error polish) ✅ shipped; DX-3 (hot-reload), DX-5 (cargo xtask) pending |
 | Blocked/demand-driven (Pillar 7) | 6 items | **Blocked on external** — T3 WT library maturity for 5 languages; T1/T2 are inherently language-limited (see Section 10) |
 
 ---
