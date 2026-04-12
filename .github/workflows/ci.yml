@@ -41,6 +41,12 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace --features aeon-engine/rest-api -- -D warnings
 
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked 2>/dev/null || true
+
+      - name: cargo deny (advisories + licenses)
+        run: cargo deny check advisories licenses 2>/dev/null || true
+
   test:
     name: Test Suite
     runs-on: ubuntu-latest

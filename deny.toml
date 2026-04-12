@@ -1,0 +1,71 @@
+# cargo-deny configuration for Aeon
+# Run: cargo deny check
+# Docs: https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+    "wasm32-unknown-unknown",
+]
+
+# ── Advisories ─────────────────────────────────────────────────────────
+# Checks for known security vulnerabilities in dependencies.
+[advisories]
+vulnerability = "deny"
+unmaintained = "warn"
+yanked = "warn"
+notice = "warn"
+ignore = []
+
+# ── Licenses ───────────────────────────────────────────────────────────
+# Aeon is Apache-2.0. Allow compatible open-source licenses.
+[licenses]
+unlicensed = "deny"
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "BSL-1.0",           # Boost
+    "OpenSSL",
+    "CC0-1.0",
+    "MPL-2.0",           # Used by some crypto crates
+    "0BSD",
+]
+copyleft = "deny"
+confidence-threshold = 0.8
+exceptions = []
+
+[licenses.private]
+ignore = false
+registries = []
+
+# ── Bans ───────────────────────────────────────────────────────────────
+# Prevent unwanted or duplicate dependencies.
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+highlight = "all"
+deny = [
+    # Prefer rustls over openssl for TLS
+    { crate = "openssl-sys", wrappers = [] },
+]
+skip = []
+skip-tree = []
+
+# ── Sources ────────────────────────────────────────────────────────────
+# Only allow crates from crates.io (no git deps in published crates).
+[sources]
+unknown-registry = "warn"
+unknown-git = "warn"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
