@@ -18,6 +18,8 @@ pub mod node;
 #[cfg(feature = "cluster")]
 pub mod raft_config;
 #[cfg(feature = "cluster")]
+pub mod log_store;
+#[cfg(feature = "cluster")]
 pub mod store;
 #[cfg(feature = "cluster")]
 pub mod transport;
