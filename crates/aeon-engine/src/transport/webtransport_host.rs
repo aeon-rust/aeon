@@ -240,10 +240,16 @@ impl ProcessorTransport for WebTransportProcessorHost {
             // inflight capacity is saturated, `start_batch` suspends until
             // an earlier batch completes — this is the session-level
             // backpressure that bounds the pending map.
-            let (batch_id, rx) = session.batch_inflight.start_batch().await;
+            //
+            // TR-1: events are retained inside the pending slot as
+            // Arc<Vec<Event>> so a disconnect can drain and replay them.
+            // Retention is a refcount bump, not a copy.
+            let events = Arc::new(events);
+            let (batch_id, rx) = session.batch_inflight.start_batch(Arc::clone(&events)).await;
 
             // Encode batch request
-            let wire = crate::batch_wire::encode_batch_request(batch_id, &events, session.codec)?;
+            let wire =
+                crate::batch_wire::encode_batch_request(batch_id, events.as_slice(), session.codec)?;
 
             // Write length-prefixed frame to data stream
             {
