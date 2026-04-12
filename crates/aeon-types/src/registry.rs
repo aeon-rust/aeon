@@ -66,7 +66,8 @@ pub struct ProcessorVersion {
     pub registered_at: i64,
     /// Who registered this version (operator ID or "cli").
     pub registered_by: String,
-    /// Endpoint URL for T3/T4 processors (e.g., "https://host:4462").
+    /// Endpoint URL for T3/T4 processors.
+    /// T3 WebTransport: `https://host:4472`; T4 WebSocket: `ws://host:4471/api/v1/processors/connect`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
     /// Maximum batch size this processor version supports.
@@ -609,7 +610,7 @@ mod tests {
             group: "analytics".into(),
         };
         r.connection = Some(ProcessorConnectionConfig {
-            endpoint: Some("https://host:4462".into()),
+            endpoint: Some("https://host:4472".into()),
             batch_size: Some(512),
             timeout_ms: None,
             min_instances: None,
@@ -636,14 +637,14 @@ mod tests {
             status: VersionStatus::Available,
             registered_at: 1000,
             registered_by: "cli".into(),
-            endpoint: Some("https://proc.example.com:4462".into()),
+            endpoint: Some("https://proc.example.com:4472".into()),
             max_batch_size: Some(2048),
         };
         let json = serde_json::to_string(&pv).unwrap();
         let back: ProcessorVersion = serde_json::from_str(&json).unwrap();
         assert_eq!(
             back.endpoint.as_deref(),
-            Some("https://proc.example.com:4462")
+            Some("https://proc.example.com:4472")
         );
         assert_eq!(back.max_batch_size, Some(2048));
     }

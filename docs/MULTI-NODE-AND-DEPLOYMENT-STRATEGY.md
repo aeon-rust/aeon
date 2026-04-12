@@ -188,12 +188,12 @@ spec:
                 fieldRef:
                   fieldPath: metadata.name  # "aeon-0", "aeon-1", etc.
           ports:
-            - containerPort: 4460
-              protocol: UDP   # QUIC for Raft
-            - containerPort: 4461
-              protocol: TCP   # REST API
-            - containerPort: 4462
-              protocol: TCP   # Metrics
+            - containerPort: 4470
+              protocol: UDP   # QUIC for Raft/PoH (cluster inter-node, mTLS)
+            - containerPort: 4471
+              protocol: TCP   # REST API + T4 WebSocket + /metrics (management plane)
+            - containerPort: 4472
+              protocol: UDP   # T3 WebTransport + external QUIC connectors
 ```
 
 **Key insight:** On K8s, Aeon does NOT know or care which physical cores it gets.

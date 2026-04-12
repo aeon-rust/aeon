@@ -16,10 +16,10 @@ spec:
       port: {{ .Values.ports.api }}
       targetPort: api
       protocol: TCP
-    - name: metrics
-      port: {{ .Values.ports.metrics }}
-      targetPort: metrics
-      protocol: TCP
+    - name: webtransport
+      port: {{ .Values.ports.webtransport }}
+      targetPort: webtransport
+      protocol: UDP
     - name: quic
       port: {{ .Values.ports.quic }}
       targetPort: quic

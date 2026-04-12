@@ -2471,11 +2471,12 @@ fn cmd_doctor(api: &str, kafka: &str, state_dir: &Path, manifest: Option<&Path>)
 
     // (2) Port availability for in-process Aeon defaults.
     println!("Ports:");
+    // Canonical triplet: 4470 (cluster QUIC), 4471 (REST API + T4 WebSocket + /metrics),
+    // 4472 (T3 WebTransport + external QUIC connectors).
     for (port, label) in [
-        (4460u16, "processor T3 (WebTransport)"),
-        (4461, "processor T4 (WebSocket)"),
-        (4462, "cluster QUIC"),
-        (4471, "REST API"),
+        (4470u16, "cluster QUIC (Raft/PoH)"),
+        (4471, "REST API + T4 WebSocket + /metrics"),
+        (4472, "T3 WebTransport + external QUIC"),
     ] {
         let r = check_port_available(port, label);
         r.print();

@@ -44,9 +44,9 @@ spec:
             - name: api
               containerPort: {{ .Values.ports.api }}
               protocol: TCP
-            - name: metrics
-              containerPort: {{ .Values.ports.metrics }}
-              protocol: TCP
+            - name: webtransport
+              containerPort: {{ .Values.ports.webtransport }}
+              protocol: UDP
           livenessProbe:
             httpGet:
               path: /health
