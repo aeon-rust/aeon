@@ -7,7 +7,7 @@
 //! For streaming replication protocol, a future version will use
 //! START_REPLICATION with a walsender connection.
 
-use aeon_types::{AeonError, Event, PartitionId, Source};
+use aeon_types::{AeonError, BackoffPolicy, Event, PartitionId, Source};
 use bytes::Bytes;
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,6 +29,10 @@ pub struct PostgresCdcSourceConfig {
     pub poll_interval: Duration,
     /// Source identifier for events (interned).
     pub source_name: Arc<str>,
+    /// Reconnect backoff policy (TR-3). Applied when the connection or
+    /// `pg_logical_slot_get_changes()` query fails. Exponential + jitter
+    /// prevents reconnect storms against a flaky Postgres primary.
+    pub backoff: BackoffPolicy,
 }
 
 impl PostgresCdcSourceConfig {
@@ -46,7 +50,14 @@ impl PostgresCdcSourceConfig {
             batch_size: 1024,
             poll_interval: Duration::from_millis(100),
             source_name: Arc::from("postgres-cdc"),
+            backoff: BackoffPolicy::default(),
         }
+    }
+
+    /// Override the reconnect backoff policy.
+    pub fn with_backoff(mut self, backoff: BackoffPolicy) -> Self {
+        self.backoff = backoff;
+        self
     }
 
     /// Set batch size.
@@ -85,64 +96,99 @@ impl PostgresCdcSourceConfig {
 /// - A publication on the target tables
 /// - Sufficient replication slots configured
 pub struct PostgresCdcSource {
-    client: Client,
+    /// `None` when the connection has been dropped after an error and a
+    /// reconnect is pending; the next `next_batch()` will attempt to rebuild.
+    client: Option<Client>,
     config: PostgresCdcSourceConfig,
-    _connection_handle: tokio::task::JoinHandle<()>,
+    _connection_handle: Option<tokio::task::JoinHandle<()>>,
+    /// TR-3 reconnect backoff. Advanced on query/connection errors; reset on
+    /// every successful query (even when the result set is empty).
+    backoff: aeon_types::Backoff,
 }
 
 impl PostgresCdcSource {
     /// Connect to PostgreSQL and set up the replication slot.
     pub async fn new(config: PostgresCdcSourceConfig) -> Result<Self, AeonError> {
-        let (client, connection) = tokio_postgres::connect(&config.connection_string, NoTls)
-            .await
-            .map_err(|e| AeonError::connection(format!("postgres connect failed: {e}")))?;
-
-        let conn_handle = tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                tracing::error!(error = %e, "postgres connection error");
-            }
-        });
-
-        // Create logical replication slot if configured.
-        // Uses 'test_decoding' plugin for SQL-level polling via
-        // pg_logical_slot_get_changes(). The 'pgoutput' plugin is
-        // designed for streaming replication protocol, not SQL queries.
-        if config.create_slot {
-            let create_sql = format!(
-                "SELECT pg_create_logical_replication_slot('{}', 'test_decoding')",
-                config.slot_name
-            );
-            match client.simple_query(&create_sql).await {
-                Ok(_) => {
-                    tracing::info!(slot = %config.slot_name, "created replication slot");
-                }
-                Err(e) => {
-                    let msg = format!("{e}");
-                    if !msg.contains("already exists") {
-                        return Err(AeonError::connection(format!(
-                            "create replication slot failed: {e}"
-                        )));
-                    }
-                }
-            }
-        }
-
-        tracing::info!(
-            slot = %config.slot_name,
-            publication = %config.publication,
-            "PostgresCdcSource connected"
-        );
-
+        let (client, conn_handle) = establish(&config).await?;
+        let backoff = config.backoff.iter();
         Ok(Self {
-            client,
+            client: Some(client),
             config,
-            _connection_handle: conn_handle,
+            _connection_handle: Some(conn_handle),
+            backoff,
         })
     }
 }
 
+/// Establish a fresh tokio-postgres connection and (optionally) create the
+/// replication slot. Returns the client and the driver task handle.
+async fn establish(
+    config: &PostgresCdcSourceConfig,
+) -> Result<(Client, tokio::task::JoinHandle<()>), AeonError> {
+    let (client, connection) = tokio_postgres::connect(&config.connection_string, NoTls)
+        .await
+        .map_err(|e| AeonError::connection(format!("postgres connect failed: {e}")))?;
+
+    let conn_handle = tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            tracing::error!(error = %e, "postgres connection error");
+        }
+    });
+
+    if config.create_slot {
+        let create_sql = format!(
+            "SELECT pg_create_logical_replication_slot('{}', 'test_decoding')",
+            config.slot_name
+        );
+        match client.simple_query(&create_sql).await {
+            Ok(_) => {
+                tracing::info!(slot = %config.slot_name, "created replication slot");
+            }
+            Err(e) => {
+                let msg = format!("{e}");
+                if !msg.contains("already exists") {
+                    return Err(AeonError::connection(format!(
+                        "create replication slot failed: {e}"
+                    )));
+                }
+            }
+        }
+    }
+
+    tracing::info!(
+        slot = %config.slot_name,
+        publication = %config.publication,
+        "PostgresCdcSource connected"
+    );
+
+    Ok((client, conn_handle))
+}
+
 impl Source for PostgresCdcSource {
     async fn next_batch(&mut self) -> Result<Vec<Event>, AeonError> {
+        // Reconnect if the client was dropped after a prior error (TR-3).
+        // Returning Ok(empty) with a backoff sleep keeps the pipeline alive
+        // rather than bubbling connection failures all the way up.
+        if self.client.is_none() {
+            match establish(&self.config).await {
+                Ok((client, handle)) => {
+                    self.client = Some(client);
+                    self._connection_handle = Some(handle);
+                    self.backoff.reset();
+                }
+                Err(e) => {
+                    let delay = self.backoff.next_delay();
+                    tracing::warn!(
+                        error = %e,
+                        delay_ms = delay.as_millis() as u64,
+                        "postgres reconnect failed; backing off before retry"
+                    );
+                    tokio::time::sleep(delay).await;
+                    return Ok(Vec::new());
+                }
+            }
+        }
+
         // Use pg_logical_slot_get_changes with test_decoding plugin.
         // Returns text-format change descriptions (BEGIN, COMMIT,
         // table ... INSERT/UPDATE/DELETE with column values).
@@ -151,9 +197,33 @@ impl Source for PostgresCdcSource {
             self.config.slot_name, self.config.batch_size,
         );
 
-        let rows = self.client.simple_query(&query).await.map_err(|e| {
-            AeonError::connection(format!("pg_logical_slot_get_changes failed: {e}"))
-        })?;
+        let client = self
+            .client
+            .as_ref()
+            .ok_or_else(|| AeonError::state("postgres client missing after establish"))?;
+
+        let rows = match client.simple_query(&query).await {
+            Ok(rows) => rows,
+            Err(e) => {
+                // Drop the client so the next next_batch() rebuilds it, back
+                // off, and return empty instead of Err so the pipeline stays
+                // alive through the outage.
+                let delay = self.backoff.next_delay();
+                tracing::warn!(
+                    error = %e,
+                    delay_ms = delay.as_millis() as u64,
+                    "pg_logical_slot_get_changes failed; dropping connection and backing off"
+                );
+                self.client = None;
+                self._connection_handle = None;
+                tokio::time::sleep(delay).await;
+                return Ok(Vec::new());
+            }
+        };
+
+        // Successful query — reset backoff so the next outage starts again
+        // at `initial_ms`.
+        self.backoff.reset();
 
         let mut events = Vec::new();
         let now = std::time::Instant::now();
