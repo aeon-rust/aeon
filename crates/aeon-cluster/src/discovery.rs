@@ -177,6 +177,7 @@ impl K8sDiscovery {
     /// Build a ClusterConfig from the discovered K8s environment.
     pub fn to_cluster_config(&self) -> ClusterConfig {
         let peers: Vec<NodeAddress> = self.peers().into_iter().map(|(_, addr)| addr).collect();
+        let initial_members = self.members();
 
         ClusterConfig {
             node_id: self.node_id,
@@ -184,7 +185,11 @@ impl K8sDiscovery {
             num_partitions: self.partitions,
             peers,
             seed_nodes: Vec::new(),
-            tls: None, // TLS configured separately via Helm values
+            tls: None, // File-based TLS configured separately via Helm values
+            auto_tls: true, // Use ephemeral self-signed certs for dev/testing
+            initial_members,
+            advertise_addr: None,
+            raft_timing: crate::config::RaftTiming::default(),
         }
     }
 }
@@ -212,6 +217,10 @@ mod tests {
             ],
             seed_nodes: Vec::new(),
             tls: None,
+            auto_tls: false,
+            initial_members: Vec::new(),
+            advertise_addr: None,
+            raft_timing: crate::config::RaftTiming::default(),
         };
         let peers = resolve_peers(&config);
         assert_eq!(peers.len(), 2);
@@ -231,6 +240,10 @@ mod tests {
             ],
             seed_nodes: Vec::new(),
             tls: None,
+            auto_tls: false,
+            initial_members: Vec::new(),
+            advertise_addr: None,
+            raft_timing: crate::config::RaftTiming::default(),
         };
         let members = initial_members(&config);
         assert_eq!(members.len(), 3);

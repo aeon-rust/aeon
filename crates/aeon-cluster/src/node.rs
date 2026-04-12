@@ -17,7 +17,7 @@ mod inner {
     use crate::transport::endpoint::QuicEndpoint;
     use crate::transport::network::QuicNetworkFactory;
     use crate::transport::server;
-    use crate::types::{ClusterRequest, ClusterResponse, NodeAddress, NodeId};
+    use crate::types::{ClusterRequest, ClusterResponse, JoinRequest, NodeAddress, NodeId};
 
     /// A stub RaftNetworkFactory that does nothing (for single-node clusters).
     /// Multi-node networking is implemented in Phase 8c.
@@ -122,6 +122,8 @@ mod inner {
         endpoint: Option<Arc<QuicEndpoint>>,
         /// Shutdown signal for the QUIC server task.
         shutdown: Arc<std::sync::atomic::AtomicBool>,
+        /// Shared read handle to the committed cluster state.
+        shared_state: crate::store::SharedClusterState,
     }
 
     impl ClusterNode {
@@ -131,14 +133,15 @@ mod inner {
 
             let raft_config = Arc::new(Config {
                 cluster_name: "aeon".to_string(),
-                heartbeat_interval: 500,
-                election_timeout_min: 1500,
-                election_timeout_max: 3000,
+                heartbeat_interval: config.raft_timing.heartbeat_ms,
+                election_timeout_min: config.raft_timing.election_min_ms,
+                election_timeout_max: config.raft_timing.election_max_ms,
                 ..Config::default()
             });
 
             let log_store = MemLogStore::new();
             let state_machine = StateMachineStore::new();
+            let shared_state = state_machine.shared_state();
             let network = StubNetworkFactory;
 
             let raft = Raft::new(
@@ -174,6 +177,7 @@ mod inner {
                 config,
                 endpoint: None,
                 shutdown,
+                shared_state,
             };
 
             // Assign all partitions to self
@@ -207,14 +211,15 @@ mod inner {
 
             let raft_config = Arc::new(Config {
                 cluster_name: "aeon".to_string(),
-                heartbeat_interval: 500,
-                election_timeout_min: 1500,
-                election_timeout_max: 3000,
+                heartbeat_interval: config.raft_timing.heartbeat_ms,
+                election_timeout_min: config.raft_timing.election_min_ms,
+                election_timeout_max: config.raft_timing.election_max_ms,
                 ..Config::default()
             });
 
             let log_store = MemLogStore::new();
             let state_machine = StateMachineStore::new();
+            let shared_state = state_machine.shared_state();
             let network = QuicNetworkFactory::new(Arc::clone(&endpoint));
 
             let raft = Raft::new(
@@ -239,22 +244,26 @@ mod inner {
                 server::serve(server_ep, server_raft, server_shutdown).await;
             });
 
-            // Build membership from self + peers
-            let local_addr = endpoint.local_addr().map_err(|e| AeonError::Cluster {
-                message: format!("failed to get local QUIC address: {e}"),
-                source: None,
-            })?;
-
-            let mut members = BTreeMap::new();
-            members.insert(
-                config.node_id,
-                NodeAddress::new(local_addr.ip().to_string(), local_addr.port()),
-            );
-            for (i, peer) in config.peers.iter().enumerate() {
-                // Peer node IDs are assigned sequentially starting after self
-                let peer_id = config.node_id + (i as u64) + 1;
-                members.insert(peer_id, peer.clone());
-            }
+            // Build membership — use pre-computed initial_members if available,
+            // otherwise derive from local endpoint address + peers
+            let members: BTreeMap<u64, NodeAddress> = if !config.initial_members.is_empty() {
+                config.initial_members.iter().cloned().collect()
+            } else {
+                let local_addr = endpoint.local_addr().map_err(|e| AeonError::Cluster {
+                    message: format!("failed to get local QUIC address: {e}"),
+                    source: None,
+                })?;
+                let mut m = BTreeMap::new();
+                m.insert(
+                    config.node_id,
+                    NodeAddress::new(local_addr.ip().to_string(), local_addr.port()),
+                );
+                for (i, peer) in config.peers.iter().enumerate() {
+                    let peer_id = config.node_id + (i as u64) + 1;
+                    m.insert(peer_id, peer.clone());
+                }
+                m
+            };
 
             raft.initialize(members)
                 .await
@@ -268,7 +277,12 @@ mod inner {
                 config,
                 endpoint: Some(endpoint),
                 shutdown,
+                shared_state,
             };
+
+            // NOTE: InitialAssignment is NOT proposed here — it must happen
+            // after leader election completes, and only on the leader node.
+            // The caller (main.rs) handles this after waiting for election.
 
             tracing::info!(
                 node_id = node.config.node_id,
@@ -276,6 +290,71 @@ mod inner {
                 partitions = node.config.num_partitions,
                 "Multi-node cluster bootstrapped with QUIC transport"
             );
+
+            Ok(node)
+        }
+
+        /// Start as a peer node in a fresh cluster bootstrap.
+        ///
+        /// Unlike `bootstrap_multi()`, this does NOT call `raft.initialize()`.
+        /// The bootstrap node (node 1) initializes the cluster with all members;
+        /// peer nodes just start their Raft instance + QUIC server and wait for
+        /// the leader to replicate the initial log entries via AppendEntries.
+        pub async fn start_peer(
+            config: ClusterConfig,
+            endpoint: Arc<QuicEndpoint>,
+        ) -> Result<Self, AeonError> {
+            config.validate()?;
+
+            let raft_config = Arc::new(Config {
+                cluster_name: "aeon".to_string(),
+                heartbeat_interval: config.raft_timing.heartbeat_ms,
+                election_timeout_min: config.raft_timing.election_min_ms,
+                election_timeout_max: config.raft_timing.election_max_ms,
+                ..Config::default()
+            });
+
+            let log_store = MemLogStore::new();
+            let state_machine = StateMachineStore::new();
+            let network = QuicNetworkFactory::new(Arc::clone(&endpoint));
+
+            let raft = Raft::new(
+                config.node_id,
+                raft_config,
+                network,
+                log_store,
+                state_machine,
+            )
+            .await
+            .map_err(|e| AeonError::Cluster {
+                message: format!("failed to create Raft node: {e}"),
+                source: None,
+            })?;
+
+            // Start the QUIC RPC server so the bootstrap leader can reach us
+            let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let server_ep = Arc::clone(&endpoint);
+            let server_raft = raft.clone();
+            let server_shutdown = Arc::clone(&shutdown);
+            tokio::spawn(async move {
+                server::serve(server_ep, server_raft, server_shutdown).await;
+            });
+
+            let shared_state = crate::store::SharedClusterState::default();
+
+            tracing::info!(
+                node_id = config.node_id,
+                peers = config.peers.len(),
+                "Peer node started — awaiting cluster initialization from bootstrap node"
+            );
+
+            let node = Self {
+                raft,
+                config,
+                endpoint: Some(endpoint),
+                shutdown,
+                shared_state,
+            };
 
             Ok(node)
         }
@@ -299,9 +378,9 @@ mod inner {
 
             let raft_config = Arc::new(Config {
                 cluster_name: "aeon".to_string(),
-                heartbeat_interval: 500,
-                election_timeout_min: 1500,
-                election_timeout_max: 3000,
+                heartbeat_interval: config.raft_timing.heartbeat_ms,
+                election_timeout_min: config.raft_timing.election_min_ms,
+                election_timeout_max: config.raft_timing.election_max_ms,
                 ..Config::default()
             });
 
@@ -331,23 +410,245 @@ mod inner {
                 server::serve(server_ep, server_raft, server_shutdown).await;
             });
 
-            // TODO: Contact seed nodes to add ourselves to the cluster.
-            // This requires a cluster management RPC (AddLearner + ChangeMembership)
-            // that is not yet implemented. For now, log the intent.
-            tracing::info!(
-                node_id = config.node_id,
-                seed_nodes = ?config.seed_nodes,
-                "Node started with QUIC transport, awaiting cluster join (seed-based join is Phase 2)"
-            );
+            // Use advertise_addr if set; otherwise fall back to bind address.
+            // In K8s, advertise_addr should be the pod's DNS name.
+            let self_addr = config
+                .advertise_addr
+                .clone()
+                .unwrap_or_else(|| NodeAddress::new(
+                    config.bind.ip().to_string(),
+                    config.bind.port(),
+                ));
+
+            let join_req = JoinRequest {
+                node_id: config.node_id,
+                addr: self_addr,
+            };
+
+            // Try each seed node until one accepts the join.
+            // If a seed is not the leader, it returns leader_id — retry against
+            // the actual leader via any seed that knows the leader address.
+            let mut last_err = String::from("no seed nodes responded");
+            let mut joined = false;
+
+            for seed in &config.seed_nodes {
+                // Use a temporary node_id of 0 for the seed connection target
+                // (we don't know the seed's Raft ID, but the connection only
+                // needs the address for DNS resolution).
+                tracing::info!(seed = %seed, "attempting to join cluster via seed node");
+
+                match crate::transport::network::send_join_request(
+                    &endpoint,
+                    0, // target_id is only used for connection caching
+                    seed,
+                    &join_req,
+                )
+                .await
+                {
+                    Ok(resp) if resp.success => {
+                        tracing::info!(
+                            node_id = config.node_id,
+                            leader = ?resp.leader_id,
+                            "successfully joined cluster via seed {}",
+                            seed
+                        );
+                        joined = true;
+                        break;
+                    }
+                    Ok(resp) => {
+                        tracing::warn!(
+                            seed = %seed,
+                            leader = ?resp.leader_id,
+                            msg = %resp.message,
+                            "seed rejected join, will try next"
+                        );
+                        last_err = resp.message;
+                    }
+                    Err(e) => {
+                        tracing::warn!(seed = %seed, error = %e, "failed to contact seed");
+                        last_err = e.to_string();
+                    }
+                }
+            }
+
+            if !joined {
+                return Err(AeonError::Cluster {
+                    message: format!("failed to join cluster via any seed node: {last_err}"),
+                    source: None,
+                });
+            }
 
             let node = Self {
                 raft,
                 config,
                 endpoint: Some(endpoint),
                 shutdown,
+                shared_state: crate::store::SharedClusterState::default(),
             };
 
             Ok(node)
+        }
+
+        /// Add a node to the cluster dynamically.
+        ///
+        /// This is a two-step process:
+        /// 1. Add as learner — starts replication, blocks until caught up
+        /// 2. Promote to voter — participates in elections and quorum
+        ///
+        /// Must be called on the current leader. If not leader, returns an error.
+        pub async fn add_node(
+            &self,
+            node_id: NodeId,
+            addr: NodeAddress,
+        ) -> Result<(), AeonError> {
+            // Step 1: Add as learner (blocking = true → waits for log catch-up)
+            self.raft
+                .add_learner(node_id, addr, true)
+                .await
+                .map_err(|e| AeonError::Cluster {
+                    message: format!("failed to add learner node {node_id}: {e}"),
+                    source: None,
+                })?;
+
+            tracing::info!(node_id, "node added as learner, promoting to voter");
+
+            // Step 2: Promote to voter
+            let mut voters = std::collections::BTreeSet::new();
+            voters.insert(node_id);
+            self.raft
+                .change_membership(
+                    openraft::ChangeMembers::AddVoterIds(voters),
+                    false, // don't retain removed voters as learners
+                )
+                .await
+                .map_err(|e| AeonError::Cluster {
+                    message: format!("failed to promote node {node_id} to voter: {e}"),
+                    source: None,
+                })?;
+
+            tracing::info!(node_id, "node promoted to voter");
+
+            // Step 3: Rebalance partitions to include the new node
+            let members = self.members().await?;
+            let all_nodes: Vec<u64> = members.keys().copied().collect();
+            if !all_nodes.is_empty() {
+                self.propose(ClusterRequest::RebalancePartitions {
+                    nodes: all_nodes.clone(),
+                })
+                .await?;
+                tracing::info!(
+                    node_id,
+                    cluster_size = all_nodes.len(),
+                    "partition rebalance proposed after node addition"
+                );
+            }
+
+            Ok(())
+        }
+
+        /// Remove a node from the cluster dynamically.
+        ///
+        /// This is a two-step process:
+        /// 1. Demote from voter — stops participating in quorum
+        /// 2. Remove from cluster — stops replication
+        ///
+        /// Must be called on the current leader. The leader cannot remove itself.
+        pub async fn remove_node(&self, node_id: NodeId) -> Result<(), AeonError> {
+            if node_id == self.config.node_id {
+                return Err(AeonError::Config {
+                    message: "a node cannot remove itself from the cluster; \
+                              transfer leadership first"
+                        .to_string(),
+                });
+            }
+
+            // Step 1: Demote from voter to learner
+            let mut to_remove = std::collections::BTreeSet::new();
+            to_remove.insert(node_id);
+            self.raft
+                .change_membership(
+                    openraft::ChangeMembers::RemoveVoters(to_remove.clone()),
+                    false,
+                )
+                .await
+                .map_err(|e| AeonError::Cluster {
+                    message: format!("failed to demote node {node_id} from voter: {e}"),
+                    source: None,
+                })?;
+
+            tracing::info!(node_id, "node demoted from voter, removing from cluster");
+
+            // Step 2: Remove from cluster entirely
+            self.raft
+                .change_membership(
+                    openraft::ChangeMembers::RemoveNodes(to_remove),
+                    false,
+                )
+                .await
+                .map_err(|e| AeonError::Cluster {
+                    message: format!("failed to remove node {node_id} from cluster: {e}"),
+                    source: None,
+                })?;
+
+            // Disconnect QUIC connection to removed node
+            if let Some(ep) = &self.endpoint {
+                ep.disconnect(node_id);
+            }
+
+            tracing::info!(node_id, "node removed from cluster");
+
+            // Step 3: Rebalance partitions away from the removed node
+            let members = self.members().await?;
+            let remaining_nodes: Vec<u64> = members.keys().copied().collect();
+            if !remaining_nodes.is_empty() {
+                self.propose(ClusterRequest::RebalancePartitions {
+                    nodes: remaining_nodes.clone(),
+                })
+                .await?;
+                tracing::info!(
+                    removed = node_id,
+                    remaining = remaining_nodes.len(),
+                    "partition rebalance proposed after node removal"
+                );
+            }
+
+            Ok(())
+        }
+
+        /// Get the current cluster members (voters and learners).
+        pub async fn members(
+            &self,
+        ) -> Result<BTreeMap<NodeId, NodeAddress>, AeonError> {
+            let metrics = self.raft.metrics().borrow().clone();
+            let membership = metrics
+                .membership_config
+                .membership()
+                .clone();
+
+            // Collect all nodes (voters + learners)
+            let mut result = BTreeMap::new();
+            for (id, node) in membership.nodes() {
+                result.insert(*id, node.clone());
+            }
+            Ok(result)
+        }
+
+        /// Check if this node is currently the Raft leader.
+        pub async fn is_leader(&self) -> bool {
+            self.raft
+                .current_leader()
+                .await
+                .is_some_and(|leader| leader == self.config.node_id)
+        }
+
+        /// Get the current cluster size (number of voters).
+        pub async fn voter_count(&self) -> usize {
+            let metrics = self.raft.metrics().borrow().clone();
+            metrics
+                .membership_config
+                .membership()
+                .voter_ids()
+                .count()
         }
 
         /// Propose a ClusterRequest through Raft consensus.
@@ -367,6 +668,49 @@ mod inner {
         /// Get the current leader's NodeId.
         pub async fn current_leader(&self) -> Option<NodeId> {
             self.raft.current_leader().await
+        }
+
+        /// Propose initial partition assignment via Raft.
+        ///
+        /// Must be called only on the leader node after election completes.
+        /// Uses round-robin distribution across all nodes. Idempotent — if
+        /// partitions are already assigned, the state machine ignores duplicates.
+        pub async fn assign_initial_partitions(&self) -> Result<(), AeonError> {
+            // Derive node IDs from initial_members (populated during K8s discovery).
+            // Falls back to collecting from Raft membership metrics.
+            let nodes: Vec<u64> = if !self.config.initial_members.is_empty() {
+                let mut ids: Vec<u64> =
+                    self.config.initial_members.iter().map(|(id, _)| *id).collect();
+                ids.sort();
+                ids
+            } else {
+                let metrics = self.raft.metrics().borrow().clone();
+                let mut ids: Vec<u64> = metrics
+                    .membership_config
+                    .membership()
+                    .voter_ids()
+                    .collect();
+                ids.sort();
+                ids
+            };
+            self.propose(ClusterRequest::InitialAssignment {
+                num_partitions: self.config.num_partitions,
+                nodes,
+            })
+            .await?;
+            Ok(())
+        }
+
+        /// Get a read handle to the committed cluster state.
+        pub fn shared_state(&self) -> crate::store::SharedClusterState {
+            Arc::clone(&self.shared_state)
+        }
+
+        /// Get the current partition table from the committed state.
+        pub async fn partition_table_snapshot(
+            &self,
+        ) -> crate::types::PartitionTable {
+            self.shared_state.read().await.partition_table.clone()
         }
 
         /// Get the node's config.
@@ -402,6 +746,17 @@ mod inner {
         /// Get the QUIC endpoint (if running in multi-node mode).
         pub fn endpoint(&self) -> Option<&Arc<QuicEndpoint>> {
             self.endpoint.as_ref()
+        }
+    }
+
+    impl aeon_types::CheckpointReplicator for ClusterNode {
+        async fn submit_checkpoint(
+            &self,
+            source_offsets: std::collections::HashMap<u16, i64>,
+        ) -> Result<(), aeon_types::AeonError> {
+            self.propose(ClusterRequest::SubmitCheckpoint { source_offsets })
+                .await
+                .map(|_| ())
         }
     }
 
@@ -503,6 +858,109 @@ mod inner {
                 .propose(ClusterRequest::UpdateConfig {
                     key: "batch_size".to_string(),
                     value: "2048".to_string(),
+                })
+                .await
+                .unwrap();
+            assert_eq!(resp, ClusterResponse::Ok);
+
+            node.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn rebalance_partitions_via_raft() {
+            let config = ClusterConfig::single_node(1, 8);
+            let node = ClusterNode::bootstrap_single(config).await.unwrap();
+
+            // All 8 partitions are on node 1. Rebalance to include nodes 1,2,3.
+            let resp = node
+                .propose(ClusterRequest::RebalancePartitions {
+                    nodes: vec![1, 2, 3],
+                })
+                .await
+                .unwrap();
+            assert_eq!(resp, ClusterResponse::Ok);
+
+            node.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn initial_assignment_via_raft() {
+            let config = ClusterConfig::single_node(1, 4);
+            let node = ClusterNode::bootstrap_single(config).await.unwrap();
+
+            // Override with a 6-partition assignment across 3 nodes
+            let resp = node
+                .propose(ClusterRequest::InitialAssignment {
+                    num_partitions: 6,
+                    nodes: vec![1, 2, 3],
+                })
+                .await
+                .unwrap();
+            assert_eq!(resp, ClusterResponse::Ok);
+
+            node.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn rebalance_after_node_removal() {
+            let config = ClusterConfig::single_node(1, 6);
+            let node = ClusterNode::bootstrap_single(config).await.unwrap();
+
+            // First distribute across 3 nodes
+            let resp = node
+                .propose(ClusterRequest::RebalancePartitions {
+                    nodes: vec![1, 2, 3],
+                })
+                .await
+                .unwrap();
+            assert_eq!(resp, ClusterResponse::Ok);
+
+            // Now node 3 is removed — rebalance to just nodes 1 and 2
+            let resp = node
+                .propose(ClusterRequest::RebalancePartitions {
+                    nodes: vec![1, 2],
+                })
+                .await
+                .unwrap();
+            assert_eq!(resp, ClusterResponse::Ok);
+
+            node.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn submit_checkpoint_offsets_via_raft() {
+            use aeon_types::CheckpointReplicator;
+
+            let config = ClusterConfig::single_node(1, 4);
+            let node = ClusterNode::bootstrap_single(config).await.unwrap();
+
+            let mut offsets = std::collections::HashMap::new();
+            offsets.insert(0u16, 100i64);
+            offsets.insert(1u16, 200i64);
+            offsets.insert(2u16, 300i64);
+
+            // Submit via the CheckpointReplicator trait
+            node.submit_checkpoint(offsets.clone()).await.unwrap();
+
+            // Submit again with higher offsets — should advance
+            let mut offsets2 = std::collections::HashMap::new();
+            offsets2.insert(0u16, 150i64);
+            offsets2.insert(1u16, 180i64); // lower than 200 — should NOT regress
+            offsets2.insert(3u16, 50i64); // new partition
+            node.submit_checkpoint(offsets2).await.unwrap();
+
+            node.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn rebalance_empty_nodes_is_noop() {
+            let config = ClusterConfig::single_node(1, 4);
+            let node = ClusterNode::bootstrap_single(config).await.unwrap();
+
+            // Rebalance with empty nodes list should succeed (no-op)
+            let resp = node
+                .propose(ClusterRequest::RebalancePartitions {
+                    nodes: vec![],
                 })
                 .await
                 .unwrap();

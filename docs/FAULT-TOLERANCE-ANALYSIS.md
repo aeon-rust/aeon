@@ -1,0 +1,654 @@
+# Aeon — Fault-Tolerance Analysis & Unified To-Do List
+
+> **Date**: 2026-04-12
+> **Scope**: Comprehensive failure scenario analysis for Aeon cluster, covering all
+> persistence gaps, measured timings, and a unified to-do list organized by
+> architectural pillar.
+>
+> **Context**: This document consolidates findings from the 3-node DOKS cluster
+> validation (P4f), codebase audit of `aeon-cluster`, `aeon-engine`, and `aeon-state`
+> crates, and real-world leader failover measurements. It supersedes the previous
+> to-do list in ROADMAP.md (2026-04-11 Audit), which is retained for historical
+> reference.
+
+---
+
+## 1. Current Persistence Model
+
+### What Is Persisted to Disk
+
+| Component | Persisted? | Where | Survives |
+|-----------|-----------|-------|----------|
+| Checkpoint WAL | Yes | `AEON-CKP` file (append-only, CRC32) | Process crash, node restart |
+| L3 State (redb) | Yes | `data/state/l3.redb` (ACID, B-tree) | All failure modes |
+| L2 State (mmap) | Yes | Append-only log with in-memory index | OS crash (page cache flush) |
+| PoH chain tip | Yes | Stored in L3 | All failure modes |
+| Merkle log | Yes | Stored in L3 | All failure modes |
+| Source-Anchor offset | Yes | Via checkpoint WAL | Process crash |
+
+### What Is NOT Persisted (In-Memory Only)
+
+| Component | Location | Lost On |
+|-----------|----------|---------|
+| **Raft log (MemLogStore)** | `aeon-cluster/src/store.rs:46` | Any process restart |
+| **Raft vote state** | `MemLogStore` inner BTreeMap | Any process restart |
+| **Raft snapshots (ClusterSnapshot)** | `StateMachineStore` in-memory | Any process restart |
+| **SPSC ring buffers** | `rtrb` in `pipeline.rs` | Any process restart |
+| **L1 DashMap state** | `aeon-state/src/l1.rs` | Any process restart |
+| **Partition transfer state** | `ClusterSnapshot` (BulkSync/Cutover) | Any process restart |
+
+---
+
+## 2. Failure Scenarios
+
+### Scenario 1: Leader Node Hard Power-Off
+
+**Sequence:**
+1. Leader stops sending heartbeats immediately
+2. Followers wait 1500-3000ms (randomized election timeout), then start election
+3. New leader elected within ~2-3s of actual crash (K8s takes ~10s to detect)
+4. New leader runs partition assignment — partitions on dead node get reassigned
+5. K8s StatefulSet recreates the pod, node rejoins as follower
+
+**Data at risk:**
+- **Uncommitted Raft entries**: If the leader accepted a `ClusterRequest` (e.g., partition
+  assignment, membership change) but crashed before replicating to a quorum, that entry is
+  **lost**. OpenRaft requires quorum commit, so only uncommitted entries are at risk.
+- **In-flight pipeline events**: SPSC ring buffers on the crashed node are lost entirely.
+  Events between last checkpoint flush and crash = duplicates on replay (at-least-once).
+- **Checkpoint WAL**: Survives on the crashed node's disk (PVC in K8s). On restart, pipeline
+  resumes from last checkpoint — but replays events already sent to sink.
+
+**Critical gap**: The Raft log itself (`MemLogStore`) is lost on crash. When the node restarts,
+it has zero Raft history. It must receive a full snapshot from the current leader to rebuild state.
+
+### Scenario 2: Previous Leader Rejoins After New Leader Elected
+
+**Sequence:**
+1. Old leader restarts with empty `MemLogStore` (term=0, no log entries)
+2. Contacts cluster, discovers new leader with higher term
+3. Steps down, becomes follower
+4. Receives Raft snapshot from new leader (`ClusterSnapshot` with partition table, membership)
+5. Catches up on any log entries after snapshot
+6. Resumes pipeline processing from checkpoint WAL offsets
+
+**Data consistency:**
+- OpenRaft handles term/log conflicts correctly — old leader's uncommitted entries are discarded
+- Committed entries (replicated to quorum before crash) are safe — they exist on surviving nodes
+- The only risk: entries the old leader committed locally but **failed to replicate** before crash.
+  These are genuinely lost because no other node has them.
+
+This is inherent to Raft consensus — not an Aeon-specific bug. etcd, CockroachDB, and every
+Raft implementation has this property. The mitigation is: don't acknowledge writes to clients
+until quorum-committed.
+
+### Scenario 3: Network Partition (Split-Brain)
+
+**Sequence:**
+1. If leader is isolated from majority: leader loses quorum, cannot commit new entries,
+   eventually steps down
+2. Majority side elects new leader, continues operating
+3. When network heals: old leader discovers higher term, steps down, syncs from new leader
+
+**Assessment**: Aeon handles this correctly — OpenRaft's term-based conflict resolution prevents
+split-brain. No manual intervention needed.
+
+### Scenario 4: Flaky Network (Intermittent Connectivity)
+
+**Sequence:**
+1. Missed heartbeats trigger unnecessary elections
+2. Leader changes frequently ("election storms")
+3. Each election = ~2-3s of no writes accepted
+4. Partition assignments may thrash if leader keeps changing
+
+**Gap**: No pre-vote protocol. OpenRaft supports pre-vote (prevents disruptive elections from
+partitioned nodes), but Aeon doesn't configure it. A node that briefly loses connectivity will
+increment its term and force an unnecessary election when it reconnects.
+
+### Scenario 5: Simultaneous Multi-Node Failure (Quorum Loss)
+
+**Sequence:**
+1. If 2 of 3 nodes crash: no quorum, cluster is **completely stalled**
+2. No reads, no writes, no leader election possible
+3. Surviving node cannot do anything alone
+
+**Recovery:**
+- Must bring at least one more node back online
+- Since `MemLogStore` is in-memory, restarted nodes have empty state
+- If the surviving node was a follower: it has the most recent state, can serve as snapshot source
+- If all 3 crash: total state loss for Raft metadata. Pipelines resume from checkpoint WAL only.
+
+**This requires manual intervention** — specifically, re-bootstrapping the cluster if all nodes
+lost their Raft state simultaneously. Fixing GAP 1 + GAP 2 (persistent Raft store) would
+make this scenario fully automatic.
+
+---
+
+## 3. Measured Timings (Real 3-Node DOKS Cluster)
+
+| Metric | Measured | Notes |
+|--------|----------|-------|
+| Leader election (total) | **~12-13 seconds** | Includes K8s pod termination detection (~10s) + Raft election rounds (~2-3s) |
+| Raft election (pure) | **~2-3 seconds** | Hardcoded: heartbeat=500ms, election_min=1500ms, election_max=3000ms |
+| State sync (new node) | **< 1 second** | Raft snapshot install — metadata only (~KB), not event data |
+| Partition rebalance | **< 1 second** | Round-robin assignment after leader election |
+
+**Breakdown of 12-13s total election time:**
+- K8s detects pod is gone: ~10s (kubelet grace period)
+- Followers notice missing heartbeats: ~1.5-3s (election timeout range)
+- Election rounds complete: ~0.5-1s
+
+**Gate 2 target**: Leader failover <5s recovery. The pure Raft election is within target (~2-3s).
+The K8s detection time is infrastructure-dependent and can be tuned via pod liveness probes.
+
+---
+
+## 4. Identified Gaps (Ranked by Severity)
+
+### GAP 1: In-Memory Raft Log (CRITICAL)
+
+- **File**: `crates/aeon-cluster/src/store.rs:46-155`
+- **Risk**: Node crash = complete loss of Raft votes, log entries, and committed index
+- **Impact**: Every restart requires full snapshot transfer from leader. Total metadata loss
+  if all nodes crash simultaneously.
+- **Fix**: Replace `MemLogStore` with persistent backend via L3Store trait (redb default,
+  RocksDB pluggable). Store votes, log entries, and hard state to disk.
+- **Architectural connection**: Reuses `L3Store` adapter pattern from `aeon-state`. Same
+  redb engine, same trait interface, consistent persistence model across the codebase.
+- **Prerequisite**: FT-7 (make `TieredStore` generic over `L3Store`) must come first so the
+  Raft store can use any configured L3 backend.
+
+### GAP 2: In-Memory Snapshots (HIGH)
+
+- **File**: `crates/aeon-cluster/src/store.rs:162-490`
+- **Risk**: Snapshot exists only in RAM. If leader crashes during snapshot transfer to a new
+  node, transfer fails and must restart from scratch.
+- **Impact**: Slow node recovery; total metadata loss if all nodes crash.
+- **Fix**: Persist `ClusterSnapshot` to the same redb database as the Raft log (GAP 1).
+  Load on startup. This also automatically solves GAP 7 (transfer state durability).
+
+### GAP 3: At-Least-Once Delivery Window (MEDIUM)
+
+- **File**: `crates/aeon-engine/src/checkpoint.rs`
+- **Risk**: Race between `sink.write_batch()` completing and `checkpoint.flush()`. If crash
+  happens between these two operations, checkpoint hasn't recorded the new offset — events
+  are replayed — duplicates.
+- **Current backend**: Custom WAL format (`AEON-CKP` magic, CRC32 integrity). The
+  `CheckpointBackend` enum also defines `StateStore`, `Kafka`, `None` variants — but only
+  `Wal` is implemented.
+- **Fix**: Implement `CheckpointBackend::StateStore` — write checkpoint records through
+  `L3Store` trait (redb ACID transactions). Make `StateStore` the default backend (convention).
+  Keep `Wal` as configurable fallback.
+- **Architectural connection**: Checkpoint writes flow through the same L3 backend as
+  application state. ACID atomicity eliminates the race window. The `L3Store` trait provides
+  the abstraction; redb or RocksDB handles the durability.
+
+### GAP 4: Election Timing (MEDIUM)
+
+- **File**: `crates/aeon-cluster/src/node.rs` (hardcoded timeouts)
+- **Risk**: 12-13s leader election means 12-13s of no Raft writes. Pipeline data continues
+  flowing (source->processor->sink), but partition reassignment stalls.
+- **Current values**: `heartbeat_interval=500ms`, `election_timeout_min=1500ms`,
+  `election_timeout_max=3000ms` (hardcoded in all 4 bootstrap functions).
+- **Fix**: Make timeouts configurable via cluster config. Recommended defaults:
+  `heartbeat=200ms`, `election_min=600ms`, `election_max=1200ms` for faster failover.
+
+### GAP 5: SPSC Buffer Loss on Crash (ACCEPTED)
+
+- **File**: `crates/aeon-engine/src/pipeline.rs`
+- **Risk**: In-flight events in `rtrb` ring buffers are lost on crash.
+- **Assessment**: These events will be replayed from checkpoint (at-least-once), so no data
+  loss — just duplicates. Persisting SPSC buffers would destroy hot-path performance.
+- **Decision**: Accepted. No action needed.
+
+### GAP 6: No Pre-Vote Protocol (LOW-MEDIUM)
+
+- **Risk**: Flaky network causes unnecessary elections and term inflation.
+- **Fix**: Enable OpenRaft's pre-vote feature. One configuration line.
+- **Effort**: Trivial.
+
+### GAP 7: Partition Transfer State Not Durable (SOLVED BY GAP 2)
+
+- **File**: `crates/aeon-cluster/src/store.rs` (BulkSync/Cutover states in ClusterSnapshot)
+- **Risk**: If a node crashes mid-partition-transfer, transfer restarts from scratch.
+- **Fix**: Automatically solved by GAP 2 — persisting ClusterSnapshot persists transfer state.
+
+### GAP 8: Health Check Messages Unused (LOW)
+
+- **File**: `crates/aeon-cluster/src/framing.rs` — `HealthPing`/`HealthPong` defined but not sent
+- **Risk**: No application-level health detection beyond Raft heartbeats.
+- **Fix**: Implement periodic health pings with latency tracking. Low priority — Raft
+  heartbeats already provide basic liveness detection.
+
+### GAP 9: Production Cluster Uses Insecure TLS (HIGH)
+
+- **File**: `crates/aeon-cli/src/main.rs:405-408` (production code path)
+- **File**: `crates/aeon-cluster/src/transport/tls.rs:186-228` (`AcceptAnyCert` verifier)
+- **Risk**: The production CLI calls `dev_quic_configs_insecure()` for cluster QUIC transport.
+  This generates ephemeral self-signed certificates and uses `AcceptAnyCert` — a custom
+  `ServerCertVerifier` that unconditionally accepts **any** server certificate via the rustls
+  `.dangerous()` API. No chain-of-trust validation occurs.
+- **Impact**: Man-in-the-middle attack on QUIC inter-node transport could intercept/modify
+  Raft RPCs (partition assignments, membership changes), inject false cluster state, or
+  observe all control-plane traffic. This is the cluster's only inter-node communication channel.
+- **Additional vectors**:
+  - `aeon-processor-client`: `webtransport-insecure` feature enables `.with_no_cert_validation()`
+    for WebTransport processor connections. Correctly feature-gated for dev-dependencies only,
+    but no runtime guard prevents accidental production use.
+  - `aeon-crypto/src/tls.rs`: `CertificateStore::new_insecure()` creates empty cert store — used
+    in tests but available in public API.
+- **Existing infrastructure**: The `aeon-crypto` crate already has proper TLS support:
+  - `CertificateStore` with CA cert loading, key/cert file paths
+  - `auto-tls` feature for development self-signed cert generation (rcgen)
+  - Full mTLS capability — just not wired into the cluster transport
+- **Fix**: Wire proper mTLS for cluster QUIC using `CertificateStore` from `aeon-crypto`.
+  Production mode: require CA cert + node cert/key paths in config. Development mode: keep
+  insecure self-signed behind explicit `--insecure` CLI flag (not default). The `auto-tls`
+  feature can generate dev certs, but `AcceptAnyCert` should never be used without explicit
+  opt-in.
+
+---
+
+## 5. Architectural Connections
+
+Several gaps and existing to-do items are **the same problem at different layers** — persistence
+through the `L3Store` trait:
+
+```
+                    L3Store Trait (aeon-state)
+                   /          |           \
+                  /           |            \
+        RedbStore        (future)       (future)
+        (default)       RocksDB         other
+           |               |
+    +------+------+--------+
+    |      |      |
+    v      v      v
+  App    Raft   Checkpoint
+  State   Log    Records
+  (L3)  (FT-1)  (FT-3)
+```
+
+### Connection 1: Raft Log (FT-1) reuses L3Store
+
+Instead of building a new persistence layer for `MemLogStore`, implement `RaftLogStorage`
+backed by the same `L3Store` trait. One persistence engine (redb or configured alternative)
+for both application state and consensus state.
+
+### Connection 2: Checkpoint (FT-3) reuses L3Store
+
+The `CheckpointBackend::StateStore` variant already exists in the enum. Implementation writes
+checkpoint records through `L3Store` — gaining ACID atomicity and eliminating the at-least-once
+race window. This becomes the default by convention.
+
+### Connection 3: Raft Snapshot (FT-2) shares FT-1's store
+
+`ClusterSnapshot` serializes into the same redb database as the Raft log. One open database
+handle, two tables (log entries + snapshots). Automatically solves GAP 7 (transfer state).
+
+### Connection 4: TieredStore generics (FT-7) enables all of the above
+
+Currently `TieredStore` is hardcoded to `Option<RedbStore>`. Making it generic over `L3Store`
+(or using `Box<dyn L3Store>`) allows runtime backend selection via config. This must be done
+first — FT-1 and FT-3 then work with any configured L3 backend.
+
+---
+
+## 6. Automatic vs Manual Recovery
+
+| Scenario | Automatic? | Manual Intervention? |
+|----------|------------|---------------------|
+| Single node crash | **Yes** — K8s restarts pod, Raft syncs state | No |
+| Leader crash | **Yes** — new election + reassignment | No |
+| Network partition (minority isolated) | **Yes** — majority continues, minority rejoins | No |
+| Network partition (leader isolated) | **Yes** — new leader elected, old steps down | No |
+| Flaky network | **Mostly** — works but may cause election storms | Maybe tune timeouts |
+| 2-of-3 nodes crash | **Partial** — needs 1 node back for quorum | Must restart at least 1 node |
+| All nodes crash (current) | **No** — Raft state lost (in-memory) | Must re-bootstrap cluster |
+| All nodes crash (after FT-1 + FT-2) | **Yes** — each node recovers from disk | No |
+| MITM on inter-node QUIC (current) | **Vulnerable** — no cert validation | Must deploy proper mTLS (FT-8) |
+| MITM on inter-node QUIC (after FT-8) | **Protected** — mTLS with CA chain | No |
+
+---
+
+## 7. Unified To-Do List
+
+This list supersedes the "Comprehensive To-Do List (2026-04-11 Audit)" in ROADMAP.md, which
+is retained for historical reference.
+
+### Pillar 1: Persistence & Durability (Fault-Tolerance Core)
+
+| ID | Task | Connects To | Effort | Depends On |
+|----|------|-------------|--------|------------|
+| **FT-9** | Move `L3Store` trait + `BatchOp`/`BatchEntry`/`KvPairs` to `aeon-types` — enables `aeon-cluster` and `aeon-engine` to use L3Store without cross-crate dependency on `aeon-state`. `RedbStore` implementation stays in `aeon-state`. Follows CLAUDE.md rule #1: "Traits are defined BEFORE implementations." | Prerequisite for FT-7, FT-1, FT-3. Currently `aeon-cluster` does not depend on `aeon-state`. | Low | — |
+| **FT-7** | Make `TieredStore` generic over `L3Store` — change `l3: Option<RedbStore>` to `l3: Option<Arc<dyn L3Store>>` for runtime backend selection via config (`state.l3.backend`). L3Store is confirmed object-safe (no generics, no Self-returning methods). | L3Backend enum (exists), TieredStore (hardcoded to RedbStore) | Low | FT-9 |
+| **FT-4** | ~~Enable OpenRaft pre-vote~~ — **Blocked upstream**: openraft 0.9.21 does not expose `enable_pre_vote` (not a configurable feature); openraft 0.10 is alpha-only. Mitigation until upstream support arrives: widen election timeout jitter range via FT-5 (larger gap between `election_timeout_min` and `election_timeout_max` reduces split-vote probability). Revisit when openraft 0.10 stabilizes. | GAP 6 | Blocked | Upstream openraft 0.10 |
+| **FT-5** | Configurable election timeouts — expose heartbeat/election_min/election_max in cluster config | GAP 4 | Low | — |
+| **FT-1** | Persistent Raft log via L3Store — replace `MemLogStore` with L3-backed `RaftLogStore` implementing `RaftLogStorage` + `RaftLogReader`. Key mapping: log entries as `raft:log:{index}`, vote as `raft:vote`, committed as `raft:committed`. | GAP 1, L3Store adapter pattern | Medium | FT-9 |
+| **FT-2** | Persistent Raft snapshots — serialize `ClusterSnapshot` to L3 (same DB as FT-1) | GAP 2, also solves GAP 7 | Low | FT-1 |
+| **FT-3** | Checkpoint via L3 backend (convention) — create `CheckpointPersist` trait abstracting WAL vs L3Store, implement `CheckpointBackend::StateStore`, make it default. Keep WAL as configurable fallback. Pipeline holds `Box<dyn CheckpointPersist>` instead of `Option<CheckpointWriter>`. | GAP 3, existing `CheckpointBackend` enum | Medium | FT-7 |
+| **FT-6** | Wire `HealthPing`/`HealthPong` — application-level health detection | GAP 8 | Low | — |
+| **FT-8** | Production mTLS for cluster QUIC — wire `CertificateStore` from `aeon-crypto` (already produces rustls `ServerConfig`/`ClientConfig`), require CA cert + node cert/key in production. Keep `--insecure` flag for dev only. Also guard `webtransport-insecure` with runtime check. | GAP 9 | Medium | — |
+| **FT-10** | Systematic `unwrap()` audit — eliminate 1,312 `.unwrap()`/`.expect()`/`panic!()`/`unreachable!()` calls in production code (CLAUDE.md rule #2). Approach: (a) categorize hot-path vs control-plane, recoverable vs invariant; (b) hot-path errors → `Result<T, AeonError>` with `?`; (c) genuinely-impossible invariants → `.expect("invariant: <reason>")` with documented reason; (d) add `#![warn(clippy::unwrap_used, clippy::expect_used)]` per crate as files are cleaned. Excludes `aeon-cli` (CLI layer permitted) and tests/benches. **Directly tied to zero-event-loss guarantee** — any panic on the pipeline thread drops in-flight batches. | GAP A, zero-event-loss guarantee (Gate 1) | High | — |
+| **FT-11** | Hot-path zero-copy violations (hard blocker) — eliminate any `.to_vec()`, `.to_string()`, `.into_bytes()`, `Vec::from(bytes)`, `String::from(&str)` on hot path. These are **real CLAUDE.md rule #3 violations** causing payload/metadata data copies (not refcount ops). Every occurrence represents a genuine allocation on the hot path and must be replaced with `Bytes` slices, `&[u8]` references, or `Arc<str>` interning. Scope: `pipeline.rs`, `pipeline_manager.rs`, connector sources/sinks, processor adapters. | GAP E, CLAUDE.md rule #3 enforcement | Medium | — |
+| **FT-12** | Hot-path refcount & config optimization (perf tuning) — **not a rule violation, but a Gate 1 latency optimization**. Refcount clones (`Bytes::clone`, `Arc::clone`, `Event::clone`) are cheap (~15-30ns each) but compound across pipeline stages. Two parts: **(a)** replace `Arc::clone`/`Bytes::clone`/`Event::clone` with `&Event`/`&Bytes` references where fan-out isn't required; add `// clone: <justification>` comments to legitimate clones. **(b)** move per-event `config.clone()` in `pipeline_manager.rs` to `Arc<Config>` so it's one refcount bump, not a struct deep-copy. Benchmark before/after with `gate1_steady_state` (target: <100ns per-event overhead). | GAP E, Gate 1 perf target | Medium | FT-11 |
+
+**Accepted (no action):**
+- GAP 5 (SPSC buffer loss) — at-least-once replay from checkpoint covers this
+- GAP 7 (transfer state durability) — solved automatically by FT-2
+
+### Pillar 2: Zero-Downtime Deployment
+
+| ID | Task | Source | Effort |
+|----|------|--------|--------|
+| **ZD-1** | Add `POST /api/v1/processors` route + handler | Plan Phase A1 | Low |
+| **ZD-2** | ~~Fix CLI serde PascalCase -> kebab-case~~ | **Done** — commit fa10635 (2026-04-11), already using `"wasm"`, `"native-so"`, `"available"` | — |
+| **ZD-3** | Replace SHA-512 placeholder with real SHA-512 in `registry.rs` | Plan Phase A3 | Low |
+| **ZD-4** | Source `pause()`/`resume()` + pipeline drain mechanism | Plan Phase B1-B2 | Medium |
+| **ZD-5** | Hot-swap orchestrator — drain->swap->resume for Wasm/Native | Plan Phase B3-B4 | Medium |
+| **ZD-6** | Same-type source/sink reconfiguration | Plan Phase C1-C3 | Medium |
+| **ZD-7** | Cross-type connector swap via blue-green pipeline | Deferred (ZD-9 in old list) | High |
+
+### Pillar 3: Cluster Operations & Validation
+
+| ID | Task | Source | Effort |
+|----|------|--------|--------|
+| **CL-1** | Multi-node acceptance testing — 9 Gate 2 checklist items | ROADMAP Gate 2 criteria | High |
+| **CL-2** | Partition reassignment real-network validation | Implemented, needs cloud testing | Medium |
+| **CL-3** | PoH chain transfer real-network testing | Crypto tests pass, real transfer deferred | Medium |
+| **CL-4** | Cluster-level Prometheus metrics — expose Raft term, election count, replication lag, membership size via `aeon-observability`. Metrics: `aeon_raft_term` (gauge), `aeon_raft_elections_total` (counter), `aeon_raft_replication_lag` (gauge per follower), `aeon_cluster_membership_size` (gauge). Required for monitoring election storms (GAP 6) and replication health. | Raft internal metrics exist (`self.raft.metrics()`) but not Prometheus-exposed | Low |
+| **CL-5** | Raft-aware K8s auto-scaling — new pods auto-join Raft cluster when `cluster.auto_join: true`. Config: `autoscaling.mode: "raft-aware"` triggers Raft `add_learner` → catch-up → `change_membership` on scale-up; graceful `remove_node` with partition drain on scale-down. Cloud-agnostic: works with DOKS HPA, AWS EKS/Karpenter, GKE, AKS. HPA remains disabled when `cluster.enabled: true` unless `autoscaling.mode` is explicitly set. Depends on CL-6 for safe scale-down (partition drain). | HPA exists in Helm (`helm/aeon/templates/hpa.yaml`) but guarded off for cluster mode. No Raft join-on-boot logic. | High |
+| **CL-6** | Partition transfer data movement — state machine currently tracks `PartitionTransferState::{Pending, BulkSync, Cutover, Complete}` but **no actual data is moved**. Required for Gate 2 acceptance and prerequisite for safe CL-5 scale-down. Split into 4 sub-tasks: | GAP C, Gate 2 | Very High |
+| **CL-6a** | Bulk sync protocol — stream L3 state for partition from source → target node via existing QUIC transport (`aeon-cluster/src/transport/`). Use `L3Store::scan_prefix(partition_key)` on source, send KV pairs as QUIC stream, target writes via `L3Store::write_batch`. Apply backpressure if target can't keep up. | CL-6 sub-task | Medium |
+| **CL-6b** | PoH chain transfer — ship entire hash chain with Merkle proof from source → target, verify on target before accepting cutover. Scaffolding exists in `aeon-cluster/src/poh/transfer.rs` (tests pass) but real streaming transfer not wired. | CL-6 sub-task | Medium |
+| **CL-6c** | Cutover handshake — atomic "stop accepting writes for partition X on node A, start on node B" via Raft-proposed cutover entry. Source flushes pending writes, acks final offset, target begins accepting. Zero-event-loss guarantee: writes during cutover window are buffered on target and replayed from source's final offset. | CL-6 sub-task | Medium |
+| **CL-6d** | Backpressure & throttling during transfer — cap transfer bandwidth at configurable fraction of link capacity (default 30%) so ongoing pipeline traffic isn't saturated. Report transfer progress as Prometheus metric (`aeon_partition_transfer_progress`). | CL-6 sub-task | Low |
+
+### Pillar 4: Transport Resilience (Deferred)
+
+| ID | Task | Source | Effort |
+|----|------|--------|--------|
+| **TR-1** | In-flight batch replay on T3/T4 disconnect | ZD-10 in old list | Medium |
+| **TR-2** | Wasm state transfer on hot-swap | ZD-11 in old list | Medium |
+| **TR-3** | Connection backoff with jitter across all connectors — add shared `BackoffPolicy { initial_ms, max_ms, multiplier, jitter_pct }` abstraction in `aeon-types`; wrap reconnect loops in Kafka source/sink, Redis Streams, NATS, RabbitMQ, MQTT, Postgres/MySQL/MongoDB CDC, QUIC, WebTransport, WebSocket connectors with exponential backoff + jitter (default: 100ms → 30s cap). Exposed as per-connector YAML config. Prevents reconnect storms during upstream outages that worsen recovery and appear as DDoS to upstream services. | GAP H | Medium |
+
+### Pillar 5: Exactly-Once Delivery (Future)
+
+| ID | Task | Details | Effort |
+|----|------|---------|--------|
+| **EO-1** | Implement `IdempotentSink` for `KafkaSink` — use Kafka transactions (`init_transactions`, `begin_transaction`, `send_offsets_to_transaction`, `commit_transaction`) for exactly-once sink delivery. | `IdempotentSink` trait exists in `aeon-types` (`traits.rs:120-126`) with `has_seen()` method. `DeliverySemantics::ExactlyOnce` variant references it. Zero implementations currently exist. Kafka is the natural first target. | Medium |
+| **EO-2** | Atomic checkpoint + sink commit — combine checkpoint offset write (FT-3) with Kafka transaction commit into a single atomic operation. Eliminates the at-least-once window entirely for Kafka sinks. | Depends on FT-3 (checkpoint via L3) and EO-1 (Kafka transactions). The sink ack, checkpoint write, and Kafka offset commit happen in one transaction. | Medium |
+| **EO-3** | Implement `IdempotentSink` for other sinks — Redis (SET NX / SETNX pattern), PostgreSQL (INSERT ON CONFLICT), NATS JetStream (message dedup). Each connector that supports server-side dedup gets an `IdempotentSink` implementation. | Demand-driven — implement per connector as exactly-once is requested. | Per-connector |
+
+### Pillar 6: Developer Experience & Adoption-Readiness
+
+Adoption across programming languages (Section 10) is one of Aeon's core goals. This
+pillar ensures that once a developer chooses a tier (T1/T2/T3/T4), the experience of
+integrating, testing, deploying, and operating against Aeon is friction-free.
+
+| ID | Task | Details | Effort |
+|----|------|---------|--------|
+| **DX-1** | CLI integration test suite — `aeon-cli` currently has **0 tests**. All previously-found bugs (ZD-1/2/3) shipped because no test exercised CLI deserialization or command flow. Use `assert_cmd` crate + snapshot testing (`insta`). Cover: `aeon init`, `aeon dev`, `aeon processor register/list`, `aeon deploy`, `aeon status`. Mock REST server for API-hitting commands. | GAP D | Medium |
+| **DX-2** | `aeon doctor` command — validates environment before a new user's first pipeline run. Checks: (a) config file syntax & schema; (b) Redpanda/Kafka reachable on configured bootstrap; (c) L3 state dir writable; (d) ports 4460/4461/4462 available; (e) required features compiled in (e.g., `kafka` feature for Kafka connectors); (f) processor artifact exists and loadable (for configured Wasm/native). Reports pass/warn/fail with actionable fix suggestions. | GAP G | Low |
+| **DX-3** | Hot-reload in `aeon dev` via `notify` crate — watch processor artifact file, trigger drain→swap on change. Reuses ZD-5 hot-swap orchestrator, adds filesystem watcher. Formerly deferred as ZD-12; promoted because it dramatically improves the Wasm/native dev loop. | GAP G, formerly ZD-12 | Medium |
+| **DX-4** | CLI error message polish — map `AeonError` variants to user-friendly messages in the CLI output layer (Rust `Debug` output is unreadable for end users). Each error kind gets a short human message + a "try this" hint. E.g., `AeonError::Config(...)` → `"Config error in line 23: field 'bootstrap' is required. Try: bootstrap: localhost:9092"`. | GAP G | Low |
+| **DX-5** | `cargo xtask` for dev workflows — one-liner entrypoints for: running the full Gate 1 validation suite, comparing benchmarks between branches, preparing a release (version bump + changelog entry + tag), regenerating SDK wire protocol examples. Reduces "remembered CLI incantations" barrier for contributors. | GAP G | Low |
+
+### Pillar 7: Blocked / Demand-Driven (No Action Now)
+
+| ID | Task | Tier | Blocker |
+|----|------|------|---------|
+| **BL-1** | Node.js T3 WebTransport SDK | T3 | No stable npm WT package (`@aspect-build/webtransport` is stopgap) |
+| **BL-2** | Java T3 WebTransport SDK | T3 | Flupke WT is experimental, no stable client |
+| **BL-3** | C# T3 WebTransport SDK | T3 | `System.Net.Quic` preview only, not until .NET 11+ |
+| **BL-4** | C/C++ T3 WebTransport SDK | T3 | No mature WT library (quinn/quiche C bindings possible future) |
+| **BL-5** | PHP T3 WebTransport SDK | T3 | PHP ecosystem lacks QUIC/WT support entirely |
+| **BL-6** | Child process isolation tier (T5) | — | Design only |
+
+**Note on T1/T2 language scope**: T1 (Native .so/.dll) is inherently limited to Rust, C/C++,
+and C# NativeAOT — languages that produce C-ABI shared libraries. T2 (Wasm) is limited to
+Rust, AssemblyScript, and C/C++ — languages with wasm32 compilation. No action items exist
+for extending T1/T2 to other languages because it is a runtime constraint, not an Aeon
+limitation. See Section 10 for the full per-language × per-tier matrix.
+
+### Documentation Updates
+
+| ID | Task | Status |
+|----|------|--------|
+| **DOC-1** | Create `docs/FAULT-TOLERANCE-ANALYSIS.md` | **Done** (2026-04-12) — this document |
+| **DOC-2** | Update ROADMAP.md — reference this doc, mark old to-do OVERRIDDEN, add unified list | **Done** (2026-04-12) |
+| **DOC-3** | Update ARCHITECTURE.md — L3 backend is redb (default), RocksDB pluggable via L3Store trait | **Done** (2026-04-12) |
+| **DOC-4** | Mark L2 mmap as DONE in ROADMAP (was marked "NOT IMPLEMENTED" — stale) | **Done** (2026-04-12) |
+| **DOC-5** | Doc staleness sweep — update `CLUSTERING.md` header (DOKS validation done), update `MULTI-NODE-AND-DEPLOYMENT-STRATEGY.md` to reference this analysis, update `E2E-TEST-PLAN.md` (G1/G2/G3, F7, A5 marked ❌ but actually done — also flagged as ZD-plan A4). Single-pass sweep. | GAP F | Pending |
+
+### Stale Items Corrected
+
+| Item | Old Status | Actual Status |
+|------|-----------|---------------|
+| L2 mmap tier | "NOT IMPLEMENTED — l2.rs doesn't exist" | **DONE** — `aeon-state/src/l2.rs` (646 lines, 10 tests, feature-gated `mmap`) |
+| Multi-node DOKS (P4f) | "Blocked on infra" | **DONE** — 3-node cluster validated (2026-04-12) |
+| Raft consensus real-network | "Needs multi-node cloud" | **DONE** — leader failover, log replication, node rejoin tested on DOKS |
+| Cross-node QUIC | "Needs multi-node cloud" | **DONE** — all 3 nodes consistent (log_idx=16, applied=16, term=25) |
+| CI/CD items (4) | Listed as pending | **DONE** (2026-04-12) — release.yml, Dockerfile, deny.toml, CHANGELOG |
+
+### Summary Counts
+
+| Category | Count | Status |
+|----------|-------|--------|
+| Fault-tolerance (Pillar 1) | 12 items | **Pending** — FT-9 is Phase 0 prerequisite; FT-4/FT-5 are quick wins; FT-8 (mTLS) + FT-10 (unwrap audit) high priority for zero-event-loss; FT-11 (zero-copy blocker) + FT-12 (refcount perf) |
+| Zero-downtime (Pillar 2) | 7 items | **Pending** — ZD-1/ZD-2/ZD-3 are bug fixes |
+| Cluster validation (Pillar 3) | 9 items | **Partially done** — DOKS deployed; Gate 2 criteria, cluster metrics, auto-scaling, and CL-6 partition transfer (4 sub-tasks) remain |
+| Transport resilience (Pillar 4) | 3 items | **Mixed** — TR-3 (connection backoff) is actionable; TR-1/TR-2 deferred |
+| Exactly-once delivery (Pillar 5) | 3 items | **Future** — depends on FT-3; Kafka transactions first |
+| Developer experience (Pillar 6) | 5 items | **Pending** — DX-1 (CLI tests), DX-2 (aeon doctor), DX-3 (hot-reload) highest impact for adoption |
+| Blocked/demand-driven (Pillar 7) | 6 items | **Blocked on external** — T3 WT library maturity for 5 languages; T1/T2 are inherently language-limited (see Section 10) |
+
+---
+
+## 8. Execution Order
+
+```
+Phase 0: Trait Movement (prerequisite — unblocks FT-7, FT-1, FT-3)
+  FT-9 (move L3Store trait + BatchOp/BatchEntry/KvPairs to aeon-types)
+
+Phase 1: Quick Wins + Security + Safety (no dependencies, can parallelize)
+  FT-4  (pre-vote)          — trivial config change
+  FT-5  (election timeouts) — low, config extraction
+  FT-6  (health pings)      — low, wire existing messages
+  FT-8  (production mTLS)   — medium, HIGH PRIORITY (security gap)
+  FT-10 (unwrap audit)      — high, HIGH PRIORITY (zero-event-loss guarantee)
+  FT-11 (zero-copy violations) — medium, HARD BLOCKER (CLAUDE.md rule #3)
+  TR-3  (connection backoff) — medium, HIGH PRIORITY (reconnect storms)
+  ZD-2  (CLI serde fix)     — trivial
+  DX-2  (aeon doctor)       — low, high adoption value
+  DX-4  (CLI error polish)  — low, high adoption value
+  DOC-5 (doc staleness sweep) — low
+
+Phase 2: L3Store Generics (depends on FT-9)
+  FT-7 (TieredStore generic over L3Store)
+
+Phase 3: Persistence Core (FT-1 depends on FT-9; FT-3 depends on FT-7)
+  FT-1 (persistent Raft log via L3Store)
+    -> FT-2 (persistent Raft snapshots, same DB)
+  FT-3 (checkpoint via L3 + CheckpointPersist trait, convention default)
+
+Phase 4: Zero-Downtime Bug Fixes + Dev UX
+  ZD-1 (POST /api/v1/processors route)
+  ZD-3 (real SHA-512 in registry)
+  DX-1 (CLI integration test suite) — parallel
+
+Phase 5: Zero-Downtime Features (sequential dependency chain)
+  ZD-4 (source pause/resume + drain)
+    -> ZD-5 (hot-swap orchestrator)
+      -> ZD-6 (source/sink reconfiguration)
+      -> DX-3 (hot-reload in aeon dev — reuses ZD-5 orchestrator)
+
+Phase 6: Cluster Validation (Gate 2)
+  CL-1  (acceptance testing)
+  CL-2  (partition reassignment)
+  CL-3  (PoH chain transfer)
+  CL-4  (cluster-level Prometheus metrics)
+  CL-6a (partition bulk sync protocol)
+    -> CL-6b (PoH chain transfer real streaming)
+      -> CL-6c (cutover handshake)
+        -> CL-6d (backpressure/throttling)
+          -> CL-5 (raft-aware K8s auto-scaling — needs CL-6 for safe scale-down)
+
+Phase 7: Exactly-Once Delivery (depends on FT-3)
+  EO-1 (IdempotentSink for KafkaSink — Kafka transactions)
+  EO-2 (atomic checkpoint + sink commit)
+  EO-3 (IdempotentSink for other sinks — demand-driven)
+
+Phase 8: Deferred + Nice-to-Have
+  ZD-7 (cross-type connector swap)
+  TR-1 (batch replay on disconnect)
+  TR-2 (Wasm state transfer)
+  FT-12 (refcount & config perf tuning — after FT-11, Gate 1 tuning pass)
+  DX-5 (cargo xtask for dev workflows)
+```
+
+---
+
+## 9. Verification Checklist
+
+After each phase:
+
+```bash
+# Compilation
+cargo check --workspace
+cargo clippy --workspace -- -D warnings
+
+# Tests
+cargo test -p aeon-cluster                    # Raft persistence (after Phase 3)
+cargo test -p aeon-state                      # L3Store generics (after Phase 2)
+cargo test -p aeon-engine --lib rest_api      # REST API (after Phase 4)
+cargo check -p aeon-cli --features rest-api   # CLI (after ZD-2)
+
+# Phase 3 specific
+# - Start single-node, write state, kill process, restart — verify Raft state recovered
+# - Start 3-node cluster, kill all nodes, restart all — verify cluster reforms from disk
+
+# Phase 5 specific
+# - Run pipeline, call upgrade via REST, verify zero event loss during swap
+
+# Phase 6 specific
+# - Gate 2 acceptance criteria (see ROADMAP.md)
+```
+
+---
+
+## 10. SDK & Multi-Language Coverage
+
+Aeon's four-tier processor architecture targets adoption across programming languages.
+Each tier has different language availability due to runtime constraints and external
+library maturity.
+
+### Per-Tier Language Support
+
+#### T1 Native (.so/.dll) — Limited to Compiled-to-Native Languages
+
+T1 requires compiling to a platform-native shared library with C-ABI exports. This
+inherently limits T1 to languages that can produce `.so`/`.dll`/`.dylib` binaries:
+
+| Language | Status | SDK | Notes |
+|----------|--------|-----|-------|
+| **Rust** | Ready | `aeon-native-sdk` crate | Native ecosystem match |
+| **C/C++** | Ready | `sdks/c/` (CMake, header-only) | Manual wire format parsing |
+| **C# (.NET NativeAOT)** | Ready | `sdks/dotnet/AeonPassthroughNative/` | Requires .NET 8+, AOT compilation |
+
+**Not applicable**: Python, Go, Node.js, Java, PHP, Ruby, etc. — these languages cannot
+produce C-ABI shared libraries. Use T2 (Wasm), T3 (WebTransport), or T4 (WebSocket) instead.
+
+#### T2 Wasm — Limited to Wasm-Compilable Languages
+
+T2 requires compiling to `wasm32-unknown-unknown` target. Only languages with mature
+Wasm compilation toolchains are supported:
+
+| Language | Status | SDK | Notes |
+|----------|--------|-----|-------|
+| **Rust** | Ready | `aeon-wasm-sdk` crate | `aeon_processor!` macro, 10-line hello-world |
+| **AssemblyScript** | Ready | `sdks/typescript/assembly/` | TypeScript-like syntax, compiles to Wasm |
+| **C/C++** | Possible | `sdks/c/` (wasm32 target) | Requires clang/LLVM, manual allocator, steep learning curve |
+
+**Not practical for T2**: Python, Go, Node.js, Java, PHP, C# — these languages either
+cannot compile to wasm32-unknown-unknown or produce prohibitively large binaries with
+runtime dependencies. Use T3 or T4 instead.
+
+#### T3 WebTransport (QUIC/HTTP3) — Limited by Client Library Maturity
+
+T3 is architecturally complete on Aeon's side (host, AWPP protocol, ED25519 auth). However,
+WebTransport is a relatively new protocol and **client library availability varies by
+language**. This is an external ecosystem constraint, not an Aeon limitation.
+
+| Language | Status | Client Library | Notes |
+|----------|--------|---------------|-------|
+| **Python** | Ready | `aioquic` | E2E tested, passing (2026-04-10) |
+| **Go** | Ready | `quic-go/webtransport-go` | E2E tested, passing (2026-04-10) |
+| **Rust** | Ready | `wtransport` | E2E tested, passing |
+| **Node.js** | **Deferred** | No stable npm WT package | `@aspect-build/webtransport` is stopgap |
+| **Java** | **Deferred** | Flupke WT is experimental | No stable Java WebTransport client |
+| **C# (.NET)** | **Deferred** | `System.Net.Quic` preview only | Not until .NET 11+ |
+| **C/C++** | **Deferred** | No mature WT library | Could use quinn/quiche C bindings (future) |
+| **PHP** | **Deferred** | No WT library exists | PHP ecosystem lacks QUIC/WT support entirely |
+
+See `docs/WT-SDK-INTEGRATION-PLAN.md` for detailed tracking of each language's WT library
+maturity and SDK sequencing.
+
+#### T4 WebSocket — Universal (All Languages)
+
+T4 uses standard WebSocket over HTTP, which is supported by virtually every programming
+language. This is the **universal fallback** for languages without T1/T2/T3 support.
+
+| Language | Status | SDK | Notes |
+|----------|--------|-----|-------|
+| **Python** | Ready | `sdks/python/aeon_transport.py` | Pure asyncio |
+| **Go** | Ready | `sdks/go/aeon.go` | gorilla/websocket |
+| **Node.js** | Ready | `sdks/nodejs/aeon.js` | ws + msgpackr |
+| **Java** | Ready | `sdks/java/` | javax.websocket + Jackson |
+| **C# (.NET)** | Ready | `sdks/dotnet/AeonProcessorSdk/` | ClientWebSocket |
+| **PHP** | Ready | `sdks/php/src/` | 6 async adapters (Swoole, AMPHP, Revolt, Workerman, etc.) |
+| **Rust** | Ready | `crates/aeon-processor-client/` | tokio-tungstenite |
+| **C/C++** | Ready | Via libwebsockets or similar | Standard WebSocket libraries |
+
+Any language with a WebSocket client can implement the AWPP protocol and connect as a T4
+processor. This includes Ruby, Perl, R, Lua, Haskell, Dart, Julia, Scala, Elixir, and others.
+
+### Summary Matrix
+
+```
+Language        T1 Native   T2 Wasm     T3 WebTransport   T4 WebSocket
+─────────────   ─────────   ─────────   ────────────────   ────────────
+Rust            ✅ Ready     ✅ Ready     ✅ Ready            ✅ Ready
+C/C++           ✅ Ready     ⚠ Possible  ❌ Deferred         ✅ Ready
+C# (.NET)       ✅ NativeAOT ❌ N/A       ❌ Deferred         ✅ Ready
+AssemblyScript  ❌ N/A       ✅ Ready     ❌ N/A              ❌ N/A
+Python          ❌ N/A       ❌ N/A       ✅ Ready            ✅ Ready
+Go              ❌ N/A       ❌ N/A       ✅ Ready            ✅ Ready
+Java            ❌ N/A       ❌ N/A       ❌ Deferred         ✅ Ready
+Node.js         ❌ N/A       ❌ N/A       ❌ Deferred         ✅ Ready
+PHP             ❌ N/A       ❌ N/A       ❌ Deferred         ✅ Ready
+Other languages ❌ N/A       ❌ N/A       ❌ N/A              ✅ Via WS
+
+Legend:
+  ✅ Ready     — SDK exists, E2E tests passing
+  ⚠ Possible  — Technically feasible, steep learning curve
+  ❌ Deferred  — Blocked on external library maturity
+  ❌ N/A       — Not applicable for this tier (language/runtime limitation)
+```
+
+### Key Takeaways
+
+1. **T1 and T2 are inherently limited** to languages that can compile to native binaries
+   (T1) or Wasm (T2). This is a runtime constraint, not an Aeon limitation. These tiers
+   offer maximum performance (T1: ~4.2M evt/s, T2: ~940K evt/s) for the languages that
+   support them.
+
+2. **T3 is architecturally complete** on Aeon's side but **blocked by WebTransport client
+   library maturity** in 5 of 8 target languages. As WT libraries mature in each language
+   ecosystem, Aeon SDKs will follow. See `docs/WT-SDK-INTEGRATION-PLAN.md`.
+
+3. **T4 is the universal tier** — any language with a WebSocket client can integrate with
+   Aeon. Performance is lower (~400K evt/s) but language coverage is effectively unlimited.
+
+4. **For most developers**, the adoption path is: start with T4 (any language, easiest
+   setup), then migrate to T3 (3x performance) or T2/T1 (10x performance) as needs grow.
