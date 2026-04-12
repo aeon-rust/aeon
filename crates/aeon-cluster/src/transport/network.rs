@@ -14,10 +14,12 @@ use openraft::raft::{
 };
 use openraft::storage::Snapshot;
 
+use aeon_types::AeonError;
+
 use crate::raft_config::AeonRaftConfig;
 use crate::transport::endpoint::QuicEndpoint;
 use crate::transport::framing::{self, MessageType};
-use crate::types::{NodeAddress, NodeId};
+use crate::types::{JoinRequest, JoinResponse, NodeAddress, NodeId, RemoveNodeRequest, RemoveNodeResponse};
 
 /// Factory that creates QUIC-based RaftNetwork connections.
 pub struct QuicNetworkFactory {
@@ -195,4 +197,105 @@ impl openraft::RaftNetwork<AeonRaftConfig> for QuicNetworkConnection {
             .await
             .map_err(RPCError::Network)
     }
+}
+
+// ── Public cluster management RPC helpers ───────────────────────────
+
+/// Send a join request to a seed node and return the response.
+///
+/// The seed may not be the leader — check `JoinResponse::leader_id` and
+/// retry against the actual leader if needed.
+pub async fn send_join_request(
+    endpoint: &QuicEndpoint,
+    seed_id: NodeId,
+    seed_addr: &NodeAddress,
+    request: &JoinRequest,
+) -> Result<JoinResponse, AeonError> {
+    cluster_rpc(
+        endpoint,
+        seed_id,
+        seed_addr,
+        MessageType::AddNodeRequest,
+        MessageType::AddNodeResponse,
+        request,
+    )
+    .await
+}
+
+/// Send a remove-node request to the leader and return the response.
+pub async fn send_remove_request(
+    endpoint: &QuicEndpoint,
+    leader_id: NodeId,
+    leader_addr: &NodeAddress,
+    request: &RemoveNodeRequest,
+) -> Result<RemoveNodeResponse, AeonError> {
+    cluster_rpc(
+        endpoint,
+        leader_id,
+        leader_addr,
+        MessageType::RemoveNodeRequest,
+        MessageType::RemoveNodeResponse,
+        request,
+    )
+    .await
+}
+
+/// Generic cluster management RPC: serialize request → QUIC stream → deserialize response.
+async fn cluster_rpc<Req: serde::Serialize, Resp: serde::de::DeserializeOwned>(
+    endpoint: &QuicEndpoint,
+    target_id: NodeId,
+    target_addr: &NodeAddress,
+    msg_type: MessageType,
+    resp_type: MessageType,
+    request: &Req,
+) -> Result<Resp, AeonError> {
+    let conn = endpoint
+        .connect(target_id, target_addr)
+        .await
+        .map_err(|e| AeonError::Connection {
+            message: format!("failed to connect to node {target_id} at {target_addr}: {e}"),
+            source: None,
+            retryable: true,
+        })?;
+
+    let (mut send, mut recv) = conn.open_bi().await.map_err(|e| AeonError::Connection {
+        message: format!("failed to open QUIC stream to node {target_id}: {e}"),
+        source: None,
+        retryable: true,
+    })?;
+
+    let payload =
+        bincode::serialize(request).map_err(|e| AeonError::Serialization {
+            message: format!("serialize cluster RPC request: {e}"),
+            source: None,
+        })?;
+
+    framing::write_frame(&mut send, msg_type, &payload).await?;
+    send.finish().map_err(|e| AeonError::Connection {
+        message: format!("failed to finish QUIC send: {e}"),
+        source: None,
+        retryable: false,
+    })?;
+
+    let (recv_type, resp_payload) = framing::read_frame(&mut recv).await?;
+
+    if recv_type != resp_type {
+        return Err(AeonError::Connection {
+            message: format!(
+                "unexpected response type: {:?} (expected {:?})",
+                recv_type, resp_type
+            ),
+            source: None,
+            retryable: false,
+        });
+    }
+
+    let response: Resp = bincode::deserialize(&resp_payload).map_err(|e| {
+        AeonError::Serialization {
+            message: format!("deserialize cluster RPC response: {e}"),
+            source: None,
+        }
+    })?;
+
+    Ok(response)
 }

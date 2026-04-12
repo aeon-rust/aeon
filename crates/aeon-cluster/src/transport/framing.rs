@@ -21,6 +21,12 @@ pub enum MessageType {
     DiscoveryResponse = 10,
     HealthPing = 11,
     HealthPong = 12,
+    /// Request leader to add this node to the cluster (join protocol).
+    AddNodeRequest = 13,
+    AddNodeResponse = 14,
+    /// Request leader to remove a node from the cluster.
+    RemoveNodeRequest = 15,
+    RemoveNodeResponse = 16,
 }
 
 impl MessageType {
@@ -38,6 +44,10 @@ impl MessageType {
             10 => Some(Self::DiscoveryResponse),
             11 => Some(Self::HealthPing),
             12 => Some(Self::HealthPong),
+            13 => Some(Self::AddNodeRequest),
+            14 => Some(Self::AddNodeResponse),
+            15 => Some(Self::RemoveNodeRequest),
+            16 => Some(Self::RemoveNodeResponse),
             _ => None,
         }
     }
@@ -139,12 +149,12 @@ mod tests {
 
     #[test]
     fn message_type_roundtrip() {
-        for i in 1..=12u8 {
+        for i in 1..=16u8 {
             let mt = MessageType::from_u8(i).unwrap();
             assert_eq!(mt as u8, i);
         }
         assert!(MessageType::from_u8(0).is_none());
-        assert!(MessageType::from_u8(13).is_none());
+        assert!(MessageType::from_u8(17).is_none());
     }
 
     #[test]

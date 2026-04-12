@@ -20,6 +20,7 @@ mod inner {
     use openraft::{Entry, LogId, StorageError, StoredMembership, Vote};
     use tokio::sync::RwLock;
 
+    use crate::partition_manager;
     use crate::raft_config::AeonRaftConfig;
     use crate::snapshot::ClusterSnapshot;
     use crate::types::{ClusterRequest, ClusterResponse, NodeAddress, PartitionOwnership};
@@ -166,7 +167,15 @@ mod inner {
         /// Optional encryption key for snapshot encryption at rest.
         #[cfg(feature = "encryption-at-rest")]
         encryption_key: Option<aeon_crypto::encryption::EtmKey>,
+        /// Shared read handle — cloned snapshot updated after each apply.
+        /// External consumers (REST API, ClusterNode) can read from this
+        /// without accessing the Raft internals.
+        shared_state: Arc<tokio::sync::RwLock<ClusterSnapshot>>,
     }
+
+    /// Read-only handle to the cluster state machine snapshot.
+    /// Can be cheaply cloned and shared across threads.
+    pub type SharedClusterState = Arc<tokio::sync::RwLock<ClusterSnapshot>>;
 
     // Manual Debug impl to avoid exposing encryption key
     impl Debug for StateMachineStore {
@@ -188,7 +197,17 @@ mod inner {
                 snapshot_idx: 0,
                 #[cfg(feature = "encryption-at-rest")]
                 encryption_key: None,
+                shared_state: Arc::new(tokio::sync::RwLock::new(ClusterSnapshot::default())),
             }
+        }
+
+        /// Get a shared read handle to the cluster state.
+        ///
+        /// The returned Arc can be cloned and held by external consumers
+        /// (ClusterNode, REST API) for read-only access to the latest
+        /// committed state.
+        pub fn shared_state(&self) -> SharedClusterState {
+            Arc::clone(&self.shared_state)
         }
 
         /// Create a state machine with snapshot encryption at rest.
@@ -200,6 +219,7 @@ mod inner {
                 last_membership: StoredMembership::new(None, openraft::Membership::new(vec![], ())),
                 snapshot_idx: 0,
                 encryption_key: Some(key),
+                shared_state: Arc::new(tokio::sync::RwLock::new(ClusterSnapshot::default())),
             }
         }
 
@@ -273,6 +293,46 @@ mod inner {
                         .config_overrides
                         .insert(key.clone(), value.clone());
                     ClusterResponse::Ok
+                }
+                ClusterRequest::SubmitCheckpoint { source_offsets } => {
+                    // Merge incoming offsets into the cluster-wide source_anchor_offsets.
+                    // Only update if the new offset is ahead of the existing one.
+                    for (&partition_u16, &offset) in source_offsets {
+                        let pid = aeon_types::PartitionId::new(partition_u16);
+                        let entry = self
+                            .state
+                            .source_anchor_offsets
+                            .entry(pid)
+                            .or_insert(0);
+                        if offset > *entry as i64 {
+                            *entry = offset as u64;
+                        }
+                    }
+                    ClusterResponse::Ok
+                }
+                ClusterRequest::RebalancePartitions { nodes } => {
+                    let moves =
+                        partition_manager::compute_rebalance(&self.state.partition_table, nodes);
+                    for (partition, _from, to) in &moves {
+                        self.state.partition_table.assign(*partition, *to);
+                    }
+                    ClusterResponse::Ok
+                }
+                ClusterRequest::InitialAssignment {
+                    num_partitions,
+                    nodes,
+                } => {
+                    // Idempotent: skip if partitions are already assigned.
+                    if self.state.partition_table.iter().next().is_some() {
+                        ClusterResponse::Ok
+                    } else {
+                        let assignments =
+                            partition_manager::initial_assignment(*num_partitions, nodes);
+                        for (partition, node) in assignments {
+                            self.state.partition_table.assign(partition, node);
+                        }
+                        ClusterResponse::Ok
+                    }
                 }
             }
         }
@@ -364,6 +424,9 @@ mod inner {
                 }
             }
 
+            // Push committed state to the shared read handle.
+            *self.shared_state.write().await = self.state.clone();
+
             Ok(responses)
         }
 
@@ -378,6 +441,7 @@ mod inner {
                 snapshot_idx: self.snapshot_idx,
                 #[cfg(feature = "encryption-at-rest")]
                 encryption_key: self.encryption_key.clone(),
+                shared_state: Arc::clone(&self.shared_state),
             })
         }
 
@@ -418,6 +482,9 @@ mod inner {
             self.state = state;
             self.last_applied_log = meta.last_log_id;
             self.last_membership = meta.last_membership.clone();
+
+            // Push restored state to the shared read handle.
+            *self.shared_state.write().await = self.state.clone();
 
             Ok(())
         }

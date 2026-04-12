@@ -81,6 +81,24 @@ pub enum ClusterRequest {
     },
     /// Update a cluster-wide configuration key.
     UpdateConfig { key: String, value: String },
+    /// Submit checkpoint source offsets for Raft replication.
+    /// Persists the per-partition source-anchor offsets in the cluster state
+    /// so that any node can resume from the checkpointed position after failover.
+    SubmitCheckpoint {
+        /// Per-partition source offsets at checkpoint time (partition_id_u16 → offset).
+        source_offsets: std::collections::HashMap<u16, i64>,
+    },
+    /// Rebalance partitions across the given set of active nodes.
+    /// The state machine computes moves internally using `compute_rebalance`
+    /// and applies them atomically. This ensures the rebalance is deterministic
+    /// and identical on all Raft replicas.
+    RebalancePartitions { nodes: Vec<NodeId> },
+    /// Assign partitions using initial round-robin distribution.
+    /// Used during multi-node bootstrap when no partitions are assigned yet.
+    InitialAssignment {
+        num_partitions: u16,
+        nodes: Vec<NodeId>,
+    },
 }
 
 /// Response after applying a ClusterRequest to the state machine.
@@ -90,6 +108,48 @@ pub enum ClusterResponse {
     Ok,
     /// Operation failed with a reason.
     Error(String),
+}
+
+// ── Join protocol messages (over QUIC, not through Raft log) ────────
+
+/// Request from a new node to join an existing cluster.
+/// Sent to a seed node (which may forward to the leader).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JoinRequest {
+    /// The node ID the joining node wants to use.
+    pub node_id: NodeId,
+    /// The address the joining node is reachable at (for Raft RPCs).
+    pub addr: NodeAddress,
+}
+
+/// Response to a join request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JoinResponse {
+    /// Whether the join was accepted.
+    pub success: bool,
+    /// The current leader's node ID (so the joiner can redirect if needed).
+    pub leader_id: Option<NodeId>,
+    /// Human-readable error message if `success` is false.
+    pub message: String,
+}
+
+/// Request to remove a node from the cluster.
+/// Sent to the leader node.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoveNodeRequest {
+    /// The node ID to remove from the cluster.
+    pub node_id: NodeId,
+}
+
+/// Response to a remove-node request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoveNodeResponse {
+    /// Whether the removal was accepted.
+    pub success: bool,
+    /// The current leader's node ID (for redirect if this node is not leader).
+    pub leader_id: Option<NodeId>,
+    /// Human-readable error or status message.
+    pub message: String,
 }
 
 /// Ownership state of a single partition.

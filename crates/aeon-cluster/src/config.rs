@@ -113,9 +113,12 @@ pub struct ClusterConfig {
 impl ClusterConfig {
     /// Create a minimal single-node config for development/testing.
     pub fn single_node(node_id: u64, num_partitions: u16) -> Self {
+        // FT-10: hardcoded socket-address literal is infallible at parse time.
+        #[allow(clippy::unwrap_used)]
+        let bind = "0.0.0.0:4470".parse().unwrap();
         Self {
             node_id,
-            bind: "0.0.0.0:4470".parse().unwrap(),
+            bind,
             num_partitions,
             peers: Vec::new(),
             seed_nodes: Vec::new(),

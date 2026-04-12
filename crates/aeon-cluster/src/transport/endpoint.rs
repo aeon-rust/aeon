@@ -129,7 +129,7 @@ impl QuicEndpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::tls::dev_quic_configs;
+    use crate::transport::tls::{dev_quic_configs, dev_quic_configs_insecure};
 
     #[tokio::test]
     async fn endpoint_bind_and_local_addr() {
@@ -144,8 +144,8 @@ mod tests {
 
     #[tokio::test]
     async fn endpoint_connect_and_pool() {
-        // Use the same cert for both endpoints so client trusts server
-        let (server_cfg, client_cfg) = dev_quic_configs();
+        // Use insecure configs to avoid IPv6/SAN issues on Windows
+        let (server_cfg, client_cfg) = dev_quic_configs_insecure();
 
         // Start a "server" endpoint
         let server = QuicEndpoint::bind(
@@ -168,8 +168,8 @@ mod tests {
         let client =
             QuicEndpoint::bind("127.0.0.1:0".parse().unwrap(), server_cfg, client_cfg).unwrap();
 
-        // Use "localhost" as host to match cert SAN
-        let target = NodeAddress::new("localhost", server_addr.port());
+        // Use 127.0.0.1 to avoid IPv6 resolution on Windows (localhost → ::1 first)
+        let target = NodeAddress::new("127.0.0.1", server_addr.port());
 
         // Connect
         let conn = client.connect(1, &target).await.unwrap();

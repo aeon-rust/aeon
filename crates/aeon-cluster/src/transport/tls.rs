@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use aeon_types::AeonError;
 
-use crate::config::TlsConfig;
+use crate::config::{ClusterConfig, TlsConfig};
 
 /// Build a rustls ServerConfig for QUIC from TLS file paths.
 pub fn build_server_config(tls: &TlsConfig) -> Result<rustls::ServerConfig, AeonError> {
@@ -109,9 +109,96 @@ pub fn build_client_config(tls: &TlsConfig) -> Result<rustls::ClientConfig, Aeon
     Ok(config)
 }
 
+/// Wrap a rustls `ServerConfig` into a `quinn::ServerConfig`.
+fn quic_server_config(rustls_config: rustls::ServerConfig) -> Result<quinn::ServerConfig, AeonError> {
+    let quic_crypto =
+        quinn::crypto::rustls::QuicServerConfig::try_from(rustls_config).map_err(|e| {
+            AeonError::Config {
+                message: format!("failed to build QUIC server config: {e}"),
+            }
+        })?;
+    Ok(quinn::ServerConfig::with_crypto(Arc::new(quic_crypto)))
+}
+
+/// Wrap a rustls `ClientConfig` into a `quinn::ClientConfig`.
+fn quic_client_config(rustls_config: rustls::ClientConfig) -> Result<quinn::ClientConfig, AeonError> {
+    let quic_crypto =
+        quinn::crypto::rustls::QuicClientConfig::try_from(rustls_config).map_err(|e| {
+            AeonError::Config {
+                message: format!("failed to build QUIC client config: {e}"),
+            }
+        })?;
+    Ok(quinn::ClientConfig::new(Arc::new(quic_crypto)))
+}
+
+/// Build the `(ServerConfig, ClientConfig)` pair a cluster node should use,
+/// selecting the safest TLS mode the cluster config permits (FT-8).
+///
+/// Selection order:
+/// 1. `config.tls = Some(...)` → **production mTLS** via file-based certs
+///    (peer verification enforced on both sides).
+/// 2. `config.auto_tls = true` → **insecure dev mode**: self-signed cert +
+///    accept-any-cert verifier. Emits a loud runtime warning so operators
+///    notice when this path activates unexpectedly in production.
+/// 3. Neither set → error. Single-node clusters don't call this function;
+///    the caller should short-circuit before reaching here.
+///
+/// `auto-tls` is a build-time feature; if the binary was compiled without it
+/// and falls into case 2, this returns a config error instead of silently
+/// starting insecurely.
+pub fn quic_configs_for_cluster(
+    config: &ClusterConfig,
+) -> Result<(quinn::ServerConfig, quinn::ClientConfig), AeonError> {
+    if let Some(tls) = &config.tls {
+        let server_rustls = build_server_config(tls)?;
+        let client_rustls = build_client_config(tls)?;
+        tracing::info!(
+            cert = ?tls.cert,
+            ca = ?tls.ca,
+            "cluster TLS: production mTLS enabled (file-based certs, peer verification active)"
+        );
+        return Ok((quic_server_config(server_rustls)?, quic_client_config(client_rustls)?));
+    }
+
+    if config.auto_tls {
+        #[cfg(feature = "auto-tls")]
+        {
+            tracing::warn!(
+                node_id = config.node_id,
+                "⚠ cluster TLS: auto_tls=true — using SELF-SIGNED certs and ACCEPT-ANY-CERT \
+                 peer verifier. This is INSECURE and intended for development/testing only. \
+                 For production, set cluster.tls.{{cert,key,ca}} to file paths."
+            );
+            let (server_cfg, client_cfg) = dev_quic_configs_insecure();
+            return Ok((server_cfg, client_cfg));
+        }
+        #[cfg(not(feature = "auto-tls"))]
+        {
+            return Err(AeonError::Config {
+                message: "cluster.auto_tls=true but this binary was built without the \
+                          'auto-tls' feature. Either enable the feature or provide \
+                          cluster.tls.{cert,key,ca} file paths."
+                    .to_string(),
+            });
+        }
+    }
+
+    Err(AeonError::Config {
+        message: "cluster TLS not configured: set cluster.tls.{cert,key,ca} for production \
+                  mTLS, or cluster.auto_tls=true for development self-signed mode"
+            .to_string(),
+    })
+}
+
 /// Generate ephemeral self-signed certs for development/testing.
 /// Returns (cert_der, key_der) pair.
-#[cfg(test)]
+/// FT-10: `.unwrap()` calls below are on rcgen/rustls crypto primitive
+/// construction with hardcoded or caller-supplied SAN inputs. With valid
+/// strings these paths are infallible; a panic here would indicate a
+/// fundamental rcgen/rustls bug. Helper is `#[cfg(any(test, feature = "auto-tls"))]`
+/// so it never ships in production builds without the dev feature.
+#[cfg(any(test, feature = "auto-tls"))]
+#[allow(clippy::unwrap_used)]
 pub fn dev_self_signed_cert(
     subject_alt_names: Vec<String>,
 ) -> (
@@ -127,7 +214,10 @@ pub fn dev_self_signed_cert(
 }
 
 /// Build insecure QUIC configs for development (no TLS file paths needed).
-#[cfg(test)]
+///
+/// FT-10: dev helper; unwraps are on infallible crypto-construction paths.
+#[cfg(any(test, feature = "auto-tls"))]
+#[allow(clippy::unwrap_used)]
 pub fn dev_quic_configs() -> (quinn::ServerConfig, quinn::ClientConfig) {
     let (cert_der, key_der) = dev_self_signed_cert(vec!["localhost".to_string()]);
 
@@ -153,6 +243,83 @@ pub fn dev_quic_configs() -> (quinn::ServerConfig, quinn::ClientConfig) {
     (server_config, client_config)
 }
 
+/// Build QUIC configs for multi-node development clusters.
+///
+/// Each node generates its own self-signed cert. The client uses a custom
+/// verifier that accepts any server certificate — suitable for development
+/// and testing only, NOT for production deployments.
+///
+/// FT-10: dev helper; unwraps are on infallible crypto-construction paths.
+#[cfg(any(test, feature = "auto-tls"))]
+#[allow(clippy::unwrap_used)]
+pub fn dev_quic_configs_insecure() -> (quinn::ServerConfig, quinn::ClientConfig) {
+    let (cert_der, key_der) = dev_self_signed_cert(vec!["localhost".to_string()]);
+
+    // Server config — no client auth required
+    let server_crypto = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der], key_der.clone_key())
+        .unwrap();
+    let server_config = quinn::ServerConfig::with_crypto(Arc::new(
+        quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto).unwrap(),
+    ));
+
+    // Client config — skip server certificate verification (dev only)
+    let client_crypto = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAnyCert))
+        .with_no_client_auth();
+    let client_config = quinn::ClientConfig::new(Arc::new(
+        quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto).unwrap(),
+    ));
+
+    (server_config, client_config)
+}
+
+/// A certificate verifier that accepts any server certificate.
+/// For development/testing only.
+#[cfg(any(test, feature = "auto-tls"))]
+#[derive(Debug)]
+struct AcceptAnyCert;
+
+#[cfg(any(test, feature = "auto-tls"))]
+impl rustls::client::danger::ServerCertVerifier for AcceptAnyCert {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,5 +337,110 @@ mod tests {
         // Just verify they constructed without panicking
         let _ = server;
         let _ = client;
+    }
+
+    // ── quic_configs_for_cluster selector (FT-8) ────────────────────
+
+    fn base_cfg() -> ClusterConfig {
+        use crate::types::NodeAddress;
+        ClusterConfig {
+            node_id: 1,
+            bind: "0.0.0.0:4470".parse().unwrap(),
+            num_partitions: 16,
+            peers: vec![NodeAddress::new("10.0.0.2", 4470)],
+            seed_nodes: Vec::new(),
+            tls: None,
+            auto_tls: false,
+            initial_members: Vec::new(),
+            advertise_addr: None,
+            raft_timing: crate::config::RaftTiming::default(),
+        }
+    }
+
+    #[test]
+    fn selector_errors_without_tls_or_auto_tls() {
+        let cfg = base_cfg();
+        let err = quic_configs_for_cluster(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("cluster TLS not configured"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn selector_accepts_auto_tls_when_feature_enabled() {
+        let cfg = ClusterConfig {
+            auto_tls: true,
+            ..base_cfg()
+        };
+        // This test runs in `cfg(test)` which implies auto-tls helpers are
+        // compiled, but the `cfg(feature = "auto-tls")` gate in the selector
+        // depends on the actual feature. With feature enabled we expect Ok;
+        // without, Err.
+        let result = quic_configs_for_cluster(&cfg);
+        #[cfg(feature = "auto-tls")]
+        {
+            assert!(result.is_ok(), "expected Ok with auto-tls feature, got {result:?}");
+        }
+        #[cfg(not(feature = "auto-tls"))]
+        {
+            assert!(result.is_err(), "expected Err without auto-tls feature");
+        }
+    }
+
+    #[test]
+    fn selector_production_path_builds_configs_from_files() {
+        // Write a self-signed cert + key + self-CA to temp files, then verify
+        // that the production path (config.tls = Some(...)) actually builds
+        // a valid quinn ServerConfig + ClientConfig pair without errors.
+        use rcgen::{CertificateParams, KeyPair};
+
+        let key_pair = KeyPair::generate().unwrap();
+        let params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let cert = params.self_signed(&key_pair).unwrap();
+        let cert_pem = cert.pem();
+        let key_pem = key_pair.serialize_pem();
+
+        let tmp = std::env::temp_dir().join(format!("aeon-tls-ft8-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let cert_path = tmp.join("node.pem");
+        let key_path = tmp.join("node.key");
+        let ca_path = tmp.join("ca.pem");
+        std::fs::write(&cert_path, &cert_pem).unwrap();
+        std::fs::write(&key_path, &key_pem).unwrap();
+        // Self-signed → the same cert serves as its own CA for this test.
+        std::fs::write(&ca_path, &cert_pem).unwrap();
+
+        let cfg = ClusterConfig {
+            tls: Some(TlsConfig {
+                cert: cert_path,
+                key: key_path,
+                ca: ca_path,
+            }),
+            ..base_cfg()
+        };
+
+        let result = quic_configs_for_cluster(&cfg);
+        assert!(result.is_ok(), "production mTLS path failed: {result:?}");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn selector_errors_on_missing_cert_files() {
+        // tls: Some(...) with non-existent paths → build_server_config fails
+        let cfg = ClusterConfig {
+            tls: Some(TlsConfig {
+                cert: std::path::PathBuf::from("/nonexistent/cert.pem"),
+                key: std::path::PathBuf::from("/nonexistent/key.pem"),
+                ca: std::path::PathBuf::from("/nonexistent/ca.pem"),
+            }),
+            ..base_cfg()
+        };
+        let err = quic_configs_for_cluster(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("cert") || err.to_string().contains("read"),
+            "expected file-read error, got: {err}"
+        );
     }
 }

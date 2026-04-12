@@ -179,9 +179,12 @@ impl K8sDiscovery {
         let peers: Vec<NodeAddress> = self.peers().into_iter().map(|(_, addr)| addr).collect();
         let initial_members = self.members();
 
+        // FT-10: formatting "0.0.0.0:{u16}" always produces a valid SocketAddr.
+        #[allow(clippy::unwrap_used)]
+        let bind = format!("0.0.0.0:{}", self.quic_port).parse().unwrap();
         ClusterConfig {
             node_id: self.node_id,
-            bind: format!("0.0.0.0:{}", self.quic_port).parse().unwrap(),
+            bind,
             num_partitions: self.partitions,
             peers,
             seed_nodes: Vec::new(),
