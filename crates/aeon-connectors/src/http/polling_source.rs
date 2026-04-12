@@ -4,7 +4,7 @@
 //! body as a single Event. No backpressure buffer needed — the polling
 //! interval provides natural flow control.
 
-use aeon_types::{AeonError, Event, PartitionId, Source};
+use aeon_types::{AeonError, Backoff, BackoffPolicy, Event, PartitionId, Source};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,6 +20,12 @@ pub struct HttpPollingSourceConfig {
     pub source_name: Arc<str>,
     /// Optional headers to include in requests.
     pub headers: Vec<(String, String)>,
+    /// Reconnect backoff policy — TR-3 applies when the endpoint is down /
+    /// returns 5xx / body read fails. On error, `next_batch` sleeps for the
+    /// current backoff delay (capped at `max_ms`) and returns an empty batch
+    /// instead of propagating the Err, so the pipeline stays alive through
+    /// transient outages. Reset on the first successful poll after failure.
+    pub backoff: BackoffPolicy,
 }
 
 impl HttpPollingSourceConfig {
@@ -31,6 +37,7 @@ impl HttpPollingSourceConfig {
             timeout: Duration::from_secs(30),
             source_name: Arc::from("http-poll"),
             headers: Vec::new(),
+            backoff: BackoffPolicy::default(),
         }
     }
 
@@ -57,6 +64,12 @@ impl HttpPollingSourceConfig {
         self.headers.push((key.into(), value.into()));
         self
     }
+
+    /// Override the reconnect backoff policy (defaults to `BackoffPolicy::default()`).
+    pub fn with_backoff(mut self, backoff: BackoffPolicy) -> Self {
+        self.backoff = backoff;
+        self
+    }
 }
 
 /// HTTP Polling event source.
@@ -68,6 +81,8 @@ pub struct HttpPollingSource {
     config: HttpPollingSourceConfig,
     client: reqwest::Client,
     last_poll: Option<tokio::time::Instant>,
+    /// TR-3: backoff state — advanced on every failure, reset on success.
+    backoff: Backoff,
 }
 
 impl HttpPollingSource {
@@ -80,10 +95,12 @@ impl HttpPollingSource {
 
         tracing::info!(url = %config.url, interval = ?config.interval, "HttpPollingSource created");
 
+        let backoff = Backoff::new(config.backoff);
         Ok(Self {
             config,
             client,
             last_poll: None,
+            backoff,
         })
     }
 }
@@ -106,23 +123,57 @@ impl Source for HttpPollingSource {
             request = request.header(key.as_str(), value.as_str());
         }
 
-        // Execute
-        let response = request.send().await.map_err(|e| {
-            AeonError::connection(format!("http poll failed: {}: {e}", self.config.url))
-        })?;
+        // TR-3: on any transient error, back off and return an empty batch
+        // instead of propagating Err. Returning Err would kill the pipeline
+        // task; keeping it alive matches the behaviour of every other
+        // reconnecting source (NATS, MQTT, Postgres CDC, MySQL, RabbitMQ,
+        // MongoDB CDC).
+        let response = match request.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                let delay = self.backoff.next_delay();
+                tracing::warn!(
+                    url = %self.config.url,
+                    error = %e,
+                    delay_ms = delay.as_millis() as u64,
+                    "http poll request failed, backing off"
+                );
+                tokio::time::sleep(delay).await;
+                return Ok(Vec::new());
+            }
+        };
 
         if !response.status().is_success() {
-            return Err(AeonError::connection(format!(
-                "http poll returned {}: {}",
-                response.status(),
-                self.config.url,
-            )));
+            let status = response.status();
+            let delay = self.backoff.next_delay();
+            tracing::warn!(
+                url = %self.config.url,
+                %status,
+                delay_ms = delay.as_millis() as u64,
+                "http poll returned non-success status, backing off"
+            );
+            tokio::time::sleep(delay).await;
+            return Ok(Vec::new());
         }
 
-        let body = response
-            .bytes()
-            .await
-            .map_err(|e| AeonError::connection(format!("http poll body read failed: {e}")))?;
+        let body = match response.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                let delay = self.backoff.next_delay();
+                tracing::warn!(
+                    url = %self.config.url,
+                    error = %e,
+                    delay_ms = delay.as_millis() as u64,
+                    "http poll body read failed, backing off"
+                );
+                tokio::time::sleep(delay).await;
+                return Ok(Vec::new());
+            }
+        };
+
+        // Success — reset backoff so the next failure starts fresh from
+        // `initial_ms` rather than inheriting the previous outage's growth.
+        self.backoff.reset();
 
         if body.is_empty() {
             return Ok(Vec::new());
