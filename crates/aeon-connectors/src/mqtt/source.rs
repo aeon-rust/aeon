@@ -13,8 +13,7 @@
 //! WebSocket source relies on.
 
 use crate::push_buffer::{PushBufferConfig, PushBufferRx, push_buffer};
-use aeon_types::{AeonError, Event, PartitionId, Source};
-use bytes::Bytes;
+use aeon_types::{AeonError, BackoffPolicy, Event, PartitionId, Source};
 use rumqttc::{AsyncClient, EventLoop, MqttOptions, QoS};
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,6 +40,10 @@ pub struct MqttSourceConfig {
     pub keep_alive: Duration,
     /// Channel capacity for the MQTT event loop.
     pub cap: usize,
+    /// Reconnect backoff policy — applied when the MQTT eventloop returns an
+    /// error (connection drop, protocol error, etc.). Exponential growth with
+    /// jitter prevents thundering-herd reconnect storms during broker outages.
+    pub backoff: BackoffPolicy,
 }
 
 impl MqttSourceConfig {
@@ -57,6 +60,7 @@ impl MqttSourceConfig {
             source_name: Arc::from("mqtt"),
             keep_alive: Duration::from_secs(30),
             cap: 256,
+            backoff: BackoffPolicy::default(),
         }
     }
 
@@ -81,6 +85,12 @@ impl MqttSourceConfig {
     /// Set the poll timeout.
     pub fn with_poll_timeout(mut self, timeout: Duration) -> Self {
         self.poll_timeout = timeout;
+        self
+    }
+
+    /// Override the reconnect backoff policy.
+    pub fn with_backoff(mut self, backoff: BackoffPolicy) -> Self {
+        self.backoff = backoff;
         self
     }
 }
@@ -120,7 +130,7 @@ impl MqttSource {
         let (tx, rx) = push_buffer(config.buffer_config);
         let source_name = config.source_name;
 
-        let handle = tokio::spawn(mqtt_reader(eventloop, tx, source_name));
+        let handle = tokio::spawn(mqtt_reader(eventloop, tx, source_name, config.backoff));
 
         Ok(Self {
             rx,
@@ -135,11 +145,18 @@ async fn mqtt_reader(
     mut eventloop: EventLoop,
     tx: crate::push_buffer::PushBufferTx,
     source_name: Arc<str>,
+    backoff_policy: BackoffPolicy,
 ) {
+    let mut backoff = backoff_policy.iter();
     loop {
         match eventloop.poll().await {
             Ok(rumqttc::Event::Incoming(rumqttc::Packet::Publish(publish))) => {
-                let payload = Bytes::from(publish.payload.to_vec());
+                // Successful delivery — reset backoff so the next outage
+                // starts again at `initial_ms` rather than wherever we left off.
+                backoff.reset();
+
+                // FT-11: rumqttc Publish.payload is bytes::Bytes — clone is refcount-only.
+                let payload = publish.payload.clone();
                 let mut event = Event::new(
                     uuid::Uuid::nil(),
                     0,
@@ -163,11 +180,16 @@ async fn mqtt_reader(
                     break; // Buffer closed
                 }
             }
-            Ok(_) => {} // Other events (ConnAck, PingResp, etc.)
+            Ok(rumqttc::Event::Incoming(rumqttc::Packet::ConnAck(_))) => {
+                // Successful (re)connection — reset backoff.
+                backoff.reset();
+            }
+            Ok(_) => {} // Other events (PingResp, SubAck, etc.)
             Err(e) => {
-                tracing::error!(error = %e, "mqtt eventloop error");
-                // Back off on error before retrying
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                let delay = backoff.next_delay();
+                tracing::error!(error = %e, delay_ms = delay.as_millis() as u64,
+                    "mqtt eventloop error; backing off before retry");
+                tokio::time::sleep(delay).await;
             }
         }
     }

@@ -134,12 +134,13 @@ impl Sink for MqttSink {
     async fn write_batch(&mut self, outputs: Vec<Output>) -> Result<BatchResult, AeonError> {
         let ids = outputs.iter().filter_map(|o| o.source_event_id).collect();
         for output in &outputs {
+            // FT-11: publish_bytes accepts bytes::Bytes directly — clone is refcount-only.
             self.client
-                .publish(
-                    &self.config.topic,
+                .publish_bytes(
+                    self.config.topic.clone(),
                     self.config.qos,
                     false, // retain
-                    output.payload.to_vec(),
+                    output.payload.clone(),
                 )
                 .await
                 .map_err(|e| AeonError::connection(format!("mqtt publish failed: {e}")))?;

@@ -43,7 +43,12 @@ pub struct QuicSink {
 impl QuicSink {
     /// Connect to the QUIC server.
     pub async fn new(config: QuicSinkConfig) -> Result<Self, AeonError> {
-        let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())
+        // FT-10: hardcoded ephemeral-bind socket address — parsing
+        // "0.0.0.0:0" into SocketAddr is infallible. Documented allow for
+        // a genuine constant, not a runtime input.
+        #[allow(clippy::unwrap_used)]
+        let bind_addr: std::net::SocketAddr = "0.0.0.0:0".parse().unwrap();
+        let mut endpoint = quinn::Endpoint::client(bind_addr)
             .map_err(|e| AeonError::connection(format!("quic client bind failed: {e}")))?;
         endpoint.set_default_client_config(config.client_config);
 

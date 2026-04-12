@@ -4,7 +4,6 @@
 //! Messages are acknowledged after being returned from `next_batch()`.
 
 use aeon_types::{AeonError, Event, PartitionId, Source};
-use bytes::Bytes;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -148,7 +147,8 @@ impl Source for NatsSource {
 
         match first {
             Ok(Some(Ok(msg))) => {
-                let payload = Bytes::from(msg.payload.to_vec());
+                // FT-11: async_nats Message.payload is bytes::Bytes — clone is refcount-only.
+                let payload = msg.payload.clone();
                 let mut event = Event::new(
                     uuid::Uuid::nil(),
                     0,
@@ -184,7 +184,8 @@ impl Source for NatsSource {
         while events.len() < self.config.batch_size {
             match tokio::time::timeout_at(drain_deadline, messages.next()).await {
                 Ok(Some(Ok(msg))) => {
-                    let payload = Bytes::from(msg.payload.to_vec());
+                    // FT-11: async_nats Message.payload is bytes::Bytes — clone is refcount-only.
+                let payload = msg.payload.clone();
                     let mut event = Event::new(
                         uuid::Uuid::nil(),
                         0,

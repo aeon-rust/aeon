@@ -54,6 +54,12 @@
 //! - [`mask_pii`] / [`mask_email`]: PII/PHI masking utilities
 //! - Span helpers: Pre-defined spans for source/processor/sink instrumentation
 
+// FT-10: no-panic policy. Production code in this crate must not use
+// `.unwrap()` or `.expect()` except for explicitly-documented startup-time
+// invariants, which must carry an `#[allow(...)]` attribute with rationale.
+// Test modules and benches are exempt (`cfg(not(test))`).
+#![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::expect_used))]
+
 pub mod histogram;
 pub mod logging;
 pub mod metrics;

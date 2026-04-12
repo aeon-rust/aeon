@@ -117,8 +117,11 @@ impl MerkleMountainRange {
             return self.nodes[peaks[0]];
         }
 
-        // Bag the peaks: start from the rightmost, fold left
-        let mut hash = self.nodes[*peaks.last().expect("peaks non-empty")];
+        // Bag the peaks: start from the rightmost, fold left.
+        // FT-10: guarded above by `peaks.len() == 1` / empty early-return,
+        // so at this point peaks.len() >= 2 and last() is Some.
+        #[allow(clippy::expect_used)]
+        let mut hash = self.nodes[*peaks.last().expect("invariant: peaks.len() >= 2 here")];
         for &peak_pos in peaks.iter().rev().skip(1) {
             hash = sha512_pair(self.nodes[peak_pos].as_ref(), hash.as_ref());
         }

@@ -9,7 +9,6 @@
 //! - **UnorderedBatch**: JetStream publish (enqueue), collect ack futures, await in flush().
 
 use aeon_types::{AeonError, BatchResult, DeliveryStrategy, Output, Sink};
-use bytes::Bytes;
 
 /// Configuration for `NatsSink`.
 pub struct NatsSinkConfig {
@@ -109,7 +108,9 @@ impl Sink for NatsSink {
                     // Publish and await each ack individually.
                     for output in &outputs {
                         let subject = self.config.subject.clone();
-                        let payload = Bytes::from(output.payload.to_vec());
+                        // FT-11: zero-copy — async_nats uses the same bytes::Bytes,
+                        // so .clone() is a refcount bump, not a data copy.
+                        let payload = output.payload.clone();
                         let ack_future = js.publish(subject, payload).await.map_err(|e| {
                             AeonError::connection(format!("nats jetstream publish failed: {e}"))
                         })?;
@@ -125,7 +126,8 @@ impl Sink for NatsSink {
                     let mut ack_futures = Vec::with_capacity(outputs.len());
                     for output in &outputs {
                         let subject = self.config.subject.clone();
-                        let payload = Bytes::from(output.payload.to_vec());
+                        // FT-11: zero-copy clone (refcount-only).
+                        let payload = output.payload.clone();
                         let ack_future = js.publish(subject, payload).await.map_err(|e| {
                             AeonError::connection(format!("nats jetstream publish failed: {e}"))
                         })?;
@@ -145,7 +147,8 @@ impl Sink for NatsSink {
                     // Store ack futures — flush() will collect acks.
                     for output in &outputs {
                         let subject = self.config.subject.clone();
-                        let payload = Bytes::from(output.payload.to_vec());
+                        // FT-11: zero-copy clone (refcount-only).
+                        let payload = output.payload.clone();
                         let ack_future = js.publish(subject, payload).await.map_err(|e| {
                             AeonError::connection(format!("nats jetstream publish failed: {e}"))
                         })?;
@@ -158,7 +161,8 @@ impl Sink for NatsSink {
             // Core NATS — fire and forget (strategy irrelevant).
             for output in &outputs {
                 let subject = self.config.subject.clone();
-                let payload = Bytes::from(output.payload.to_vec());
+                // FT-11: zero-copy clone (refcount-only).
+                let payload = output.payload.clone();
                 self.client
                     .publish(subject, payload)
                     .await

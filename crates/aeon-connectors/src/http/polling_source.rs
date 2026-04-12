@@ -5,7 +5,6 @@
 //! interval provides natural flow control.
 
 use aeon_types::{AeonError, Event, PartitionId, Source};
-use bytes::Bytes;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -134,7 +133,8 @@ impl Source for HttpPollingSource {
             0,
             Arc::clone(&self.config.source_name),
             PartitionId::new(0),
-            Bytes::from(body.to_vec()),
+            // FT-11: reqwest Response.bytes() returns bytes::Bytes directly.
+            body,
         );
 
         Ok(vec![event])

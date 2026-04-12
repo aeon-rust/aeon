@@ -66,7 +66,8 @@ impl Sink for WebSocketSink {
 
         let ids = outputs.iter().filter_map(|o| o.source_event_id).collect();
         for output in &outputs {
-            let msg = Message::Binary(output.payload.to_vec().into());
+            // FT-11: Message::Binary holds bytes::Bytes — clone is refcount-only.
+            let msg = Message::Binary(output.payload.clone());
             self.writer
                 .send(msg)
                 .await

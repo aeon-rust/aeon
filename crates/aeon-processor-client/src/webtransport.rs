@@ -11,6 +11,20 @@ use std::sync::Arc;
 use aeon_types::AeonError;
 use wtransport::{ClientConfig, Endpoint};
 
+/// Log the webtransport-insecure warning at most once per process.
+#[cfg(feature = "webtransport-insecure")]
+fn warn_once_webtransport_insecure() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            "⚠ webtransport-insecure feature is ENABLED: server certificates will NOT be \
+             validated. This is intended for local development ONLY. Rebuild without the \
+             `webtransport-insecure` feature before deploying to production."
+        );
+    }
+}
+
 use crate::auth;
 use crate::wire::{self, Accepted, Challenge, Heartbeat, Register};
 use crate::{BatchProcessFn, ProcessFn, ProcessorConfig, SessionInfo};
@@ -48,10 +62,15 @@ async fn run_webtransport_inner(
     let url = config.url.clone();
 
     #[cfg(feature = "webtransport-insecure")]
-    let wt_config = ClientConfig::builder()
-        .with_bind_default()
-        .with_no_cert_validation()
-        .build();
+    let wt_config = {
+        // FT-8: compile-time insecure mode. Log once per process at connect
+        // time so operators notice when a "dev" binary is running in prod.
+        warn_once_webtransport_insecure();
+        ClientConfig::builder()
+            .with_bind_default()
+            .with_no_cert_validation()
+            .build()
+    };
 
     #[cfg(not(feature = "webtransport-insecure"))]
     let wt_config = ClientConfig::builder()

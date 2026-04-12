@@ -96,7 +96,8 @@ impl WebSocketSource {
                             0,
                             Arc::clone(&source_name),
                             PartitionId::new(0),
-                            Bytes::from(text.as_bytes().to_vec()),
+                            // FT-11: Utf8Bytes: AsRef<Bytes> — clone is refcount-only.
+                            AsRef::<Bytes>::as_ref(&text).clone(),
                         );
                         // tx.send blocks when the push buffer is full; that
                         // back-pressures the outer read.next() loop and

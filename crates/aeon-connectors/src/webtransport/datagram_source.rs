@@ -9,7 +9,6 @@
 
 use crate::push_buffer::{PushBufferConfig, PushBufferRx, push_buffer};
 use aeon_types::{AeonError, Event, PartitionId, Source};
-use bytes::Bytes;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -135,7 +134,8 @@ async fn datagram_accept_loop(
                             continue;
                         }
 
-                        let payload = Bytes::from(datagram.payload().to_vec());
+                        // FT-11: datagram.payload() returns bytes::Bytes directly.
+                        let payload = datagram.payload();
                         let event = Event::new(
                             uuid::Uuid::nil(),
                             0,
