@@ -3023,7 +3023,7 @@ developer experience, and deferred work into 7 pillars with clear dependency cha
 | 2. Zero-Downtime Deployment | 7 | High | ZD-1/2/3 (bug fixes) then ZD-4/5/6 (drain/swap/reconfig) |
 | 3. Cluster Operations | 9 | Medium | Gate 2 acceptance, partition reassignment, PoH transfer, cluster metrics (CL-4), CL-6a/b/c/d (partition transfer data movement), raft-aware auto-scaling (CL-5, depends on CL-6) |
 | 4. Transport Resilience | 3 | Mixed | TR-3 (connection backoff with jitter): shipped for MQTT source+sink, MongoDB CDC, and `QuicEndpoint::connect_with_backoff()` (bootstrap/join path only — openraft RPC path stays fail-fast; see "Retry layering" below). Remaining connectors need reconnect loops introduced first. TR-1/2 deferred. |
-| 5. Exactly-Once Delivery | 3 | Future | EO-1 (Kafka IdempotentSink) -> EO-2 (atomic checkpoint+commit) -> EO-3 (other sinks) |
+| 5. Exactly-Once Delivery | 3 | Future | EO-1 (Kafka IdempotentSink ✅) -> EO-3 (other sinks ✅ for Nats/Redis) -> EO-2 (two-phase L3 `pending → committed` bracketing each sink tier's native atomic primitive — per-source UUIDv7 identity, no intermediate topic; first cut Kafka→Kafka, other tiers demand-driven; see FAULT-TOLERANCE-ANALYSIS.md EO-2 and THROUGHPUT-VALIDATION.md) |
 | 6. Developer Experience & Adoption-Readiness | 5 | Medium | DX-1 (CLI tests), DX-2 (aeon doctor), DX-3 (hot-reload), DX-4 (error polish), DX-5 (cargo xtask) |
 | 7. Blocked / Demand-Driven | 6 | Blocked | T3 WT SDKs (5 languages blocked on library maturity), T5 isolation tier. T1/T2 inherently language-limited (see FT analysis §10) |
 

@@ -50,8 +50,8 @@ pub use scanner::{
 };
 pub use state::{BatchEntry, BatchOp, KvPairs, L3Backend, L3Store};
 pub use traits::{
-    CheckpointReplicator, IdempotentSink, Processor, ProcessorTransport, Seekable, Sink, Source,
-    StateOps,
+    CheckpointReplicator, IdempotentSink, Processor, ProcessorTransport, Seekable, Sink,
+    SinkEosTier, Source, StateOps, TransactionalSink,
 };
 pub use transport_codec::{TransportCodec, WireEvent, WireOutput};
 pub use uuid::CoreLocalUuidGenerator;

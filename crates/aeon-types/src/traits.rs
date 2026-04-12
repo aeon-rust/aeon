@@ -152,6 +152,99 @@ pub trait IdempotentSink: Sink {
     ) -> impl std::future::Future<Output = Result<bool, AeonError>> + Send;
 }
 
+/// EO-2: Which native atomic-commit primitive a sink exposes.
+///
+/// Each tier corresponds to a commit primitive the pipeline engine can drive
+/// from `TransactionalSink::commit()`. The tier is fixed per connector type
+/// (not per-instance config) and governs how the engine brackets a batch of
+/// writes with a two-phase L3 checkpoint record (`pending → committed`).
+///
+/// See `docs/THROUGHPUT-VALIDATION.md` §7 for the full tier table and
+/// `docs/FAULT-TOLERANCE-ANALYSIS.md` EO-2 for the design rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SinkEosTier {
+    /// T1 — Transactional DBs (Postgres, MySQL, SQLite, MongoDB).
+    /// Commit primitive: `COMMIT` on an in-progress SQL transaction,
+    /// with `ON CONFLICT DO NOTHING` (or equivalent) supplying idempotence.
+    TransactionalDb,
+    /// T2 — Transactional streams (Kafka, Redpanda).
+    /// Commit primitive: `commit_transaction` + `send_offsets_to_transaction`
+    /// on the producer epoch established via `init_transactions`.
+    TransactionalStream,
+    /// T3 — Atomic-rename files.
+    /// Commit primitive: write to `*.tmp`, then `rename()` into place.
+    AtomicRenameFile,
+    /// T4 — Dedup-keyed stores (Redis Streams, NATS JetStream).
+    /// Commit primitive: pipeline EXEC (Redis) or ack-all + msg-id (JetStream).
+    /// Idempotence comes from the sink's per-event dedup key.
+    DedupKeyed,
+    /// T5 — Idempotency-Key receivers (webhook, WS, WT).
+    /// Commit primitive: HTTP request carrying `Idempotency-Key: <event_id>`.
+    /// The server is responsible for deduplication.
+    IdempotencyKey,
+    /// T6 — Fire-and-forget (stdout, blackhole).
+    /// No commit primitive. EOS is not meaningful — present so the capability
+    /// probe is total.
+    FireAndForget,
+}
+
+/// EO-2: Sink that supports transactional commit around a batch.
+///
+/// The pipeline engine drives the commit lifecycle:
+///
+/// ```text
+///   begin()                              ← pipeline opens a txn
+///   write_batch()  (1..N times)          ← normal sink writes
+///   L3[pipeline/partition] = Pending {   ← phase 1 of two-phase L3 record
+///     offset, pending_event_ids }
+///   commit()                             ← sink's native atomic primitive
+///   L3[pipeline/partition] = Committed   ← phase 2
+/// ```
+///
+/// On crash after `Pending` but before `Committed`, recovery replays the
+/// pending batch through the sink and relies on the sink's `IdempotentSink`
+/// primitive (EO-1/EO-3) to suppress duplicates. A sink implementing
+/// `TransactionalSink` must therefore also implement `IdempotentSink`
+/// unless its tier provides commit-atomicity sufficient on its own
+/// (Kafka transactions, atomic rename).
+///
+/// Tier selection (`eos_tier()`) is advisory metadata for the engine —
+/// it lets the engine pick tier-specific recovery strategies (e.g. for
+/// `TransactionalStream` the engine can call `abort()` on restart;
+/// for `DedupKeyed` it just replays because the dedup keys will match).
+///
+/// Sinks that do not support atomic commit (e.g. plain fire-and-forget)
+/// should NOT implement this trait — the engine falls back to the
+/// at-least-once checkpoint path.
+pub trait TransactionalSink: Sink {
+    /// Tier the sink belongs to. See [`SinkEosTier`].
+    ///
+    /// Pure metadata — the engine calls this once at pipeline start.
+    fn eos_tier(&self) -> SinkEosTier;
+
+    /// Begin a transactional commit window.
+    ///
+    /// The sink transitions from idle to "in-transaction" — subsequent
+    /// `write_batch()` calls are associated with this transaction. Must be
+    /// idempotent within the same generation so that replays on recovery
+    /// do not double-open.
+    fn begin(&mut self) -> impl std::future::Future<Output = Result<(), AeonError>> + Send;
+
+    /// Commit the in-progress transaction atomically.
+    ///
+    /// After `commit()` returns `Ok(())`, every `write_batch()` since the
+    /// matching `begin()` is durably visible to downstream consumers. After
+    /// this returns, the sink is back in the idle state.
+    fn commit(&mut self) -> impl std::future::Future<Output = Result<(), AeonError>> + Send;
+
+    /// Abort the in-progress transaction.
+    ///
+    /// Used on recovery when the last L3 record is `Pending` but the engine
+    /// decides to replay from the prior `Committed` checkpoint instead of
+    /// finishing the pending batch. Must leave the sink in the idle state.
+    fn abort(&mut self) -> impl std::future::Future<Output = Result<(), AeonError>> + Send;
+}
+
 /// Async transport abstraction for all processor tiers (T1–T4).
 ///
 /// The pipeline calls this trait exclusively — it never knows whether the
@@ -281,6 +374,37 @@ mod tests {
     /// If this compiles, `&dyn ProcessorTransport` works — required by Decision D2.
     #[allow(dead_code)]
     fn _assert_processor_transport_object_safe(_: &dyn ProcessorTransport) {}
+
+    /// EO-2: SinkEosTier is a plain Copy/Eq enum — cheap to carry around and
+    /// safe to use in match arms. These asserts fail at compile time if the
+    /// bounds ever regress.
+    #[allow(dead_code)]
+    fn _assert_sink_eos_tier_bounds() {
+        fn needs<T: Copy + Eq + std::fmt::Debug + Send + Sync + 'static>() {}
+        needs::<SinkEosTier>();
+    }
+
+    #[test]
+    fn sink_eos_tier_variants_distinct() {
+        use SinkEosTier::*;
+        let all = [
+            TransactionalDb,
+            TransactionalStream,
+            AtomicRenameFile,
+            DedupKeyed,
+            IdempotencyKey,
+            FireAndForget,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for (j, b) in all.iter().enumerate() {
+                if i == j {
+                    assert_eq!(a, b);
+                } else {
+                    assert_ne!(a, b, "variants {i} and {j} compare equal");
+                }
+            }
+        }
+    }
 
     #[test]
     fn filter_processor_drops_non_matching() {

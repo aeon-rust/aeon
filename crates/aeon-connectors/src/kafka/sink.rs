@@ -8,7 +8,10 @@
 //!   and returns immediately. `flush()` calls `producer.flush()` to await all
 //!   pending deliveries. Higher throughput, downstream sorts by UUIDv7.
 
-use aeon_types::{AeonError, BatchResult, DeliveryStrategy, IdempotentSink, Output, Sink};
+use aeon_types::{
+    AeonError, BatchResult, DeliveryStrategy, IdempotentSink, Output, Sink, SinkEosTier,
+    TransactionalSink,
+};
 use futures_util::future::join_all;
 use rdkafka::config::ClientConfig;
 use rdkafka::message::OwnedHeaders;
@@ -117,6 +120,15 @@ pub struct KafkaSink {
     /// True when the producer was initialised for transactional writes
     /// (`transactional.id` set + `init_transactions` succeeded).
     transactional: bool,
+    /// EO-2: true when an outer `TransactionalSink::begin()` is active.
+    ///
+    /// While this is set, `Sink::write_batch()` skips its own per-batch
+    /// `begin_transaction` / `commit_transaction` envelope because the
+    /// pipeline is driving a longer-lived transaction that will be closed
+    /// by the matching `commit()` or `abort()` call. This is the switch
+    /// that lets the same producer serve both the EO-1 per-batch model
+    /// and the EO-2 two-phase-L3 model.
+    in_outer_txn: bool,
 }
 
 impl KafkaSink {
@@ -174,6 +186,7 @@ impl KafkaSink {
             delivered: 0,
             pending: 0,
             transactional,
+            in_outer_txn: false,
         })
     }
 
@@ -341,7 +354,14 @@ impl Sink for KafkaSink {
         // Transactional envelope: begin before the first send so that any
         // produce error can be turned into an `abort_transaction` and nothing
         // ever becomes visible to `read_committed` consumers.
-        if self.transactional {
+        //
+        // EO-2: when `in_outer_txn` is set, the pipeline has already called
+        // `TransactionalSink::begin()` and will close the transaction with
+        // `commit()` / `abort()`. Skipping the per-batch begin/commit lets
+        // the outer transaction span this produce along with the pending-L3
+        // write and any other batches before the checkpoint boundary.
+        let manage_txn = self.transactional && !self.in_outer_txn;
+        if manage_txn {
             self.producer.begin_transaction().map_err(|e| {
                 AeonError::connection(format!("kafka begin_transaction failed: {e}"))
             })?;
@@ -356,7 +376,7 @@ impl Sink for KafkaSink {
             .produce_inner(&outputs, count, event_ids.clone())
             .await;
 
-        if self.transactional {
+        if manage_txn {
             match &outcome {
                 Ok(_) => {
                     // Commit the transaction. A commit failure after successful
@@ -403,6 +423,90 @@ impl Sink for KafkaSink {
     }
 }
 
+/// EO-2: `TransactionalSink` for Kafka — tier T2 (`TransactionalStream`).
+///
+/// Drives the Kafka producer-epoch transaction lifecycle from outside the
+/// per-batch envelope. The pipeline flush path is expected to:
+///
+/// ```text
+///   sink.begin().await?;             // open an outer transaction
+///   sink.write_batch(batch).await?;  // one or more produce batches
+///   sink.write_batch(batch).await?;  // (per-batch envelope is skipped)
+///   // write Pending L3 record here
+///   sink.commit().await?;            // flip to Committed once ack returns
+///   // write Committed L3 record here
+/// ```
+///
+/// On recovery, the engine may instead call `sink.abort().await?` to discard
+/// any in-flight outer transaction before replaying from the prior committed
+/// checkpoint. The idempotent-producer sequence fencing guarantees that a
+/// replay after abort produces exactly the same sequence numbers the broker
+/// has already rejected, so there are no zombie writes.
+///
+/// Requires `transactional_id` to be configured — without it
+/// (`is_transactional() == false`), `begin()` returns an error rather than
+/// silently degrading to at-least-once, so the engine can detect the
+/// misconfiguration at pipeline start instead of at first crash.
+impl TransactionalSink for KafkaSink {
+    fn eos_tier(&self) -> SinkEosTier {
+        SinkEosTier::TransactionalStream
+    }
+
+    async fn begin(&mut self) -> Result<(), AeonError> {
+        if !self.transactional {
+            return Err(AeonError::config(
+                "KafkaSink::begin requires transactional_id to be configured; \
+                 call KafkaSinkConfig::with_transactional_id() before constructing the sink",
+            ));
+        }
+        if self.in_outer_txn {
+            // Idempotent — repeated begins from the same generation are a
+            // no-op. A doubled begin on the rdkafka side would return
+            // `ERR_STATE` ("Operation not valid in state"), which we avoid
+            // by tracking state here.
+            return Ok(());
+        }
+        self.producer.begin_transaction().map_err(|e| {
+            AeonError::connection(format!("kafka begin_transaction failed: {e}"))
+        })?;
+        self.in_outer_txn = true;
+        Ok(())
+    }
+
+    async fn commit(&mut self) -> Result<(), AeonError> {
+        if !self.in_outer_txn {
+            // No outer transaction in flight — nothing to commit. This is
+            // the normal case when the sink is used in the at-least-once
+            // (non-EO-2) path; the per-batch envelope has already committed.
+            return Ok(());
+        }
+        self.producer
+            .commit_transaction(self.config.flush_timeout)
+            .map_err(|e| {
+                AeonError::connection(format!("kafka commit_transaction failed: {e}"))
+            })?;
+        self.in_outer_txn = false;
+        Ok(())
+    }
+
+    async fn abort(&mut self) -> Result<(), AeonError> {
+        if !self.in_outer_txn {
+            return Ok(());
+        }
+        // Clear the flag first so that a retry from the caller doesn't try
+        // to abort an already-aborted transaction. rdkafka would return
+        // `ERR_STATE` on the second abort; pre-clearing mirrors how we
+        // handle re-entrant begin().
+        self.in_outer_txn = false;
+        self.producer
+            .abort_transaction(self.config.flush_timeout)
+            .map_err(|e| {
+                AeonError::connection(format!("kafka abort_transaction failed: {e}"))
+            })?;
+        Ok(())
+    }
+}
+
 /// Helper to create a Redpanda-optimized sink config.
 pub fn redpanda_sink_config(
     brokers: impl Into<String>,
@@ -436,5 +540,13 @@ mod tests {
     #[allow(dead_code)]
     fn _assert_kafka_sink_is_idempotent() {
         _assert_idempotent_sink::<KafkaSink>();
+    }
+
+    /// EO-2: compile-time proof that `KafkaSink` satisfies `TransactionalSink`.
+    #[allow(dead_code)]
+    fn _assert_transactional_sink<T: TransactionalSink>() {}
+    #[allow(dead_code)]
+    fn _assert_kafka_sink_is_transactional() {
+        _assert_transactional_sink::<KafkaSink>();
     }
 }

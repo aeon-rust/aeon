@@ -422,6 +422,18 @@ Build/change component
     → Record: per-event overhead, CPU %, memory, P99
 ```
 
+#### Design-validation record for EOS at 20M ev/s
+
+The EO-2 (atomic checkpoint + sink commit) design was validated against this
+performance model before any code was written. The validation walks the per-event
+cost budget, the per-checkpoint amortisation (L3 redb writes at 1–10 Hz), the
+pull-vs-push backpressure split (§10.1), and the multi-node per-partition model
+(§6, §11). It concludes that EO-2 adds **zero per-event hot-path cost** and
+preserves the <100 ns / ≥5× headroom targets.
+
+See `docs/THROUGHPUT-VALIDATION.md`. Any departure from these numbers re-enters
+review before landing.
+
 ---
 
 ## 6. Multi-Tier State Management
