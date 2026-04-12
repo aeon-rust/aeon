@@ -2470,15 +2470,17 @@ fn cmd_doctor(api: &str, kafka: &str, state_dir: &Path, manifest: Option<&Path>)
     results.push(check_compiled_features());
 
     // (2) Port availability for in-process Aeon defaults.
+    //
+    // IMPORTANT: 4470 (QUIC) and 4472 (WebTransport/HTTP3) are UDP; probing them
+    // with a TCP listener always succeeds even when Aeon is running, which
+    // produces a false PASS. Probe with the correct L4 protocol per port.
     println!("Ports:");
-    // Canonical triplet: 4470 (cluster QUIC), 4471 (REST API + T4 WebSocket + /metrics),
-    // 4472 (T3 WebTransport + external QUIC connectors).
-    for (port, label) in [
-        (4470u16, "cluster QUIC (Raft/PoH)"),
-        (4471, "REST API + T4 WebSocket + /metrics"),
-        (4472, "T3 WebTransport + external QUIC"),
+    for (port, proto, label) in [
+        (4470u16, PortProto::Udp, "cluster QUIC (Raft/PoH)"),
+        (4471, PortProto::Tcp, "REST API + T4 WebSocket + /metrics"),
+        (4472, PortProto::Udp, "T3 WebTransport + external QUIC"),
     ] {
-        let r = check_port_available(port, label);
+        let r = check_port_available(port, proto, label);
         r.print();
         results.push(r);
     }
@@ -2554,21 +2556,44 @@ fn check_compiled_features() -> CheckResult {
     r
 }
 
-/// A port is "available" if we can bind to it on 127.0.0.1. If bind fails, something
-/// is likely already listening — typically fine for REST API (server running) but a
-/// conflict if the user is trying to start a fresh Aeon instance.
-fn check_port_available(port: u16, label: &str) -> CheckResult {
-    use std::net::TcpListener;
+/// L4 protocol for port availability probes. TCP binds a `TcpListener`; UDP binds
+/// a `UdpSocket`. Using the wrong one produces a false PASS because TCP and UDP
+/// port namespaces are independent.
+#[derive(Clone, Copy)]
+enum PortProto {
+    Tcp,
+    Udp,
+}
+
+impl PortProto {
+    fn as_str(self) -> &'static str {
+        match self {
+            PortProto::Tcp => "tcp",
+            PortProto::Udp => "udp",
+        }
+    }
+}
+
+/// A port is "available" if we can bind it on 127.0.0.1 with the correct L4
+/// protocol. If bind fails, something is likely already listening — typically
+/// fine for REST API (server running) but a conflict if the user is trying
+/// to start a fresh Aeon instance.
+fn check_port_available(port: u16, proto: PortProto, label: &str) -> CheckResult {
     let addr = format!("127.0.0.1:{port}");
-    match TcpListener::bind(&addr) {
-        Ok(_) => CheckResult::pass(
-            format!("port {port}"),
-            format!("{label}: available"),
-        ),
+    let bind_result: std::io::Result<()> = match proto {
+        PortProto::Tcp => std::net::TcpListener::bind(&addr).map(|_| ()),
+        PortProto::Udp => std::net::UdpSocket::bind(&addr).map(|_| ()),
+    };
+    let port_label = format!("port {port}/{}", proto.as_str());
+    match bind_result {
+        Ok(()) => CheckResult::pass(port_label, format!("{label}: available")),
         Err(e) => CheckResult::warn(
-            format!("port {port}"),
+            port_label,
             format!("{label}: in use ({e})"),
-            format!("stop whatever is bound to {port}, or set a different port in config"),
+            format!(
+                "stop whatever is bound to {port}/{}, or set a different port in config",
+                proto.as_str()
+            ),
         ),
     }
 }
