@@ -236,6 +236,42 @@ impl aeon_types::Processor for WasmProcessor {
     fn process_batch(&self, events: Vec<Event>) -> Result<Vec<Output>, AeonError> {
         WasmProcessor::process_batch(self, events)
     }
+
+    /// TR-2: Export the host-side KV state HashMap so it can be carried into
+    /// the new instance on a hot-swap. State is host-side (see
+    /// `runtime::HostState.state`), so a swap that doesn't transfer it would
+    /// lose all guest state — ValueState, MapState, and any raw
+    /// `state::put/get` keys would reset to empty.
+    fn snapshot_state(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, AeonError> {
+        let instance = self
+            .instance
+            .lock()
+            .map_err(|e| AeonError::processor(format!("wasm snapshot lock poisoned: {e}")))?;
+        Ok(instance
+            .host_state()
+            .state
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect())
+    }
+
+    /// TR-2: Replace the host-side KV state HashMap with the snapshot from the
+    /// outgoing processor. Clears any state the fresh instance accrued between
+    /// instantiation and this call (there shouldn't be any, because restore
+    /// runs before the first event).
+    fn restore_state(&self, snapshot: Vec<(Vec<u8>, Vec<u8>)>) -> Result<(), AeonError> {
+        let mut instance = self
+            .instance
+            .lock()
+            .map_err(|e| AeonError::processor(format!("wasm restore lock poisoned: {e}")))?;
+        let host = instance.host_state_mut();
+        host.state.clear();
+        host.state.reserve(snapshot.len());
+        for (k, v) in snapshot {
+            host.state.insert(k, v);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -659,5 +695,116 @@ mod tests {
                 "event {i}: payload mismatch"
             );
         }
+    }
+
+    /// TR-2 — snapshot on one instance, restore on another, verify all keys
+    /// survive the transfer. Uses the minimal passthrough WAT so we don't
+    /// care about processor correctness, only that the host-side HashMap
+    /// round-trips through the Processor trait.
+    #[test]
+    fn tr2_snapshot_restore_roundtrip() {
+        use crate::runtime::WasmModule;
+        use aeon_types::Processor as ProcessorTrait;
+
+        // A WAT that only needs to instantiate successfully — we never call
+        // process(). We just drive snapshot_state / restore_state via the
+        // HostState HashMap underneath.
+        const MINIMAL_WAT: &str = r#"
+            (module
+                (import "env" "state_put" (func $state_put (param i32 i32 i32 i32)))
+                (import "env" "state_get" (func $state_get (param i32 i32 i32 i32) (result i32)))
+                (import "env" "state_delete" (func $state_delete (param i32 i32)))
+                (memory (export "memory") 1)
+            )
+        "#;
+
+        let module = Arc::new(WasmModule::from_wat(MINIMAL_WAT).unwrap());
+        let from = WasmProcessor::new(Arc::clone(&module)).unwrap();
+        let to = WasmProcessor::new(Arc::clone(&module)).unwrap();
+
+        // Seed state directly on the outgoing instance's HostState.
+        {
+            let mut inst = from.instance.lock().unwrap();
+            let hs = inst.host_state_mut();
+            hs.state.insert(b"counter".to_vec(), b"42".to_vec());
+            hs.state.insert(b"name".to_vec(), b"alice".to_vec());
+            hs.state.insert(b"blob".to_vec(), vec![0xFF; 128]);
+        }
+
+        let snap = ProcessorTrait::snapshot_state(&from).unwrap();
+        assert_eq!(snap.len(), 3);
+
+        // Fresh instance starts empty.
+        {
+            let inst = to.instance.lock().unwrap();
+            assert!(inst.host_state().state.is_empty());
+        }
+
+        ProcessorTrait::restore_state(&to, snap).unwrap();
+
+        // After restore the incoming instance must hold exactly the same KVs.
+        let inst = to.instance.lock().unwrap();
+        let state = &inst.host_state().state;
+        assert_eq!(state.len(), 3);
+        assert_eq!(state.get(b"counter".as_ref()).unwrap().as_slice(), b"42");
+        assert_eq!(state.get(b"name".as_ref()).unwrap().as_slice(), b"alice");
+        assert_eq!(state.get(b"blob".as_ref()).unwrap().as_slice(), &[0xFF; 128][..]);
+    }
+
+    /// TR-2 — restore replaces, does not merge. A key present on the target
+    /// but absent from the snapshot must be gone after restore.
+    #[test]
+    fn tr2_restore_replaces_existing_state() {
+        use crate::runtime::WasmModule;
+        use aeon_types::Processor as ProcessorTrait;
+
+        const MINIMAL_WAT: &str = r#"
+            (module
+                (import "env" "state_put" (func $state_put (param i32 i32 i32 i32)))
+                (import "env" "state_get" (func $state_get (param i32 i32 i32 i32) (result i32)))
+                (import "env" "state_delete" (func $state_delete (param i32 i32)))
+                (memory (export "memory") 1)
+            )
+        "#;
+
+        let module = Arc::new(WasmModule::from_wat(MINIMAL_WAT).unwrap());
+        let to = WasmProcessor::new(Arc::clone(&module)).unwrap();
+
+        // Pre-populate the target with a stale key.
+        {
+            let mut inst = to.instance.lock().unwrap();
+            inst.host_state_mut()
+                .state
+                .insert(b"stale".to_vec(), b"old".to_vec());
+        }
+
+        let snap = vec![(b"fresh".to_vec(), b"new".to_vec())];
+        ProcessorTrait::restore_state(&to, snap).unwrap();
+
+        let inst = to.instance.lock().unwrap();
+        let state = &inst.host_state().state;
+        assert_eq!(state.len(), 1);
+        assert!(!state.contains_key(b"stale".as_ref()));
+        assert_eq!(state.get(b"fresh".as_ref()).unwrap().as_slice(), b"new");
+    }
+
+    /// TR-2 — default Processor trait impls are stateless. A custom processor
+    /// that doesn't override gets an empty snapshot and a no-op restore.
+    #[test]
+    fn tr2_stateless_processor_defaults() {
+        use aeon_types::Processor as ProcessorTrait;
+
+        struct Stateless;
+        impl ProcessorTrait for Stateless {
+            fn process(&self, _e: Event) -> Result<Vec<Output>, AeonError> {
+                Ok(Vec::new())
+            }
+        }
+
+        let p = Stateless;
+        let snap = ProcessorTrait::snapshot_state(&p).unwrap();
+        assert!(snap.is_empty());
+        // Non-empty snapshot goes in, no-op out — just verifies no panic.
+        ProcessorTrait::restore_state(&p, vec![(b"k".to_vec(), b"v".to_vec())]).unwrap();
     }
 }

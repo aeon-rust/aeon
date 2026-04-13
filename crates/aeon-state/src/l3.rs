@@ -3,8 +3,9 @@
 //! The L3 tier provides durable state that survives process restarts. It sits
 //! at the bottom of the tiered hierarchy (L1 DashMap → L2 mmap → L3 persistent).
 //!
-//! **Adapter pattern**: The [`L3Store`] trait defines the interface. Implementations
-//! are selected via the [`L3Backend`] config enum:
+//! **Adapter pattern**: The [`L3Store`] trait is defined in `aeon-types` (so that
+//! crates like `aeon-cluster` can depend on the abstraction without pulling in
+//! `aeon-state`). Implementations are selected via the [`L3Backend`] config enum:
 //!
 //! - `redb` (default): Pure Rust B-tree database, ACID, no C dependencies.
 //!   Feature-gated behind `redb`.
@@ -17,74 +18,15 @@
 //! copy-on-write B-tree avoids compaction stalls, providing predictable latency
 //! for a real-time pipeline engine.
 
-use aeon_types::AeonError;
-
-/// Result type for key-value scan operations.
-pub type KvPairs = Vec<(Vec<u8>, Vec<u8>)>;
-
-/// Batch operation type for [`L3Store::write_batch`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BatchOp {
-    Put,
-    Delete,
-}
-
-/// A single batch operation: (op, key, optional value).
-pub type BatchEntry = (BatchOp, Vec<u8>, Option<Vec<u8>>);
-
-/// Configuration for the L3 backend selection.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub enum L3Backend {
-    /// redb — pure Rust B-tree database (default).
-    #[default]
-    Redb,
-    /// RocksDB — LSM-tree (future, feature-gated).
-    RocksDb,
-}
-
-/// L3 persistent state store trait.
-///
-/// Implementations must be thread-safe. The interface is synchronous — the async
-/// boundary lives at the [`TieredStore`](crate::TieredStore) level, which calls
-/// L3 ops on a background task.
-///
-/// Both redb and RocksDB (future) implement this trait, allowing runtime selection
-/// via configuration (`state.l3.backend`).
-pub trait L3Store: Send + Sync {
-    /// Get a value by key. Returns `None` if not found.
-    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, AeonError>;
-
-    /// Put a key-value pair. Overwrites if key exists.
-    fn put(&self, key: &[u8], value: &[u8]) -> Result<(), AeonError>;
-
-    /// Delete a key. No-op if key doesn't exist.
-    fn delete(&self, key: &[u8]) -> Result<(), AeonError>;
-
-    /// Execute a batch of operations atomically.
-    ///
-    /// For `BatchOp::Put`, the value slice must be `Some`. For `BatchOp::Delete`, it's `None`.
-    fn write_batch(&self, ops: &[BatchEntry]) -> Result<(), AeonError>;
-
-    /// Scan all entries whose keys start with `prefix`.
-    fn scan_prefix(&self, prefix: &[u8]) -> Result<KvPairs, AeonError>;
-
-    /// Flush any buffered writes to durable storage.
-    fn flush(&self) -> Result<(), AeonError>;
-
-    /// Approximate number of entries.
-    fn len(&self) -> Result<usize, AeonError>;
-
-    /// Whether the store is empty.
-    fn is_empty(&self) -> Result<bool, AeonError> {
-        Ok(self.len()? == 0)
-    }
-}
+// Re-export the trait and associated types from aeon-types so downstream code
+// using `crate::l3::L3Store` etc. continues to work unchanged.
+pub use aeon_types::{BatchEntry, BatchOp, KvPairs, L3Backend, L3Store};
 
 // --- redb implementation ---
 
 #[cfg(feature = "redb")]
 mod redb_store {
-    use super::*;
+    use aeon_types::{AeonError, BatchEntry, BatchOp, KvPairs, L3Store};
     use redb::{ReadableTable, ReadableTableMetadata};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};

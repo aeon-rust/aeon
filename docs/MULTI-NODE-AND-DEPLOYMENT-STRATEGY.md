@@ -3,6 +3,11 @@
 > Discussion document: Aeon deployment models across IaaS, Kubernetes,
 > and serverless platforms. Covers CPU pinning, Raft networking, and
 > what works where.
+>
+> **See also**: `docs/FAULT-TOLERANCE-ANALYSIS.md` for the unified multi-node
+> to-do list, failure-scenario analysis, and persistence gap breakdown. The
+> 3-node DOKS validation (2026-04-12) supersedes earlier "blocked on infra"
+> notes in this document.
 
 ---
 
@@ -183,12 +188,12 @@ spec:
                 fieldRef:
                   fieldPath: metadata.name  # "aeon-0", "aeon-1", etc.
           ports:
-            - containerPort: 4460
-              protocol: UDP   # QUIC for Raft
-            - containerPort: 4461
-              protocol: TCP   # REST API
-            - containerPort: 4462
-              protocol: TCP   # Metrics
+            - containerPort: 4470
+              protocol: UDP   # QUIC for Raft/PoH (cluster inter-node, mTLS)
+            - containerPort: 4471
+              protocol: TCP   # REST API + T4 WebSocket + /metrics (management plane)
+            - containerPort: 4472
+              protocol: UDP   # T3 WebTransport + external QUIC connectors
 ```
 
 **Key insight:** On K8s, Aeon does NOT know or care which physical cores it gets.
@@ -504,8 +509,8 @@ Full to-do list with item IDs: `docs/PROCESSOR-DEPLOYMENT.md` Section 13.
 |----------|-------|-----------------|
 | ~~**Must fix**~~ | ~~ZD-1 (POST route), ZD-2 (CLI serde), ZD-3 (SHA-512)~~ | ~~Processor registration via CLI/REST, artifact integrity~~ **Done (2026-04-11)** |
 | ~~**High**~~ | ~~ZD-4 (hot-swap orchestrator)~~ | ~~Zero-downtime Wasm and Native .so processor upgrades~~ **Done (2026-04-11)** — `PipelineControl` + `run_buffered_managed()` |
-| ~~**Medium**~~ | ~~ZD-5 (blue-green runtime), ZD-6 (canary traffic split)~~ | ~~Advanced upgrade strategies~~ **Done (2026-04-11)** — Blue-green shadow + cutover, canary probabilistic split via `PipelineControl` |
-| ~~**Medium**~~ | ~~ZD-7, ZD-8 (same-type source/sink reconfig)~~ | ~~Connector config changes without pipeline restart~~ **Done (2026-04-11)** — `drain_and_swap_source()`/`drain_and_swap_sink()` via `Box<dyn Any>` downcast |
+| ~~**Medium**~~ | ~~ZD-5 (blue-green runtime), ZD-6 (canary traffic split)~~ | ~~Advanced upgrade strategies~~ **Done (2026-04-11)** — Blue-green shadow + cutover, canary probabilistic split via `PipelineControl`. REST API fully wired: `instantiate_processor()` helper loads artifact + instantiates, endpoints call `ctrl.start_blue_green()` / `ctrl.start_canary()` / `ctrl.complete_canary()`. |
+| ~~**Medium**~~ | ~~ZD-7, ZD-8 (same-type source/sink reconfig)~~ | ~~Connector config changes without pipeline restart~~ **Done (2026-04-11)** — `drain_and_swap_source()`/`drain_and_swap_sink()` via `Box<dyn Any>` downcast. REST endpoints: `POST .../reconfigure/source` and `.../reconfigure/sink` with same-type enforcement. |
 | **Low** | ZD-9 (cross-type via blue-green pipeline), ZD-10 (batch replay), ZD-11 (Wasm state), ~~ZD-12 (file watcher)~~ **Done**, ZD-13 (child process) | All deferred — edge cases, no user demand. See `PROCESSOR-DEPLOYMENT.md` §13.4 |
 
 ### 7.3 Deployment Environments — What Changes Where

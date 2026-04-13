@@ -22,7 +22,9 @@ use aeon_types::traits::ProcessorTransport;
 use aeon_types::transport_codec::TransportCodec;
 
 use crate::identity_store::ProcessorIdentityStore;
-use crate::transport::session::{AwppSession, ControlChannel, PipelineResolver};
+use crate::transport::session::{
+    AwppSession, ControlChannel, InflightBatch, PipelineResolver, ReplayOrchestrator,
+};
 
 // ── Configuration ───────────────────────────────────────────────────────
 
@@ -58,6 +60,10 @@ pub struct WebTransportHostConfig {
     /// cause unbounded memory growth. `call_batch` suspends on the session
     /// semaphore when this limit is reached.
     pub max_inflight_batches: usize,
+    /// TR-1 replay-on-reconnect window. When `Some(dur)` the host stashes
+    /// in-flight batches on disconnect and replays them if a matching
+    /// identity reconnects within `dur`. `None` disables replay.
+    pub replay_window: Option<Duration>,
 }
 
 impl WebTransportHostConfig {
@@ -80,6 +86,7 @@ impl WebTransportHostConfig {
             pipeline_name: String::new(),
             pipeline_codec: None,
             max_inflight_batches: crate::transport::session::DEFAULT_MAX_INFLIGHT_BATCHES,
+            replay_window: Some(Duration::from_secs(30)),
         }
     }
 }
@@ -102,6 +109,8 @@ pub struct WebTransportProcessorHost {
     routing: RoutingTable,
     /// Data stream send halves, populated by the accept loop.
     data_streams: DataStreamMap,
+    /// TR-1 replay orchestrator (None if replay is disabled).
+    replay: Option<Arc<ReplayOrchestrator>>,
     /// Host configuration.
     config: Arc<WebTransportHostConfig>,
     /// When the host was started.
@@ -139,6 +148,7 @@ impl WebTransportProcessorHost {
         let sessions: Arc<DashMap<String, Arc<AwppSession>>> = Arc::new(DashMap::new());
         let routing: RoutingTable = Arc::new(DashMap::new());
         let data_streams: DataStreamMap = Arc::new(DashMap::new());
+        let replay = config.replay_window.map(ReplayOrchestrator::new);
         let config = Arc::new(config);
 
         let handle = tokio::spawn(wt_accept_loop(
@@ -146,6 +156,7 @@ impl WebTransportProcessorHost {
             sessions.clone(),
             routing.clone(),
             data_streams.clone(),
+            replay.clone(),
             config.clone(),
         ));
 
@@ -153,11 +164,21 @@ impl WebTransportProcessorHost {
             sessions,
             routing,
             data_streams,
+            replay,
             config,
             created_at: Instant::now(),
             local_addr,
             _accept_handle: handle,
         })
+    }
+
+    /// Number of batches currently stashed for replay across all
+    /// disconnected identities.
+    pub fn stashed_replay_batches(&self) -> usize {
+        self.replay
+            .as_ref()
+            .map(|r| r.stashed_batch_count())
+            .unwrap_or(0)
     }
 
     /// The actual socket address the host is listening on.
@@ -240,10 +261,16 @@ impl ProcessorTransport for WebTransportProcessorHost {
             // inflight capacity is saturated, `start_batch` suspends until
             // an earlier batch completes — this is the session-level
             // backpressure that bounds the pending map.
-            let (batch_id, rx) = session.batch_inflight.start_batch().await;
+            //
+            // TR-1: events are retained inside the pending slot as
+            // Arc<Vec<Event>> so a disconnect can drain and replay them.
+            // Retention is a refcount bump, not a copy.
+            let events = Arc::new(events);
+            let (batch_id, rx) = session.batch_inflight.start_batch(Arc::clone(&events)).await;
 
             // Encode batch request
-            let wire = crate::batch_wire::encode_batch_request(batch_id, &events, session.codec)?;
+            let wire =
+                crate::batch_wire::encode_batch_request(batch_id, events.as_slice(), session.codec)?;
 
             // Write length-prefixed frame to data stream
             {
@@ -317,6 +344,7 @@ async fn wt_accept_loop(
     sessions: Arc<DashMap<String, Arc<AwppSession>>>,
     routing: RoutingTable,
     data_streams: DataStreamMap,
+    replay: Option<Arc<ReplayOrchestrator>>,
     config: Arc<WebTransportHostConfig>,
 ) {
     loop {
@@ -341,11 +369,12 @@ async fn wt_accept_loop(
         let sessions = sessions.clone();
         let routing = routing.clone();
         let data_streams = data_streams.clone();
+        let replay = replay.clone();
         let config = config.clone();
 
         tokio::spawn(async move {
             if let Err(e) =
-                handle_wt_session(session, sessions, routing, data_streams, config).await
+                handle_wt_session(session, sessions, routing, data_streams, replay, config).await
             {
                 tracing::debug!(error = %e, "T3 session ended");
             }
@@ -359,6 +388,7 @@ async fn handle_wt_session(
     sessions: Arc<DashMap<String, Arc<AwppSession>>>,
     routing: RoutingTable,
     data_streams: DataStreamMap,
+    replay: Option<Arc<ReplayOrchestrator>>,
     config: Arc<WebTransportHostConfig>,
 ) -> Result<(), AeonError> {
     // Accept the first bidirectional stream as the control stream
@@ -448,7 +478,43 @@ async fn handle_wt_session(
 
                 // Store send half for outbound batch requests
                 let send = Arc::new(Mutex::new(send));
-                data_streams.insert(key.clone(), send);
+                data_streams.insert(key.clone(), send.clone());
+
+                // TR-1: replay any stashed batches matching this
+                // identity+pipeline+partition. The data stream must exist
+                // in the map *before* we replay — `call_batch`-style sends
+                // look it up by key — so we trigger replay here rather
+                // than on handshake.
+                if let Some(orch) = &replay {
+                    if let Some(batches) =
+                        orch.take(&session.fingerprint, &pipeline_name, partition)
+                    {
+                        if !batches.is_empty() {
+                            tracing::info!(
+                                session_id = %session_id,
+                                pipeline = %pipeline_name,
+                                partition,
+                                count = batches.len(),
+                                "T3 reconnect — replaying stashed batches"
+                            );
+                            let session_replay = session.clone();
+                            let send_replay = send.clone();
+                            let pipeline_replay = pipeline_name.clone();
+                            let batch_timeout = config.batch_timeout;
+                            tokio::spawn(async move {
+                                wt_replay_batches(
+                                    batches,
+                                    &session_replay,
+                                    &send_replay,
+                                    &pipeline_replay,
+                                    partition,
+                                    batch_timeout,
+                                )
+                                .await;
+                            });
+                        }
+                    }
+                }
 
                 // Spawn reader task for inbound batch responses
                 let session_ref = session.clone();
@@ -477,6 +543,21 @@ async fn handle_wt_session(
         }
     }
 
+    // TR-1: stash in-flight batches before close(), since close() cancels
+    // them. A matching reconnect within `replay_window` picks them up.
+    let stashed = if let Some(orch) = &replay {
+        orch.stash(&session)
+    } else {
+        0
+    };
+    if stashed > 0 {
+        tracing::info!(
+            session_id = %session_id,
+            stashed,
+            "T3 disconnect — batches stashed for TR-1 replay"
+        );
+    }
+
     // Cleanup
     session.close();
     sessions.remove(&session_id);
@@ -490,6 +571,80 @@ async fn handle_wt_session(
     config.identity_store.disconnect(&session.fingerprint);
 
     Ok(())
+}
+
+// ── Replay (TR-1) ───────────────────────────────────────────────────────
+
+/// Re-submit stashed `InflightBatch`es on a new T3 session's data stream.
+/// See the T4 counterpart in `websocket_host.rs` — identical pattern with
+/// length-prefixed QUIC framing instead of binary WebSocket frames.
+async fn wt_replay_batches(
+    batches: Vec<InflightBatch>,
+    session: &Arc<AwppSession>,
+    stream: &Arc<Mutex<wtransport::SendStream>>,
+    _pipeline: &str,
+    _partition: u16,
+    batch_timeout: Duration,
+) {
+    for inflight in batches {
+        let InflightBatch {
+            events, responder, ..
+        } = inflight;
+
+        let (new_id, rx) = session.batch_inflight.start_batch(Arc::clone(&events)).await;
+
+        let wire =
+            match crate::batch_wire::encode_batch_request(new_id, events.as_slice(), session.codec)
+            {
+                Ok(w) => w,
+                Err(e) => {
+                    session.batch_inflight.complete_batch(
+                        new_id,
+                        Err(AeonError::serialization("replay encode failed")),
+                    );
+                    let _ = responder.send(Err(e));
+                    continue;
+                }
+            };
+
+        // Length-prefix-write on the existing data stream (same framing as call_batch).
+        let send_result = {
+            let mut send = stream.lock().await;
+            let len = (wire.len() as u32).to_le_bytes();
+            match send.write_all(&len).await {
+                Ok(()) => send.write_all(&wire).await,
+                Err(e) => Err(e),
+            }
+        };
+        if let Err(e) = send_result {
+            session.batch_inflight.complete_batch(
+                new_id,
+                Err(AeonError::connection("replay send failed")),
+            );
+            let _ = responder.send(Err(AeonError::connection(format!(
+                "T3 replay write failed: {e}"
+            ))));
+            continue;
+        }
+
+        let session_c = Arc::clone(session);
+        tokio::spawn(async move {
+            let result = match tokio::time::timeout(batch_timeout, rx).await {
+                Ok(Ok(r)) => r,
+                Ok(Err(_)) => Err(AeonError::connection(
+                    "T3 session closed during replay batch",
+                )),
+                Err(_) => {
+                    session_c.batch_inflight.complete_batch(
+                        new_id,
+                        Err(AeonError::connection("T3 replay batch timeout")),
+                    );
+                    Err(AeonError::connection("T3 replay batch timeout"))
+                }
+            };
+            let _ = responder.send(result);
+        });
+    }
 }
 
 /// Read batch responses from a QUIC data stream.

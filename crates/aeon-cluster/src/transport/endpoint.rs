@@ -3,7 +3,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use aeon_types::AeonError;
+use aeon_types::{AeonError, BackoffPolicy};
 use dashmap::DashMap;
 use quinn::{ClientConfig, Connection, Endpoint, ServerConfig};
 
@@ -90,6 +90,59 @@ impl QuicEndpoint {
         Ok(connection)
     }
 
+    /// Connect with retry on retryable errors (TR-3).
+    ///
+    /// Intended for bootstrap/join flows where the target may not be ready
+    /// yet (e.g., the seed node is still starting, DNS hasn't propagated).
+    /// Retries up to `max_attempts` times with exponential backoff + jitter
+    /// per `policy`, returning the final error if all attempts fail.
+    ///
+    /// **Not** intended for the openraft RPC path — openraft has its own
+    /// retry logic at the protocol level, and blocking a client task here
+    /// would delay heartbeats. Use plain `connect()` for those.
+    pub async fn connect_with_backoff(
+        &self,
+        node_id: NodeId,
+        addr: &NodeAddress,
+        policy: BackoffPolicy,
+        max_attempts: usize,
+    ) -> Result<Connection, AeonError> {
+        let attempts = max_attempts.max(1);
+        let mut backoff = policy.iter();
+        let mut last_err: Option<AeonError> = None;
+        for attempt in 1..=attempts {
+            match self.connect(node_id, addr).await {
+                Ok(c) => return Ok(c),
+                Err(e) => {
+                    let retryable = matches!(
+                        &e,
+                        AeonError::Connection { retryable: true, .. }
+                    );
+                    if !retryable || attempt == attempts {
+                        return Err(e);
+                    }
+                    let delay = backoff.next_delay();
+                    tracing::warn!(
+                        node_id,
+                        %addr,
+                        attempt,
+                        max_attempts = attempts,
+                        delay_ms = delay.as_millis() as u64,
+                        error = %e,
+                        "connect failed; backing off before retry"
+                    );
+                    last_err = Some(e);
+                    tokio::time::sleep(delay).await;
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| AeonError::Connection {
+            message: format!("connect_with_backoff exhausted {attempts} attempts"),
+            source: None,
+            retryable: true,
+        }))
+    }
+
     /// Accept an incoming connection.
     pub async fn accept(&self) -> Option<quinn::Incoming> {
         self.endpoint.accept().await
@@ -129,7 +182,7 @@ impl QuicEndpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::tls::dev_quic_configs;
+    use crate::transport::tls::{dev_quic_configs, dev_quic_configs_insecure};
 
     #[tokio::test]
     async fn endpoint_bind_and_local_addr() {
@@ -144,8 +197,8 @@ mod tests {
 
     #[tokio::test]
     async fn endpoint_connect_and_pool() {
-        // Use the same cert for both endpoints so client trusts server
-        let (server_cfg, client_cfg) = dev_quic_configs();
+        // Use insecure configs to avoid IPv6/SAN issues on Windows
+        let (server_cfg, client_cfg) = dev_quic_configs_insecure();
 
         // Start a "server" endpoint
         let server = QuicEndpoint::bind(
@@ -168,8 +221,8 @@ mod tests {
         let client =
             QuicEndpoint::bind("127.0.0.1:0".parse().unwrap(), server_cfg, client_cfg).unwrap();
 
-        // Use "localhost" as host to match cert SAN
-        let target = NodeAddress::new("localhost", server_addr.port());
+        // Use 127.0.0.1 to avoid IPv6 resolution on Windows (localhost → ::1 first)
+        let target = NodeAddress::new("127.0.0.1", server_addr.port());
 
         // Connect
         let conn = client.connect(1, &target).await.unwrap();
@@ -191,4 +244,47 @@ mod tests {
         let server = server_handle.await.unwrap();
         server.close();
     }
+
+    #[tokio::test]
+    async fn connect_with_backoff_returns_quickly_on_success() {
+        let (server_cfg, client_cfg) = dev_quic_configs_insecure();
+
+        let server = QuicEndpoint::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            server_cfg.clone(),
+            client_cfg.clone(),
+        )
+        .unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let server_handle = tokio::spawn(async move {
+            if let Some(incoming) = server.accept().await {
+                let _conn = incoming.await.ok();
+            }
+            server
+        });
+
+        let client =
+            QuicEndpoint::bind("127.0.0.1:0".parse().unwrap(), server_cfg, client_cfg).unwrap();
+        let target = NodeAddress::new("127.0.0.1", server_addr.port());
+
+        let start = std::time::Instant::now();
+        let conn = client
+            .connect_with_backoff(1, &target, BackoffPolicy::default(), 3)
+            .await
+            .unwrap();
+        // Success on first attempt should not sleep.
+        assert!(start.elapsed() < std::time::Duration::from_millis(500));
+        assert!(conn.close_reason().is_none());
+
+        client.close();
+        let server = server_handle.await.unwrap();
+        server.close();
+    }
+
+    // Note: an exhaust-path integration test (connect against a silent port
+    // and assert retry exhaustion) takes ~90 s against quinn's default
+    // handshake timeout of ~30 s per attempt — too slow for CI. The retry
+    // mechanism's timing is already covered by `BackoffPolicy` unit tests
+    // in aeon-types (11 tests: monotonic growth, cap, jitter, reset).
 }

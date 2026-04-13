@@ -272,6 +272,11 @@ impl ProcessorRegistry {
     fn artifact_path(&self, name: &str, version: &str) -> PathBuf {
         self.artifact_dir.join(name).join(version)
     }
+
+    /// Get the filesystem path for a processor artifact (public, for native loader).
+    pub fn artifact_path_for(&self, name: &str, version: &str) -> PathBuf {
+        self.artifact_path(name, version)
+    }
 }
 
 impl std::fmt::Debug for ProcessorRegistry {

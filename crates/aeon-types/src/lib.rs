@@ -4,7 +4,14 @@
 //! depend on `aeon-types` for the canonical Event/Output envelopes,
 //! error types, and trait definitions.
 
+// FT-10: no-panic policy. Production code in this crate must not use
+// `.unwrap()` or `.expect()` except for explicitly-documented startup-time
+// invariants, which must carry an `#[allow(...)]` attribute with rationale.
+// Test modules and benches are exempt (`cfg(not(test))`).
+#![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::expect_used))]
+
 pub mod awpp;
+pub mod backoff;
 pub mod delivery;
 pub mod error;
 pub mod event;
@@ -15,11 +22,13 @@ pub mod processor_identity;
 pub mod processor_transport;
 pub mod registry;
 pub mod scanner;
+pub mod state;
 pub mod traits;
 pub mod transport_codec;
 pub mod uuid;
 
 // Re-export primary types at crate root for convenience.
+pub use backoff::{Backoff, BackoffPolicy};
 pub use delivery::{BatchFailurePolicy, BatchResult, DeliverySemantics, DeliveryStrategy};
 pub use error::{AeonError, Result};
 pub use event::{Event, Output};
@@ -33,12 +42,16 @@ pub use processor_transport::{
 pub use registry::{
     BlueGreenActive, BlueGreenState, CanaryState, CanaryThresholds, PipelineAction,
     PipelineDefinition, PipelineHistoryEntry, PipelineState, ProcessorRecord, ProcessorRef,
-    ProcessorType, ProcessorVersion, RegistryCommand, RegistryResponse, SinkConfig, SourceConfig,
-    UpgradeInfo, UpgradeStrategy, VersionStatus,
+    ProcessorType, ProcessorVersion, RegistryApplier, RegistryCommand, RegistryResponse,
+    SinkConfig, SourceConfig, UpgradeInfo, UpgradeStrategy, VersionStatus,
 };
 pub use scanner::{
     BytesFinder, contains_byte, contains_bytes, find_byte, find_bytes, json_field_value,
 };
-pub use traits::{IdempotentSink, Processor, ProcessorTransport, Seekable, Sink, Source, StateOps};
+pub use state::{BatchEntry, BatchOp, KvPairs, L3Backend, L3Store};
+pub use traits::{
+    CheckpointReplicator, IdempotentSink, Processor, ProcessorTransport, Seekable, Sink,
+    SinkEosTier, Source, StateOps, TransactionalSink,
+};
 pub use transport_codec::{TransportCodec, WireEvent, WireOutput};
 pub use uuid::CoreLocalUuidGenerator;

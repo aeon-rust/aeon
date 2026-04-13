@@ -28,7 +28,7 @@
 //! See `docs/CONNECTOR-AUDIT.md` §4.4. MQTT is post-Gate 2 per `CLAUDE.md` so
 //! this investment is deferred.
 
-use aeon_types::{AeonError, BatchResult, Output, Sink};
+use aeon_types::{AeonError, BackoffPolicy, BatchResult, Output, Sink};
 use rumqttc::{AsyncClient, MqttOptions, QoS};
 use std::time::Duration;
 
@@ -48,6 +48,10 @@ pub struct MqttSinkConfig {
     pub keep_alive: Duration,
     /// Channel capacity for the MQTT event loop.
     pub cap: usize,
+    /// Reconnect backoff policy — applied when the event loop returns an error
+    /// (connection drop, protocol error). Exponential + jitter prevents
+    /// thundering-herd reconnect storms during broker outages (TR-3).
+    pub backoff: BackoffPolicy,
 }
 
 impl MqttSinkConfig {
@@ -61,7 +65,14 @@ impl MqttSinkConfig {
             qos: QoS::AtLeastOnce,
             keep_alive: Duration::from_secs(30),
             cap: 256,
+            backoff: BackoffPolicy::default(),
         }
+    }
+
+    /// Override the reconnect backoff policy.
+    pub fn with_backoff(mut self, backoff: BackoffPolicy) -> Self {
+        self.backoff = backoff;
+        self
     }
 
     /// Set client ID.
@@ -103,14 +114,20 @@ impl MqttSink {
             "MqttSink connecting"
         );
 
-        // Spawn event loop poller to handle protocol traffic
+        // Spawn event loop poller to handle protocol traffic.
+        // TR-3: shared BackoffPolicy with jitter replaces hardcoded sleep(1s).
+        // Reset on any successful poll so the next outage restarts at initial_ms.
+        let backoff_policy = config.backoff;
         let handle = tokio::spawn(async move {
+            let mut backoff = backoff_policy.iter();
             loop {
                 match eventloop.poll().await {
-                    Ok(_) => {}
+                    Ok(_) => backoff.reset(),
                     Err(e) => {
-                        tracing::error!(error = %e, "mqtt sink eventloop error");
-                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        let delay = backoff.next_delay();
+                        tracing::error!(error = %e, delay_ms = delay.as_millis() as u64,
+                            "mqtt sink eventloop error; backing off before retry");
+                        tokio::time::sleep(delay).await;
                     }
                 }
             }
@@ -134,12 +151,13 @@ impl Sink for MqttSink {
     async fn write_batch(&mut self, outputs: Vec<Output>) -> Result<BatchResult, AeonError> {
         let ids = outputs.iter().filter_map(|o| o.source_event_id).collect();
         for output in &outputs {
+            // FT-11: publish_bytes accepts bytes::Bytes directly — clone is refcount-only.
             self.client
-                .publish(
-                    &self.config.topic,
+                .publish_bytes(
+                    self.config.topic.clone(),
                     self.config.qos,
                     false, // retain
-                    output.payload.to_vec(),
+                    output.payload.clone(),
                 )
                 .await
                 .map_err(|e| AeonError::connection(format!("mqtt publish failed: {e}")))?;

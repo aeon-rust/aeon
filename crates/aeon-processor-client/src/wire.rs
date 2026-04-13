@@ -104,6 +104,29 @@ impl Heartbeat {
 
 // --- Batch Wire Format ---
 
+// FT-10: Fixed-size LE readers. The caller guarantees length via explicit
+// bounds checks before calling. Using `from_le_bytes` directly on a copied
+// array avoids the `try_into().unwrap()` pattern flagged by clippy and
+// surfaces a clean panic-free signature.
+#[inline]
+fn read_u64_le(data: &[u8]) -> u64 {
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&data[..8]);
+    u64::from_le_bytes(b)
+}
+#[inline]
+fn read_u32_le(data: &[u8]) -> u32 {
+    let mut b = [0u8; 4];
+    b.copy_from_slice(&data[..4]);
+    u32::from_le_bytes(b)
+}
+#[inline]
+fn read_u16_le(data: &[u8]) -> u16 {
+    let mut b = [0u8; 2];
+    b.copy_from_slice(&data[..2]);
+    u16::from_le_bytes(b)
+}
+
 /// Decode a batch request from binary wire format.
 ///
 /// Wire format:
@@ -116,15 +139,15 @@ pub fn decode_batch_request(
         return Err(AeonError::state("Batch request too short"));
     }
 
-    let batch_id = u64::from_le_bytes(data[0..8].try_into().unwrap());
-    let event_count = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
+    let batch_id = read_u64_le(&data[0..8]);
+    let event_count = read_u32_le(&data[8..12]) as usize;
 
     // Verify CRC32.
     if data.len() < 16 {
         return Err(AeonError::state("Batch missing CRC32"));
     }
     let crc_offset = data.len() - 4;
-    let stored_crc = u32::from_le_bytes(data[crc_offset..].try_into().unwrap());
+    let stored_crc = read_u32_le(&data[crc_offset..]);
     let computed_crc = crc32fast::hash(&data[..crc_offset]);
     if stored_crc != computed_crc {
         return Err(AeonError::state(format!(
@@ -140,7 +163,7 @@ pub fn decode_batch_request(
         if offset + 4 > crc_offset {
             return Err(AeonError::state("Truncated event in batch"));
         }
-        let event_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+        let event_len = read_u32_le(&data[offset..offset + 4]) as usize;
         offset += 4;
 
         if offset + event_len > crc_offset {
@@ -216,7 +239,7 @@ pub fn parse_data_frame(data: &[u8]) -> Result<(String, u16, &[u8]), AeonError> 
         return Err(AeonError::state("Data frame too short"));
     }
 
-    let name_len = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+    let name_len = read_u32_le(&data[0..4]) as usize;
     if data.len() < 4 + name_len + 2 {
         return Err(AeonError::state("Data frame truncated"));
     }
@@ -225,7 +248,7 @@ pub fn parse_data_frame(data: &[u8]) -> Result<(String, u16, &[u8]), AeonError> 
         .map_err(|e| AeonError::state(format!("Invalid pipeline name UTF-8: {e}")))?
         .to_string();
 
-    let partition = u16::from_le_bytes(data[4 + name_len..4 + name_len + 2].try_into().unwrap());
+    let partition = read_u16_le(&data[4 + name_len..4 + name_len + 2]);
 
     let batch_data = &data[4 + name_len + 2..];
     Ok((name, partition, batch_data))

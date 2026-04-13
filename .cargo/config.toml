@@ -1,0 +1,6 @@
+# Workspace-wide cargo configuration.
+#
+# `cargo xtask ...` resolves to running the `xtask` binary in the workspace.
+# See `xtask/src/main.rs` for available subcommands (ci, doctor, bench).
+[alias]
+xtask = "run --package xtask --quiet --"

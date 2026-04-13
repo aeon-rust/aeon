@@ -3,7 +3,7 @@
 //! Uses consumer groups for reliable delivery with acknowledgment.
 //! Pull-source: `next_batch()` issues XREADGROUP with COUNT and BLOCK.
 
-use aeon_types::{AeonError, Event, PartitionId, Source};
+use aeon_types::{AeonError, Backoff, BackoffPolicy, Event, PartitionId, Source};
 use bytes::Bytes;
 use redis::AsyncCommands;
 use redis::aio::MultiplexedConnection;
@@ -26,6 +26,11 @@ pub struct RedisSourceConfig {
     pub block_ms: usize,
     /// Source identifier for events (interned).
     pub source_name: Arc<str>,
+    /// TR-3 reconnect backoff. On XREADGROUP / XACK failure (broker down,
+    /// network partition), the source drops its connection, sleeps for the
+    /// current delay, and returns an empty batch so the pipeline stays alive.
+    /// The next `next_batch()` rebuilds the connection and retries.
+    pub backoff: BackoffPolicy,
 }
 
 impl RedisSourceConfig {
@@ -44,7 +49,14 @@ impl RedisSourceConfig {
             batch_size: 1024,
             block_ms: 1000,
             source_name: Arc::from("redis"),
+            backoff: BackoffPolicy::default(),
         }
+    }
+
+    /// Override the reconnect backoff policy.
+    pub fn with_backoff(mut self, backoff: BackoffPolicy) -> Self {
+        self.backoff = backoff;
+        self
     }
 
     /// Set batch size.
@@ -72,9 +84,13 @@ impl RedisSourceConfig {
 /// delivery semantics. Messages are acknowledged after being returned
 /// from `next_batch()`.
 pub struct RedisSource {
-    conn: MultiplexedConnection,
+    client: redis::Client,
+    /// Lazy connection — None after a network error, rebuilt on next
+    /// `next_batch()`. Start fully populated after `new()` succeeds.
+    conn: Option<MultiplexedConnection>,
     config: RedisSourceConfig,
     pending_ack_ids: Vec<String>,
+    backoff: Backoff,
 }
 
 impl RedisSource {
@@ -83,12 +99,42 @@ impl RedisSource {
         let client = redis::Client::open(config.url.as_str())
             .map_err(|e| AeonError::connection(format!("redis client create failed: {e}")))?;
 
+        // Initial connect is validated synchronously so misconfiguration
+        // (bad URL, wrong auth) surfaces on startup. Runtime failures later
+        // fall into the backoff path.
+        let conn = Self::establish(&client, &config).await?;
+
+        tracing::info!(
+            stream = %config.stream_key,
+            group = %config.group,
+            consumer = %config.consumer,
+            "RedisSource connected"
+        );
+
+        let backoff = Backoff::new(config.backoff);
+        Ok(Self {
+            client,
+            conn: Some(conn),
+            config,
+            pending_ack_ids: Vec::new(),
+            backoff,
+        })
+    }
+
+    /// Build a fresh connection and (re-)ensure the consumer group exists.
+    ///
+    /// Used both by the synchronous initial connect and by the reconnect path
+    /// on transient failure. Idempotent: `XGROUP CREATE` yields BUSYGROUP on
+    /// repeat calls which is treated as success.
+    async fn establish(
+        client: &redis::Client,
+        config: &RedisSourceConfig,
+    ) -> Result<MultiplexedConnection, AeonError> {
         let mut conn = client
             .get_multiplexed_async_connection()
             .await
             .map_err(|e| AeonError::connection(format!("redis connect failed: {e}")))?;
 
-        // Create consumer group (ignore error if it already exists)
         let result: redis::RedisResult<String> = redis::cmd("XGROUP")
             .arg("CREATE")
             .arg(&config.stream_key)
@@ -107,7 +153,6 @@ impl RedisSource {
                 );
             }
             Err(e) => {
-                // BUSYGROUP = group already exists, that's fine
                 let msg = format!("{e}");
                 if !msg.contains("BUSYGROUP") {
                     return Err(AeonError::connection(format!(
@@ -117,18 +162,7 @@ impl RedisSource {
             }
         }
 
-        tracing::info!(
-            stream = %config.stream_key,
-            group = %config.group,
-            consumer = %config.consumer,
-            "RedisSource connected"
-        );
-
-        Ok(Self {
-            conn,
-            config,
-            pending_ack_ids: Vec::new(),
-        })
+        Ok(conn)
     }
 
     /// Acknowledge previously read messages.
@@ -137,9 +171,12 @@ impl RedisSource {
             return Ok(());
         }
 
-        let ids: Vec<&str> = self.pending_ack_ids.iter().map(|s| s.as_str()).collect();
-        let _: u64 = self
+        let conn = self
             .conn
+            .as_mut()
+            .ok_or_else(|| AeonError::connection("redis conn not established"))?;
+        let ids: Vec<&str> = self.pending_ack_ids.iter().map(|s| s.as_str()).collect();
+        let _: u64 = conn
             .xack(&self.config.stream_key, &self.config.group, &ids)
             .await
             .map_err(|e| AeonError::connection(format!("redis XACK failed: {e}")))?;
@@ -151,19 +188,76 @@ impl RedisSource {
 
 impl Source for RedisSource {
     async fn next_batch(&mut self) -> Result<Vec<Event>, AeonError> {
-        // Acknowledge previous batch before reading new one
-        self.ack_pending().await?;
+        // TR-3: if we don't have a live connection, try to rebuild it.
+        // On failure, back off and return an empty batch so the pipeline
+        // stays alive across Redis restarts / transient network drops.
+        if self.conn.is_none() {
+            match Self::establish(&self.client, &self.config).await {
+                Ok(c) => {
+                    tracing::info!(stream = %self.config.stream_key, "redis reconnected");
+                    self.conn = Some(c);
+                    self.backoff.reset();
+                    // Pending acks from the pre-disconnect batch are gone
+                    // with the dropped connection — Redis will redeliver via
+                    // the consumer group's PEL. Clear our local tracker.
+                    self.pending_ack_ids.clear();
+                }
+                Err(e) => {
+                    let delay = self.backoff.next_delay();
+                    tracing::warn!(
+                        error = %e,
+                        delay_ms = delay.as_millis() as u64,
+                        "redis reconnect failed, backing off"
+                    );
+                    tokio::time::sleep(delay).await;
+                    return Ok(Vec::new());
+                }
+            }
+        }
+
+        // Best-effort ack. On failure, drop the connection so the next call
+        // reconnects; unacked IDs will be redelivered via the PEL.
+        if let Err(e) = self.ack_pending().await {
+            let delay = self.backoff.next_delay();
+            tracing::warn!(
+                error = %e,
+                delay_ms = delay.as_millis() as u64,
+                "redis XACK failed, dropping connection and backing off"
+            );
+            self.conn = None;
+            tokio::time::sleep(delay).await;
+            return Ok(Vec::new());
+        }
 
         let opts = StreamReadOptions::default()
             .count(self.config.batch_size)
             .block(self.config.block_ms)
             .group(&self.config.group, &self.config.consumer);
 
-        let reply: StreamReadReply = self
+        let conn = self
             .conn
+            .as_mut()
+            .ok_or_else(|| AeonError::connection("redis conn lost between reconnect and read"))?;
+        let reply: StreamReadReply = match conn
             .xread_options(&[&self.config.stream_key], &[">"], &opts)
             .await
-            .map_err(|e| AeonError::connection(format!("redis XREADGROUP failed: {e}")))?;
+        {
+            Ok(r) => r,
+            Err(e) => {
+                let delay = self.backoff.next_delay();
+                tracing::warn!(
+                    error = %e,
+                    delay_ms = delay.as_millis() as u64,
+                    "redis XREADGROUP failed, dropping connection and backing off"
+                );
+                self.conn = None;
+                tokio::time::sleep(delay).await;
+                return Ok(Vec::new());
+            }
+        };
+
+        // Successful read — reset backoff.
+        self.backoff.reset();
 
         let mut events = Vec::new();
         let now = std::time::Instant::now();

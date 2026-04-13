@@ -20,7 +20,11 @@ impl PassthroughProcessor {
 
 impl Processor for PassthroughProcessor {
     fn process(&self, event: Event) -> Result<Vec<Output>, AeonError> {
-        // Bytes::clone = Arc increment, zero-copy (required to borrow event for identity)
+        // clone: Arc<str> refcount bump — destination is shared across all
+        //        outputs this processor emits.
+        // clone: Bytes refcount bump (zero-copy) — payload is shared with the
+        //        source event; event.payload is still borrowed by
+        //        with_event_identity immediately after.
         Ok(vec![
             Output::new(Arc::clone(&self.destination), event.payload.clone())
                 .with_event_identity(&event),
@@ -30,6 +34,7 @@ impl Processor for PassthroughProcessor {
     fn process_batch(&self, events: Vec<Event>) -> Result<Vec<Output>, AeonError> {
         let mut outputs = Vec::with_capacity(events.len());
         for event in events {
+            // clone × 2: both refcount bumps — see process() above for rationale.
             outputs.push(
                 Output::new(Arc::clone(&self.destination), event.payload.clone())
                     .with_event_identity(&event),

@@ -117,6 +117,7 @@ impl PushBufferRx {
 }
 
 /// Configuration for a push buffer.
+#[derive(Clone)]
 pub struct PushBufferConfig {
     /// Bounded channel capacity (Phase 1).
     pub channel_capacity: usize,

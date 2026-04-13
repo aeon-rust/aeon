@@ -3,8 +3,7 @@
 //! Uses JetStream pull-based consumer for durable, at-least-once delivery.
 //! Messages are acknowledged after being returned from `next_batch()`.
 
-use aeon_types::{AeonError, Event, PartitionId, Source};
-use bytes::Bytes;
+use aeon_types::{AeonError, BackoffPolicy, Event, PartitionId, Source};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,6 +23,10 @@ pub struct NatsSourceConfig {
     pub fetch_timeout: Duration,
     /// Source identifier for events (interned).
     pub source_name: Arc<str>,
+    /// Reconnect backoff policy (TR-3). Applied when the JetStream message
+    /// pull stream errors out (typically a broken connection). Exponential
+    /// growth with jitter prevents reconnect storms during NATS outages.
+    pub backoff: BackoffPolicy,
 }
 
 impl NatsSourceConfig {
@@ -41,7 +44,14 @@ impl NatsSourceConfig {
             batch_size: 1024,
             fetch_timeout: Duration::from_secs(1),
             source_name: Arc::from("nats"),
+            backoff: BackoffPolicy::default(),
         }
+    }
+
+    /// Override the reconnect backoff policy.
+    pub fn with_backoff(mut self, backoff: BackoffPolicy) -> Self {
+        self.backoff = backoff;
+        self
     }
 
     /// Set the durable consumer name.
@@ -78,6 +88,9 @@ pub struct NatsSource {
         async_nats::jetstream::consumer::Consumer<async_nats::jetstream::consumer::pull::Config>,
     config: NatsSourceConfig,
     messages: Option<async_nats::jetstream::consumer::pull::Stream>,
+    /// TR-3 reconnect backoff. Advanced on message-stream errors; reset on
+    /// every successful message delivery.
+    backoff: aeon_types::Backoff,
 }
 
 impl NatsSource {
@@ -115,23 +128,39 @@ impl NatsSource {
             "NatsSource connected"
         );
 
+        let backoff = config.backoff.iter();
         Ok(Self {
             consumer,
             config,
             messages: None,
+            backoff,
         })
     }
 }
 
 impl Source for NatsSource {
     async fn next_batch(&mut self) -> Result<Vec<Event>, AeonError> {
-        // Initialize message stream if needed
+        // Initialize or re-initialize the message stream. On transient errors
+        // (TR-3) we drop the stream and sleep with jittered exponential
+        // backoff so repeated re-stream attempts during a NATS outage don't
+        // generate a reconnect storm. Returning Ok(vec![]) rather than
+        // propagating Err keeps the pipeline alive through the outage.
         if self.messages.is_none() {
-            let msgs =
-                self.consumer.messages().await.map_err(|e| {
-                    AeonError::connection(format!("nats messages stream failed: {e}"))
-                })?;
-            self.messages = Some(msgs);
+            match self.consumer.messages().await {
+                Ok(msgs) => {
+                    self.messages = Some(msgs);
+                }
+                Err(e) => {
+                    let delay = self.backoff.next_delay();
+                    tracing::warn!(
+                        error = %e,
+                        delay_ms = delay.as_millis() as u64,
+                        "nats messages stream init failed; backing off before retry"
+                    );
+                    tokio::time::sleep(delay).await;
+                    return Ok(Vec::new());
+                }
+            }
         }
 
         let messages = self
@@ -148,7 +177,12 @@ impl Source for NatsSource {
 
         match first {
             Ok(Some(Ok(msg))) => {
-                let payload = Bytes::from(msg.payload.to_vec());
+                // Successful delivery — reset backoff so the next outage
+                // starts again at `initial_ms`.
+                self.backoff.reset();
+
+                // FT-11: async_nats Message.payload is bytes::Bytes — clone is refcount-only.
+                let payload = msg.payload.clone();
                 let mut event = Event::new(
                     uuid::Uuid::nil(),
                     0,
@@ -174,9 +208,20 @@ impl Source for NatsSource {
                 let _ = msg.ack().await;
             }
             Ok(Some(Err(e))) => {
-                return Err(AeonError::connection(format!("nats recv error: {e}")));
+                // Stream-level error (typically a broken connection). Drop the
+                // message stream so the next next_batch() re-creates it, then
+                // back off.
+                let delay = self.backoff.next_delay();
+                tracing::warn!(
+                    error = %e,
+                    delay_ms = delay.as_millis() as u64,
+                    "nats recv error; dropping stream and backing off before retry"
+                );
+                self.messages = None;
+                tokio::time::sleep(delay).await;
+                return Ok(events);
             }
-            _ => return Ok(events), // Timeout or stream ended
+            _ => return Ok(events), // Timeout or stream ended cleanly
         }
 
         // Drain additional messages
@@ -184,7 +229,8 @@ impl Source for NatsSource {
         while events.len() < self.config.batch_size {
             match tokio::time::timeout_at(drain_deadline, messages.next()).await {
                 Ok(Some(Ok(msg))) => {
-                    let payload = Bytes::from(msg.payload.to_vec());
+                    // FT-11: async_nats Message.payload is bytes::Bytes — clone is refcount-only.
+                let payload = msg.payload.clone();
                     let mut event = Event::new(
                         uuid::Uuid::nil(),
                         0,

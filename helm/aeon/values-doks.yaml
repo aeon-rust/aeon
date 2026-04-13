@@ -1,0 +1,47 @@
+# DOKS 3-node cluster deployment — DigitalOcean Kubernetes
+# Usage: helm install aeon ./helm/aeon -f ./helm/aeon/values-doks.yaml
+
+image:
+  repository: registry.digitalocean.com/rust-proxy-registry/aeon
+  tag: latest
+  pullPolicy: Always
+
+imagePullSecrets:
+  - name: rust-proxy-registry
+
+config:
+  logLevel: info
+  apiAddr: "0.0.0.0:4471"
+  artifactDir: /app/artifacts
+
+# Enable cluster mode (StatefulSet + headless Service)
+cluster:
+  enabled: true
+  replicas: 3
+  partitions: 16
+  tls:
+    enabled: false  # Start without TLS for initial validation
+
+# Resource limits — sized for 2 vCPU / 8 GiB nodes (DOKS system pods
+# already consume ~2 CPU per node, so requests must be modest to fit).
+resources:
+  requests:
+    cpu: "200m"
+    memory: 512Mi
+  limits:
+    cpu: "1500m"
+    memory: 2Gi
+
+# Smaller PVCs for initial testing
+persistence:
+  enabled: true
+  size: 5Gi
+
+# Relax security context — readOnlyRootFilesystem can conflict
+# with artifact writes; disable for initial deployment
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false
+  capabilities:
+    drop:
+      - ALL

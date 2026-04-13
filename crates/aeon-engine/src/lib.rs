@@ -1,6 +1,14 @@
 //! Pipeline orchestrator, SPSC wiring, and backpressure management.
 
+// FT-10: no-panic policy. Production code in this crate must not use
+// `.unwrap()` or `.expect()` except for explicitly-documented startup-time
+// invariants, which must carry an `#[allow(...)]` attribute with rationale.
+// Test modules and benches are exempt (`cfg(not(test))`).
+#![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::expect_used))]
+
 pub mod affinity;
+#[cfg(feature = "cluster")]
+pub mod cluster_applier;
 pub mod batch_tuner;
 pub mod batch_wire;
 pub mod checkpoint;
@@ -40,7 +48,10 @@ pub use batch_wire::{
     encode_batch_response, serialize_batch_request, serialize_batch_response,
 };
 
-pub use checkpoint::{CheckpointReader, CheckpointRecord, CheckpointWriter};
+pub use checkpoint::{
+    CheckpointPersist, CheckpointReader, CheckpointRecord, CheckpointWriter, L3CheckpointStore,
+    WalCheckpointStore,
+};
 pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitState};
 pub use dag::{DagGraph, NodeKind, run_chain, run_fan_in, run_fan_out, run_routed};
 pub use delivery::{CheckpointBackend, CheckpointConfig, DeliveryConfig, FlushStrategy};
@@ -53,6 +64,8 @@ pub use pipeline::{
     CorePinning, MultiPartitionConfig, PipelineConfig, PipelineControl, PipelineMetrics, run,
     run_buffered, run_buffered_managed, run_multi_partition, run_with_delivery,
 };
+#[cfg(feature = "processor-auth")]
+pub use pipeline::{PohConfig, PohState, create_poh_state};
 pub use pipeline_manager::PipelineManager;
 pub use processor::PassthroughProcessor;
 pub use registry::ProcessorRegistry;
@@ -65,6 +78,9 @@ pub use transport::{
 
 #[cfg(feature = "native-loader")]
 pub use native_loader::NativeProcessor;
+
+#[cfg(feature = "cluster")]
+pub use cluster_applier::ClusterRegistryApplier;
 
 #[cfg(feature = "rest-api")]
 pub use rest_api::{AppState, api_router, serve};

@@ -145,6 +145,21 @@ enum Commands {
         #[arg(long, default_value = "/app/artifacts")]
         artifact_dir: String,
     },
+    /// Check environment readiness (DX-2): ports, connectivity, state dir, artifacts
+    Doctor {
+        /// Aeon REST API address (probes /health)
+        #[arg(long, default_value_t = default_api())]
+        api: String,
+        /// Kafka/Redpanda bootstrap address to probe (TCP connect)
+        #[arg(long, default_value = "localhost:19092")]
+        kafka: String,
+        /// Local state directory to verify writability
+        #[arg(long, default_value = "./data/state")]
+        state_dir: PathBuf,
+        /// Optional manifest YAML to validate (schema + referenced artifacts)
+        #[arg(long)]
+        manifest: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -314,9 +329,96 @@ enum Lang {
     Typescript,
 }
 
-fn main() -> Result<()> {
+fn main() {
     let cli = Cli::parse();
+    if let Err(err) = run(cli) {
+        print_pretty_error(&err);
+        std::process::exit(1);
+    }
+}
 
+/// Pretty-print an `anyhow::Error` with a human-readable summary, full context
+/// chain, and (when we can recognise the pattern) an actionable hint.
+///
+/// anyhow's default Debug output is information-dense but reads like a stack
+/// trace; end users typically want "what broke" + "what to try next" on two
+/// lines. DX-4.
+fn print_pretty_error(err: &anyhow::Error) {
+    // Top-level message
+    eprintln!("error: {err}");
+
+    // Context chain (skip the top which we already printed)
+    let mut causes = err.chain().skip(1).peekable();
+    if causes.peek().is_some() {
+        for cause in causes {
+            eprintln!("  caused by: {cause}");
+        }
+    }
+
+    if let Some(hint) = error_hint(err) {
+        eprintln!();
+        eprintln!("hint: {hint}");
+    }
+}
+
+/// Map common error shapes to actionable remediation hints. Matching happens
+/// on the flattened error chain text — cheap, string-based, and easy to extend.
+fn error_hint(err: &anyhow::Error) -> Option<&'static str> {
+    // Build a lowercased haystack of the full chain once.
+    let haystack: String = err
+        .chain()
+        .map(|c| c.to_string().to_lowercase())
+        .collect::<Vec<_>>()
+        .join(" | ");
+
+    // Order matters: more specific patterns first.
+    if haystack.contains("connection refused")
+        || haystack.contains("failed to reach aeon api")
+        || haystack.contains("tcp connect error")
+    {
+        return Some(
+            "Aeon server unreachable. Is `aeon serve` running? Run `aeon doctor` to diagnose, or set AEON_API_URL to a reachable address.",
+        );
+    }
+    if haystack.contains("status code 401") || haystack.contains("unauthorized") {
+        return Some("authentication failed. Check AEON_API_TOKEN or your pipeline identity key (`aeon processor identity list <name>`).");
+    }
+    if haystack.contains("status code 403") || haystack.contains("forbidden") {
+        return Some("access denied. The caller has no permission for this resource — check identity scope (allowed_pipelines).");
+    }
+    if haystack.contains("status code 404") {
+        return Some("resource not found. Run `aeon processor list` / `aeon pipeline list` to see what exists.");
+    }
+    if haystack.contains("failed to run npm") {
+        return Some("Node.js is required. Install from https://nodejs.org or your OS package manager.");
+    }
+    if haystack.contains("failed to run cargo build") || haystack.contains("cargo build failed") {
+        return Some("Rust toolchain build failed. Ensure `rustup target add wasm32-unknown-unknown` for Wasm processors.");
+    }
+    if haystack.contains("unknown file extension") {
+        return Some("supported artifacts: .wasm (guest) or .so/.dll/.dylib (native). Run `aeon build` to produce one.");
+    }
+    if haystack.contains("wasm validation failed") || haystack.contains("failed to compile wasm") {
+        return Some("artifact is not a valid Aeon Wasm component. Rebuild with `aeon build --release` and re-run `aeon validate`.");
+    }
+    if haystack.contains("native validation requires the 'native-validate' feature") {
+        return Some("rebuild the CLI with `--features native-validate` (enabled by default in release builds).");
+    }
+    if haystack.contains("directory '") && haystack.contains("already exists") {
+        return Some("remove the existing directory or pick a different project name.");
+    }
+    if haystack.contains("file not found") || haystack.contains("no such file") {
+        return Some("check the path spelling and current working directory. Use an absolute path if unsure.");
+    }
+    if haystack.contains("invalid json response") || haystack.contains("expected array") {
+        return Some(
+            "unexpected response shape from the API. Check that the Aeon server version matches this CLI — run `aeon --version` and compare with the server banner.",
+        );
+    }
+    None
+}
+
+fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Some(Commands::New {
             name,
@@ -350,6 +452,12 @@ fn main() -> Result<()> {
         Some(Commands::Tls { action }) => cmd_tls(&action),
         #[cfg(feature = "rest-api")]
         Some(Commands::Serve { addr, artifact_dir }) => cmd_serve(&addr, &artifact_dir),
+        Some(Commands::Doctor {
+            api,
+            kafka,
+            state_dir,
+            manifest,
+        }) => cmd_doctor(&api, &kafka, &state_dir, manifest.as_deref()),
         None => {
             println!("Aeon v{}", env!("CARGO_PKG_VERSION"));
             println!("Run `aeon --help` for available commands.");
@@ -379,23 +487,161 @@ fn cmd_serve(addr: &str, artifact_dir: &str) -> Result<()> {
     rt.block_on(async {
         // Resolve artifact directory from env or CLI flag
         let dir = std::env::var("AEON_ARTIFACT_DIR").unwrap_or_else(|_| artifact_dir.to_string());
-        let registry = aeon_engine::registry::ProcessorRegistry::new(&dir)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        let pipelines = aeon_engine::pipeline_manager::PipelineManager::new();
-        let identities = aeon_engine::identity_store::ProcessorIdentityStore::new();
+        let registry = Arc::new(
+            aeon_engine::registry::ProcessorRegistry::new(&dir)
+                .map_err(|e| anyhow::anyhow!("{e}"))?,
+        );
+        let pipelines = Arc::new(aeon_engine::pipeline_manager::PipelineManager::new());
+        let identities = Arc::new(aeon_engine::identity_store::ProcessorIdentityStore::new());
+
+        // Cluster initialization — detect K8s environment
+        let cluster_enabled = std::env::var("AEON_CLUSTER_ENABLED")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false);
+
+        let cluster_node: Option<Arc<aeon_cluster::ClusterNode>> = if cluster_enabled {
+            match aeon_cluster::discovery::from_k8s_env() {
+                Some(k8s) => {
+                    tracing::info!(
+                        node_id = k8s.node_id,
+                        pod = %k8s.pod_name,
+                        replicas = k8s.replicas,
+                        partitions = k8s.partitions,
+                        "K8s cluster discovery: initializing Raft node"
+                    );
+
+                    let config = k8s.to_cluster_config();
+
+                    // Select TLS mode based on cluster config (FT-8):
+                    //   - config.tls = Some(...)  → production mTLS (file-based)
+                    //   - config.auto_tls = true  → insecure dev self-signed (loud warning)
+                    //   - neither                 → error
+                    let (server_cfg, client_cfg) =
+                        aeon_cluster::transport::tls::quic_configs_for_cluster(&config)
+                            .map_err(|e| anyhow::anyhow!("TLS config: {e}"))?;
+
+                    let endpoint = Arc::new(
+                        aeon_cluster::transport::endpoint::QuicEndpoint::bind(
+                            config.bind,
+                            server_cfg,
+                            client_cfg,
+                        )
+                        .map_err(|e| anyhow::anyhow!("QUIC bind failed: {e}"))?,
+                    );
+
+                    // All nodes call bootstrap_multi with the same membership.
+                    // openraft requires every node to initialize with identical
+                    // membership for fresh cluster bootstrap. Raft election then
+                    // determines the actual leader.
+                    let node = aeon_cluster::ClusterNode::bootstrap_multi(config, endpoint)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("Cluster bootstrap failed: {e}"))?;
+
+                    let node = Arc::new(node);
+
+                    // Install the engine-side RegistryApplier so RegistryCommand
+                    // entries committed through Raft (from any node) dispatch to
+                    // this node's ProcessorRegistry / PipelineManager. Without this,
+                    // pipelines created via REST on one node would replicate but
+                    // never take effect on follower replicas.
+                    node.install_registry_applier(Arc::new(
+                        aeon_engine::ClusterRegistryApplier::new(
+                            Arc::clone(&registry),
+                            Arc::clone(&pipelines),
+                        ),
+                    ))
+                    .await;
+
+                    // Spawn background task for leader election + partition assignment.
+                    // Retries for up to 120s. Each iteration checks:
+                    //   1. Is a leader elected?
+                    //   2. Am I the leader?
+                    //   3. Are partitions already assigned?
+                    // Keeps retrying because during rolling restarts, leadership
+                    // can change — the first detected leader may be an old pod.
+                    let bg_node = Arc::clone(&node);
+                    tokio::spawn(async move {
+                        let mut leader_logged = false;
+                        for attempt in 1..=60 {
+                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+                            // Check if partitions are already assigned (by any leader)
+                            let pt = bg_node.partition_table_snapshot().await;
+                            if pt.iter().next().is_some() {
+                                tracing::info!(
+                                    attempt,
+                                    "Partition table already populated — assignment complete"
+                                );
+                                return;
+                            }
+
+                            if let Some(leader) = bg_node.current_leader().await {
+                                if !leader_logged {
+                                    tracing::info!(leader_id = leader, attempt, "Raft leader elected");
+                                    leader_logged = true;
+                                }
+                                if leader == bg_node.config().node_id {
+                                    match bg_node.assign_initial_partitions().await {
+                                        Ok(()) => {
+                                            tracing::info!(
+                                                partitions = bg_node.config().num_partitions,
+                                                "Initial partition assignment committed via Raft"
+                                            );
+                                            return;
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                error = %e,
+                                                attempt,
+                                                "Initial partition assignment failed — will retry"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        tracing::error!("Partition assignment not completed after 120s — cluster may be unhealthy");
+                    });
+
+                    Some(node)
+                }
+                None => {
+                    tracing::warn!(
+                        "AEON_CLUSTER_ENABLED=true but K8s env vars missing — running standalone"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         let state = Arc::new(aeon_engine::AppState {
-            registry: Arc::new(registry),
-            pipelines: Arc::new(pipelines),
+            registry,
+            pipelines,
             delivery_ledgers: dashmap::DashMap::new(),
             pipeline_controls: dashmap::DashMap::new(),
-            identities: Arc::new(identities),
+            pipeline_metrics: dashmap::DashMap::new(),
+            poh_chains: dashmap::DashMap::new(),
+            identities,
             authenticator: None,
             ws_host: None,
+            cluster_node: cluster_node.clone(),
         });
 
         let listen_addr =
             std::env::var("AEON_API_ADDR").unwrap_or_else(|_| addr.to_string());
+
+        // Log cluster status
+        if let Some(ref node) = cluster_node {
+            tracing::info!(
+                node_id = node.config().node_id,
+                partitions = node.config().num_partitions,
+                peers = node.config().peers.len(),
+                "Aeon serving with Raft cluster"
+            );
+        }
+
         aeon_engine::serve(state, &listen_addr)
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))
@@ -2149,5 +2395,381 @@ fn cmd_tls(action: &TlsAction) -> Result<()> {
             }
             Ok(())
         }
+    }
+}
+
+// ── aeon doctor (DX-2) ────────────────────────────────────────────────
+
+/// Status of a single doctor check.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CheckStatus {
+    Pass,
+    Warn,
+    Fail,
+}
+
+impl CheckStatus {
+    fn tag(&self) -> &'static str {
+        match self {
+            Self::Pass => "[PASS]",
+            Self::Warn => "[WARN]",
+            Self::Fail => "[FAIL]",
+        }
+    }
+}
+
+/// One line of doctor output.
+struct CheckResult {
+    status: CheckStatus,
+    name: String,
+    detail: String,
+    /// Optional actionable fix suggestion on warn/fail.
+    fix: Option<String>,
+}
+
+impl CheckResult {
+    fn pass(name: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            status: CheckStatus::Pass,
+            name: name.into(),
+            detail: detail.into(),
+            fix: None,
+        }
+    }
+    fn warn(name: impl Into<String>, detail: impl Into<String>, fix: impl Into<String>) -> Self {
+        Self {
+            status: CheckStatus::Warn,
+            name: name.into(),
+            detail: detail.into(),
+            fix: Some(fix.into()),
+        }
+    }
+    fn fail(name: impl Into<String>, detail: impl Into<String>, fix: impl Into<String>) -> Self {
+        Self {
+            status: CheckStatus::Fail,
+            name: name.into(),
+            detail: detail.into(),
+            fix: Some(fix.into()),
+        }
+    }
+    fn print(&self) {
+        println!("  {} {}: {}", self.status.tag(), self.name, self.detail);
+        if let Some(fix) = &self.fix {
+            println!("         fix: {fix}");
+        }
+    }
+}
+
+fn cmd_doctor(api: &str, kafka: &str, state_dir: &Path, manifest: Option<&Path>) -> Result<()> {
+    println!("Aeon doctor — environment readiness check");
+    println!("aeon v{}\n", env!("CARGO_PKG_VERSION"));
+
+    let mut results: Vec<CheckResult> = Vec::new();
+
+    // (1) Compiled features — helps users diagnose "feature not compiled" errors.
+    results.push(check_compiled_features());
+
+    // (2) Port availability for in-process Aeon defaults.
+    //
+    // IMPORTANT: 4470 (QUIC) and 4472 (WebTransport/HTTP3) are UDP; probing them
+    // with a TCP listener always succeeds even when Aeon is running, which
+    // produces a false PASS. Probe with the correct L4 protocol per port.
+    println!("Ports:");
+    for (port, proto, label) in [
+        (4470u16, PortProto::Udp, "cluster QUIC (Raft/PoH)"),
+        (4471, PortProto::Tcp, "REST API + T4 WebSocket + /metrics"),
+        (4472, PortProto::Udp, "T3 WebTransport + external QUIC"),
+    ] {
+        let r = check_port_available(port, proto, label);
+        r.print();
+        results.push(r);
+    }
+
+    // (3) REST API reachability.
+    println!("\nREST API:");
+    let r = check_rest_api(api);
+    r.print();
+    results.push(r);
+
+    // (4) Kafka/Redpanda reachability.
+    println!("\nKafka/Redpanda:");
+    let r = check_tcp_reachable("kafka bootstrap", kafka);
+    r.print();
+    results.push(r);
+
+    // (5) State directory writability.
+    println!("\nState directory:");
+    let r = check_state_dir(state_dir);
+    r.print();
+    results.push(r);
+
+    // (6) Manifest validation (if provided).
+    if let Some(path) = manifest {
+        println!("\nManifest:");
+        let (r, artifact_paths) = check_manifest(path);
+        r.print();
+        results.push(r);
+
+        if !artifact_paths.is_empty() {
+            println!("\nArtifacts referenced by manifest:");
+            for p in artifact_paths {
+                let r = check_artifact(&p);
+                r.print();
+                results.push(r);
+            }
+        }
+    }
+
+    // Summary.
+    let (pass, warn, fail) = results.iter().fold((0, 0, 0), |(p, w, f), r| match r.status {
+        CheckStatus::Pass => (p + 1, w, f),
+        CheckStatus::Warn => (p, w + 1, f),
+        CheckStatus::Fail => (p, w, f + 1),
+    });
+    println!("\n─────");
+    println!("Summary: {pass} pass, {warn} warn, {fail} fail");
+
+    if fail > 0 {
+        bail!("{fail} check(s) failed");
+    }
+    Ok(())
+}
+
+/// List compile-time features so users can tell at a glance what this binary
+/// supports (kafka/wasm/rest-api/webtransport-insecure, etc.).
+fn check_compiled_features() -> CheckResult {
+    let mut feats: Vec<&'static str> = Vec::new();
+    if cfg!(feature = "native-validate") {
+        feats.push("native-validate");
+    }
+    if cfg!(feature = "rest-api") {
+        feats.push("rest-api");
+    }
+    let detail = if feats.is_empty() {
+        "(none — running minimal build)".to_string()
+    } else {
+        feats.join(", ")
+    };
+    println!("Build:");
+    let r = CheckResult::pass("compiled features", detail);
+    r.print();
+    r
+}
+
+/// L4 protocol for port availability probes. TCP binds a `TcpListener`; UDP binds
+/// a `UdpSocket`. Using the wrong one produces a false PASS because TCP and UDP
+/// port namespaces are independent.
+#[derive(Clone, Copy)]
+enum PortProto {
+    Tcp,
+    Udp,
+}
+
+impl PortProto {
+    fn as_str(self) -> &'static str {
+        match self {
+            PortProto::Tcp => "tcp",
+            PortProto::Udp => "udp",
+        }
+    }
+}
+
+/// A port is "available" if we can bind it on 127.0.0.1 with the correct L4
+/// protocol. If bind fails, something is likely already listening — typically
+/// fine for REST API (server running) but a conflict if the user is trying
+/// to start a fresh Aeon instance.
+fn check_port_available(port: u16, proto: PortProto, label: &str) -> CheckResult {
+    let addr = format!("127.0.0.1:{port}");
+    let bind_result: std::io::Result<()> = match proto {
+        PortProto::Tcp => std::net::TcpListener::bind(&addr).map(|_| ()),
+        PortProto::Udp => std::net::UdpSocket::bind(&addr).map(|_| ()),
+    };
+    let port_label = format!("port {port}/{}", proto.as_str());
+    match bind_result {
+        Ok(()) => CheckResult::pass(port_label, format!("{label}: available")),
+        Err(e) => CheckResult::warn(
+            port_label,
+            format!("{label}: in use ({e})"),
+            format!(
+                "stop whatever is bound to {port}/{}, or set a different port in config",
+                proto.as_str()
+            ),
+        ),
+    }
+}
+
+/// GET {api}/health with a short timeout. A 200 means the engine is up; anything
+/// else is reported as a warning (not fatal — doctor may run before server start).
+fn check_rest_api(api: &str) -> CheckResult {
+    let url = format!("{}/health", api.trim_end_matches('/'));
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_millis(500))
+        .timeout_read(std::time::Duration::from_millis(500))
+        .build();
+    match agent.get(&url).call() {
+        Ok(resp) if resp.status() == 200 => {
+            CheckResult::pass("REST API", format!("reachable at {api}"))
+        }
+        Ok(resp) => CheckResult::warn(
+            "REST API",
+            format!("{api} returned HTTP {}", resp.status()),
+            "check that the engine is healthy — `aeon serve` logs",
+        ),
+        Err(e) => CheckResult::warn(
+            "REST API",
+            format!("not reachable at {api}: {e}"),
+            "start the engine with `aeon serve`, or pass --api <url>",
+        ),
+    }
+}
+
+/// Pure TCP probe — no protocol handshake. Good enough to distinguish "broker down"
+/// from "broker up"; does not validate that it's actually Kafka/Redpanda.
+fn check_tcp_reachable(label: &str, addr: &str) -> CheckResult {
+    use std::net::{TcpStream, ToSocketAddrs};
+    let timeout = std::time::Duration::from_millis(500);
+    match addr.to_socket_addrs() {
+        Ok(mut iter) => match iter.next() {
+            Some(sock) => match TcpStream::connect_timeout(&sock, timeout) {
+                Ok(_) => CheckResult::pass(label, format!("{addr} reachable")),
+                Err(e) => CheckResult::warn(
+                    label,
+                    format!("{addr} not reachable: {e}"),
+                    "start your broker (e.g., `aeon dev up` for local Redpanda) or pass --kafka <addr>",
+                ),
+            },
+            None => CheckResult::fail(
+                label,
+                format!("{addr} resolved to no addresses"),
+                "verify the address/port is correct",
+            ),
+        },
+        Err(e) => CheckResult::fail(
+            label,
+            format!("cannot resolve {addr}: {e}"),
+            "check DNS or use an explicit IP:port",
+        ),
+    }
+}
+
+/// Ensure the state dir exists and is writable. Creates the directory if it doesn't
+/// exist (mirrors the engine's own startup behavior); the write test is a touch-file.
+fn check_state_dir(dir: &Path) -> CheckResult {
+    if !dir.exists() {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            return CheckResult::fail(
+                "state dir",
+                format!("{} does not exist and could not be created: {e}", dir.display()),
+                "create the directory manually or run with elevated permissions",
+            );
+        }
+    }
+    let probe = dir.join(".aeon-doctor-write-test");
+    match std::fs::write(&probe, b"ok") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&probe);
+            CheckResult::pass("state dir", format!("{} writable", dir.display()))
+        }
+        Err(e) => CheckResult::fail(
+            "state dir",
+            format!("{} not writable: {e}", dir.display()),
+            "fix directory permissions or choose a different --state-dir",
+        ),
+    }
+}
+
+/// Parse the manifest and extract any artifact paths it references, so we can
+/// validate those files separately. The manifest schema used by `cmd_apply` keeps
+/// `pipelines` as generic JSON, so we walk it looking for `processor_path` /
+/// `artifact` / `path` string fields under pipeline definitions.
+fn check_manifest(path: &Path) -> (CheckResult, Vec<PathBuf>) {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                CheckResult::fail(
+                    "manifest",
+                    format!("{} unreadable: {e}", path.display()),
+                    "check the file path and permissions",
+                ),
+                Vec::new(),
+            );
+        }
+    };
+    let manifest: Manifest = match serde_yaml::from_str(&content) {
+        Ok(m) => m,
+        Err(e) => {
+            return (
+                CheckResult::fail(
+                    "manifest",
+                    format!("{} invalid YAML: {e}", path.display()),
+                    "run `aeon validate <file>` for detailed schema errors",
+                ),
+                Vec::new(),
+            );
+        }
+    };
+
+    let mut artifacts: Vec<PathBuf> = Vec::new();
+    for pipeline in &manifest.pipelines {
+        collect_artifact_paths(pipeline, &mut artifacts);
+    }
+
+    let detail = format!(
+        "{}: {} pipeline(s), {} identity(ies), {} artifact ref(s)",
+        path.display(),
+        manifest.pipelines.len(),
+        manifest.identities.len(),
+        artifacts.len(),
+    );
+    (CheckResult::pass("manifest", detail), artifacts)
+}
+
+/// Walk a serde_json::Value looking for string fields likely to be artifact paths.
+/// Conservative: only `processor_path`, `artifact`, and `path` keys — false positives
+/// would cause spurious "artifact missing" warnings which are worse than silence.
+fn collect_artifact_paths(value: &serde_json::Value, out: &mut Vec<PathBuf>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                if matches!(k.as_str(), "processor_path" | "artifact" | "path")
+                    && let serde_json::Value::String(s) = v
+                {
+                    out.push(PathBuf::from(s));
+                }
+                collect_artifact_paths(v, out);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr {
+                collect_artifact_paths(v, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Verify an artifact file exists and has a recognised extension. Does NOT fully
+/// load/validate it — that's `aeon validate`'s job. This check is fast and
+/// dependency-free so `aeon doctor` stays responsive.
+fn check_artifact(path: &Path) -> CheckResult {
+    if !path.exists() {
+        return CheckResult::fail(
+            "artifact",
+            format!("{} missing", path.display()),
+            "build the artifact (`aeon build`) or correct the path in the manifest",
+        );
+    }
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    match ext {
+        "wasm" | "so" | "dll" | "dylib" => CheckResult::pass(
+            "artifact",
+            format!("{} (.{ext}) present", path.display()),
+        ),
+        _ => CheckResult::warn(
+            "artifact",
+            format!("{} has unexpected extension '.{ext}'", path.display()),
+            "expected .wasm, .so, .dll, or .dylib",
+        ),
     }
 }

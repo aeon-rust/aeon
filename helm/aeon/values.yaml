@@ -7,6 +7,10 @@ image:
   tag: latest
   pullPolicy: IfNotPresent
 
+# Pull secrets for private registries (e.g. DOCR)
+imagePullSecrets: []
+#  - name: rust-proxy-registry
+
 # Aeon configuration
 config:
   # REST API listen address
@@ -19,10 +23,13 @@ config:
   artifactDir: /app/artifacts
 
 # Ports
+#   quic         (4470/UDP): cluster inter-node QUIC (Raft/PoH, mTLS). Internal only.
+#   api          (4471/TCP): REST API + T4 WebSocket + /metrics (Prometheus scrape).
+#   webtransport (4472/UDP): T3 WebTransport + external QUIC connectors (data plane).
 ports:
   quic: 4470
   api: 4471
-  metrics: 4472
+  webtransport: 4472
 
 # Service configuration
 service:

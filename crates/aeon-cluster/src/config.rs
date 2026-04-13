@@ -19,6 +19,91 @@ pub struct TlsConfig {
     pub ca: PathBuf,
 }
 
+/// Raft consensus timing configuration (FT-5).
+///
+/// Controls election timing. Widening the `[min, max]` range reduces the probability
+/// of split-votes in flaky networks (mitigation for the absence of pre-vote in
+/// openraft 0.9.x — see FAULT-TOLERANCE-ANALYSIS.md FT-4).
+///
+/// Defaults match OpenRaft's recommended ratios (election_min = 3 × heartbeat,
+/// election_max = 6 × heartbeat).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RaftTiming {
+    /// Heartbeat interval in milliseconds (leader → follower). Default: 500ms.
+    pub heartbeat_ms: u64,
+    /// Minimum randomized election timeout in milliseconds. Default: 1500ms.
+    pub election_min_ms: u64,
+    /// Maximum randomized election timeout in milliseconds. Default: 3000ms.
+    pub election_max_ms: u64,
+}
+
+impl Default for RaftTiming {
+    fn default() -> Self {
+        Self {
+            heartbeat_ms: 500,
+            election_min_ms: 1500,
+            election_max_ms: 3000,
+        }
+    }
+}
+
+impl RaftTiming {
+    /// Production-recommended timings for a 3-node cluster on a reliable VPC.
+    ///
+    /// Wider jitter window (2000–6000 ms, W=4000 ms) vs. the default
+    /// (1500–3000 ms, W=1500 ms) reduces split-vote probability by ~60%
+    /// at the cost of ~3 s additional worst-case failover latency.
+    ///
+    /// Mitigation for openraft 0.9.x pre-vote absence (FT-4). See
+    /// `docs/CLUSTERING.md` §Raft timing for the probability math.
+    pub fn prod_recommended() -> Self {
+        Self {
+            heartbeat_ms: 500,
+            election_min_ms: 2000,
+            election_max_ms: 6000,
+        }
+    }
+
+    /// Flaky-network preset — wide jitter window tolerates clock drift and
+    /// packet loss at the cost of slower leader failover (~12 s worst case).
+    ///
+    /// Use when the inter-node network shows occasional multi-second pauses
+    /// (congested VPCs, cross-region clusters, sharing a noisy neighbour).
+    pub fn flaky_network() -> Self {
+        Self {
+            heartbeat_ms: 500,
+            election_min_ms: 3000,
+            election_max_ms: 12000,
+        }
+    }
+
+    /// Validate timing constraints: `heartbeat < election_min < election_max`.
+    pub fn validate(&self) -> Result<(), AeonError> {
+        if self.heartbeat_ms == 0 {
+            return Err(AeonError::Config {
+                message: "raft_timing.heartbeat_ms must be > 0".to_string(),
+            });
+        }
+        if self.election_min_ms <= self.heartbeat_ms {
+            return Err(AeonError::Config {
+                message: format!(
+                    "raft_timing.election_min_ms ({}) must be > heartbeat_ms ({})",
+                    self.election_min_ms, self.heartbeat_ms
+                ),
+            });
+        }
+        if self.election_max_ms <= self.election_min_ms {
+            return Err(AeonError::Config {
+                message: format!(
+                    "raft_timing.election_max_ms ({}) must be > election_min_ms ({})",
+                    self.election_max_ms, self.election_min_ms
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Complete cluster configuration, matching the YAML manifest schema.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClusterConfig {
@@ -37,18 +122,40 @@ pub struct ClusterConfig {
     /// TLS configuration (None = insecure dev mode).
     #[serde(default)]
     pub tls: Option<TlsConfig>,
+    /// When true, use ephemeral self-signed certs (auto-tls feature).
+    /// Bypasses the file-based TLS requirement for multi-node clusters.
+    #[serde(default)]
+    pub auto_tls: bool,
+    /// Pre-computed full membership map (node_id → address) for cluster bootstrap.
+    /// When set, `bootstrap_multi()` uses this instead of deriving from local_addr + peers.
+    #[serde(default)]
+    pub initial_members: Vec<(u64, NodeAddress)>,
+    /// Externally routable address for this node (used in join requests).
+    /// If None, falls back to `bind` address. In K8s, set to the pod DNS name.
+    #[serde(default)]
+    pub advertise_addr: Option<NodeAddress>,
+    /// Raft consensus timing (FT-5). Controls heartbeat and election intervals.
+    #[serde(default)]
+    pub raft_timing: RaftTiming,
 }
 
 impl ClusterConfig {
     /// Create a minimal single-node config for development/testing.
     pub fn single_node(node_id: u64, num_partitions: u16) -> Self {
+        // FT-10: hardcoded socket-address literal is infallible at parse time.
+        #[allow(clippy::unwrap_used)]
+        let bind = "0.0.0.0:4470".parse().unwrap();
         Self {
             node_id,
-            bind: "0.0.0.0:4470".parse().unwrap(),
+            bind,
             num_partitions,
             peers: Vec::new(),
             seed_nodes: Vec::new(),
             tls: None,
+            auto_tls: false,
+            initial_members: Vec::new(),
+            advertise_addr: None,
+            raft_timing: RaftTiming::default(),
         }
     }
 
@@ -76,6 +183,8 @@ impl ClusterConfig {
             });
         }
 
+        self.raft_timing.validate()?;
+
         // Check for duplicate peers
         for (i, a) in self.peers.iter().enumerate() {
             for b in &self.peers[i + 1..] {
@@ -87,24 +196,30 @@ impl ClusterConfig {
             }
         }
 
-        // Multi-node clusters require TLS — plaintext inter-node traffic is not allowed
-        if !self.is_single_node() && self.tls.is_none() {
+        // Multi-node clusters require TLS — plaintext inter-node traffic is not allowed.
+        // auto_tls (ephemeral self-signed certs) satisfies this for dev/testing.
+        if !self.is_single_node() && self.tls.is_none() && !self.auto_tls {
             return Err(AeonError::Config {
                 message: "multi-node clusters require TLS configuration. \
-                          Set cluster.tls with cert, key, and ca paths"
+                          Set cluster.tls with cert, key, and ca paths, \
+                          or enable auto-tls for development"
                     .to_string(),
             });
         }
 
-        // Odd-number enforcement for multi-node clusters
+        // Advisory: odd-number clusters are preferred for Raft quorum efficiency.
+        // Even-number clusters are valid but suboptimal — they waste a node
+        // without improving fault tolerance. We log a warning rather than
+        // blocking because even-number states occur naturally during scaling
+        // (e.g., adding a 2nd node before adding the 3rd, or a node going
+        // down temporarily from 3→2).
         let cluster_size = self.initial_cluster_size();
         if cluster_size > 1 && cluster_size % 2 == 0 {
-            return Err(AeonError::Config {
-                message: format!(
-                    "cluster size must be odd (got {cluster_size}). \
-                     Even-number clusters waste a node without improving fault tolerance"
-                ),
-            });
+            tracing::warn!(
+                cluster_size,
+                "even-number cluster size ({cluster_size}) is suboptimal — \
+                 add one more node for better fault tolerance"
+            );
         }
 
         Ok(())
@@ -157,13 +272,17 @@ mod tests {
             ],
             seed_nodes: Vec::new(),
             tls: None,
+            auto_tls: false,
+            initial_members: Vec::new(),
+            advertise_addr: None,
+            raft_timing: RaftTiming::default(),
         };
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("TLS"));
     }
 
     #[test]
-    fn rejects_even_cluster_size() {
+    fn allows_even_cluster_size_with_warning() {
         let cfg = ClusterConfig {
             node_id: 1,
             bind: "0.0.0.0:4470".parse().unwrap(),
@@ -171,10 +290,13 @@ mod tests {
             peers: vec![NodeAddress::new("10.0.0.2", 4433)],
             seed_nodes: Vec::new(),
             tls: test_tls(),
+            auto_tls: false,
+            initial_members: Vec::new(),
+            advertise_addr: None,
+            raft_timing: RaftTiming::default(),
         };
-        // 1 self + 1 peer = 2 (even)
-        let err = cfg.validate().unwrap_err();
-        assert!(err.to_string().contains("odd"));
+        // 1 self + 1 peer = 2 (even) — should succeed (advisory warning only)
+        cfg.validate().unwrap();
     }
 
     #[test]
@@ -190,6 +312,10 @@ mod tests {
                 peers,
                 seed_nodes: Vec::new(),
                 tls: test_tls(),
+                auto_tls: false,
+                initial_members: Vec::new(),
+                advertise_addr: None,
+                raft_timing: RaftTiming::default(),
             };
             // 1 + 2=3, 1+4=5, 1+6=7 — all odd
             cfg.validate().unwrap();
@@ -208,6 +334,10 @@ mod tests {
             ],
             seed_nodes: Vec::new(),
             tls: test_tls(),
+            auto_tls: false,
+            initial_members: Vec::new(),
+            advertise_addr: None,
+            raft_timing: RaftTiming::default(),
         };
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("duplicate"));
@@ -223,6 +353,10 @@ mod tests {
             peers: Vec::new(),
             seed_nodes: vec![NodeAddress::new("10.0.0.1", 4433)],
             tls: None,
+            auto_tls: false,
+            initial_members: Vec::new(),
+            advertise_addr: None,
+            raft_timing: RaftTiming::default(),
         };
         assert!(!cfg.is_single_node());
         let err = cfg.validate().unwrap_err();
@@ -238,6 +372,10 @@ mod tests {
             peers: Vec::new(),
             seed_nodes: vec![NodeAddress::new("10.0.0.1", 4433)],
             tls: test_tls(),
+            auto_tls: false,
+            initial_members: Vec::new(),
+            advertise_addr: None,
+            raft_timing: RaftTiming::default(),
         };
         assert!(!cfg.is_single_node());
         // cluster size = 1 (self only), odd-number check passes
@@ -260,6 +398,10 @@ mod tests {
                 key: PathBuf::from("/etc/aeon/tls/node.key"),
                 ca: PathBuf::from("/etc/aeon/tls/ca.pem"),
             }),
+            auto_tls: false,
+            initial_members: Vec::new(),
+            advertise_addr: None,
+            raft_timing: RaftTiming::default(),
         };
 
         let bytes = bincode::serialize(&cfg).unwrap();
@@ -268,5 +410,106 @@ mod tests {
         assert_eq!(decoded.num_partitions, cfg.num_partitions);
         assert_eq!(decoded.peers.len(), 2);
         assert!(decoded.tls.is_some());
+    }
+
+    #[test]
+    fn raft_timing_defaults() {
+        let t = RaftTiming::default();
+        assert_eq!(t.heartbeat_ms, 500);
+        assert_eq!(t.election_min_ms, 1500);
+        assert_eq!(t.election_max_ms, 3000);
+        t.validate().unwrap();
+    }
+
+    #[test]
+    fn raft_timing_prod_recommended_preset() {
+        let t = RaftTiming::prod_recommended();
+        assert_eq!(t.heartbeat_ms, 500);
+        assert_eq!(t.election_min_ms, 2000);
+        assert_eq!(t.election_max_ms, 6000);
+        t.validate().unwrap();
+        // Window must be strictly wider than default to justify the preset.
+        let default_window = RaftTiming::default().election_max_ms - RaftTiming::default().election_min_ms;
+        let prod_window = t.election_max_ms - t.election_min_ms;
+        assert!(prod_window > default_window);
+    }
+
+    #[test]
+    fn raft_timing_flaky_network_preset() {
+        let t = RaftTiming::flaky_network();
+        assert_eq!(t.heartbeat_ms, 500);
+        assert_eq!(t.election_min_ms, 3000);
+        assert_eq!(t.election_max_ms, 12000);
+        t.validate().unwrap();
+        // Flaky preset must be wider than prod-recommended.
+        let prod_window = RaftTiming::prod_recommended().election_max_ms
+            - RaftTiming::prod_recommended().election_min_ms;
+        let flaky_window = t.election_max_ms - t.election_min_ms;
+        assert!(flaky_window > prod_window);
+    }
+
+    #[test]
+    fn raft_timing_rejects_zero_heartbeat() {
+        let t = RaftTiming {
+            heartbeat_ms: 0,
+            election_min_ms: 1500,
+            election_max_ms: 3000,
+        };
+        let err = t.validate().unwrap_err();
+        assert!(err.to_string().contains("heartbeat_ms"));
+    }
+
+    #[test]
+    fn raft_timing_rejects_min_le_heartbeat() {
+        let t = RaftTiming {
+            heartbeat_ms: 500,
+            election_min_ms: 500,
+            election_max_ms: 3000,
+        };
+        let err = t.validate().unwrap_err();
+        assert!(err.to_string().contains("election_min_ms"));
+    }
+
+    #[test]
+    fn raft_timing_rejects_max_le_min() {
+        let t = RaftTiming {
+            heartbeat_ms: 500,
+            election_min_ms: 3000,
+            election_max_ms: 2500,
+        };
+        let err = t.validate().unwrap_err();
+        assert!(err.to_string().contains("election_max_ms"));
+    }
+
+    #[test]
+    fn raft_timing_accepts_wide_jitter_for_flaky_networks() {
+        // Mitigation for FT-4 (pre-vote blocked upstream): wide jitter range
+        // reduces split-vote probability on flaky networks.
+        let t = RaftTiming {
+            heartbeat_ms: 500,
+            election_min_ms: 2000,
+            election_max_ms: 6000, // 4s jitter window
+        };
+        t.validate().unwrap();
+    }
+
+    #[test]
+    fn cluster_config_serde_omits_raft_timing_uses_default() {
+        // YAML/JSON without raft_timing field should deserialize with defaults.
+        let json = r#"{
+            "node_id": 1,
+            "bind": "0.0.0.0:4470",
+            "num_partitions": 16,
+            "peers": [],
+            "seed_nodes": [],
+            "tls": null,
+            "auto_tls": false,
+            "initial_members": [],
+            "advertise_addr": null
+        }"#;
+        let cfg: ClusterConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.raft_timing.heartbeat_ms, 500);
+        assert_eq!(cfg.raft_timing.election_min_ms, 1500);
+        assert_eq!(cfg.raft_timing.election_max_ms, 3000);
     }
 }

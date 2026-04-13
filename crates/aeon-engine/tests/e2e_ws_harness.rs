@@ -92,6 +92,7 @@ pub async fn start_ws_test_server(pipeline_name: &str) -> WsTestServer {
         pipeline_name: pipeline_name.to_string(),
         pipeline_codec: None,
         max_inflight_batches: aeon_engine::transport::session::DEFAULT_MAX_INFLIGHT_BATCHES,
+        replay_window: None,
     };
 
     let ws_host = Arc::new(WebSocketProcessorHost::new(ws_config));
@@ -110,6 +111,9 @@ pub async fn start_ws_test_server(pipeline_name: &str) -> WsTestServer {
         pipelines: Arc::new(PipelineManager::new()),
         delivery_ledgers: dashmap::DashMap::new(),
         pipeline_controls: dashmap::DashMap::new(),
+        pipeline_metrics: dashmap::DashMap::new(),
+        #[cfg(feature = "processor-auth")]
+        poh_chains: dashmap::DashMap::new(),
         identities: Arc::clone(&identity_store),
         #[cfg(feature = "processor-auth")]
         authenticator: None,
@@ -117,6 +121,8 @@ pub async fn start_ws_test_server(pipeline_name: &str) -> WsTestServer {
         api_token: None,
         #[cfg(feature = "websocket-host")]
         ws_host: Some(Arc::clone(&ws_host)),
+        #[cfg(feature = "cluster")]
+        cluster_node: None,
     });
 
     let router = api_router(state);

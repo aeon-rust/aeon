@@ -401,6 +401,63 @@ D1 (Python, aioquic) + D2 (Go, quic-go/webtransport-go) + D3 (Rust
 Network, wtransport) now prove the T3 WebTransport host end-to-end
 with three independent real clients across three languages.
 
+### 2026-04-12 — CI/CD scaffolding + WebSocket live-tail + to-do audit
+
+- `.github/workflows/release.yml`: 5-stage release pipeline (validate → crates.io → binaries → GH release → Docker Hub)
+- `deny.toml`: cargo-deny config for advisories, license compliance, dependency bans
+- `CHANGELOG.md`: keep-a-changelog format, v0.1.0 entry
+- `GET /api/v1/pipelines/{name}/tail`: WebSocket live-tail streaming pipeline metrics at 1 Hz
+- `pipeline_metrics` DashMap added to AppState for metrics registration
+- To-do list audit: 3 of 6 code stubs were already implemented; updated ROADMAP accordingly
+
+### 2026-04-11 — Phase C+D REST API wired to PipelineControl
+
+All zero-downtime upgrade and reconfiguration REST endpoints are now fully
+wired to `PipelineControl` with real processor instantiation:
+
+| Endpoint | Before | After |
+|----------|--------|-------|
+| `POST .../upgrade/blue-green` | Metadata only | Loads artifact → instantiates processor → `ctrl.start_blue_green()` |
+| `POST .../upgrade/canary` | Metadata only | Loads artifact → instantiates processor → `ctrl.start_canary()` |
+| `POST .../promote` | Metadata only | Calls `ctrl.set_canary_pct()` or `ctrl.complete_canary()` |
+| `POST .../reconfigure/source` | Did not exist | Updates metadata, enforces same-type (cross-type rejected) |
+| `POST .../reconfigure/sink` | Did not exist | Updates metadata, enforces same-type (cross-type rejected) |
+
+Extracted `instantiate_processor()` helper shared across upgrade, blue-green,
+and canary paths. Added `PipelineAction::Reconfigured` variant.
+
+11 new tests: 6 PipelineManager unit (reconfigure source/sink: same-type,
+cross-type rejected, not-running rejected, history recording) + 4 REST API
+(reconfigure source, sink, cross-type rejected, nonexistent pipeline) +
+`PipelineAction` now derives `PartialEq`/`Eq`.
+
+**763 lib tests, 17 E2E integration tests, zero clippy warnings.**
+
+### 2026-04-11 — Multi-node cluster lifecycle tests landed
+
+10 new integration tests in `crates/aeon-cluster/tests/multi_node.rs`
+covering the full cluster lifecycle over QUIC transport:
+
+| Test | Scenario |
+|------|----------|
+| `three_node_cluster_formation` | Bootstrap 3-node, verify leader consensus |
+| `three_node_log_replication` | 20 entries replicate to all 3 nodes |
+| `dynamic_add_second_node` | 1→2 nodes (even-number cluster) |
+| `dynamic_scale_one_to_three` | 1→2→3 sequential scaling |
+| `scale_three_to_five` | 3→4→5 nodes, all replicate |
+| `remove_node_from_three_node_cluster` | 3→2 removal, cluster continues |
+| `leader_failover` | Shut down leader, re-election succeeds |
+| `join_via_rpc_add_node_request` | End-to-end QUIC RPC join protocol |
+| `remove_via_rpc` | End-to-end QUIC RPC node removal |
+| `replication_consistency_across_nodes` | 20 entries, identical last_applied |
+
+All 10 pass. Required fix: Windows resolves `localhost` to `::1` (IPv6)
+first — QUIC endpoints bound to `127.0.0.1` reject the connection.
+Switched to `127.0.0.1` addresses + `dev_quic_configs_insecure()`
+(AcceptAnyCert) for all multi-node tests.
+
+Total cluster test count: 72 lib + 10 multi-node + 5 single-node = **87**.
+
 ### Resolved: SDK envelope Uuid serialization (msgpack)
 
 For a brief window A10 / C8 / D3 / F6 all pinned to `.codec("json")`

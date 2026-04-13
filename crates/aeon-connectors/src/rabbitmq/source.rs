@@ -5,7 +5,7 @@
 //! Phase 3 backpressure: when overloaded, uses basic.cancel to stop delivery.
 
 use crate::push_buffer::{PushBufferConfig, PushBufferRx, push_buffer};
-use aeon_types::{AeonError, Event, PartitionId, Source};
+use aeon_types::{AeonError, BackoffPolicy, Event, PartitionId, Source};
 use bytes::Bytes;
 use lapin::options::*;
 use lapin::types::FieldTable;
@@ -31,6 +31,10 @@ pub struct RabbitMqSourceConfig {
     pub source_name: Arc<str>,
     /// Whether to declare the queue (create if not exists).
     pub declare_queue: bool,
+    /// Reconnect backoff policy (TR-3). Applied when the AMQP connection or
+    /// consumer stream dies. Exponential + jitter prevents reconnect storms
+    /// against a flaky RabbitMQ broker.
+    pub backoff: BackoffPolicy,
 }
 
 impl RabbitMqSourceConfig {
@@ -45,7 +49,14 @@ impl RabbitMqSourceConfig {
             poll_timeout: Duration::from_secs(1),
             source_name: Arc::from("rabbitmq"),
             declare_queue: true,
+            backoff: BackoffPolicy::default(),
         }
+    }
+
+    /// Override the reconnect backoff policy.
+    pub fn with_backoff(mut self, backoff: BackoffPolicy) -> Self {
+        self.backoff = backoff;
+        self
     }
 
     /// Set consumer tag.
@@ -82,87 +93,146 @@ impl RabbitMqSourceConfig {
 /// RabbitMQ event source.
 ///
 /// Spawns a background task that consumes from the queue via AMQP
-/// basic.consume and pushes events into the push buffer.
+/// basic.consume and pushes events into the push buffer. The reader task
+/// transparently reconnects with jittered exponential backoff (TR-3) on
+/// connection loss, so a flaky broker doesn't silently kill the source.
 pub struct RabbitMqSource {
     rx: PushBufferRx,
     poll_timeout: Duration,
     _reader_handle: tokio::task::JoinHandle<()>,
-    _connection: Connection,
 }
 
 impl RabbitMqSource {
     /// Connect to RabbitMQ, declare queue if needed, and start consuming.
+    ///
+    /// Returns an error if the **initial** connection fails. Subsequent
+    /// reconnections are handled transparently by the background reader.
     pub async fn new(config: RabbitMqSourceConfig) -> Result<Self, AeonError> {
-        let conn = Connection::connect(&config.uri, ConnectionProperties::default())
-            .await
-            .map_err(|e| AeonError::connection(format!("rabbitmq connect failed: {e}")))?;
+        // Validate the initial connection synchronously so misconfiguration
+        // surfaces loudly to the operator. The connection is dropped before
+        // the reader task starts; the reader re-establishes its own handle
+        // so the reconnect loop owns a single connection/channel/consumer
+        // triple throughout its lifetime.
+        let _validate = connect_and_consume(&config).await?;
+        drop(_validate);
 
-        let channel = conn
-            .create_channel()
-            .await
-            .map_err(|e| AeonError::connection(format!("rabbitmq channel create failed: {e}")))?;
-
-        // Set QoS
-        channel
-            .basic_qos(config.prefetch_count, BasicQosOptions::default())
-            .await
-            .map_err(|e| AeonError::connection(format!("rabbitmq basic_qos failed: {e}")))?;
-
-        // Declare queue if configured
-        if config.declare_queue {
-            channel
-                .queue_declare(
-                    &config.queue,
-                    QueueDeclareOptions {
-                        durable: true,
-                        ..Default::default()
-                    },
-                    FieldTable::default(),
-                )
-                .await
-                .map_err(|e| {
-                    AeonError::connection(format!("rabbitmq queue_declare failed: {e}"))
-                })?;
-        }
-
-        // Start consuming
-        let consumer = channel
-            .basic_consume(
-                &config.queue,
-                &config.consumer_tag,
-                BasicConsumeOptions::default(),
-                FieldTable::default(),
-            )
-            .await
-            .map_err(|e| AeonError::connection(format!("rabbitmq basic_consume failed: {e}")))?;
-
-        tracing::info!(
-            queue = %config.queue,
-            consumer_tag = %config.consumer_tag,
-            prefetch = config.prefetch_count,
-            "RabbitMqSource consuming"
-        );
-
-        let (tx, rx) = push_buffer(config.buffer_config);
-        let source_name = config.source_name;
-
-        let handle = tokio::spawn(rabbitmq_reader(consumer, channel, tx, source_name));
+        let (tx, rx) = push_buffer(config.buffer_config.clone());
+        let poll_timeout = config.poll_timeout;
+        let handle = tokio::spawn(rabbitmq_reader(config, tx));
 
         Ok(Self {
             rx,
-            poll_timeout: config.poll_timeout,
+            poll_timeout,
             _reader_handle: handle,
-            _connection: conn,
         })
     }
 }
 
-async fn rabbitmq_reader(
+/// Establish connection → channel → QoS → (optional queue declare) → consumer.
+/// Returns the triple so callers can drive the stream.
+async fn connect_and_consume(
+    config: &RabbitMqSourceConfig,
+) -> Result<(Connection, Channel, Consumer), AeonError> {
+    let conn = Connection::connect(&config.uri, ConnectionProperties::default())
+        .await
+        .map_err(|e| AeonError::connection(format!("rabbitmq connect failed: {e}")))?;
+
+    let channel = conn
+        .create_channel()
+        .await
+        .map_err(|e| AeonError::connection(format!("rabbitmq channel create failed: {e}")))?;
+
+    channel
+        .basic_qos(config.prefetch_count, BasicQosOptions::default())
+        .await
+        .map_err(|e| AeonError::connection(format!("rabbitmq basic_qos failed: {e}")))?;
+
+    if config.declare_queue {
+        channel
+            .queue_declare(
+                &config.queue,
+                QueueDeclareOptions {
+                    durable: true,
+                    ..Default::default()
+                },
+                FieldTable::default(),
+            )
+            .await
+            .map_err(|e| AeonError::connection(format!("rabbitmq queue_declare failed: {e}")))?;
+    }
+
+    let consumer = channel
+        .basic_consume(
+            &config.queue,
+            &config.consumer_tag,
+            BasicConsumeOptions::default(),
+            FieldTable::default(),
+        )
+        .await
+        .map_err(|e| AeonError::connection(format!("rabbitmq basic_consume failed: {e}")))?;
+
+    tracing::info!(
+        queue = %config.queue,
+        consumer_tag = %config.consumer_tag,
+        prefetch = config.prefetch_count,
+        "RabbitMqSource consuming"
+    );
+
+    Ok((conn, channel, consumer))
+}
+
+async fn rabbitmq_reader(config: RabbitMqSourceConfig, tx: crate::push_buffer::PushBufferTx) {
+    let mut backoff = config.backoff.iter();
+
+    // Outer reconnect loop. Each iteration owns a fresh
+    // Connection+Channel+Consumer triple. On any disconnect the inner loop
+    // breaks and we back off before attempting to reconnect.
+    'reconnect: loop {
+        let (conn, channel, consumer) = match connect_and_consume(&config).await {
+            Ok(triple) => {
+                backoff.reset();
+                triple
+            }
+            Err(e) => {
+                let delay = backoff.next_delay();
+                tracing::warn!(
+                    error = %e,
+                    delay_ms = delay.as_millis() as u64,
+                    "rabbitmq reconnect failed; backing off before retry"
+                );
+                tokio::time::sleep(delay).await;
+                continue 'reconnect;
+            }
+        };
+
+        if !drive_consumer(consumer, &channel, &tx, &config.source_name).await {
+            // Buffer closed — drop the connection and exit cleanly.
+            drop(channel);
+            drop(conn);
+            return;
+        }
+
+        // Inner loop exited because of a delivery/channel error. Drop the
+        // triple so the broker sees a clean disconnect, then back off.
+        drop(channel);
+        drop(conn);
+        let delay = backoff.next_delay();
+        tracing::warn!(
+            delay_ms = delay.as_millis() as u64,
+            "rabbitmq consumer stream ended; backing off before reconnect"
+        );
+        tokio::time::sleep(delay).await;
+    }
+}
+
+/// Drive an active consumer stream. Returns `false` when the push buffer is
+/// closed (shutdown); `true` when the stream needs a reconnect.
+async fn drive_consumer(
     mut consumer: Consumer,
-    channel: Channel,
-    tx: crate::push_buffer::PushBufferTx,
-    source_name: Arc<str>,
-) {
+    channel: &Channel,
+    tx: &crate::push_buffer::PushBufferTx,
+    source_name: &Arc<str>,
+) -> bool {
     use futures_util::StreamExt;
 
     while let Some(delivery_result) = consumer.next().await {
@@ -185,12 +255,11 @@ async fn rabbitmq_reader(
                 let mut event = Event::new(
                     uuid::Uuid::nil(),
                     0,
-                    Arc::clone(&source_name),
+                    Arc::clone(source_name),
                     PartitionId::new(0),
                     payload,
                 );
 
-                // Propagate AMQP headers as event metadata
                 if let Some(headers) = &delivery.properties.headers() {
                     for (key, value) in headers.inner() {
                         let value_str = format!("{value:?}");
@@ -200,7 +269,6 @@ async fn rabbitmq_reader(
                     }
                 }
 
-                // Store routing key as metadata
                 if let Some(routing_key) = delivery.routing_key.as_str().into() {
                     event
                         .metadata
@@ -208,22 +276,22 @@ async fn rabbitmq_reader(
                 }
 
                 if tx.send(event).await.is_err() {
-                    break; // Buffer closed
+                    return false; // Buffer closed — shutdown signal.
                 }
 
-                // Acknowledge after pushing to buffer
                 let _ = delivery.ack(BasicAckOptions::default()).await;
             }
             Err(e) => {
                 tracing::error!(error = %e, "rabbitmq delivery error");
-                // Check if channel is still alive
                 if !channel.status().connected() {
                     tracing::error!("rabbitmq channel disconnected");
-                    break;
+                    return true; // Trigger reconnect.
                 }
             }
         }
     }
+    // Stream ended cleanly (consumer cancelled or channel closed) — reconnect.
+    true
 }
 
 impl Source for RabbitMqSource {

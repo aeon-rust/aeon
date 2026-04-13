@@ -7,11 +7,14 @@
 //! The tiered store provides the abstraction so that upstream code (typed wrappers,
 //! engine) doesn't need to change regardless of which tiers are enabled.
 
+use std::sync::Arc;
+
 use aeon_types::{AeonError, StateOps};
 
 use crate::l1::L1Store;
+use crate::l3::L3Store;
 #[cfg(feature = "redb")]
-use crate::l3::{L3Store, RedbStore};
+use crate::l3::RedbStore;
 
 /// Configuration for tier promotion/demotion thresholds.
 #[derive(Debug, Clone)]
@@ -25,7 +28,10 @@ pub struct TieredConfig {
     /// L2 backing file path (required if l2_enabled).
     #[cfg(feature = "mmap")]
     pub l2_path: Option<std::path::PathBuf>,
-    /// L3 configuration (required if l3_enabled).
+    /// L3 backend selector (FT-7). Defaults to `Redb`. When the RocksDB
+    /// adapter lands, set to `L3Backend::RocksDb` at config-parse time.
+    pub l3_backend: aeon_types::L3Backend,
+    /// L3 configuration (required if l3_enabled and l3_backend=Redb).
     #[cfg(feature = "redb")]
     pub l3_config: Option<crate::l3::RedbConfig>,
 }
@@ -38,9 +44,39 @@ impl Default for TieredConfig {
             l3_enabled: false,
             #[cfg(feature = "mmap")]
             l2_path: None,
+            l3_backend: aeon_types::L3Backend::default(),
             #[cfg(feature = "redb")]
             l3_config: None,
         }
+    }
+}
+
+/// Open the L3 backend selected by `config.l3_backend`.
+///
+/// `Redb` requires the `redb` feature and a populated `config.l3_config`.
+/// `RocksDb` is not yet implemented — returns an error until the adapter lands.
+fn open_l3_backend(config: &TieredConfig) -> Result<Arc<dyn L3Store>, AeonError> {
+    match config.l3_backend {
+        aeon_types::L3Backend::Redb => {
+            #[cfg(feature = "redb")]
+            {
+                let cfg = config
+                    .l3_config
+                    .clone()
+                    .ok_or_else(|| AeonError::state("L3 Redb enabled but l3_config not set"))?;
+                Ok(Arc::new(RedbStore::open(cfg)?) as Arc<dyn L3Store>)
+            }
+            #[cfg(not(feature = "redb"))]
+            {
+                let _ = config; // suppress unused
+                Err(AeonError::state(
+                    "L3 backend=Redb but crate built without `redb` feature",
+                ))
+            }
+        }
+        aeon_types::L3Backend::RocksDb => Err(AeonError::state(
+            "L3 backend=RocksDb: adapter not yet implemented (FT-7 placeholder)",
+        )),
     }
 }
 
@@ -57,8 +93,10 @@ pub struct TieredStore {
     l1: L1Store,
     #[cfg(feature = "mmap")]
     l2: Option<crate::l2::L2Store>,
-    #[cfg(feature = "redb")]
-    l3: Option<RedbStore>,
+    /// L3 backend, held behind `Arc<dyn L3Store>` so the runtime backend
+    /// (redb today, RocksDB or others in future) is selectable via config
+    /// rather than hardcoded (FT-7).
+    l3: Option<Arc<dyn L3Store>>,
     config: TieredConfig,
 }
 
@@ -69,7 +107,6 @@ impl TieredStore {
             l1: L1Store::new(),
             #[cfg(feature = "mmap")]
             l2: None,
-            #[cfg(feature = "redb")]
             l3: None,
             config: TieredConfig::default(),
         }
@@ -78,6 +115,9 @@ impl TieredStore {
     /// Create a tiered store with custom configuration.
     ///
     /// Opens L2/L3 backends if their respective features are enabled and configured.
+    /// The L3 backend is selected by [`TieredConfig::l3_backend`] — currently `Redb`
+    /// is the only shipping implementation; `RocksDb` returns a "not implemented"
+    /// error until the adapter lands.
     pub fn with_config(config: TieredConfig) -> Result<Self, AeonError> {
         #[cfg(feature = "mmap")]
         let l2 = if config.l2_enabled {
@@ -90,13 +130,8 @@ impl TieredStore {
             None
         };
 
-        #[cfg(feature = "redb")]
-        let l3 = if config.l3_enabled {
-            let l3_config = config
-                .l3_config
-                .clone()
-                .ok_or_else(|| AeonError::state("L3 enabled but l3_config not configured"))?;
-            Some(RedbStore::open(l3_config)?)
+        let l3: Option<Arc<dyn L3Store>> = if config.l3_enabled {
+            Some(open_l3_backend(&config)?)
         } else {
             None
         };
@@ -105,10 +140,45 @@ impl TieredStore {
             l1: L1Store::new(),
             #[cfg(feature = "mmap")]
             l2,
-            #[cfg(feature = "redb")]
             l3,
             config,
         })
+    }
+
+    /// Create a tiered store with a pre-constructed L3 backend injected.
+    ///
+    /// Enables callers (notably `aeon-cluster` persistent Raft log storage, FT-1)
+    /// to share a single L3 backend instance across multiple consumers without
+    /// re-opening the file.
+    pub fn with_l3_store(
+        mut config: TieredConfig,
+        l3: Arc<dyn L3Store>,
+    ) -> Result<Self, AeonError> {
+        config.l3_enabled = true;
+        #[cfg(feature = "mmap")]
+        let l2 = if config.l2_enabled {
+            let path = config
+                .l2_path
+                .clone()
+                .ok_or_else(|| AeonError::state("L2 enabled but l2_path not configured"))?;
+            Some(crate::l2::L2Store::open(path)?)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            l1: L1Store::new(),
+            #[cfg(feature = "mmap")]
+            l2,
+            l3: Some(l3),
+            config,
+        })
+    }
+
+    /// Borrow the L3 backend, if enabled. Lets callers with a shared handle
+    /// (e.g., `aeon-cluster` RaftLogStore) reuse the same backing store.
+    pub fn l3(&self) -> Option<&Arc<dyn L3Store>> {
+        self.l3.as_ref()
     }
 
     /// Get a reference to the L1 store.
@@ -144,7 +214,6 @@ impl TieredStore {
             std::collections::HashMap::new();
 
         // L3 first (lowest priority).
-        #[cfg(feature = "redb")]
         if let Some(ref l3) = self.l3 {
             if let Ok(entries) = l3.scan_prefix(prefix) {
                 for (k, v) in entries {
@@ -231,7 +300,6 @@ impl TieredStore {
     ///
     /// Returns all entries with keys starting with `prefix` from the persistent tier.
     /// Used during partition rebalance (source node exports, target node imports).
-    #[cfg(feature = "redb")]
     pub fn export_partition(&self, prefix: &[u8]) -> Result<crate::l3::KvPairs, AeonError> {
         match &self.l3 {
             Some(l3) => l3.scan_prefix(prefix),
@@ -243,7 +311,6 @@ impl TieredStore {
     ///
     /// Bulk-writes entries into the persistent tier. Used on the target node during
     /// partition rebalance.
-    #[cfg(feature = "redb")]
     pub fn import_partition(&self, entries: Vec<(Vec<u8>, Vec<u8>)>) -> Result<(), AeonError> {
         match &self.l3 {
             Some(l3) => {
@@ -282,7 +349,6 @@ impl StateOps for TieredStore {
         }
 
         // L3 lookup → promote to L1 on hit.
-        #[cfg(feature = "redb")]
         if let Some(ref l3) = self.l3 {
             if let Ok(Some(value)) = l3.get(key) {
                 // Promote to L1 for faster subsequent access.
@@ -299,7 +365,6 @@ impl StateOps for TieredStore {
         self.l1.put(key, value).await?;
 
         // Write-through to L3 for durability (if enabled).
-        #[cfg(feature = "redb")]
         if let Some(ref l3) = self.l3 {
             l3.put(key, value)
                 .map_err(|e| AeonError::state(format!("L3 write-through: {e}")))?;
@@ -318,7 +383,6 @@ impl StateOps for TieredStore {
         }
 
         // Propagate delete to L3.
-        #[cfg(feature = "redb")]
         if let Some(ref l3) = self.l3 {
             l3.delete(key)
                 .map_err(|e| AeonError::state(format!("L3 delete propagation: {e}")))?;
@@ -367,6 +431,7 @@ mod tests {
             l3_enabled: false,
             #[cfg(feature = "mmap")]
             l2_path: None,
+            l3_backend: aeon_types::L3Backend::default(),
             #[cfg(feature = "redb")]
             l3_config: None,
         };
@@ -448,6 +513,7 @@ mod tests {
             l2_enabled: true,
             l3_enabled: false,
             l2_path: Some(l2_path),
+            l3_backend: aeon_types::L3Backend::default(),
             #[cfg(feature = "redb")]
             l3_config: None,
         };
@@ -479,6 +545,7 @@ mod tests {
             l2_enabled: true,
             l3_enabled: false,
             l2_path: Some(l2_path),
+            l3_backend: aeon_types::L3Backend::default(),
             #[cfg(feature = "redb")]
             l3_config: None,
         };
@@ -511,6 +578,7 @@ mod tests {
             l2_enabled: true,
             l3_enabled: false,
             l2_path: Some(l2_path),
+            l3_backend: aeon_types::L3Backend::default(),
             #[cfg(feature = "redb")]
             l3_config: None,
         };
@@ -537,6 +605,7 @@ mod tests {
             l3_enabled: true,
             #[cfg(feature = "mmap")]
             l2_path: None,
+            l3_backend: aeon_types::L3Backend::default(),
             l3_config: Some(crate::l3::RedbConfig {
                 path: l3_path.clone(),
                 sync_writes: false,
@@ -575,6 +644,7 @@ mod tests {
             l3_enabled: true,
             #[cfg(feature = "mmap")]
             l2_path: None,
+            l3_backend: aeon_types::L3Backend::default(),
             l3_config: Some(crate::l3::RedbConfig {
                 path: l3_path,
                 sync_writes: false,
@@ -605,6 +675,7 @@ mod tests {
             l3_enabled: true,
             #[cfg(feature = "mmap")]
             l2_path: None,
+            l3_backend: aeon_types::L3Backend::default(),
             l3_config: Some(crate::l3::RedbConfig {
                 path: l3_path,
                 sync_writes: false,
@@ -639,6 +710,7 @@ mod tests {
                 l3_enabled: true,
                 #[cfg(feature = "mmap")]
                 l2_path: None,
+                l3_backend: aeon_types::L3Backend::default(),
                 l3_config: Some(crate::l3::RedbConfig {
                     path: l3_path.clone(),
                     sync_writes: false,
@@ -660,6 +732,7 @@ mod tests {
                 l3_enabled: true,
                 #[cfg(feature = "mmap")]
                 l2_path: None,
+                l3_backend: aeon_types::L3Backend::default(),
                 l3_config: Some(crate::l3::RedbConfig {
                     path: l3_path,
                     sync_writes: false,
@@ -709,6 +782,7 @@ mod tests {
             l2_enabled: true,
             l3_enabled: true,
             l2_path: Some(l2_path),
+            l3_backend: aeon_types::L3Backend::default(),
             l3_config: Some(crate::l3::RedbConfig {
                 path: l3_path,
                 sync_writes: false,
@@ -744,6 +818,7 @@ mod tests {
             l2_enabled: true,
             l3_enabled: true,
             l2_path: Some(l2_path),
+            l3_backend: aeon_types::L3Backend::default(),
             l3_config: Some(crate::l3::RedbConfig {
                 path: l3_path,
                 sync_writes: false,
@@ -760,6 +835,57 @@ mod tests {
         assert_eq!(results.len(), 2);
     }
 
+    /// FT-7: rocksdb backend selected but not implemented — surfaces a clear
+    /// error rather than silently falling back.
+    #[test]
+    fn tiered_l3_backend_rocksdb_not_implemented() {
+        let config = TieredConfig {
+            l3_enabled: true,
+            l3_backend: aeon_types::L3Backend::RocksDb,
+            ..Default::default()
+        };
+        let err = match TieredStore::with_config(config) {
+            Ok(_) => panic!("expected RocksDb backend to return not-implemented"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("RocksDb"), "unexpected error: {msg}");
+    }
+
+    /// FT-7: callers can inject a pre-constructed `Arc<dyn L3Store>` so that a
+    /// single backing store is shared between `TieredStore` and other consumers
+    /// (e.g., RaftLogStore in FT-1).
+    #[cfg(feature = "redb")]
+    #[tokio::test]
+    async fn tiered_with_injected_l3_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let l3_path = dir.path().join("inject.redb");
+        let shared: Arc<dyn L3Store> = Arc::new(
+            RedbStore::open(crate::l3::RedbConfig {
+                path: l3_path,
+                sync_writes: false,
+            })
+            .unwrap(),
+        );
+
+        // Pre-populate through the shared handle.
+        shared.put(b"shared_key", b"shared_val").unwrap();
+
+        // Inject the same backend into a TieredStore.
+        let store =
+            TieredStore::with_l3_store(TieredConfig::default(), Arc::clone(&shared)).unwrap();
+
+        // Read-through finds the pre-written value.
+        assert_eq!(
+            store.get(b"shared_key").await.unwrap(),
+            Some(b"shared_val".to_vec())
+        );
+
+        // Write through TieredStore also visible via the shared handle.
+        store.put(b"new_key", b"new_val").await.unwrap();
+        assert_eq!(shared.get(b"new_key").unwrap(), Some(b"new_val".to_vec()));
+    }
+
     #[cfg(feature = "redb")]
     #[tokio::test]
     async fn tiered_export_import_partition() {
@@ -774,6 +900,7 @@ mod tests {
             l3_enabled: true,
             #[cfg(feature = "mmap")]
             l2_path: None,
+            l3_backend: aeon_types::L3Backend::default(),
             l3_config: Some(crate::l3::RedbConfig {
                 path: src_path,
                 sync_writes: false,
@@ -796,6 +923,7 @@ mod tests {
             l3_enabled: true,
             #[cfg(feature = "mmap")]
             l2_path: None,
+            l3_backend: aeon_types::L3Backend::default(),
             l3_config: Some(crate::l3::RedbConfig {
                 path: dst_path,
                 sync_writes: false,

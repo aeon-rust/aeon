@@ -118,6 +118,7 @@ pub async fn start_wt_test_server(pipeline_name: &str) -> WtTestServer {
         pipeline_name: pipeline_name.to_string(),
         pipeline_codec: None,
         max_inflight_batches: DEFAULT_MAX_INFLIGHT_BATCHES,
+        replay_window: None,
     };
 
     let wt_host = Arc::new(

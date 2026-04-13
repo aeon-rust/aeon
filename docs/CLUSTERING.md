@@ -4,10 +4,13 @@
 > development setups through multi-node production deployments.
 >
 > **Implementation status**: Single-node Raft is implemented and tested. Multi-node
-> cluster validation (3+ nodes, partition transfer, leader failover) is deferred to
-> post-Gate 2 as it requires multi-node infrastructure. The architecture, traits, and
-> QUIC transport code exist but have not been validated in a multi-node deployment.
-> See `docs/ROADMAP.md` for the Gate 2 deferred tasks.
+> cluster validation was completed on a 3-node DigitalOcean Kubernetes (DOKS) cluster
+> on 2026-04-12 — leader failover, log replication, node rejoin, and cross-node QUIC
+> were all validated (all nodes reached consistent state: `log_idx=16, applied=16,
+> term=25`). Remaining multi-node work (Gate 2 acceptance criteria, partition transfer
+> CL-6, cluster metrics) is tracked in `docs/FAULT-TOLERANCE-ANALYSIS.md` Section 7
+> (Pillar 3). Note that local Rancher Desktop K3s is single-node; multi-node testing
+> requires DOKS/EKS/GKE or a real multi-node K3s cluster.
 
 ---
 
@@ -149,6 +152,91 @@ Rule of thumb: `num_partitions >= max_expected_nodes * 4`.
 
 Even if you start with a single node, choose a partition count that accommodates your
 maximum expected cluster size. You cannot change it later.
+
+### Raft timing (election timeouts and heartbeats)
+
+Aeon exposes three Raft timing parameters on `ClusterConfig.raft_timing`:
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `heartbeat_ms` | 500 | Leader → follower heartbeat interval. |
+| `election_min_ms` | 1500 | Lower bound of the randomized election timeout. |
+| `election_max_ms` | 3000 | Upper bound of the randomized election timeout. |
+
+When a follower doesn't hear a heartbeat within its per-round randomized
+timeout (drawn uniformly from `[election_min_ms, election_max_ms]`), it
+becomes a candidate and starts an election.
+
+#### Why the jitter window matters
+
+If two followers time out within a few milliseconds of each other, they
+both become candidates, each votes for itself, neither wins, and the
+term is incremented — a **split vote**. With `N` followers and a window
+width `W = election_max_ms - election_min_ms`, the split-vote probability
+per election round is approximately:
+
+```
+P(split_vote) ≈ N · (N-1) · (RTT / W)
+```
+
+A 3-node cluster on a VPC with ~100 ms RTT sees:
+
+| Window W | Split-vote probability | Worst-case failover |
+|----------|------------------------|---------------------|
+| 1500 ms (default) | ~40% | ~3 s |
+| 4000 ms (prod_recommended) | ~15% | ~6 s |
+| 9000 ms (flaky_network) | ~7% | ~12 s |
+
+A wider window is the mitigation for the absence of **pre-vote** in
+openraft 0.9.x (see `docs/FAULT-TOLERANCE-ANALYSIS.md` FT-4). Pre-vote
+would eliminate split votes entirely by running a dry-run round before
+incrementing the term; without it, widening the jitter window is the
+next-best option.
+
+#### Presets
+
+Three builders are provided on `RaftTiming`:
+
+```rust
+RaftTiming::default()           // 500 / 1500 / 3000  — fast failover, dev default
+RaftTiming::prod_recommended()  // 500 / 2000 / 6000  — 3-node VPC, reliable network
+RaftTiming::flaky_network()     // 500 / 3000 / 12000 — cross-region / noisy neighbour
+```
+
+In a YAML manifest:
+
+```yaml
+cluster:
+  raft_timing:
+    heartbeat_ms: 500
+    election_min_ms: 2000
+    election_max_ms: 6000
+```
+
+Pick the preset that matches your network. If DOKS stress tests show
+stable `term` counters (no term churn under load), the default is fine.
+If you see frequent leadership changes without actual node failures,
+move up to `prod_recommended`. Only use `flaky_network` if your latency
+distribution has multi-second tails.
+
+### Connection retry and backoff — layering
+
+Aeon uses connection-retry with exponential backoff + jitter
+(`aeon_types::BackoffPolicy`), but the retry policy is layered
+intentionally. Understanding which layer retries is important when
+debugging slow failover or spurious elections.
+
+| Layer | Retries? | Notes |
+|-------|----------|-------|
+| **Connectors** (Kafka, MQTT, MongoDB CDC, NATS, RabbitMQ, …) | Yes | On transport error, back off and reconnect. Resets on any successful message/event so the next outage starts again at `initial_ms`. |
+| **Cluster bootstrap / join RPC** (`QuicEndpoint::connect_with_backoff`) | Yes (opt-in, bounded) | Seed node may still be starting; callers pass `BackoffPolicy` + `max_attempts`. |
+| **openraft Raft RPC path** (`QuicEndpoint::connect` plain) | **No — fail-fast** | openraft has its own protocol-level retry. Adding another retry layer here would block the Raft client task long enough to delay heartbeats and trigger spurious elections. This is a deliberate design decision. |
+| **Pipeline / sink writes** | Controlled by `BatchFailurePolicy` | Application concern (retry / skip / DLQ), decoupled from transport. |
+
+**If you see spurious leadership changes**, first check the Raft timing
+(above — widen the jitter window). Do **not** be tempted to add retries
+to `QuicNetworkConnection::append_entries` etc.; that will make the
+problem worse, not better.
 
 ### Starting a single-node instance
 

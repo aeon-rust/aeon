@@ -20,6 +20,7 @@ members = [
     "crates/aeon-cli",
     "samples/processors/rust-native",
     "samples/e2e-pipeline",
+    "xtask",
 ]
 
 [workspace.package]
@@ -32,7 +33,7 @@ homepage = "https://github.com/aeon-rust/aeon"
 
 [workspace.dependencies]
 # Core
-bytes = "1"
+bytes = { version = "1", features = ["serde"] }
 smallvec = "1"
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 thiserror = "2"
@@ -123,6 +124,7 @@ aeon-engine = { path = "crates/aeon-engine", version = "0.1.0" }
 aeon-connectors = { path = "crates/aeon-connectors", version = "0.1.0" }
 aeon-native-sdk = { path = "crates/aeon-native-sdk", version = "0.1.0" }
 aeon-crypto = { path = "crates/aeon-crypto", version = "0.1.0" }
+aeon-cluster = { path = "crates/aeon-cluster", version = "0.1.0" }
 aeon-observability = { path = "crates/aeon-observability", version = "0.1.0" }
 aeon-processor-client = { path = "crates/aeon-processor-client", version = "0.1.0" }
 aeon-wasm = { path = "crates/aeon-wasm", version = "0.1.0" }

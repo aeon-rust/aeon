@@ -18,7 +18,7 @@ path = "src/main.rs"
 [features]
 default = ["native-validate"]
 native-validate = ["aeon-engine/native-loader"]
-rest-api = ["aeon-engine/rest-api", "dep:tokio", "dep:tracing", "dep:tracing-subscriber", "dep:dashmap", "dep:notify", "dep:aeon-wasm", "dep:aeon-connectors", "dep:uuid", "dep:bytes"]
+rest-api = ["aeon-engine/rest-api", "aeon-engine/cluster", "dep:tokio", "dep:tracing", "dep:tracing-subscriber", "dep:dashmap", "dep:notify", "dep:aeon-wasm", "dep:aeon-connectors", "dep:uuid", "dep:bytes", "dep:aeon-cluster"]
 
 [dependencies]
 aeon-types = { workspace = true }
@@ -42,3 +42,9 @@ aeon-wasm = { workspace = true, optional = true }
 aeon-connectors = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
+aeon-cluster = { workspace = true, features = ["auto-tls"], optional = true }
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile = { workspace = true }

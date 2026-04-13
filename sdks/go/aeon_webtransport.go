@@ -39,7 +39,7 @@ import (
 // ConfigWT is the WebTransport-specific processor config. It mirrors
 // Config for T4 but adds TLS knobs and drops the "ws://" URL assumption.
 type ConfigWT struct {
-	// WebTransport URL (e.g. "https://localhost:4462"). Must be https://.
+	// WebTransport URL (e.g. "https://localhost:4472"). Must be https://.
 	URL string
 	// Processor name (must match a registered identity in Aeon).
 	Name string

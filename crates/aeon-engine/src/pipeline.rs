@@ -10,7 +10,9 @@
 
 use crate::affinity::{PipelineCores, pin_to_core, pipeline_core_assignment};
 use crate::batch_tuner::FlushTuner;
-use crate::checkpoint::{CheckpointRecord, CheckpointWriter};
+use crate::checkpoint::{
+    CheckpointPersist, CheckpointRecord, L3CheckpointStore, WalCheckpointStore,
+};
 use crate::delivery::{CheckpointBackend, DeliveryConfig};
 use crate::delivery_ledger::DeliveryLedger;
 use aeon_types::{
@@ -62,6 +64,41 @@ impl CorePinning {
     }
 }
 
+/// Proof-of-History configuration for a pipeline.
+///
+/// When enabled, the processor task appends each processed batch to a
+/// per-partition PoH chain (SHA-512 hash chain + Merkle tree of payloads).
+/// This provides cryptographic ordering proof and integrity for all events
+/// passing through the pipeline.
+#[cfg(feature = "processor-auth")]
+#[derive(Clone)]
+pub struct PohConfig {
+    /// Partition ID for this pipeline's PoH chain.
+    pub partition: PartitionId,
+    /// Maximum number of recent PoH entries kept in memory for verification.
+    /// Older entries are still tracked in the MMR (Merkle Mountain Range).
+    pub max_recent_entries: usize,
+    /// Optional Ed25519 signing key for signing Merkle roots.
+    /// Wrapped in Arc because SigningKey intentionally does not implement Clone
+    /// (it zeroizes on drop). Shared across processor task and config references.
+    pub signing_key: Option<Arc<aeon_crypto::signing::SigningKey>>,
+}
+
+#[cfg(feature = "processor-auth")]
+impl Default for PohConfig {
+    fn default() -> Self {
+        Self {
+            partition: PartitionId::new(0),
+            max_recent_entries: 1024,
+            signing_key: None,
+        }
+    }
+}
+
+/// Shared PoH chain state — accessible from the processor task and REST API.
+#[cfg(feature = "processor-auth")]
+pub type PohState = Arc<Mutex<aeon_crypto::poh::PohChain>>;
+
 /// Pipeline configuration.
 pub struct PipelineConfig {
     /// SPSC buffer capacity between source and processor.
@@ -76,6 +113,17 @@ pub struct PipelineConfig {
     /// Delivery configuration: strategy, semantics, failure policy, flush strategy, checkpoint.
     /// Default: OrderedBatch strategy, AtLeastOnce, RetryFailed, 1s flush, WAL checkpoint.
     pub delivery: DeliveryConfig,
+    /// Proof-of-History configuration. When `Some`, the processor task records
+    /// a hash chain of all processed batches for integrity verification.
+    #[cfg(feature = "processor-auth")]
+    pub poh: Option<PohConfig>,
+    /// FT-3: Optional L3 backend for `CheckpointBackend::StateStore`.
+    /// When `delivery.checkpoint.backend == StateStore`, the sink task
+    /// persists checkpoint records into this store under the `checkpoint/`
+    /// key prefix. Ignored for other backends. Typically the same
+    /// `Arc<dyn L3Store>` used for Raft log/snapshot (FT-1/FT-2), so the
+    /// whole node shares one durable handle.
+    pub l3_checkpoint_store: Option<Arc<dyn aeon_types::L3Store>>,
 }
 
 impl Default for PipelineConfig {
@@ -86,6 +134,9 @@ impl Default for PipelineConfig {
             max_batch_size: 1024,
             core_pinning: CorePinning::Disabled,
             delivery: DeliveryConfig::default(),
+            #[cfg(feature = "processor-auth")]
+            poh: None,
+            l3_checkpoint_store: None,
         }
     }
 }
@@ -101,6 +152,8 @@ pub struct PipelineMetrics {
     pub events_failed: AtomicU64,
     /// Individual retry attempts (each retry of a failed output counts as 1).
     pub events_retried: AtomicU64,
+    /// Number of PoH entries appended (one per processed batch when PoH is enabled).
+    pub poh_entries: AtomicU64,
 }
 
 impl PipelineMetrics {
@@ -112,6 +165,7 @@ impl PipelineMetrics {
             checkpoints_written: AtomicU64::new(0),
             events_failed: AtomicU64::new(0),
             events_retried: AtomicU64::new(0),
+            poh_entries: AtomicU64::new(0),
         }
     }
 }
@@ -119,6 +173,91 @@ impl PipelineMetrics {
 impl Default for PipelineMetrics {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Create a shared PoH chain from pipeline config.
+/// Returns `None` if PoH is disabled or the feature is not compiled.
+#[cfg(feature = "processor-auth")]
+pub fn create_poh_state(config: &PipelineConfig) -> Option<PohState> {
+    config.poh.as_ref().map(|poh_config| {
+        Arc::new(Mutex::new(aeon_crypto::poh::PohChain::new(
+            poh_config.partition,
+            poh_config.max_recent_entries,
+        )))
+    })
+}
+
+/// TR-2: Transfer host-side state from an outgoing processor into an
+/// incoming one on hot-swap (drain-and-swap / blue-green cutover / canary
+/// completion). No-op for stateless processors — the default trait impls
+/// return an empty snapshot and accept an empty restore.
+///
+/// Errors are logged and swallowed: we never want a snapshot/restore failure
+/// to kill the processor task loop, because that would stall the whole
+/// pipeline on what should be a best-effort state copy. Guest state loss is
+/// strictly worse than no transfer at all — but pipeline death is worse
+/// again.
+fn transfer_processor_state(
+    from: &(dyn Processor + Send + Sync),
+    to: &(dyn Processor + Send + Sync),
+) {
+    match from.snapshot_state() {
+        Ok(snap) => {
+            if snap.is_empty() {
+                // Stateless — skip the restore call entirely to avoid the
+                // (equally no-op) trait-default work.
+                return;
+            }
+            let key_count = snap.len();
+            if let Err(e) = to.restore_state(snap) {
+                tracing::warn!(
+                    error = %e,
+                    key_count,
+                    "TR-2 processor state restore failed during swap; new instance starts fresh"
+                );
+            } else {
+                tracing::info!(key_count, "TR-2 transferred processor state on swap");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "TR-2 processor state snapshot failed during swap; new instance starts fresh"
+            );
+        }
+    }
+}
+
+/// Append a batch of output payloads to the PoH chain.
+///
+/// Called in the processor task after `process_batch()`. Extracts payload bytes
+/// from each output, builds a Merkle tree, and extends the hash chain.
+#[cfg(feature = "processor-auth")]
+async fn poh_append_batch(
+    poh_state: &PohState,
+    outputs: &[Output],
+    signing_key: &Option<Arc<aeon_crypto::signing::SigningKey>>,
+    metrics: &PipelineMetrics,
+) {
+    if outputs.is_empty() {
+        return;
+    }
+    let payload_refs: Vec<&[u8]> = outputs.iter().map(|o| o.payload.as_ref()).collect();
+    let timestamp_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as i64;
+    let mut chain = poh_state.lock().await;
+    if chain
+        .append_batch(
+            &payload_refs,
+            timestamp_nanos,
+            signing_key.as_ref().map(|k| k.as_ref()),
+        )
+        .is_some()
+    {
+        metrics.poh_entries.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -381,6 +520,12 @@ where
 {
     let core_assignment = config.core_pinning.resolve();
 
+    // Initialize PoH chain if configured
+    #[cfg(feature = "processor-auth")]
+    let poh_state = create_poh_state(&config);
+    #[cfg(feature = "processor-auth")]
+    let poh_signing_key = config.poh.as_ref().and_then(|c| c.signing_key.clone());
+
     let (mut src_prod, mut src_cons) =
         rtrb::RingBuffer::<Vec<Event>>::new(config.source_buffer_capacity);
     let (mut sink_prod, sink_cons) =
@@ -427,6 +572,10 @@ where
     let shutdown_proc = Arc::clone(&shutdown);
     let metrics_proc = Arc::clone(&metrics);
     let processor = Arc::new(processor);
+    #[cfg(feature = "processor-auth")]
+    let poh_proc = poh_state.clone();
+    #[cfg(feature = "processor-auth")]
+    let poh_key_proc = poh_signing_key.clone();
 
     // Processor task: pop events, process, push outputs
     let proc_core = core_assignment.map(|c| c.processor);
@@ -445,6 +594,12 @@ where
                     metrics_proc
                         .events_processed
                         .fetch_add(count, Ordering::Relaxed);
+
+                    // PoH: append batch to hash chain if enabled
+                    #[cfg(feature = "processor-auth")]
+                    if let Some(ref poh) = poh_proc {
+                        poh_append_batch(poh, &outputs, &poh_key_proc, &metrics_proc).await;
+                    }
 
                     // Push outputs into sink buffer
                     let mut pending = Some(outputs);
@@ -536,6 +691,12 @@ where
 {
     let core_assignment = config.core_pinning.resolve();
 
+    // Initialize PoH chain if configured
+    #[cfg(feature = "processor-auth")]
+    let poh_state = create_poh_state(&config);
+    #[cfg(feature = "processor-auth")]
+    let poh_signing_key = config.poh.as_ref().and_then(|c| c.signing_key.clone());
+
     let (mut src_prod, mut src_cons) =
         rtrb::RingBuffer::<Vec<Event>>::new(config.source_buffer_capacity);
     let (mut sink_prod, sink_cons) =
@@ -579,6 +740,10 @@ where
 
     let shutdown_proc = Arc::clone(&shutdown);
     let metrics_proc = Arc::clone(&metrics);
+    #[cfg(feature = "processor-auth")]
+    let poh_proc = poh_state.clone();
+    #[cfg(feature = "processor-auth")]
+    let poh_key_proc = poh_signing_key.clone();
 
     // Processor task — the single difference from run_buffered. Calls
     // `transport.call_batch(events).await` instead of the synchronous
@@ -601,6 +766,12 @@ where
                     metrics_proc
                         .events_processed
                         .fetch_add(count, Ordering::Relaxed);
+
+                    // PoH: append batch to hash chain if enabled
+                    #[cfg(feature = "processor-auth")]
+                    if let Some(ref poh) = poh_proc {
+                        poh_append_batch(poh, &outputs, &poh_key_proc, &metrics_proc).await;
+                    }
 
                     let mut pending = Some(outputs);
                     while let Some(batch) = pending.take() {
@@ -652,26 +823,54 @@ where
 /// `run_buffered_transport` so the two call sites can spawn `run_sink_task`
 /// with identical setup.
 fn build_sink_task_ctx(config: &PipelineConfig, core: Option<usize>) -> SinkTaskCtx {
-    // Initialize checkpoint writer if WAL backend is configured.
-    let checkpoint_writer = if config.delivery.checkpoint.backend == CheckpointBackend::Wal {
-        let dir = config.delivery.checkpoint.dir.clone().unwrap_or_else(|| {
-            std::env::var("AEON_CHECKPOINT_DIR")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|_| std::env::temp_dir().join("aeon-checkpoints"))
-        });
-        let wal_path = dir.join("pipeline.wal");
-        match CheckpointWriter::new(&wal_path) {
-            Ok(writer) => {
-                tracing::info!(path = %wal_path.display(), "Checkpoint WAL initialized");
-                Some(writer)
-            }
-            Err(e) => {
-                tracing::warn!("Checkpoint WAL init failed: {e}, continuing without checkpoints");
-                None
+    // Initialize the checkpoint persister. FT-3: the concrete backend is
+    // chosen by `CheckpointBackend`; `None`/`Kafka` yield no persister for
+    // now (Kafka-topic checkpointing is a separate follow-up).
+    let checkpoint_writer: Option<Box<dyn CheckpointPersist>> = match config
+        .delivery
+        .checkpoint
+        .backend
+    {
+        CheckpointBackend::Wal => {
+            let dir = config.delivery.checkpoint.dir.clone().unwrap_or_else(|| {
+                std::env::var("AEON_CHECKPOINT_DIR")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|_| std::env::temp_dir().join("aeon-checkpoints"))
+            });
+            let wal_path = dir.join("pipeline.wal");
+            match WalCheckpointStore::open(&wal_path) {
+                Ok(writer) => {
+                    tracing::info!(path = %wal_path.display(), "Checkpoint WAL initialized");
+                    Some(Box::new(writer) as Box<dyn CheckpointPersist>)
+                }
+                Err(e) => {
+                    tracing::warn!("Checkpoint WAL init failed: {e}, continuing without checkpoints");
+                    None
+                }
             }
         }
-    } else {
-        None
+        CheckpointBackend::StateStore => match &config.l3_checkpoint_store {
+            Some(l3) => match L3CheckpointStore::open(Arc::clone(l3)) {
+                Ok(store) => {
+                    tracing::info!("Checkpoint L3 store initialized");
+                    Some(Box::new(store) as Box<dyn CheckpointPersist>)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Checkpoint L3 store init failed: {e}, continuing without checkpoints"
+                    );
+                    None
+                }
+            },
+            None => {
+                tracing::warn!(
+                    "CheckpointBackend::StateStore configured but no l3_checkpoint_store provided; \
+                     continuing without checkpoints"
+                );
+                None
+            }
+        },
+        CheckpointBackend::Kafka | CheckpointBackend::None => None,
     };
 
     SinkTaskCtx {
@@ -756,6 +955,9 @@ where
             max_batch_size: config.pipeline.max_batch_size,
             core_pinning: CorePinning::Disabled,
             delivery: config.pipeline.delivery.clone(),
+            #[cfg(feature = "processor-auth")]
+            poh: config.pipeline.poh.clone(),
+            l3_checkpoint_store: config.pipeline.l3_checkpoint_store.clone(),
         };
 
         if let Some(ref assignments) = core_assignments {
@@ -825,7 +1027,7 @@ struct SinkTaskCtx {
     failure_policy: BatchFailurePolicy,
     max_retries: u32,
     retry_backoff: Duration,
-    checkpoint_writer: Option<CheckpointWriter>,
+    checkpoint_writer: Option<Box<dyn CheckpointPersist>>,
 }
 
 /// Shared sink task body for `run_buffered` / `run_buffered_transport`.
@@ -1122,7 +1324,7 @@ fn credit_pending_on_flush(
 
 /// Write a checkpoint record with ledger-populated offsets and pending IDs.
 fn write_checkpoint(
-    ckpt_writer: &mut Option<CheckpointWriter>,
+    ckpt_writer: &mut Option<Box<dyn CheckpointPersist>>,
     ledger: &Option<Arc<DeliveryLedger>>,
     metrics: &Arc<PipelineMetrics>,
     delivered: &mut u64,
@@ -1397,6 +1599,12 @@ where
 {
     let core_assignment = config.core_pinning.resolve();
 
+    // Initialize PoH chain if configured
+    #[cfg(feature = "processor-auth")]
+    let poh_state = create_poh_state(&config);
+    #[cfg(feature = "processor-auth")]
+    let poh_signing_key = config.poh.as_ref().and_then(|c| c.signing_key.clone());
+
     let (mut src_prod, mut src_cons) =
         rtrb::RingBuffer::<Vec<Event>>::new(config.source_buffer_capacity);
     let (mut sink_prod, sink_cons) =
@@ -1466,6 +1674,10 @@ where
     let shutdown_proc = Arc::clone(&shutdown);
     let metrics_proc = Arc::clone(&metrics);
     let control_proc = Arc::clone(&control);
+    #[cfg(feature = "processor-auth")]
+    let poh_proc = poh_state.clone();
+    #[cfg(feature = "processor-auth")]
+    let poh_key_proc = poh_signing_key.clone();
 
     // Processor task: pops events, processes, pushes outputs.
     // Supports three modes:
@@ -1497,6 +1709,11 @@ where
                         }
                         UpgradeAction::CutoverBlueGreen => {
                             if let Some(green) = green_processor.take() {
+                                // TR-2: transfer host-side state from blue → green.
+                                transfer_processor_state(
+                                    current_processor.as_ref(),
+                                    green.as_ref(),
+                                );
                                 current_processor = green;
                             }
                             control_proc.upgrade_action_complete.notify_one();
@@ -1512,6 +1729,11 @@ where
                         }
                         UpgradeAction::CompleteCanary => {
                             if let Some(canary) = canary_processor.take() {
+                                // TR-2: transfer host-side state from baseline → canary.
+                                transfer_processor_state(
+                                    current_processor.as_ref(),
+                                    canary.as_ref(),
+                                );
                                 current_processor = canary;
                             }
                             control_proc.canary_pct.store(0, Ordering::Release);
@@ -1583,6 +1805,12 @@ where
                         .events_processed
                         .fetch_add(count, Ordering::Relaxed);
 
+                    // PoH: append batch to hash chain if enabled
+                    #[cfg(feature = "processor-auth")]
+                    if let Some(ref poh) = poh_proc {
+                        poh_append_batch(poh, &outputs, &poh_key_proc, &metrics_proc).await;
+                    }
+
                     let mut pending = Some(outputs);
                     while let Some(batch) = pending.take() {
                         match sink_prod.push(batch) {
@@ -1621,6 +1849,14 @@ where
                                 {
                                     let mut slot = control_proc.new_processor.lock().await;
                                     if let Some(new_proc) = slot.take() {
+                                        // TR-2: transfer host-side state from
+                                        // old → new. Pipeline is already quiesced
+                                        // (paused + both rings empty) so no
+                                        // events race the snapshot.
+                                        transfer_processor_state(
+                                            current_processor.as_ref(),
+                                            new_proc.as_ref(),
+                                        );
                                         current_processor = new_proc;
                                         control_proc.swap_complete.notify_one();
                                         break;
@@ -3545,5 +3781,225 @@ mod tests {
         source_shutdown.store(true, Ordering::Release);
         shutdown.store(true, Ordering::Release);
         let _ = pipeline_handle.await;
+    }
+
+    // ── PoH integration tests ────────────────────────────────────────────
+
+    #[cfg(feature = "processor-auth")]
+    mod poh_tests {
+        use super::*;
+        use crate::delivery_ledger::DeliveryLedger;
+
+        type Ledger = Option<Arc<DeliveryLedger>>;
+        const NO_LEDGER: Ledger = None;
+
+        #[tokio::test]
+        async fn run_buffered_with_poh_records_chain() {
+            let events = make_events(50);
+            let source = MemorySource::new(events, 16);
+            let processor = PassthroughProcessor::new(Arc::from("output"));
+            let sink = BlackholeSink::new();
+            let config = PipelineConfig {
+                poh: Some(PohConfig {
+                    partition: PartitionId::new(7),
+                    max_recent_entries: 256,
+                    signing_key: None,
+                }),
+                ..PipelineConfig::default()
+            };
+            let metrics = Arc::new(PipelineMetrics::new());
+            let shutdown = Arc::new(AtomicBool::new(false));
+
+            run_buffered(
+                source,
+                processor,
+                sink,
+                config,
+                Arc::clone(&metrics),
+                shutdown,
+                NO_LEDGER,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(metrics.events_processed.load(Ordering::Relaxed), 50);
+            assert!(
+                metrics.poh_entries.load(Ordering::Relaxed) > 0,
+                "poh_entries should be > 0 after processing with PoH enabled"
+            );
+        }
+
+        #[tokio::test]
+        async fn run_buffered_without_poh_no_entries() {
+            let events = make_events(50);
+            let source = MemorySource::new(events, 16);
+            let processor = PassthroughProcessor::new(Arc::from("output"));
+            let sink = BlackholeSink::new();
+            let config = PipelineConfig::default(); // poh: None
+            let metrics = Arc::new(PipelineMetrics::new());
+            let shutdown = Arc::new(AtomicBool::new(false));
+
+            run_buffered(
+                source,
+                processor,
+                sink,
+                config,
+                Arc::clone(&metrics),
+                shutdown,
+                NO_LEDGER,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(metrics.events_processed.load(Ordering::Relaxed), 50);
+            assert_eq!(
+                metrics.poh_entries.load(Ordering::Relaxed),
+                0,
+                "poh_entries should be 0 when PoH is disabled"
+            );
+        }
+
+        #[tokio::test]
+        async fn poh_chain_integrity_after_pipeline() {
+            let events = make_events(100);
+            let source = MemorySource::new(events, 10);
+            let processor = PassthroughProcessor::new(Arc::from("output"));
+            let sink = BlackholeSink::new();
+
+            let config = PipelineConfig {
+                poh: Some(PohConfig {
+                    partition: PartitionId::new(3),
+                    max_recent_entries: 256,
+                    signing_key: None,
+                }),
+                ..PipelineConfig::default()
+            };
+            let metrics = Arc::new(PipelineMetrics::new());
+            let shutdown = Arc::new(AtomicBool::new(false));
+
+            run_buffered(
+                source,
+                processor,
+                sink,
+                config,
+                Arc::clone(&metrics),
+                shutdown,
+                NO_LEDGER,
+            )
+            .await
+            .unwrap();
+
+            let poh_count = metrics.poh_entries.load(Ordering::Relaxed);
+            assert!(poh_count > 0, "should have PoH entries, got {poh_count}");
+        }
+
+        #[tokio::test]
+        async fn poh_with_signing_key() {
+            let signing_key = aeon_crypto::signing::SigningKey::generate();
+            let events = make_events(20);
+            let source = MemorySource::new(events, 10);
+            let processor = PassthroughProcessor::new(Arc::from("output"));
+            let sink = BlackholeSink::new();
+
+            let config = PipelineConfig {
+                poh: Some(PohConfig {
+                    partition: PartitionId::new(0),
+                    max_recent_entries: 64,
+                    signing_key: Some(Arc::new(signing_key)),
+                }),
+                ..PipelineConfig::default()
+            };
+            let metrics = Arc::new(PipelineMetrics::new());
+            let shutdown = Arc::new(AtomicBool::new(false));
+
+            run_buffered(
+                source,
+                processor,
+                sink,
+                config,
+                Arc::clone(&metrics),
+                shutdown,
+                NO_LEDGER,
+            )
+            .await
+            .unwrap();
+
+            assert!(metrics.poh_entries.load(Ordering::Relaxed) > 0);
+        }
+
+        #[tokio::test]
+        async fn create_poh_state_returns_none_when_disabled() {
+            let config = PipelineConfig::default();
+            assert!(create_poh_state(&config).is_none());
+        }
+
+        #[tokio::test]
+        async fn create_poh_state_returns_some_when_enabled() {
+            let config = PipelineConfig {
+                poh: Some(PohConfig::default()),
+                ..PipelineConfig::default()
+            };
+            let state = create_poh_state(&config);
+            assert!(state.is_some());
+
+            let binding = state.unwrap();
+            let chain = binding.lock().await;
+            assert_eq!(chain.partition(), PartitionId::new(0));
+            assert_eq!(chain.sequence(), 0);
+        }
+
+        #[tokio::test]
+        async fn poh_append_batch_helper_works() {
+            let poh = Arc::new(Mutex::new(
+                aeon_crypto::poh::PohChain::new(PartitionId::new(0), 64),
+            ));
+            let metrics = PipelineMetrics::new();
+
+            let dest: Arc<str> = Arc::from("output");
+            let outputs = vec![
+                Output {
+                    destination: Arc::clone(&dest),
+                    key: None,
+                    payload: Bytes::from("hello"),
+                    headers: smallvec::smallvec![],
+                    source_ts: None,
+                    source_event_id: None,
+                    source_partition: None,
+                    source_offset: None,
+                },
+                Output {
+                    destination: Arc::clone(&dest),
+                    key: None,
+                    payload: Bytes::from("world"),
+                    headers: smallvec::smallvec![],
+                    source_ts: None,
+                    source_event_id: None,
+                    source_partition: None,
+                    source_offset: None,
+                },
+            ];
+
+            poh_append_batch(&poh, &outputs, &None, &metrics).await;
+            assert_eq!(metrics.poh_entries.load(Ordering::Relaxed), 1);
+
+            let chain = poh.lock().await;
+            assert_eq!(chain.sequence(), 1);
+            assert_eq!(chain.recent_entries().len(), 1);
+            assert_eq!(chain.recent_entries()[0].batch_size, 2);
+        }
+
+        #[tokio::test]
+        async fn poh_append_empty_batch_noop() {
+            let poh = Arc::new(Mutex::new(
+                aeon_crypto::poh::PohChain::new(PartitionId::new(0), 64),
+            ));
+            let metrics = PipelineMetrics::new();
+
+            poh_append_batch(&poh, &[], &None, &metrics).await;
+            assert_eq!(metrics.poh_entries.load(Ordering::Relaxed), 0);
+
+            let chain = poh.lock().await;
+            assert_eq!(chain.sequence(), 0);
+        }
     }
 }

@@ -11,6 +11,9 @@
 > Docker installation methods are designed; `cargo install aeon-cli` and Docker Hub
 > images are not yet published (see `docs/PUBLISHING.md`). Currently, Aeon runs from
 > source via `cargo run` or `cargo build --release`.
+>
+> **Build from source**: See [`docs/BUILD-FROM-SOURCE.md`](BUILD-FROM-SOURCE.md) for
+> per-platform prerequisites, build commands, and verification steps.
 
 ---
 
@@ -48,7 +51,47 @@ The three ports serve three distinct security boundaries:
 └─────────────────────────────────────────────────────────┘
 ```
 
-### 1.2 Port Conflict Reference
+### 1.2 Additional Port Needs — Reserved Range 4473–4483
+
+The three defaults (4470/4471/4472) cover every built-in Aeon surface. Some
+deployments need extra listeners — e.g. a **WebTransport source connector**
+that accepts streams from external systems, which cannot share 4472 with the
+T3 processor host on the same node.
+
+For those cases we recommend picking sequentially from **4473–4483**. Rationale:
+
+- The entire `4473–4483` range is **unassigned on both TCP and UDP** in the
+  IANA service-name registry (NTS-KE sits at 4460/tcp; the next registered
+  port is 4484/tcp for hpssmgmt). Verified clean.
+- Sharing the `447x` prefix with Aeon's defaults keeps operational know-how
+  consistent — firewall rules, Kubernetes NetworkPolicy selectors, and mental
+  models all stay tidy.
+- Sequential allocation makes port roles memorable.
+
+Suggested allocation order (none of these are hardcoded — these are just the
+numbers we use in examples and docs):
+
+| Port | Proto | Suggested use |
+|------|-------|---------------|
+| 4473 | UDP | Second WebTransport listener — WT source connector (streams) |
+| 4474 | UDP | Third WebTransport listener — WT source connector (datagrams) |
+| 4475 | UDP | Additional QUIC-based source/sink |
+| 4476 | TCP | Secondary REST/WS listener (e.g., internal-only admin API) |
+| 4477–4483 | either | Reserved for future tier extensions |
+
+**When to deviate:** if your environment has another application on any of
+these ports, pick a different free port. Nothing in Aeon checks the `447x`
+prefix — these are documentation conventions, not enforced constraints. The
+only hard rule is **don't collide with 4470/4471/4472** on the same node,
+because those are bound by Aeon's built-in listeners.
+
+**`aeon doctor`** probes the canonical triplet (4470/UDP, 4471/TCP, 4472/UDP)
+with the correct L4 protocol. To audit additional ports from the reserved
+range, pass them via your manifest and run `aeon doctor --manifest
+path/to/manifest.yaml` — the manifest walker will flag unresolvable artifact
+paths and other config issues.
+
+### 1.3 Port Conflict Reference
 
 Applications whose default ports were explicitly avoided:
 

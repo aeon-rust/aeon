@@ -18,7 +18,7 @@ use aeon_types::awpp::{
     RejectedPayload,
 };
 use aeon_types::error::AeonError;
-use aeon_types::event::Output;
+use aeon_types::event::{Event, Output};
 use aeon_types::transport_codec::TransportCodec;
 
 #[cfg(feature = "processor-auth")]
@@ -89,11 +89,17 @@ impl SessionState {
 /// through the pipeline processor task.
 pub const DEFAULT_MAX_INFLIGHT_BATCHES: usize = 1024;
 
-/// A pending batch slot: the oneshot responder plus the semaphore permit
-/// that reserves its capacity. The permit is dropped when the entry is
-/// removed from the map, releasing the slot for the next `start_batch`.
+/// A pending batch slot: the oneshot responder, the original event batch
+/// (retained so it can be replayed on reconnect — TR-1), and the semaphore
+/// permit that reserves its capacity. The permit is dropped when the entry
+/// is removed from the map, releasing the slot for the next `start_batch`.
+///
+/// Events are carried as `Arc<Vec<Event>>` so retention is a refcount bump
+/// rather than a payload copy — the transport encoder already has the
+/// events by reference, and the replay path needs the same allocation.
 type PendingSlot = (
     oneshot::Sender<Result<Vec<Output>, AeonError>>,
+    Arc<Vec<Event>>,
     OwnedSemaphorePermit,
 );
 
@@ -129,12 +135,20 @@ impl BatchInflight {
 
     /// Allocate a batch_id and return the receiver for the eventual response.
     ///
+    /// The `events` handle is retained inside the pending map so disconnect
+    /// handlers can drain the in-flight batches for replay (TR-1) rather
+    /// than losing them. Callers should pass the same `Arc<Vec<Event>>` they
+    /// serialize onto the wire — retention is a refcount bump, not a copy.
+    ///
     /// Awaits a semaphore permit first — if the session already has
     /// `max_inflight` batches outstanding, the caller suspends until an
     /// earlier batch completes (or is cancelled). The permit is held inside
     /// the pending map and released automatically when the batch completes
-    /// or is cancelled via `complete_batch` / `cancel_all`.
-    pub async fn start_batch(&self) -> (u64, oneshot::Receiver<Result<Vec<Output>, AeonError>>) {
+    /// or is cancelled via `complete_batch` / `cancel_all` / `drain_for_replay`.
+    pub async fn start_batch(
+        &self,
+        events: Arc<Vec<Event>>,
+    ) -> (u64, oneshot::Receiver<Result<Vec<Output>, AeonError>>) {
         // A closed semaphore is only possible during shutdown. If that
         // happens we fall back to an immediately-cancelled receiver so the
         // caller sees a clean error instead of panicking.
@@ -148,7 +162,7 @@ impl BatchInflight {
         };
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
-        self.pending.insert(id, (tx, permit));
+        self.pending.insert(id, (tx, events, permit));
         (id, rx)
     }
 
@@ -158,7 +172,7 @@ impl BatchInflight {
     /// Dropping the stored `OwnedSemaphorePermit` releases a slot so the
     /// next `start_batch` caller can proceed.
     pub fn complete_batch(&self, batch_id: u64, result: Result<Vec<Output>, AeonError>) -> bool {
-        if let Some((_, (tx, _permit))) = self.pending.remove(&batch_id) {
+        if let Some((_, (tx, _events, _permit))) = self.pending.remove(&batch_id) {
             let _ = tx.send(result);
             true
         } else {
@@ -171,6 +185,16 @@ impl BatchInflight {
         self.pending.len() as u32
     }
 
+    /// Sum of event counts across all in-flight batches. Used by metrics and
+    /// disconnect-handling logs so operators see exactly how many events were
+    /// retained for replay (or lost, if replay is disabled).
+    pub fn inflight_event_count(&self) -> u64 {
+        self.pending
+            .iter()
+            .map(|e| e.value().1.len() as u64)
+            .sum()
+    }
+
     /// Number of permits currently available — i.e., how many additional
     /// batches can be started before `start_batch` begins to block.
     pub fn available_permits(&self) -> usize {
@@ -181,8 +205,244 @@ impl BatchInflight {
     pub fn cancel_all(&self) {
         let keys: Vec<u64> = self.pending.iter().map(|e| *e.key()).collect();
         for key in keys {
-            if let Some((_, (tx, _permit))) = self.pending.remove(&key) {
+            if let Some((_, (tx, _events, _permit))) = self.pending.remove(&key) {
                 let _ = tx.send(Err(AeonError::connection("session closed")));
+            }
+        }
+    }
+
+    /// Drain all in-flight batches for replay (TR-1). Removes every pending
+    /// entry and returns `(batch_id, events, oneshot_sender)` tuples — the
+    /// oneshot senders are **not** signalled, so the pipeline callers remain
+    /// parked awaiting their responses. A reconnect orchestrator can then
+    /// re-submit the events on a new session and forward the response via
+    /// the returned `oneshot::Sender` when it arrives.
+    ///
+    /// Batches returned in ascending `batch_id` order so replay preserves
+    /// original submission order. Drop the `Sender` to fail the waiting
+    /// caller if replay is abandoned (the oneshot closes with
+    /// `RecvError::Closed`).
+    #[must_use = "dropped senders fail the waiting pipeline callers — wire them to replay or to final error"]
+    pub fn drain_for_replay(&self) -> Vec<InflightBatch> {
+        let mut keys: Vec<u64> = self.pending.iter().map(|e| *e.key()).collect();
+        keys.sort_unstable();
+        let mut out = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let Some((_, (tx, events, permit))) = self.pending.remove(&key) {
+                out.push(InflightBatch {
+                    batch_id: key,
+                    events,
+                    responder: tx,
+                    _permit: permit,
+                });
+            }
+        }
+        out
+    }
+}
+
+/// A batch drained from `BatchInflight::drain_for_replay`. Holds the original
+/// events and the oneshot responder so a reconnect orchestrator can re-submit
+/// the batch on a new session and forward the response to the waiting caller.
+///
+/// The `_permit` field keeps the original session's permit alive until this
+/// struct is dropped — dropping it releases the slot on the **old** session's
+/// semaphore, which is harmless because that session is closing anyway.
+pub struct InflightBatch {
+    pub batch_id: u64,
+    pub events: Arc<Vec<Event>>,
+    pub responder: oneshot::Sender<Result<Vec<Output>, AeonError>>,
+    _permit: OwnedSemaphorePermit,
+}
+
+// ── Replay Orchestrator (TR-1 Stage 2) ──────────────────────────────────
+
+/// Replay bucket key: `(fingerprint, pipeline, partition)`.
+///
+/// Batches are stashed per identity-pipeline-partition so a reconnect
+/// arriving with the same ED25519 fingerprint and covering the same
+/// partition picks up exactly the batches that were mid-flight when the
+/// prior session dropped.
+pub type ReplayKey = (String, String, u16);
+
+struct ReplayBucket {
+    batches: Vec<InflightBatch>,
+    expires_at: Instant,
+}
+
+/// Host-level orchestrator for TR-1 replay-on-reconnect.
+///
+/// When a processor session disconnects with in-flight batches, the host
+/// calls [`ReplayOrchestrator::stash`]. The batches live in identity-keyed
+/// buckets for `replay_window`. If a new session arrives with the same
+/// fingerprint and is assigned the same pipeline+partition, the host
+/// calls [`ReplayOrchestrator::take`] to re-submit them on the new session
+/// — the original pipeline callers remain parked on their oneshot receivers
+/// and get the replayed response transparently.
+///
+/// If the replay window elapses without a matching reconnect, a background
+/// sweep fails each stashed batch's oneshot with a `connection` error so
+/// pipeline callers unblock.
+pub struct ReplayOrchestrator {
+    buckets: Arc<DashMap<ReplayKey, ReplayBucket>>,
+    replay_window: Duration,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ReplayOrchestrator {
+    /// Create a new orchestrator and spawn its expiry-sweep task.
+    ///
+    /// `replay_window` is how long a disconnected processor has to
+    /// reconnect before its stashed batches are failed. Typical value is
+    /// 30s — long enough to ride out a transient network glitch, short
+    /// enough that a permanently-dead processor doesn't park pipeline
+    /// callers forever.
+    pub fn new(replay_window: Duration) -> Arc<Self> {
+        let buckets: Arc<DashMap<ReplayKey, ReplayBucket>> = Arc::new(DashMap::new());
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let orchestrator = Arc::new(Self {
+            buckets: Arc::clone(&buckets),
+            replay_window,
+            shutdown: Arc::clone(&shutdown),
+        });
+
+        // Sweep cadence: quarter of the window, clamped to [100ms, 5s].
+        // Short enough that expired buckets don't linger, long enough that
+        // idle hosts don't burn CPU on empty scans.
+        let interval = replay_window
+            .checked_div(4)
+            .unwrap_or(Duration::from_secs(1))
+            .max(Duration::from_millis(100))
+            .min(Duration::from_secs(5));
+
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                if shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
+                let now = Instant::now();
+                let expired: Vec<ReplayKey> = buckets
+                    .iter()
+                    .filter(|e| e.value().expires_at <= now)
+                    .map(|e| e.key().clone())
+                    .collect();
+                for key in expired {
+                    if let Some((_, bucket)) = buckets.remove(&key) {
+                        tracing::warn!(
+                            fingerprint = %key.0,
+                            pipeline = %key.1,
+                            partition = key.2,
+                            batches = bucket.batches.len(),
+                            "TR-1 replay window expired — failing stashed batches"
+                        );
+                        for b in bucket.batches {
+                            let _ = b.responder.send(Err(AeonError::connection(
+                                "TR-1 replay window expired before processor reconnected",
+                            )));
+                        }
+                    }
+                }
+            }
+        });
+
+        orchestrator
+    }
+
+    /// Configured replay window.
+    pub fn replay_window(&self) -> Duration {
+        self.replay_window
+    }
+
+    /// Stash in-flight batches from a disconnected session. Returns the
+    /// number of batches stashed.
+    ///
+    /// Drains `session.batch_inflight` and bucketizes by (fingerprint,
+    /// pipeline, partition). Partition comes from `events[0].partition`
+    /// in each batch; pipeline is the session's assignment that contains
+    /// that partition. A batch whose events list is empty, or whose
+    /// partition isn't in any assignment, falls into the empty-pipeline
+    /// bucket and will only be reclaimed by a matching reconnect if the
+    /// caller also supplies empty strings — in practice this only happens
+    /// in tests.
+    pub fn stash(&self, session: &AwppSession) -> usize {
+        let drained = session.batch_inflight.drain_for_replay();
+        let expires_at = Instant::now() + self.replay_window;
+        let count = drained.len();
+        for batch in drained {
+            let partition = batch
+                .events
+                .first()
+                .map(|e| e.partition.as_u16())
+                .unwrap_or(0);
+            let pipeline = session
+                .pipeline_assignments
+                .iter()
+                .find(|a| a.partitions.contains(&partition))
+                .map(|a| a.name.clone())
+                .unwrap_or_default();
+            let key = (session.fingerprint.clone(), pipeline, partition);
+            let mut entry = self.buckets.entry(key).or_insert_with(|| ReplayBucket {
+                batches: Vec::new(),
+                expires_at,
+            });
+            entry.batches.push(batch);
+            // Refresh expiry so late-arriving batches don't inherit a stale deadline.
+            entry.expires_at = expires_at;
+        }
+        count
+    }
+
+    /// Remove and return stashed batches matching `(fingerprint,
+    /// pipeline, partition)`. Caller re-submits them on the new session.
+    ///
+    /// Returns `None` if no bucket matches, or if the bucket matches but
+    /// the replay window has already elapsed — in the latter case the
+    /// stashed responders are failed before the bucket is dropped so
+    /// pipeline callers unblock.
+    pub fn take(
+        &self,
+        fingerprint: &str,
+        pipeline: &str,
+        partition: u16,
+    ) -> Option<Vec<InflightBatch>> {
+        let key = (fingerprint.to_string(), pipeline.to_string(), partition);
+        let (_, bucket) = self.buckets.remove(&key)?;
+        if Instant::now() >= bucket.expires_at {
+            for b in bucket.batches {
+                let _ = b.responder.send(Err(AeonError::connection(
+                    "TR-1 replay window expired before processor reconnected",
+                )));
+            }
+            return None;
+        }
+        Some(bucket.batches)
+    }
+
+    /// Number of stashed buckets currently held.
+    pub fn bucket_count(&self) -> usize {
+        self.buckets.len()
+    }
+
+    /// Sum of stashed batches across all buckets.
+    pub fn stashed_batch_count(&self) -> usize {
+        self.buckets.iter().map(|e| e.value().batches.len()).sum()
+    }
+}
+
+impl Drop for ReplayOrchestrator {
+    fn drop(&mut self) {
+        // Stop the sweep task on the next tick.
+        self.shutdown.store(true, Ordering::Relaxed);
+        // Fail any remaining buckets so waiters don't leak past host shutdown.
+        let keys: Vec<ReplayKey> = self.buckets.iter().map(|e| e.key().clone()).collect();
+        for key in keys {
+            if let Some((_, bucket)) = self.buckets.remove(&key) {
+                for b in bucket.batches {
+                    let _ = b.responder.send(Err(AeonError::connection(
+                        "replay orchestrator shut down",
+                    )));
+                }
             }
         }
     }
@@ -469,10 +729,32 @@ pub fn serialize_control_message(msg: &ControlMessage) -> Result<Vec<u8>, AeonEr
 mod tests {
     use super::*;
 
+    fn empty_events() -> Arc<Vec<Event>> {
+        Arc::new(Vec::new())
+    }
+
+    fn sample_events(count: usize) -> Arc<Vec<Event>> {
+        use aeon_types::PartitionId;
+        use bytes::Bytes;
+        let src: Arc<str> = Arc::from("t");
+        let vec: Vec<Event> = (0..count)
+            .map(|i| {
+                Event::new(
+                    uuid::Uuid::nil(),
+                    i as i64,
+                    Arc::clone(&src),
+                    PartitionId::new(0),
+                    Bytes::from_static(b"x"),
+                )
+            })
+            .collect();
+        Arc::new(vec)
+    }
+
     #[tokio::test]
     async fn batch_inflight_roundtrip() {
         let inflight = BatchInflight::new();
-        let (id, mut rx) = inflight.start_batch().await;
+        let (id, mut rx) = inflight.start_batch(empty_events()).await;
         assert_eq!(id, 1);
         assert_eq!(inflight.pending_count(), 1);
 
@@ -493,8 +775,8 @@ mod tests {
     #[tokio::test]
     async fn batch_inflight_cancel_all() {
         let inflight = BatchInflight::new();
-        let (_id1, mut rx1) = inflight.start_batch().await;
-        let (_id2, mut rx2) = inflight.start_batch().await;
+        let (_id1, mut rx1) = inflight.start_batch(empty_events()).await;
+        let (_id2, mut rx2) = inflight.start_batch(empty_events()).await;
         assert_eq!(inflight.pending_count(), 2);
 
         inflight.cancel_all();
@@ -509,9 +791,9 @@ mod tests {
     #[tokio::test]
     async fn batch_inflight_ids_are_monotonic() {
         let inflight = BatchInflight::new();
-        let (id1, _rx1) = inflight.start_batch().await;
-        let (id2, _rx2) = inflight.start_batch().await;
-        let (id3, _rx3) = inflight.start_batch().await;
+        let (id1, _rx1) = inflight.start_batch(empty_events()).await;
+        let (id2, _rx2) = inflight.start_batch(empty_events()).await;
+        let (id3, _rx3) = inflight.start_batch(empty_events()).await;
         assert!(id1 < id2);
         assert!(id2 < id3);
     }
@@ -521,13 +803,14 @@ mod tests {
         // Capacity of 2 — third start_batch should block until an earlier
         // batch completes, at which point the permit is released.
         let inflight = Arc::new(BatchInflight::with_capacity(2));
-        let (id1, _rx1) = inflight.start_batch().await;
-        let (_id2, _rx2) = inflight.start_batch().await;
+        let (id1, _rx1) = inflight.start_batch(empty_events()).await;
+        let (_id2, _rx2) = inflight.start_batch(empty_events()).await;
         assert_eq!(inflight.available_permits(), 0);
 
         // Spawn a task that tries to start a third batch — it should block.
         let inflight_clone = Arc::clone(&inflight);
-        let blocked = tokio::spawn(async move { inflight_clone.start_batch().await });
+        let blocked =
+            tokio::spawn(async move { inflight_clone.start_batch(empty_events()).await });
 
         // Give it a moment to prove it is actually blocked.
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -543,14 +826,72 @@ mod tests {
     #[tokio::test]
     async fn batch_inflight_permit_released_on_cancel_all() {
         let inflight = Arc::new(BatchInflight::with_capacity(1));
-        let (_id1, _rx1) = inflight.start_batch().await;
+        let (_id1, _rx1) = inflight.start_batch(empty_events()).await;
         assert_eq!(inflight.available_permits(), 0);
 
         inflight.cancel_all();
         assert_eq!(inflight.available_permits(), 1);
 
         // Next start_batch should proceed immediately.
-        let (_id2, _rx2) = inflight.start_batch().await;
+        let (_id2, _rx2) = inflight.start_batch(empty_events()).await;
+    }
+
+    #[tokio::test]
+    async fn drain_for_replay_returns_events_and_senders_in_order() {
+        let inflight = BatchInflight::new();
+        let e1 = sample_events(3);
+        let e2 = sample_events(5);
+        let e3 = sample_events(2);
+        let (id1, _rx1) = inflight.start_batch(Arc::clone(&e1)).await;
+        let (id2, _rx2) = inflight.start_batch(Arc::clone(&e2)).await;
+        let (id3, _rx3) = inflight.start_batch(Arc::clone(&e3)).await;
+        assert_eq!(inflight.inflight_event_count(), 10);
+
+        let drained = inflight.drain_for_replay();
+        assert_eq!(drained.len(), 3);
+        assert_eq!(drained[0].batch_id, id1);
+        assert_eq!(drained[1].batch_id, id2);
+        assert_eq!(drained[2].batch_id, id3);
+        assert_eq!(drained[0].events.len(), 3);
+        assert_eq!(drained[1].events.len(), 5);
+        assert_eq!(drained[2].events.len(), 2);
+        assert_eq!(inflight.pending_count(), 0);
+        assert_eq!(inflight.inflight_event_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn drain_for_replay_keeps_waiters_parked() {
+        // Unlike cancel_all, draining must NOT complete the oneshot — the
+        // orchestrator holds the responder and only fires it once the replay
+        // result is known.
+        let inflight = BatchInflight::new();
+        let (_id, mut rx) = inflight.start_batch(sample_events(1)).await;
+
+        let drained = inflight.drain_for_replay();
+        assert_eq!(drained.len(), 1);
+        // The oneshot must still be open — nothing has been sent on it.
+        assert!(rx.try_recv().is_err()); // Empty but not closed.
+
+        // When the drained batch's responder is eventually fired by the
+        // replay orchestrator, the waiter receives it.
+        let outputs = vec![];
+        let _ = drained.into_iter().next().unwrap().responder.send(Ok(outputs));
+        let result = rx.try_recv().expect("responder fired");
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn drain_for_replay_releases_permits_on_drop() {
+        let inflight = Arc::new(BatchInflight::with_capacity(2));
+        let (_id1, _rx1) = inflight.start_batch(sample_events(1)).await;
+        let (_id2, _rx2) = inflight.start_batch(sample_events(1)).await;
+        assert_eq!(inflight.available_permits(), 0);
+
+        let drained = inflight.drain_for_replay();
+        // Permits still held by the drained batches until they're dropped.
+        assert_eq!(inflight.available_permits(), 0);
+        drop(drained);
+        assert_eq!(inflight.available_permits(), 2);
     }
 
     #[test]
@@ -627,7 +968,7 @@ mod tests {
             batch_inflight: Arc::new(BatchInflight::new()),
         };
 
-        let (_id, mut rx) = session.batch_inflight.start_batch().await;
+        let (_id, mut rx) = session.batch_inflight.start_batch(empty_events()).await;
         assert_eq!(session.batch_inflight.pending_count(), 1);
 
         session.close();
@@ -673,6 +1014,145 @@ mod tests {
     #[test]
     fn parse_invalid_control_message() {
         let result = parse_control_message(b"not json");
+        assert!(result.is_err());
+    }
+
+    // ── ReplayOrchestrator (TR-1 Stage 2) ───────────────────────────────
+
+    fn make_session(fingerprint: &str, pipeline: &str, partitions: Vec<u16>) -> AwppSession {
+        AwppSession {
+            session_id: format!("s-{fingerprint}"),
+            fingerprint: fingerprint.into(),
+            processor_name: "proc".into(),
+            processor_version: "1.0".into(),
+            codec: TransportCodec::default(),
+            pipeline_assignments: vec![PipelineAssignment {
+                name: pipeline.into(),
+                partitions,
+                batch_size: 100,
+            }],
+            batch_signing: true,
+            heartbeat_interval: Duration::from_secs(10),
+            last_heartbeat: Arc::new(AtomicI64::new(0)),
+            state: Arc::new(AtomicU8::new(SessionState::Active as u8)),
+            connected_at: Instant::now(),
+            batch_inflight: Arc::new(BatchInflight::new()),
+        }
+    }
+
+    fn events_on_partition(count: usize, partition: u16) -> Arc<Vec<Event>> {
+        use aeon_types::PartitionId;
+        use bytes::Bytes;
+        let src: Arc<str> = Arc::from("t");
+        let vec: Vec<Event> = (0..count)
+            .map(|i| {
+                Event::new(
+                    uuid::Uuid::nil(),
+                    i as i64,
+                    Arc::clone(&src),
+                    PartitionId::new(partition),
+                    Bytes::from_static(b"x"),
+                )
+            })
+            .collect();
+        Arc::new(vec)
+    }
+
+    #[tokio::test]
+    async fn replay_orchestrator_stash_and_take_roundtrip() {
+        let orch = ReplayOrchestrator::new(Duration::from_secs(5));
+        let sess = make_session("fp1", "p1", vec![0, 1]);
+
+        // Submit two batches on partition 0 and one on partition 1.
+        let (_id1, mut rx1) = sess
+            .batch_inflight
+            .start_batch(events_on_partition(2, 0))
+            .await;
+        let (_id2, _rx2) = sess
+            .batch_inflight
+            .start_batch(events_on_partition(3, 0))
+            .await;
+        let (_id3, _rx3) = sess
+            .batch_inflight
+            .start_batch(events_on_partition(1, 1))
+            .await;
+
+        assert_eq!(orch.stash(&sess), 3);
+        assert_eq!(orch.bucket_count(), 2);
+        assert_eq!(orch.stashed_batch_count(), 3);
+
+        // Reconnect for partition 0 — picks up the two stashed batches.
+        let p0 = orch.take("fp1", "p1", 0).expect("partition 0 bucket");
+        assert_eq!(p0.len(), 2);
+        assert_eq!(orch.bucket_count(), 1);
+
+        // Caller hasn't fired the senders yet — original waiter still parked.
+        assert!(rx1.try_recv().is_err());
+
+        // Once the replay resolves, firing the stashed responder unblocks the waiter.
+        let mut drained = p0.into_iter();
+        let first = drained.next().unwrap();
+        let _ = first.responder.send(Ok(vec![]));
+        assert!(rx1.try_recv().expect("responder fired").is_ok());
+
+        // Partition 1 bucket also reclaimable.
+        let p1 = orch.take("fp1", "p1", 1).expect("partition 1 bucket");
+        assert_eq!(p1.len(), 1);
+        assert_eq!(orch.bucket_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn replay_orchestrator_take_wrong_identity_returns_none() {
+        let orch = ReplayOrchestrator::new(Duration::from_secs(5));
+        let sess = make_session("fpA", "p1", vec![0]);
+        let (_id, _rx) = sess
+            .batch_inflight
+            .start_batch(events_on_partition(1, 0))
+            .await;
+        orch.stash(&sess);
+
+        assert!(orch.take("fpB", "p1", 0).is_none());
+        assert!(orch.take("fpA", "other", 0).is_none());
+        assert!(orch.take("fpA", "p1", 99).is_none());
+        // Original bucket still there for the right reconnect.
+        assert_eq!(orch.bucket_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn replay_orchestrator_expiry_fails_waiters() {
+        // Tiny window + tiny sweep cadence to keep the test fast.
+        let orch = ReplayOrchestrator::new(Duration::from_millis(200));
+        let sess = make_session("fp1", "p1", vec![0]);
+        let (_id, mut rx) = sess
+            .batch_inflight
+            .start_batch(events_on_partition(1, 0))
+            .await;
+        orch.stash(&sess);
+        assert_eq!(orch.bucket_count(), 1);
+
+        // Wait longer than the window + one sweep interval (~50ms clamped to 100ms).
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        assert_eq!(orch.bucket_count(), 0);
+        let result = rx.try_recv().expect("expiry fires the responder");
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn replay_orchestrator_drop_fails_remaining_waiters() {
+        let sess = make_session("fp1", "p1", vec![0]);
+        let (_id, mut rx) = sess
+            .batch_inflight
+            .start_batch(events_on_partition(1, 0))
+            .await;
+        {
+            let orch = ReplayOrchestrator::new(Duration::from_secs(60));
+            orch.stash(&sess);
+            // Drop the only Arc → Drop impl fires.
+        }
+        // Give the drop a tick to run.
+        tokio::task::yield_now().await;
+        let result = rx.try_recv().expect("drop fires the responder");
         assert!(result.is_err());
     }
 }

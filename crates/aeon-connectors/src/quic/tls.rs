@@ -9,6 +9,13 @@ use std::sync::Arc;
 ///
 /// Returns (ServerConfig, ClientConfig) pair for testing.
 /// NOT for production use — uses self-signed certs with no client auth.
+///
+/// FT-10: `.unwrap()` calls below are on startup-time crypto primitive
+/// construction using hardcoded inputs. rcgen/rustls APIs return `Result`
+/// for surface-area uniformity; with fixed inputs (`"localhost"`, freshly
+/// generated keypair) these paths are infallible. A panic here would
+/// indicate a fundamental rcgen/rustls bug, not a runtime condition.
+#[allow(clippy::unwrap_used)]
 pub fn dev_quic_configs() -> (quinn::ServerConfig, quinn::ClientConfig) {
     let key_pair = rcgen::KeyPair::generate().unwrap();
     let cert_params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();

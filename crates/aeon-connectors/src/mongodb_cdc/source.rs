@@ -68,6 +68,10 @@ pub struct MongoDbCdcSourceConfig {
     /// narrow the re-replay window on crash at the cost of extra fsync.
     /// Defaults to 100. Ignored if `resume_token_path` is `None`.
     pub resume_token_flush_every_n: usize,
+    /// Reconnect backoff policy — applied when the change stream returns an
+    /// error. Exponential + jitter prevents reconnect storms against a flaky
+    /// MongoDB replica set (TR-3).
+    pub backoff: aeon_types::BackoffPolicy,
 }
 
 impl MongoDbCdcSourceConfig {
@@ -84,7 +88,14 @@ impl MongoDbCdcSourceConfig {
             pipeline: Vec::new(),
             resume_token_path: None,
             resume_token_flush_every_n: 100,
+            backoff: aeon_types::BackoffPolicy::default(),
         }
+    }
+
+    /// Override the reconnect backoff policy.
+    pub fn with_backoff(mut self, backoff: aeon_types::BackoffPolicy) -> Self {
+        self.backoff = backoff;
+        self
     }
 
     /// Enable resume token persistence at the given file path.
@@ -210,6 +221,7 @@ impl MongoDbCdcSource {
             source_name,
             config.resume_token_path,
             config.resume_token_flush_every_n.max(1),
+            config.backoff,
         ));
 
         Ok(Self {
@@ -228,13 +240,19 @@ async fn mongodb_reader(
     source_name: Arc<str>,
     resume_token_path: Option<PathBuf>,
     flush_every_n: usize,
+    backoff_policy: aeon_types::BackoffPolicy,
 ) {
     let mut latest_token: Option<ResumeToken> = None;
     let mut unflushed_since: usize = 0;
+    let mut backoff = backoff_policy.iter();
 
     while let Some(result) = change_stream.next().await {
         match result {
             Ok(change_event) => {
+                // Successful event — reset backoff so the next outage restarts
+                // at initial_ms rather than wherever we left off (TR-3).
+                backoff.reset();
+
                 // Capture the per-event resume token. `change_event.id` is
                 // the authoritative resume point for this event.
                 latest_token = Some(change_event.id.clone());
@@ -311,8 +329,10 @@ async fn mongodb_reader(
                 }
             }
             Err(e) => {
-                tracing::error!(error = %e, "mongodb change stream error");
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                let delay = backoff.next_delay();
+                tracing::error!(error = %e, delay_ms = delay.as_millis() as u64,
+                    "mongodb change stream error; backing off before retry");
+                tokio::time::sleep(delay).await;
             }
         }
     }

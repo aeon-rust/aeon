@@ -22,7 +22,9 @@ use aeon_types::traits::ProcessorTransport;
 use aeon_types::transport_codec::TransportCodec;
 
 use crate::identity_store::ProcessorIdentityStore;
-use crate::transport::session::{AwppSession, ControlChannel, PipelineResolver};
+use crate::transport::session::{
+    AwppSession, ControlChannel, InflightBatch, PipelineResolver, ReplayOrchestrator,
+};
 
 // ── Configuration ───────────────────────────────────────────────────────
 
@@ -53,6 +55,11 @@ pub struct WebSocketHostConfig {
     /// cause unbounded memory growth. `call_batch` suspends on the session
     /// semaphore when this limit is reached.
     pub max_inflight_batches: usize,
+    /// TR-1 replay-on-reconnect window. When `Some(dur)` the host stashes
+    /// in-flight batches on disconnect and replays them if a matching
+    /// identity reconnects within `dur`. `None` disables replay —
+    /// in-flight batches fail immediately on disconnect (legacy behaviour).
+    pub replay_window: Option<Duration>,
 }
 
 impl WebSocketHostConfig {
@@ -73,6 +80,11 @@ impl WebSocketHostConfig {
             pipeline_name: String::new(),
             pipeline_codec: None,
             max_inflight_batches: crate::transport::session::DEFAULT_MAX_INFLIGHT_BATCHES,
+            // TR-1: default to a 30-second replay window — long enough to
+            // ride out a typical TCP reconnect, short enough that a
+            // permanently-dead processor doesn't park pipeline callers
+            // for minutes.
+            replay_window: Some(Duration::from_secs(30)),
         }
     }
 }
@@ -90,6 +102,8 @@ pub struct WebSocketProcessorHost {
     routing: Arc<DashMap<(String, u16), String>>,
     /// WebSocket handles: session_id → shared socket for sending frames.
     sockets: Arc<DashMap<String, Arc<WsSharedSocket>>>,
+    /// TR-1 replay orchestrator (None if replay is disabled).
+    replay: Option<Arc<ReplayOrchestrator>>,
     /// Host configuration.
     config: Arc<WebSocketHostConfig>,
     /// When the host was created.
@@ -99,13 +113,24 @@ pub struct WebSocketProcessorHost {
 impl WebSocketProcessorHost {
     /// Create a new WebSocket processor host.
     pub fn new(config: WebSocketHostConfig) -> Self {
+        let replay = config.replay_window.map(ReplayOrchestrator::new);
         Self {
             sessions: Arc::new(DashMap::new()),
             routing: Arc::new(DashMap::new()),
             sockets: Arc::new(DashMap::new()),
+            replay,
             config: Arc::new(config),
             created_at: Instant::now(),
         }
+    }
+
+    /// Number of batches currently stashed for replay across all
+    /// disconnected identities. Exposed for tests and /metrics.
+    pub fn stashed_replay_batches(&self) -> usize {
+        self.replay
+            .as_ref()
+            .map(|r| r.stashed_batch_count())
+            .unwrap_or(0)
     }
 
     /// Handle a WebSocket upgrade — runs the AWPP handshake and manages
@@ -158,11 +183,36 @@ impl WebSocketProcessorHost {
             "T4 processor connected via WebSocket"
         );
 
+        // TR-1: if any batches were stashed for this identity+pipeline+
+        // partition by a prior disconnected session, replay them on the
+        // new session now. Pipeline callers parked on the old session's
+        // oneshot receivers get their response transparently.
+        if let Some(orch) = &self.replay {
+            self.replay_stashed_batches(orch, &session, &shared).await;
+        }
+
         // Extract recv_rx from control channel for the read loop
         let mut recv_rx = control.recv_rx.into_inner();
 
         // Read loop — demultiplex text (control) and binary (data) frames
         let result = ws_read_loop(&mut recv_rx, &session).await;
+
+        // TR-1: on disconnect, stash in-flight batches for replay before
+        // closing the session. `session.close()` cancels remaining batches,
+        // so the stash must happen first — drain_for_replay removes the
+        // entries cancel_all would otherwise fire.
+        let stashed = if let Some(orch) = &self.replay {
+            orch.stash(&session)
+        } else {
+            0
+        };
+        if stashed > 0 {
+            tracing::info!(
+                session_id = %session_id,
+                stashed,
+                "T4 disconnect — batches stashed for TR-1 replay"
+            );
+        }
 
         // Cleanup
         session.close();
@@ -178,6 +228,45 @@ impl WebSocketProcessorHost {
         tracing::debug!(session_id = %session_id, "T4 processor disconnected");
 
         result
+    }
+
+    /// Replay any stashed batches matching this session's identity +
+    /// assignments. Each replayed batch is re-submitted on the new session
+    /// with a fresh batch_id; when the response arrives, a spawned forwarder
+    /// wires it back to the original pipeline caller's oneshot.
+    async fn replay_stashed_batches(
+        &self,
+        orch: &Arc<ReplayOrchestrator>,
+        session: &Arc<AwppSession>,
+        socket: &Arc<WsSharedSocket>,
+    ) {
+        for assignment in &session.pipeline_assignments {
+            for &partition in &assignment.partitions {
+                let Some(batches) = orch.take(&session.fingerprint, &assignment.name, partition)
+                else {
+                    continue;
+                };
+                if batches.is_empty() {
+                    continue;
+                }
+                tracing::info!(
+                    session_id = %session.session_id,
+                    pipeline = %assignment.name,
+                    partition,
+                    count = batches.len(),
+                    "T4 reconnect — replaying stashed batches"
+                );
+                ws_replay_batches(
+                    batches,
+                    session,
+                    socket,
+                    &assignment.name,
+                    partition,
+                    self.config.batch_timeout,
+                )
+                .await;
+            }
+        }
     }
 
     /// Number of active sessions.
@@ -241,10 +330,16 @@ impl ProcessorTransport for WebSocketProcessorHost {
             // inflight capacity is saturated, `start_batch` suspends until
             // an earlier batch completes — this is the session-level
             // backpressure that bounds the pending map.
-            let (batch_id, rx) = session.batch_inflight.start_batch().await;
+            //
+            // TR-1: events are retained inside the pending slot as
+            // Arc<Vec<Event>> so a disconnect can drain and replay them.
+            // Retention is a refcount bump, not a copy.
+            let events = Arc::new(events);
+            let (batch_id, rx) = session.batch_inflight.start_batch(Arc::clone(&events)).await;
 
             // Encode batch request, then wrap in data frame with routing header
-            let wire = crate::batch_wire::encode_batch_request(batch_id, &events, session.codec)?;
+            let wire =
+                crate::batch_wire::encode_batch_request(batch_id, events.as_slice(), session.codec)?;
             let frame = build_ws_data_frame(&self.config.pipeline_name, partition, &wire);
 
             // Send as binary WebSocket frame
@@ -476,6 +571,83 @@ pub fn parse_ws_routing_header(data: &[u8]) -> Result<(&str, u16, usize), AeonEr
         .map_err(|e| AeonError::serialization(format!("T4 invalid pipeline name: {e}")))?;
     let partition = u16::from_le_bytes([data[4 + name_len], data[4 + name_len + 1]]);
     Ok((name, partition, 4 + name_len + 2))
+}
+
+// ── Replay (TR-1) ───────────────────────────────────────────────────────
+
+/// Re-submit a batch of stashed `InflightBatch`es on a new session.
+///
+/// For each stashed batch: allocate a new batch_id via `start_batch`,
+/// encode the wire, send it over the new socket, and spawn a forwarder
+/// task that pipes the response back to the *original* pipeline caller's
+/// oneshot sender (which was held in `InflightBatch.responder`).
+///
+/// Batches that fail to send (socket closed mid-replay, encode error)
+/// fail their original responder with a connection error so pipeline
+/// callers don't stay parked forever.
+async fn ws_replay_batches(
+    batches: Vec<InflightBatch>,
+    session: &Arc<AwppSession>,
+    socket: &Arc<WsSharedSocket>,
+    pipeline: &str,
+    partition: u16,
+    batch_timeout: Duration,
+) {
+    for inflight in batches {
+        // Destructure only the public fields; `_permit` drops with the
+        // rest of the pattern, releasing the old session's semaphore slot.
+        let InflightBatch {
+            events, responder, ..
+        } = inflight;
+
+        let (new_id, rx) = session.batch_inflight.start_batch(Arc::clone(&events)).await;
+
+        let wire =
+            match crate::batch_wire::encode_batch_request(new_id, events.as_slice(), session.codec)
+            {
+                Ok(w) => w,
+                Err(e) => {
+                    // Release the freshly-allocated slot/permit by
+                    // completing the internal tracker with a throwaway
+                    // error, and forward the real encode error to the
+                    // original pipeline caller.
+                    session.batch_inflight.complete_batch(
+                        new_id,
+                        Err(AeonError::serialization("replay encode failed")),
+                    );
+                    let _ = responder.send(Err(e));
+                    continue;
+                }
+            };
+        let frame = build_ws_data_frame(pipeline, partition, &wire);
+
+        if let Err(e) = socket.send(Message::Binary(frame.into())).await {
+            session.batch_inflight.complete_batch(
+                new_id,
+                Err(AeonError::connection("replay send failed")),
+            );
+            let _ = responder.send(Err(e));
+            continue;
+        }
+
+        let session_c = Arc::clone(session);
+        tokio::spawn(async move {
+            let result = match tokio::time::timeout(batch_timeout, rx).await {
+                Ok(Ok(r)) => r,
+                Ok(Err(_)) => Err(AeonError::connection(
+                    "T4 session closed during replay batch",
+                )),
+                Err(_) => {
+                    session_c.batch_inflight.complete_batch(
+                        new_id,
+                        Err(AeonError::connection("T4 replay batch timeout")),
+                    );
+                    Err(AeonError::connection("T4 replay batch timeout"))
+                }
+            };
+            let _ = responder.send(result);
+        });
+    }
 }
 
 // ── Control Channel (WebSocket) ─────────────────────────────────────────

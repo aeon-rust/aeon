@@ -14,10 +14,11 @@ categories = ["concurrency", "asynchronous"]
 [features]
 default = ["native-loader", "rest-api", "processor-auth", "websocket-host"]
 native-loader = ["libloading", "aeon-native-sdk", "sha2", "hex"]
-rest-api = ["axum", "tower-http", "sha2", "hex"]
+rest-api = ["axum", "tower-http", "sha2", "hex", "aeon-wasm"]
 processor-auth = ["aeon-crypto", "rand", "sha2", "hex", "base64"]
 webtransport-host = ["wtransport", "rustls", "processor-auth"]
 websocket-host = ["processor-auth", "rest-api", "axum/ws"]
+cluster = ["aeon-cluster"]
 
 [dependencies]
 aeon-types = { workspace = true }
@@ -33,9 +34,15 @@ bincode = { workspace = true }
 crc32fast = { workspace = true }
 serde_json = { workspace = true }
 
+# Wasm processor loading (feature-gated behind rest-api for hot-swap)
+aeon-wasm = { workspace = true, optional = true }
+
 # Native .so processor loading (feature-gated)
 libloading = { version = "0.8", optional = true }
 aeon-native-sdk = { workspace = true, optional = true }
+
+# Cluster state for REST API status endpoint (feature-gated)
+aeon-cluster = { workspace = true, optional = true, features = ["cluster"] }
 
 # Processor identity / challenge-response auth (feature-gated)
 aeon-crypto = { workspace = true, optional = true }
@@ -61,6 +68,7 @@ aeon-connectors = { workspace = true, features = ["kafka", "file", "http", "webs
 aeon-observability = { path = "../aeon-observability" }
 aeon-wasm = { workspace = true }
 tempfile = "3"
+aeon-state = { workspace = true, features = ["redb"] }
 criterion = { workspace = true }
 rdkafka = { workspace = true }
 uuid = { workspace = true }

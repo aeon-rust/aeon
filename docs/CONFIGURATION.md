@@ -288,7 +288,7 @@ pub struct CheckpointConfig {
 | Backend | Latency | Durability | Best For |
 |---------|---------|------------|----------|
 | `Wal` | ~100us per write | Survives process crash (append-only WAL with CRC32 integrity) | Single-node, bare-metal, Docker. **Default.** |
-| `StateStore` | Varies by tier | Depends on L2/L3 tier config | When L2 (mmap) / L3 (RocksDB) tiers are already active. |
+| `StateStore` | ~50-200us per write | Survives process crash when L3 is a durable backend (redb default) | When the node already runs a persistent `L3Store` (Raft log/snapshot via FT-1/FT-2, or L2/L3 tiers). Requires `PipelineConfig.l3_checkpoint_store: Some(Arc<dyn L3Store>)`. See FT-3. |
 | `Kafka` | ~1-5ms per write | Survives node loss (replicated) | Multi-node clusters. Writes to a Kafka/Redpanda compacted topic. |
 | `None` | 0 | Memory only, lost on restart | Dev/test, stateless processors where source replay is acceptable. |
 
@@ -299,6 +299,7 @@ pub struct CheckpointConfig {
 | `backend` | `Wal` | Persistence backend (see table above). |
 | `retention` | `24h` | How long to retain checkpoint history before rotation/cleanup. |
 | `dir` | `None` (OS temp dir) | Directory for WAL checkpoint files. **Set `AEON_CHECKPOINT_DIR` to a persistent volume in production.** |
+| `PipelineConfig.l3_checkpoint_store` | `None` | Required when `backend = StateStore`. Plug in the same `Arc<dyn L3Store>` used for Raft (`ClusterNode::bootstrap_single_persistent`) so the whole node shares one durable backend. Records land under the `checkpoint/{be_u64:id}` prefix. |
 
 ### Recovery
 

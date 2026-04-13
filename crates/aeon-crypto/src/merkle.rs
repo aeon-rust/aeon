@@ -99,7 +99,9 @@ impl MerkleTree {
 
             // Duplicate last element if odd count
             if current_level.len() % 2 != 0 {
-                let last = *current_level.last().expect("checked non-empty");
+                // FT-10: odd count implies len >= 1, so last() is Some.
+                #[allow(clippy::expect_used)]
+                let last = *current_level.last().expect("invariant: odd-length vec is non-empty");
                 current_level.push(last);
             }
 

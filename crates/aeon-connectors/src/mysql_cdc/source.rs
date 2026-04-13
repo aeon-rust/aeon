@@ -7,7 +7,7 @@
 //! protocol directly. This implementation uses polling of the binlog via
 //! `SHOW BINLOG EVENTS` as a simpler starting point.
 
-use aeon_types::{AeonError, Event, PartitionId, Source};
+use aeon_types::{AeonError, BackoffPolicy, Event, PartitionId, Source};
 use bytes::Bytes;
 use mysql_async::prelude::*;
 use std::sync::Arc;
@@ -31,6 +31,10 @@ pub struct MysqlCdcSourceConfig {
     pub binlog_file: Option<String>,
     /// Starting binlog position (None = current).
     pub binlog_position: Option<u64>,
+    /// Reconnect backoff policy (TR-3). Applied when the pool fails to hand
+    /// out a connection or a query fails. Exponential + jitter prevents
+    /// reconnect storms against a flaky MySQL primary.
+    pub backoff: BackoffPolicy,
 }
 
 impl MysqlCdcSourceConfig {
@@ -45,7 +49,14 @@ impl MysqlCdcSourceConfig {
             source_name: Arc::from("mysql-cdc"),
             binlog_file: None,
             binlog_position: None,
+            backoff: BackoffPolicy::default(),
         }
+    }
+
+    /// Override the reconnect backoff policy.
+    pub fn with_backoff(mut self, backoff: BackoffPolicy) -> Self {
+        self.backoff = backoff;
+        self
     }
 
     /// Set server ID.
@@ -91,6 +102,9 @@ pub struct MysqlCdcSource {
     config: MysqlCdcSourceConfig,
     current_file: String,
     current_position: u64,
+    /// TR-3 reconnect backoff. Advanced on pool/query errors; reset on
+    /// every successful poll (even when no events arrive).
+    backoff: aeon_types::Backoff,
 }
 
 impl MysqlCdcSource {
@@ -128,22 +142,35 @@ impl MysqlCdcSource {
 
         drop(conn);
 
+        let backoff = config.backoff.iter();
         Ok(Self {
             pool,
             config,
             current_file: file,
             current_position: position,
+            backoff,
         })
     }
 }
 
 impl Source for MysqlCdcSource {
     async fn next_batch(&mut self) -> Result<Vec<Event>, AeonError> {
-        let mut conn = self
-            .pool
-            .get_conn()
-            .await
-            .map_err(|e| AeonError::connection(format!("mysql connect failed: {e}")))?;
+        // TR-3: on connection/query failure, back off and return Ok(empty)
+        // rather than propagating Err — keeps the pipeline alive through
+        // transient MySQL outages. Reset backoff on every successful poll.
+        let mut conn = match self.pool.get_conn().await {
+            Ok(c) => c,
+            Err(e) => {
+                let delay = self.backoff.next_delay();
+                tracing::warn!(
+                    error = %e,
+                    delay_ms = delay.as_millis() as u64,
+                    "mysql get_conn failed; backing off before retry"
+                );
+                tokio::time::sleep(delay).await;
+                return Ok(Vec::new());
+            }
+        };
 
         // Query binlog events from current position
         let query = format!(
@@ -151,10 +178,22 @@ impl Source for MysqlCdcSource {
             self.current_file, self.current_position, self.config.batch_size
         );
 
-        let rows: Vec<(String, u64, String, u32, u64, String)> = conn
-            .query(&query)
-            .await
-            .map_err(|e| AeonError::connection(format!("SHOW BINLOG EVENTS failed: {e}")))?;
+        let rows: Vec<(String, u64, String, u32, u64, String)> = match conn.query(&query).await {
+            Ok(r) => r,
+            Err(e) => {
+                let delay = self.backoff.next_delay();
+                tracing::warn!(
+                    error = %e,
+                    delay_ms = delay.as_millis() as u64,
+                    "SHOW BINLOG EVENTS failed; backing off before retry"
+                );
+                drop(conn);
+                tokio::time::sleep(delay).await;
+                return Ok(Vec::new());
+            }
+        };
+
+        self.backoff.reset();
 
         let mut events = Vec::new();
         let now = std::time::Instant::now();

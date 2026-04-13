@@ -66,7 +66,8 @@ pub struct ProcessorVersion {
     pub registered_at: i64,
     /// Who registered this version (operator ID or "cli").
     pub registered_by: String,
-    /// Endpoint URL for T3/T4 processors (e.g., "https://host:4462").
+    /// Endpoint URL for T3/T4 processors.
+    /// T3 WebTransport: `https://host:4472`; T4 WebSocket: `ws://host:4471/api/v1/processors/connect`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
     /// Maximum batch size this processor version supports.
@@ -302,7 +303,7 @@ pub struct PipelineHistoryEntry {
 }
 
 /// Pipeline lifecycle actions.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PipelineAction {
     Created,
@@ -322,6 +323,8 @@ pub enum PipelineAction {
     CanaryPromoted,
     /// Canary: fully promoted to 100%, canary completed.
     CanaryCompleted,
+    /// Source or sink reconfigured (same connector type, new config).
+    Reconfigured,
 }
 
 // ── Upgrade State Tracking ─────────────────────────────────────────────
@@ -467,6 +470,27 @@ pub enum RegistryResponse {
     Error { message: String },
 }
 
+/// Pluggable applier for Raft-replicated RegistryCommand entries.
+///
+/// The cluster state machine replicates registry commands across all nodes but
+/// does not itself own PipelineManager / ProcessorRegistry (avoiding a cyclic
+/// `aeon-cluster → aeon-engine` dependency). Instead, `aeon-engine` registers
+/// an implementation of this trait on the cluster node; the state machine then
+/// dispatches `ClusterRequest::Registry(cmd)` entries through it after the log
+/// entry is committed, so every node converges on the same local state.
+pub trait RegistryApplier: Send + Sync {
+    /// Apply a replicated command to this node's local registry/pipeline state.
+    ///
+    /// Called on every node after Raft commits the entry. Must be deterministic
+    /// w.r.t. the input command + prior applied state.
+    fn apply(
+        &self,
+        cmd: RegistryCommand,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = RegistryResponse> + Send + '_>,
+    >;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -586,7 +610,7 @@ mod tests {
             group: "analytics".into(),
         };
         r.connection = Some(ProcessorConnectionConfig {
-            endpoint: Some("https://host:4462".into()),
+            endpoint: Some("https://host:4472".into()),
             batch_size: Some(512),
             timeout_ms: None,
             min_instances: None,
@@ -613,14 +637,14 @@ mod tests {
             status: VersionStatus::Available,
             registered_at: 1000,
             registered_by: "cli".into(),
-            endpoint: Some("https://proc.example.com:4462".into()),
+            endpoint: Some("https://proc.example.com:4472".into()),
             max_batch_size: Some(2048),
         };
         let json = serde_json::to_string(&pv).unwrap();
         let back: ProcessorVersion = serde_json::from_str(&json).unwrap();
         assert_eq!(
             back.endpoint.as_deref(),
-            Some("https://proc.example.com:4462")
+            Some("https://proc.example.com:4472")
         );
         assert_eq!(back.max_batch_size, Some(2048));
     }
