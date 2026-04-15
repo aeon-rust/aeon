@@ -458,11 +458,11 @@ limitation. See Section 10 for the full per-language × per-tier matrix.
 
 | Category | Count | Status |
 |----------|-------|--------|
-| Fault-tolerance (Pillar 1) | 12 items | **Pending** — FT-9 is Phase 0 prerequisite; FT-4/FT-5 are quick wins; FT-8 (mTLS) + FT-10 (unwrap audit) high priority for zero-event-loss; FT-11 (zero-copy blocker) + FT-12 (refcount perf) |
-| Zero-downtime (Pillar 2) | 7 items | **Pending** — ZD-1/ZD-2/ZD-3 are bug fixes |
+| Fault-tolerance (Pillar 1) | 12 items | **Complete** — All shipped 2026-04-12: FT-1/FT-2 (persistent Raft log + snapshots via L3), FT-3 (L3 checkpoint), FT-4 (pre-vote mitigated via tuned `RaftTiming` presets), FT-5 (election timeouts), FT-6 (health ping/pong), FT-7 (L3 generics), FT-8 (mTLS), FT-9 (L3Store trait moved to aeon-types), FT-10 (unwrap audit — 10 crates locked), FT-11 (zero-copy via `bytes::Bytes`), FT-12 (refcount perf). Zero-event-loss prerequisites met. |
+| Zero-downtime (Pillar 2) | 7 items | **Complete** — ZD-1/2/3 bug fixes + ZD-4 (drain/swap) + ZD-5 (blue-green) + ZD-6 (canary) + ZD-7/8 (same-type source/sink reconfig) all shipped 2026-04-11/12. ZD-9 (cross-type swap via separate pipeline) deferred. |
 | Cluster validation (Pillar 3) | 9 items | **Partially done** — DOKS deployed; Gate 2 criteria, cluster metrics, auto-scaling, and CL-6 partition transfer (4 sub-tasks) remain |
-| Transport resilience (Pillar 4) | 3 items | **Mixed** — TR-3 (connection backoff) is actionable; TR-1/TR-2 deferred |
-| Exactly-once delivery (Pillar 5) | 3 items | **Future** — depends on FT-3; Kafka transactions first |
+| Transport resilience (Pillar 4) | 3 items | **Mostly complete** — TR-1 (in-flight batch replay) + TR-2 (Wasm state transfer) shipped 2026-04-12; TR-3 (connection backoff with jitter) shipped for MQTT source+sink, MongoDB CDC, and `QuicEndpoint::connect_with_backoff()` bootstrap path. Remaining TR-3 connectors need reconnect loops introduced first. |
+| Exactly-once delivery (Pillar 5) | 3 items | **Partial** — EO-1 (Kafka IdempotentSink) ✅, EO-3 (Nats/Redis idempotent) ✅, EO-2 trait framework (`SinkEosTier` + `TransactionalSink`) + Kafka T2 impl shipped 2026-04-12; pipeline two-phase L3 wiring + recovery + other-tier impls remain. |
 | Developer experience (Pillar 6) | 5 items | **Complete** — DX-1 (CLI tests), DX-2 (aeon doctor), DX-3 (hot-reload), DX-4 (error polish), DX-5 (cargo xtask) all ✅ |
 | Blocked/demand-driven (Pillar 7) | 6 items | **Blocked on external** — T3 WT library maturity for 5 languages; T1/T2 are inherently language-limited (see Section 10) |
 
