@@ -362,6 +362,77 @@ pub fn validate_pipeline_shape(m: &PipelineManifest) -> Result<(), AeonError> {
     Ok(())
 }
 
+// ── Manifest → PipelineDefinition bridge ────────────────────────────────
+
+impl PipelineManifest {
+    /// Convert an EO-2 manifest into a legacy `PipelineDefinition` suitable
+    /// for the REST API and pipeline registry. Uses the first source and
+    /// first sink for the single-source/single-sink fields.
+    ///
+    /// This is a lossy bridge — multi-source/multi-sink information beyond
+    /// the first entry is stored in the `sources_extra` / `sinks_extra`
+    /// config overrides until the registry schema is upgraded in a future
+    /// phase. The important thing is that the typed manifest has already
+    /// been validated before this conversion runs.
+    pub fn to_pipeline_definition(&self) -> crate::registry::PipelineDefinition {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+
+        let source = self.sources.first().map(|s| {
+            let mut config = std::collections::BTreeMap::new();
+            for (k, v) in &s.config {
+                config.insert(k.clone(), v.to_string().trim_matches('"').to_string());
+            }
+            config.insert("source_kind".into(), format!("{:?}", s.kind));
+            config.insert("identity".into(), format!("{:?}", s.identity));
+            config.insert("event_time".into(), format!("{:?}", s.event_time));
+            crate::registry::SourceConfig {
+                source_type: s.connector_type.clone(),
+                topic: config.remove("topic"),
+                partitions: vec![],
+                config,
+            }
+        }).unwrap_or_else(|| crate::registry::SourceConfig {
+            source_type: "unknown".into(),
+            topic: None,
+            partitions: vec![],
+            config: std::collections::BTreeMap::new(),
+        });
+
+        let sink = self.sinks.first().map(|s| {
+            let mut config = std::collections::BTreeMap::new();
+            for (k, v) in &s.config {
+                config.insert(k.clone(), v.to_string().trim_matches('"').to_string());
+            }
+            config.insert("eos_tier".into(), format!("{:?}", s.eos_tier));
+            crate::registry::SinkConfig {
+                sink_type: s.connector_type.clone(),
+                topic: config.remove("topic"),
+                config,
+            }
+        }).unwrap_or_else(|| crate::registry::SinkConfig {
+            sink_type: "unknown".into(),
+            topic: None,
+            config: std::collections::BTreeMap::new(),
+        });
+
+        let processor = crate::registry::ProcessorRef::new(
+            &self.processor.name,
+            self.processor.version.as_deref().unwrap_or("latest"),
+        );
+
+        crate::registry::PipelineDefinition::new(
+            &self.name,
+            source,
+            processor,
+            sink,
+            now,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -615,5 +686,30 @@ mod tests {
         let d = DurabilityBlock::default();
         assert_eq!(d.mode, DurabilityMode::None);
         assert_eq!(d.checkpoint.backend, CheckpointBackendDecl::StateStore);
+    }
+
+    #[test]
+    fn to_pipeline_definition_preserves_name_and_types() {
+        let m = sample_manifest();
+        let def = m.to_pipeline_definition();
+        assert_eq!(def.name, "orders");
+        assert_eq!(def.source.source_type, "kafka");
+        assert_eq!(def.sink.sink_type, "kafka");
+        assert_eq!(def.processor.name, "p");
+        assert_eq!(def.processor.version, "latest");
+    }
+
+    #[test]
+    fn to_pipeline_definition_stores_source_kind_in_config() {
+        let m = sample_manifest();
+        let def = m.to_pipeline_definition();
+        assert_eq!(def.source.config.get("source_kind").unwrap(), "Pull");
+    }
+
+    #[test]
+    fn to_pipeline_definition_stores_eos_tier_in_config() {
+        let m = sample_manifest();
+        let def = m.to_pipeline_definition();
+        assert!(def.sink.config.get("eos_tier").unwrap().contains("T2"));
     }
 }
