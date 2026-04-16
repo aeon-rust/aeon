@@ -3032,6 +3032,42 @@ developer experience, and deferred work into 7 pillars with clear dependency cha
 
 ---
 
+## Pause Point (2026-04-16) — Pending Tasks Up for Reassessment
+
+Committed this snapshot to stop-and-think before picking the next direction. Pillars 1/2/4/5/6 are complete. Pillar 3 has all transport primitives shipped (CL-6a bulk sync, CL-6b PoH transfer, CL-6c cutover handshake, CL-6d throttle + metrics). Pillar 7 is blocked by design (library-ecosystem maturity in other languages).
+
+What is **not** shipped, grouped by whether the task still earns its slot:
+
+### Pillar 3 — Cluster Operations remnants
+
+| ID | Item | Open question for reassessment |
+|----|------|-------------------------------|
+| **CL-1** | Gate 2 multi-node acceptance — 9-item checklist, partially exercised on 3-node DOKS | Split-brain, multi-broker sustained load, and CPU-pinning items are infra-bound on current DOKS node pool. Do we invest in bigger nodes / Chaos Mesh, or mark Gate 2 "best-effort validated" and ship v0.1? |
+| **CL-5** | Raft-aware K8s auto-scaling (`cluster.auto_join: true`, `autoscaling.mode: raft-aware`) — depends on CL-6 for safe scale-down | Is HPA-driven elasticity actually wanted, or is explicit node-count control the expected operator pattern? No user has asked for this yet. |
+| **CL-6c.4** | Engine-side write-freeze + buffer-and-replay — crosses `aeon-cluster` ↔ `aeon-engine`, needs partition write-gate API | Transport-level drain+freeze (CL-6c.1/2/3) is shipped. Open: is the bulk-sync→freeze delta window actually observable as an incident in practice, or does existing `tracker.state == Cutover` + coordinator drain cover the case? Consider: defer until a real DOKS handover exposes the gap. |
+| Split-brain recovery drill | Network-partition test via Chaos Mesh or manual iptables | Is this a v0.1 blocker or a post-release hardening task? |
+| Multi-broker Redpanda sustained load | Current DOKS node pool is CPU-saturated at rest (system DaemonSets eat ~2/2 vCPU) | Requires larger nodes or dedicated cluster. Cost vs signal tradeoff. |
+
+### Pillar 4 — Transport Resilience follow-up
+
+| ID | Item | Open question for reassessment |
+|----|------|-------------------------------|
+| **TR-3** | WebTransport T3 SDK reconnect layer | Downstream of Pillar 7 SDK-maturity blockers. Not actionable until target-language WT libraries stabilise. |
+
+### Anti-goals — do not pick up without new signal
+
+- **CL-6c.4 incremental splits** — prior session broke CL-6c.4 into .4.1/.4.2/.4.3 speculatively; reassess the *whole* item before splitting further.
+- **Pillar 7 BL-1..6** — explicitly blocked; revisiting is wasted effort until an ecosystem signal (library release, user ask) arrives.
+
+### What `docs/aeon-dev-notes.txt` still references as "pending" but is actually done
+
+- CL-6a/b/c/d all shipped 2026-04-16. Earlier notes that treated CL-6 as the next big block are now historical.
+- EO-2 P1–P12 all closed 2026-04-15/16 (P12 closed via CL-6a's L2-aware design).
+
+**Direction decision is the user's call. This pause is intentional — do not auto-proceed.**
+
+---
+
 ## EO-2 Implementation Phases (Design frozen 2026-04-15)
 
 > Full design: [`docs/EO-2-DURABILITY-DESIGN.md`](EO-2-DURABILITY-DESIGN.md).

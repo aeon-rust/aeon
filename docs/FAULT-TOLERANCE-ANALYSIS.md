@@ -10,6 +10,12 @@
 > crates, and real-world leader failover measurements. It supersedes the previous
 > to-do list in ROADMAP.md (2026-04-11 Audit), which is retained for historical
 > reference.
+>
+> **Pause point 2026-04-16**: CL-6a/b/c/d transport primitives all shipped. Remaining
+> Pillar 3 items (CL-1 Gate 2 acceptance, CL-5 auto-scaling, CL-6c.4 engine-side
+> freeze+replay, split-brain drill, multi-broker load) are flagged for reassessment
+> before further work. See [`ROADMAP.md` §Pause Point](ROADMAP.md#pause-point-2026-04-16--pending-tasks-up-for-reassessment)
+> for open questions on each.
 
 ---
 
