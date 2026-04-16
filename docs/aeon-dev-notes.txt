@@ -32473,7 +32473,2879 @@ claude's response:
 ✻ Brewed for 1m 1s · 1 shell still running
 
 =========================
+to do list
+==========================
+claude's response:
 
+ Doc audit complete. The audit (delegated to a research agent with code-evidence cross-referencing) found that most of the roadmap is already accurate —
+  the vast majority of the "pending" items I'd flagged last turn were already marked done in the detailed status rows. Only 4 summary-line mismatches
+  remained where rollup cells lagged behind the detail cells they summarize.
+
+  Edits applied (4 lines, 2 files):
+
+  1. FAULT-TOLERANCE-ANALYSIS.md:462 — Pillar 2 summary: "Pending — ZD-1/ZD-2/ZD-3 are bug fixes" → "Complete — all 7 items shipped 2026-04-11/12; ZD-9
+  cross-type deferred"
+  2. FAULT-TOLERANCE-ANALYSIS.md:464 — Pillar 4 summary: "TR-1/TR-2 deferred" → "TR-1/TR-2 shipped 2026-04-12; TR-3 partial"
+  3. FAULT-TOLERANCE-ANALYSIS.md:465 — Pillar 5 summary: "Future — depends on FT-3" → "Partial — EO-1 ✅, EO-3 ✅, EO-2 trait + Kafka T2 ✅ 2026-04-12,
+  remaining wiring pending"
+  4. ROADMAP.md:3023, 3025 — Matching Pillar 2 and Pillar 4 rollup rows updated to the same phrasing.
+
+  Correctly marked already (no change needed):
+  - ZD-1 through ZD-8 (detail rows in ROADMAP 999-1041, FT-ANALYSIS detail rows, PROCESSOR-DEPLOYMENT 1343-1344)
+  - TR-1, TR-2 detail rows (FT-ANALYSIS 394-395)
+  - EO-2 trait + Kafka T2 detail row (FT-ANALYSIS 402)
+  - Tier D D1/D2/D3 (E2E-TEST-PLAN 139-141 and execution log 316-324)
+  - All 12 Phase 12b language SDKs (ROADMAP 1577-1591)
+  - L2 mmap, DOKS multi-node, DX-1..5
+
+  No duplicates found — each feature tracked once per doc with consistent status after these edits.
+
+  Genuinely still open (left untouched in docs, correctly flagged):
+  - ZD-9 (cross-type swap via full separate pipeline — High effort)
+  - EO-2 pipeline wiring + recovery + non-Kafka tier impls
+  - CL-1..6 (cloud/DOKS Gate 2, partition transfer)
+  - BL-1..6 (library-blocked SDKs)
+  - Pillar 1 FT items still Pending per FT-ANALYSIS:461 — left alone; I didn't verify FT-1/2/3/7/8/9/10/11/12 code state in this pass and didn't want to
+  risk a wrong mark.
+
+  Want me to do a second pass specifically on the FT-* items to confirm their status before the next commit?
+
+✻ Brewed for 4m 28s · 1 shell still running
+
+
+=========================
+continue
+==========================
+claude's response:
+
+ Pillar 1 audit complete. All 12 FT items verified shipped in code; detail rows were already correct, only the two rollup cells were stale.
+
+  Additional edits applied (2 lines, 2 files):
+
+  5. FAULT-TOLERANCE-ANALYSIS.md:461 — Pillar 1 rollup: "Pending — FT-9 is Phase 0 prerequisite; …" → "Complete — all 12 shipped 2026-04-12"
+  6. ROADMAP.md:3022 — matching Pillar 1 row: priority "Highest" + ordering arrow → "Complete" + per-item shipped line
+
+  Evidence verified per item:
+  - FT-1 aeon-cluster/src/log_store.rs L3RaftLogStore + raft_log_survives_restart test
+  - FT-2 StateMachineStore.snapshot_store + persistent_snapshot_roundtrip_across_reopen test
+  - FT-3 aeon-engine/src/checkpoint.rs CheckpointPersist trait + L3CheckpointStore
+  - FT-4 RaftTiming::prod_recommended() / ::flaky_network() presets mitigate openraft pre-vote gap
+  - FT-5 RaftTiming validation + wired at 4 node-construction sites
+  - FT-6 aeon-cluster/src/transport/health.rs HealthPing/HealthPong
+  - FT-7 TieredStore.l3: Option<Arc<dyn L3Store>> generic injection
+  - FT-8 quic_configs_for_cluster() dispatches mTLS / auto_tls / error
+  - FT-9 aeon-types/src/state.rs lines 20-65 define L3Store trait
+  - FT-10 10 crates carry warn(clippy::unwrap_used, expect_used)
+  - FT-11 WireEvent/WireOutput use bytes::Bytes (zero-copy clones)
+  - FT-12 MemorySource::next_batch uses IntoIter<Event> (no clone) + criterion batched benches
+
+  Final doc-audit summary
+
+  Across the full sweep (this turn + previous turn):
+
+  ┌─────────────────────────────┬─────────┬───────────────────────────────────┐
+  │            File             │  Edits  │              Nature               │
+  ├─────────────────────────────┼─────────┼───────────────────────────────────┤
+  │ ROADMAP.md                  │ 3 lines │ Pillar 1, 2, 4 rollups updated    │
+  ├─────────────────────────────┼─────────┼───────────────────────────────────┤
+  │ FAULT-TOLERANCE-ANALYSIS.md │ 4 lines │ Pillar 1, 2, 4, 5 rollups updated │
+  └─────────────────────────────┴─────────┴───────────────────────────────────┘
+
+  Zero duplicates, zero conflicting entries remaining. Every Pillar-level rollup now matches the detail rows below it. The remaining **Pending** /
+  **Future** / **Deferred** markers in the docs are all genuinely open: ZD-9, EO-2 pipeline wiring, CL-* (cloud-gated), BL-* (library-blocked SDKs).
+
+  Ready to commit these 7 stale-marker fixes, or want another pass on a specific doc first?
+
+✻ Crunched for 7m 9s · 1 shell still running
+
+
+=============================
+continue
+=============================
+Committed as f83f1e3 — "docs: sync pillar rollups with shipped detail rows" (2 files, +7/-7). Working tree clean apart from your dev notes (intentionally
+  untouched).
+
+  The doc audit is now fully closed:
+  - 7 rollup cells across ROADMAP.md + FAULT-TOLERANCE-ANALYSIS.md brought in sync with their detail rows.
+  - Zero feature claims added or removed — all edits were wording on status cells, cross-referenced to the code and to the detail rows that already said
+  "shipped".
+  - Remaining open work (honestly deferred, not stale):
+    - ZD-9 cross-type connector swap via separate pipeline (High, local, ready)
+    - EO-2 pipeline two-phase L3 wiring + recovery + non-Kafka tier impls (parked per your call)
+    - CL-* cloud-gated (DOKS)
+    - BL-* library-blocked SDKs
+    - A couple of pre-existing clippy lints (trivial)
+
+  What would you like to pick up next?
+
+✻ Worked for 46s · 1 shell still running
+====================================
+ let us list to do list. and we can start development post that.
+
+======================================
+claude's response:
+
+ Here's the consolidated to-do list, per docs/FAULT-TOLERANCE-ANALYSIS.md §7 (the authoritative unified list). Most pillars are shipped — remaining work
+  clusters around multi-node cluster ops and EO-2 pipeline wiring.
+
+  Active (ready to start)
+
+  Pillar 5 — Exactly-Once Delivery
+  - EO-2 pipeline wiring: two-phase L3 record (pending → committed) bracketing the sink commit at flush boundaries. Kafka T2 TransactionalSink impl already
+  landed; engine flush path + recovery replay are next.
+  - EO-2 per-tier impls: Redis/NATS (T4), Postgres (T1), File (T3) — demand-driven after Kafka→Kafka first cut.
+
+  Pillar 3 — Cluster Ops (medium priority, mostly cloud-gated)
+  - CL-6a Bulk sync protocol — stream L3 partition state source→target via existing QUIC transport.
+  - CL-6b PoH chain transfer — wire real streaming transfer (scaffolding in aeon-cluster/src/poh/transfer.rs).
+  - CL-6c Cutover handshake — Raft-proposed atomic "stop on A, start on B" with offset flush.
+  - CL-6d Transfer backpressure + aeon_partition_transfer_progress metric.
+  - CL-5 Raft-aware K8s auto-scaling (blocked on CL-6 for safe scale-down).
+  - CL-1/2/3 Gate 2 multi-node acceptance, partition reassignment load test, PoH transfer real-network test — require DOKS cluster time.
+
+  Deferred / demand-driven
+
+  - ZD-7 cross-type connector swap (needs separate-pipeline spawn).
+  - TR-3 WebTransport T3 SDK-layer backoff (last remaining TR-3 hop).
+  - BL-1..5 WT SDKs for Node.js/Java/C#/C-C++/PHP — blocked on library maturity.
+  - BL-6 T5 child-process isolation tier (design only).
+
+  Tier 3 manual (pre-publish)
+
+  - Reserve crates.io names (13 crates), create Docker Hub aeonrust org, set GitHub secrets, verify multi-arch buildx, publish in dep order.
+
+  Recommended starting point: EO-2 pipeline flush-path wiring (Kafka→Kafka) — all prerequisites (FT-3 L3 checkpoint, EO-1 Kafka transactional sink,
+  TransactionalSink trait) are in place, and it closes Pillar 5 for the Scenario 1 path without needing cloud infra. Which one do you want to kick off?
+
+✻ Cooked for 1m 44s
+
+==============================
+ cloud infra is running from last 4 days. I forgot to delete the nodes of DOKS cluster. Last time when we discussed E0-2, you suggested about using topic
+  at sink but I suggested to either handle at source or as a last resort, to consider a topic per pipeline configuration, wherever it is stored and
+  suggested L3 backend as last resort. We thought to discuss in detail another time.
+
+===============================
+ Two things to address — DOKS first since it's burning money.
+
+  DOKS cluster (4 days running)
+
+  At ~$0.03/vCPU-hour × 3 nodes × 2 vCPU × 96h ≈ ~$17 sunk, plus load balancer / block storage. Options:
+  1. Tear down now — doctl kubernetes cluster delete aeon-cluster. CL-1/2/3 Gate 2 items can be re-run on a fresh cluster when needed (cluster creation is
+  ~5 min).
+  2. Keep it — only if you want to knock out CL-1 multi-node acceptance in this session before deletion.
+
+  Recommend option 1 unless you want to do cluster work today. Want me to draft the teardown command, or use the cluster while it's up?
+
+  EO-2 design — picking up the thread
+
+  My memory of the prior discussion is thin — let me lay out what the ROADMAP currently reflects vs. your stated preference, so we can pin down what "handle
+   at source" means concretely:
+
+  Current doc stance (FAULT-TOLERANCE-ANALYSIS.md EO-2): two-phase L3 record (pending → committed) bracketing each sink tier's native atomic primitive,
+  per-source UUIDv7 identity, no intermediate topic. Rejected topic-per-pipeline because of the Gate 1 <100ns budget and 2× storage cost.
+
+  Your preference ordering (as I understand it):
+  1. Handle at source — preferred
+  2. Topic per pipeline (config-driven, wherever stored) — middle ground
+  3. L3 backend — last resort
+
+  Before we design, three clarifying questions:
+
+  1. "Handle at source" — what does that mean to you operationally? Options I can see:
+    - (a) Source replays from its own offset on recovery + sink dedups via IdempotentSink (essentially EO-1/EO-3 only — no EO-2 needed). Works when source
+  is replayable (Kafka, CDC) AND sink has server-side dedup (Kafka txns, Redis SETNX, JS msg-id). Fails for non-replayable sources (HTTP webhooks, WS
+  ingestion) or non-idempotent sinks.
+    - (b) Source writes a "seen" marker before the pipeline consumes it (commit-before-process, like a read-side ledger). Adds a write on every event —
+  hot-path cost.
+    - (c) Something else?
+  2. Non-replayable sources — HTTP source, WS/WT ingestion, MQTT (ack-before-process) — how do you want EOS handled there? These are the cases where
+  source-only can't work without a buffer somewhere.
+  3. "Topic per pipeline" — you're imagining Aeon auto-creates a Kafka/Redpanda topic as the durable buffer, sized per pipeline config? Who pays for it when
+   the deployment has no Kafka broker (pure NATS or pure Redis pipelines)?
+
+  Once I know your answer to (1) and (2), I can write the actual design doc — not re-open the one in the repo. Which do you want to tackle first, DOKS
+  teardown or the EO-2 clarifications?
+=======================
+
+
+ I have deleted the kubernetes cluster by logging in to digitalocean control panel. I left the cluster on, with a view that we will test on it. Anyway,
+  coming to the next topic. while you have earlier proposed to use sink to host the events, with a view that streams be used primarily, I have asked about
+  sinks like webhooks/websockets/webtransport streams etc... when you said, sink may not hold it.
+    Source (per upstream + per source-method)  →  Processor (pure logic)  →  Sink (per downstream)
+         ↑                                                                         ↑
+         owns ingest UUIDv7,                                                       owns EOS tier
+         pull/push backpressure                                                    (T1..T6),
+         (Source trait + push_buffer),                                             native atomic
+         Seekable for replay                                                       primitive
+         (IdempotentSink / TransactionalSink)
+   I am not finding full details from my dev-notes. Got a quick snippet.
+
+=========================
+ Good — the design you remember is already captured in docs/THROUGHPUT-VALIDATION.md §7 and aligned with your split. Summarizing what's pinned down so we
+  know exactly what's left to decide:
+
+  Locked decisions (already written down)
+
+  Source owns:
+  - UUIDv7 minted at ingest (one ID per event, flows through to sink unchanged)
+  - Backpressure: pull sources via SPSC fill-up, push sources via 3-phase PushBuffer (mpsc → spill counter → protocol-level flow control)
+  - Seekable trait for replay on failover (broker rewind)
+
+  Sink owns its EOS tier + native atomic primitive:
+
+  ┌──────────────────────────────┬────────────────────────┬────────────────────────────────────────────────────────────┐
+  │             Tier             │        Examples        │                         Primitive                          │
+  ├──────────────────────────────┼────────────────────────┼────────────────────────────────────────────────────────────┤
+  │ T1 Transactional DBs         │ Postgres, MySQL, Mongo │ tx COMMIT + ON CONFLICT                                    │
+  ├──────────────────────────────┼────────────────────────┼────────────────────────────────────────────────────────────┤
+  │ T2 Transactional streams     │ Kafka/Redpanda         │ commit_transaction + send_offsets_to_transaction           │
+  ├──────────────────────────────┼────────────────────────┼────────────────────────────────────────────────────────────┤
+  │ T3 Atomic-rename             │ File                   │ write .tmp → rename                                        │
+  ├──────────────────────────────┼────────────────────────┼────────────────────────────────────────────────────────────┤
+  │ T4 Dedup-keyed               │ Redis, NATS JS         │ SETNX / Nats-Msg-Id                                        │
+  ├──────────────────────────────┼────────────────────────┼────────────────────────────────────────────────────────────┤
+  │ T5 Idempotency-Key receivers │ Webhook, WS, WT        │ Idempotency-Key: <source_event_id> header, receiver dedups │
+  ├──────────────────────────────┼────────────────────────┼────────────────────────────────────────────────────────────┤
+  │ T6 Fire-and-forget           │ Stdout, Blackhole      │ N/A                                                        │
+  └──────────────────────────────┴────────────────────────┴────────────────────────────────────────────────────────────┘
+
+  No intermediate topic — rejected on Gate 1 budget + 2× storage.
+
+  What's still open (needs your input)
+
+  1. T5 when the receiver doesn't cooperate. Idempotency-Key only works if the WS/WT/webhook peer honors it. If the receiver ignores the header, we degrade
+  to at-least-once silently. Options:
+    - (a) Declare T5 as "best-effort EOS, correctness depends on receiver" — document and move on.
+    - (b) Aeon emits a signed receipt the receiver must ack before we flip pending → committed — pushes complexity onto SDK.
+    - (c) Downgrade T5 sinks' declared EOS tier to "at-least-once" and never claim EOS for them.
+  2. Non-replayable push sources on crash. MQTT QoS 0, raw WS ingestion, webhooks (if client doesn't retry): event is in Aeon RAM, not yet in L3 pending,
+  node dies → event is lost. Seekable doesn't help. Options:
+    - (a) Require QoS ≥ 1 / retry-enabled clients for EOS claims; otherwise at-least-once is the ceiling.
+    - (b) PushBuffer Phase 1 writes to L3 WAL before acking the protocol (shifts cost onto hot path — kills the 400 ns budget for these sources).
+    - (c) Source-level WAL only when delivery.mode = exactly_once in pipeline config — pay-for-what-you-use.
+  3. Pipeline flush-path wiring (the actual EO-2 code work, independent of the above): engine writes L3[pipeline/partition] = {offset, pending_event_ids} →
+  calls TransactionalSink::commit() → flips to committed. Recovery replays any pending batch. Kafka T2 trait impl already landed; what's missing is the
+  engine-side orchestration + recovery path.
+
+  My read: (1a) + (2c) give you honest EOS guarantees without blowing the hot-path budget, and (3) is mechanical once those two semantic questions are
+  answered. Which of the three do you want to dig into first, or do you want to push back on my framing?
+
+✻ Baked for 51s
+
+======================
+
+> Actually I said sink may not be an option with a view that webhooks, websockets, webtransport kind of will not support that purposes and when it comes to
+   sinks like MySQL/PostgreSQL/MongoDB etc... and kafka/redpanda/redis streams/valkey streams/rabbitmq streams etc..., they need to accept for being used
+  as a tracker w.r.t. aeon processing know, and if they donot allow that, think about. I agree webhooks/websockets/webtransport at source is push scenario
+  and while we are planning for backpressure strategies, we donot have detailed plan to host a backup (that ensure sequence of received messaged and
+  messages persistence overall know) and this is absolutely true when we are not storing in pipeline-specific topic anyway. I agree, pipeline-specific
+  topic is Aeon-scoped and even though I am not wanting Aeon users to pay extra storage cost and at the same time get their data processing capabilities to
+   be slowed down with perevent persistence in pipeline-specific topic kind of... For this, we may handle as per processing configuration
+  (perevent/orderedBatch/unorderedBatch). think about persisting sequence of events, irrespective of upstream of source connector and downstream of sink
+  connector in aeon itself, while not penalizing in performance context, as doing this, can ensure guaranteed processing, and you can apply backpressure
+  strategies w.r.t. push method at source connector and supporting slow sink scenarios well effectively. While I suggested to consider L1->L2->L3, you
+  mentioned L1->L2->L3 will not be in hot path. In the past, we thought of using L3 for hosting acknowledgements of messages at sink connector &
+  downstream, so that can be deleted after a set period kind of from L3. We had a lot of discussion and you did some development work too. But since, I
+  donot feel fully convinced as you always considered kakfa/redpanda primarily and since you said these can be leveraged at sink, I shared my thought
+  process, reminding about webhooks/websockets/webtransport as non-participating downstreams of sink connectors as an example and suggested to plan more
+  comprehensively while still ensuring extreme throughput theoritically and practically and implementation-wise.
+
+==========================
+claude's response:
+
+ You're right — I've been framing this around sink-participating primitives and treating Kafka/Redpanda as the reference pipeline. That's a narrow view.
+  Let me restate what you're actually proposing so we're aligned, then engage with it seriously.
+
+  Your position, as I now understand it
+
+  The core claim: EOS correctness cannot depend on sink (or source) cooperation. Webhooks/WS/WT sinks don't accept "tracker" metadata. Even
+  Kafka/Redpanda/Postgres cooperate today, but baking in that assumption makes Aeon fragile when someone points it at a non-cooperative downstream.
+  Symmetric argument on the source side: push sources lose messages between protocol-ack and ring enqueue.
+
+  The proposal: Aeon owns the durable sequence itself — independent of source upstream and sink downstream. This durability layer:
+  - preserves ingest order per partition,
+  - survives crashes,
+  - is the single source of truth for "has this event been processed + delivered,"
+  - amortizes cost so the 400 ns/event budget holds,
+  - is configurable per-pipeline so users who don't want durability don't pay for it.
+
+  Prior direction we explored: L3-hosted sink-ACK records with TTL-based GC. You found it Kafka-biased; I agree in hindsight — I was using L3 as an
+  afterthought rather than as the spine.
+
+  What this actually looks like
+
+  An Aeon-internal WAL sitting between source ingest and sink commit, tiered across L1→L2→L3, configurable per pipeline-mode:
+
+  ┌──────────────────────────┬─────────────────────────────────┬─────────────────────────────────────────┬────────────────────────────────────────────┐
+  │           Mode           │         Hot-path write          │              Fsync cadence              │                  Use case                  │
+  ├──────────────────────────┼─────────────────────────────────┼─────────────────────────────────────────┼────────────────────────────────────────────┤
+  │ durability: none         │ —                               │ —                                       │ fire-and-forget, today's behavior          │
+  ├──────────────────────────┼─────────────────────────────────┼─────────────────────────────────────────┼────────────────────────────────────────────┤
+  │ durability:              │ append to L1 ring               │ batch boundary → L2 mmap                │ max throughput, EOS via sink dedup if      │
+  │ unorderedBatch           │                                 │                                         │ available                                  │
+  ├──────────────────────────┼─────────────────────────────────┼─────────────────────────────────────────┼────────────────────────────────────────────┤
+  │ durability: orderedBatch │ append to L1, strict partition  │ batch boundary → L2 mmap, fsync on      │ the default for EOS pipelines              │
+  │                          │ order                           │ checkpoint                              │                                            │
+  ├──────────────────────────┼─────────────────────────────────┼─────────────────────────────────────────┼────────────────────────────────────────────┤
+  │ durability: perevent     │ L2 append + fsync per event     │ synchronous                             │ regulated/financial; budget blown          │
+  │                          │                                 │                                         │ deliberately                               │
+  └──────────────────────────┴─────────────────────────────────┴─────────────────────────────────────────┴────────────────────────────────────────────┘
+
+  L2 is the append-only mmap log (already exists: aeon-state/src/l2.rs, 646 lines, 10 tests — we built this). L3 holds the checkpoint metadata
+  (last-committed sequence per partition per sink). GC: L2 segments drop once all downstream sinks have committed past that sequence.
+
+  On crash: node recovers last-committed sequence from L3, replays L2 from that point through sink (sink dedupes if it can; if it can't, at-least-once is
+  the honest ceiling for T5 — but Aeon itself has not lost data).
+
+  What I want to check with you before going deeper
+
+  1. Is this the shape you had in mind — L2 as the spine, L3 as checkpoint metadata, configurable per pipeline mode — or are you pointing at something
+  different?
+  2. Push-source ingest ack boundary: when a webhook POST lands, do we ack 2xx after L2 append (correctness) or before (throughput)? durability: perevent
+  mode pins this to "after." The others are user choice — document the tradeoff?
+  3. The prior dev work: I don't remember the specifics of the L3-ACK-TTL implementation. Do you want me to go dig it out of git history and check what
+  survived, or treat this as a fresh design pass?
+  4. Scope for first cut: all three durability modes, or land orderedBatch first (covers 90% of EOS users) and add the other two demand-driven?
+
+  No code yet — I want to get the shape right first.
+
+✻ Churned for 51s
+
+
+==========================
+ I wanted this to be configurable on per pipeline basis. Each pipeline configuration will have single/multiple source connectors mapped with source method
+   (push/pull for each, and corresponding settings, as per applicable strategies, for example push method has backpressure when compared to pull method).
+  Likewise, single processor job (check deployment scope of it), single/multiple sink connectors. We have discussed nature and source method of different
+  source connectors and their nature and behavior of different sink connectors too. Likewise, we have discussed different ways of processor implementation
+  (rust-native, rust & WASM, webtransport-based in supported programming languages, websockets-based in supported programming languages). I am not sure,
+  and am thinking about server ram usage and corresponding on-disk-hosted virtual memory (as will be managed by operating system) and how that will be
+  cached and then stored persistently on-disk in L3 scope (all until acknowledgement is received or however we plan to host until), thinking....
+
+============================
+claude's response:
+
+Good pivot — the memory-hierarchy question is exactly the right thing to nail down before any code. Let me lay it out so we're working from the same
+  numbers.
+
+  Where each tier actually lives
+
+  ┌────────────────────┬───────────────────┬─────────────────────────────────────────────────────────────────────────────────┬─────────────────────────┐
+  │        Tier        │      Backing      │                                What the OS does                                 │     Crash behavior      │
+  ├────────────────────┼───────────────────┼─────────────────────────────────────────────────────────────────────────────────┼─────────────────────────┤
+  │ L1 (DashMap)       │ Anonymous heap    │ Can swap under pressure (unpredictable)                                         │ Lost                    │
+  │                    │ pages             │                                                                                 │                         │
+  ├────────────────────┼───────────────────┼─────────────────────────────────────────────────────────────────────────────────┼─────────────────────────┤
+  │ L2 (mmap           │ File-backed pages │ Page cache IS the working set; OS flushes dirty pages on its own cadence        │ Lost pages = unfsynced  │
+  │ append-only log)   │                   │ (dirty_expire_centisecs ≈ 30 s on Linux) or on fsync/msync                      │ tail (bounded)          │
+  ├────────────────────┼───────────────────┼─────────────────────────────────────────────────────────────────────────────────┼─────────────────────────┤
+  │ L3 (redb)          │ File + WAL,       │ fsync on commit                                                                 │ Durable up to last      │
+  │                    │ explicit txn      │                                                                                 │ commit                  │
+  └────────────────────┴───────────────────┴─────────────────────────────────────────────────────────────────────────────────┴─────────────────────────┘
+
+  Key insight: L2's "RAM" and "disk" are the same pages. A write is a memcpy into a page already mapped into our address space; the OS decides whether that
+  page currently sits in physical RAM or is evicted to the backing file. We don't manage it — we just bound how much we care about.
+
+  Pipeline-topology implications
+
+  For a pipeline with 1+ sources, 1 processor, N sinks:
+
+  - Event bodies need one storage path, not N. Write once to L2, fan out N sink-reads from the same mmap.
+  - ACK cursors are per-sink-per-partition. N sinks → N cursors. These go in L3 (tiny — UUID + u64 offset).
+  - GC of L2 segments = min(ack_cursor across all sinks). Slowest sink holds the log. This is where pipeline-level back-pressure kicks in if one sink
+  stalls.
+  - Per-source method: pull sources don't need L2 for replay (broker has it); push sources do (webhook/WS/WT have nothing to replay against).
+
+  This means L2 is only mandatory for push sources when durability ≥ orderedBatch. Pull-source pipelines can skip the WAL and rely on source replay —
+  cheaper.
+
+  Concrete RAM/disk math (20M ev/s, 256 B avg)
+
+  - Raw throughput: 5 GB/s of event bytes.
+  - Retention window (time until all sinks ACK past a given seq): assume 30 s worst case = 150 GB of mmap on disk.
+  - Resident RAM = whatever the OS keeps hot. For a streaming workload (sequential read after sequential write), the working set is small — recent segments
+  in page cache, older ones evicted. Think ~2–8 GB resident on a machine with 32+ GB, OS eviction handles the rest.
+  - fsync cost: amortized at batch/checkpoint cadence (1–10 Hz). Per-event mmap append ≈ 20–50 ns (memcpy + atomic offset bump). Within the 400 ns/event
+  budget.
+
+  Disk headroom is the real planning constraint, not RAM. User running at 20M ev/s with a slow sink needs to provision for the retention window ×
+  throughput.
+
+  Concrete proposal to react to
+
+  - L2 holds event bodies, segment-rolled (e.g. 256 MB segments), append-only, mmap'd.
+  - L3 holds per-partition {last_committed_seq, per_sink_ack_seq[N]} checkpoints, written at checkpoint cadence (not per-event).
+  - GC: delete L2 segment S once min(per_sink_ack_seq) > max_seq_in(S).
+  - Back-pressure trigger: L2 total size exceeds configured cap → same 3-phase PushBuffer protocol-level flow control you already have for push sources. For
+   pull sources, just stop polling — broker queues up.
+  - durability: none: skip L2 entirely. unorderedBatch/orderedBatch: L2 + checkpoint fsync. perevent: L2 + fsync every event.
+
+  Questions for you
+
+  1. Do event bodies go through L2 always, or only for push-source partitions? Pull-source pipelines have the broker as their L2 equivalent — duplicating to
+   Aeon L2 is write amplification for no correctness gain. I'd vote: only push sources write to L2, pull sources track offsets in L3 and rely on Seekable
+  replay.
+  2. L2 size cap — global, per-pipeline, or per-partition? Pipeline scope matches your config model, but a single slow sink in one partition shouldn't stall
+   the whole pipeline. I'd vote per-partition with a pipeline-total ceiling as a safety net.
+  3. Should I pull up the prior dev work from git history (the L3-ACK-TTL thing) so we know what code already exists vs. what's new? I don't have it in
+  context.
+
+✻ Cooked for 1m 4s
+
+
+=============================
+ I am in full agreement with your thought process as you mentioned in question 1. Coming to question 2, I am thinking in between per-partition and
+  per-pipeline. Someone may deploy Aeon to handle 1 larger pipeline while some others might do 1 larger pipeline and multiple smaller pipelines or in
+  different other combinations, to fulfill their data transformation needs in their data pipelines. In another words, I see Aeon like realtime ETL engine
+  too when looking at a different perspective as our primary perspective is a realtime data processing engine, on the outset.
+
+=============================
+claude's response:
+
+ Agreed on the ETL framing — that reinforces per-pipeline as the user-facing unit. Here's a concrete three-level budget that covers both the "one big
+  pipeline" and "mixed pipelines" deployments:
+
+  L2 budget hierarchy
+
+  ┌───────────────────┬──────────────────────────────────────────────────┬─────────────────────────────────────────┬───────────────────────────────────┐
+  │       Level       │                     Purpose                      │                 Config                  │              Default              │
+  ├───────────────────┼──────────────────────────────────────────────────┼─────────────────────────────────────────┼───────────────────────────────────┤
+  │ Node-global cap   │ Disk-size safety net; prevents a runaway         │ state.l2.node_max_bytes                 │ e.g. 80% of configured state dir  │
+  │                   │ pipeline from eating all available storage       │                                         │ volume                            │
+  ├───────────────────┼──────────────────────────────────────────────────┼─────────────────────────────────────────┼───────────────────────────────────┤
+  │ Per-pipeline cap  │ Fair-share ceiling when multiple pipelines       │ pipeline.durability.l2_max_bytes        │ unset → inherits node-global      │
+  │                   │ coexist; defines each pipeline's SLO envelope    │                                         │ (single-pipeline case just works) │
+  ├───────────────────┼──────────────────────────────────────────────────┼─────────────────────────────────────────┼───────────────────────────────────┤
+  │ Per-partition     │ Early-warning threshold so one hot partition     │ derived = pipeline_cap /                │                                   │
+  │ soft target       │ backs off before it starves its siblings in the  │ partition_count, overridable            │ auto                              │
+  │                   │ same pipeline                                    │                                         │                                   │
+  └───────────────────┴──────────────────────────────────────────────────┴─────────────────────────────────────────┴───────────────────────────────────┘
+
+  Backpressure escalation
+
+  1. Partition exceeds soft target → slow that partition's source only (push: Phase 3 flow control; pull: stop polling, broker queues).
+  2. Pipeline approaches its cap → throttle all partitions in that pipeline.
+  3. Node approaches global cap → log warning, throttle all pipelines, emit metric aeon_l2_pressure{level="node"} for ops alerting.
+
+  This is what makes Aeon feel like ETL rather than a single-tenant streaming engine: operators size pipelines independently, noisy pipelines can't take
+  down quiet ones, and the single-big-pipeline case needs zero extra config (just don't set a pipeline cap).
+
+  Let me capture the ETL framing in memory since it's a lens on the product, then two quick asks:
+
+  Still pending from me:
+  - Q3: want me to pull the prior L3-ACK-TTL dev work out of git history so we know what code already exists before designing the new WAL layer?
+  - Would you also want L2 durability class to be configurable (fsync_per_event / fsync_per_batch / fsync_on_checkpoint) orthogonal to the cap? That's where
+   the perevent / orderedBatch / unorderedBatch knob lives.
+
+  Recalled 1 memory, wrote 2 memories (ctrl+o to expand)
+
+● Memory captured. Ball back to you on Q3 (pull prior L3-ACK-TTL work from git?) and the durability-class question.
+
+✻ Sautéed for 49s
+=========================
+ please check git history and code too. you will find references in roadmap, fault tolerance analysis document and in many other documents too. let us
+  review code. Let us not write any newly, until solution is freezed. In previous interactions, you were too much towards kafka/redpanda, as if it is
+  default, even though it might be my request to test using redpanda during initial development time, as post going to production, users may use their
+  choicest source connectors and sink connectors and then develop processor in chosen programming language, from among supported development options and
+  deployment options too.
+
+=============================
+claude's response:
+
+Agreed — Redpanda was your dev-testing choice, not a design anchor. Let me audit what's actually in the tree before we talk design.
+
+ Audit done. Key finding: Aeon today has metadata/offset durability but zero event-body persistence. Everything we've been discussing as "new" is genuinely
+   greenfield for event bodies — but the scaffolding around it is mostly in place.
+
+  What already exists (don't rebuild)
+
+  ┌─────────────────────────────┬──────────────────────────────────────┬───────────────────────────────────────────┬────────────────────────────────────┐
+  │            Piece            │                 File                 │                   Role                    │               Notes                │
+  ├─────────────────────────────┼──────────────────────────────────────┼───────────────────────────────────────────┼────────────────────────────────────┤
+  │                             │                                      │ In-memory per-event state                 │                                    │
+  │ DeliveryLedger              │ aeon-engine/src/delivery_ledger.rs   │ (pending/failed, retry counts,            │ IDs + offsets only, no payloads    │
+  │                             │                                      │ checkpoint_offsets())                     │                                    │
+  ├─────────────────────────────┼──────────────────────────────────────┼───────────────────────────────────────────┼────────────────────────────────────┤
+  │ CheckpointRecord +          │                                      │ Append-only WAL: monotonic ID,            │                                    │
+  │ CheckpointWriter            │ aeon-engine/src/checkpoint.rs        │ per-partition offsets, pending_event_ids: │ Metadata, ~100–200 bytes/record    │
+  │                             │                                      │  Vec<[u8; 16]>, CRC32                     │                                    │
+  ├─────────────────────────────┼──────────────────────────────────────┼───────────────────────────────────────────┼────────────────────────────────────┤
+  │ L3CheckpointStore (FT-3)    │ same file                            │ L3-backed alternative to WAL file         │ checkpoint/{id} keys, scan-prefix  │
+  │                             │                                      │                                           │ ordered                            │
+  ├─────────────────────────────┼──────────────────────────────────────┼───────────────────────────────────────────┼────────────────────────────────────┤
+  │                             │                                      │                                           │ Already matches your naming — but  │
+  │ DeliveryStrategy            │ aeon-types/src/delivery.rs           │ PerEvent / OrderedBatch / UnorderedBatch  │ controls ack timing, not           │
+  │                             │                                      │                                           │ persistence                        │
+  ├─────────────────────────────┼──────────────────────────────────────┼───────────────────────────────────────────┼────────────────────────────────────┤
+  │ DeliverySemantics           │ same                                 │ AtLeastOnce / ExactlyOnce                 │ Pipeline-config surface exists     │
+  ├─────────────────────────────┼──────────────────────────────────────┼───────────────────────────────────────────┼────────────────────────────────────┤
+  │                             │                                      │                                           │ Kafka-as-checkpoint is a shipped   │
+  │ CheckpointConfig.backend    │ same                                 │ Wal / StateStore / Kafka / None           │ option — reinforces the bias you   │
+  │                             │                                      │                                           │ flagged                            │
+  ├─────────────────────────────┼──────────────────────────────────────┼───────────────────────────────────────────┼────────────────────────────────────┤
+  │ FlushStrategy               │ same                                 │ interval, max_pending, adaptive knobs     │ 1s / 50K default                   │
+  ├─────────────────────────────┼──────────────────────────────────────┼───────────────────────────────────────────┼────────────────────────────────────┤
+  │ L2 MmapStore                │ aeon-state/src/l2.rs                 │ Append-only mmap log with index +         │ Exists, feature-gated, unused for  │
+  │                             │                                      │ compaction                                │ events                             │
+  ├─────────────────────────────┼──────────────────────────────────────┼───────────────────────────────────────────┼────────────────────────────────────┤
+  │ BatchInflight /             │ aeon-engine/src/transport/session.rs │ Transient RAM retention for T3/T4         │ Payloads in RAM only, no disk      │
+  │ ReplayOrchestrator          │                                      │ disconnect (~30s)                         │ backing                            │
+  └─────────────────────────────┴──────────────────────────────────────┴───────────────────────────────────────────┴────────────────────────────────────┘
+
+  What this changes about the design
+
+  1. The perevent / orderedBatch / unorderedBatch config knob is already there — we extend its meaning from "ack timing" to also cover "event-body
+  persistence tier." No new config surface, just richer semantics.
+  2. CheckpointConfig has Kafka as a backend option. That's where the Kafka-as-default creep you called out leaked into the code. A clean design should
+  deprecate CheckpointBackend::Kafka (or at least demote it from peer status) in favor of Wal / StateStore as the only Aeon-owned options — Kafka as a
+  checkpoint store is exactly the coupling you're objecting to.
+  3. L2 MmapStore is 646 lines of shipped, tested code sitting idle for this use case. It's already mmap-backed, append-only, has recovery + compaction. The
+   event-body WAL we sketched is this file with a thin pipeline-runner integration, per-partition segments, and GC keyed off min(ack_cursor).
+  4. BatchInflight/ReplayOrchestrator solve a narrower version of this problem (processor-disconnect only) by keeping payloads in RAM. Once L2-backed event
+  persistence lands, the replay orchestrator becomes a consumer of L2 rather than its own RAM retention scheme — simplification.
+
+  Questions before we freeze the shape
+
+  1. Deprecate CheckpointBackend::Kafka? I'd say yes — it's the single strongest symbol of the Kafka-default bias. Anyone who actually wants it can emit
+  checkpoints to a Kafka sink externally.
+  2. Should L2 carry both event bodies and checkpoint records, or keep them split (L2 for bodies, L3/redb for checkpoints as today)? Splitting matches the
+  current code; unifying means one tier to GC. I'd keep split — checkpoints are transactional, bodies are append-only, different access patterns.
+  3. BatchInflight/ReplayOrchestrator — refactor as L2 readers later, or leave them as a fast-path RAM cache on top of L2? I'd leave them as a RAM cache
+  (tier above L2) so T3/T4 recovery stays sub-ms when there's been no crash.
+
+  No code yet. Ball to you on those three plus whether my read of "extend existing mode enum rather than add a new one" matches your intent.
+
+✻ Crunched for 3m 7s
+
+※ recap: Designing Aeon's native event-body durability layer (L2 mmap-backed WAL, per-pipeline configurable) so EOS does not depend on sink or source
+  cooperation. Next: you decide whether to deprecate CheckpointBackend::Kafka and confirm keeping event bodies in L2 separate from L3 checkpoints. (disable
+  recaps in /config)
+  
+========================
+-> please deprecate CheckpointBackend::Kafka w.r.t. question 1.
+-> as you suggested w.r.t. question 2. keep them splitted and separated L2 for event bodies and L3 (redb/rocksdb/other as per configuration) for checkpoint records)
+-> please donot forget WAL is fallback of L3 store as per one of the past discussions
+-> if we refactor as L2 readers, then, it will become uniform know still thinking about BatchInflight/ReplayOrchestrator
+==========================
+claude's response:
+
+ Confirmed in code. Important catches from reading the actual files:
+
+  On (1) deprecating CheckpointBackend::Kafka: pipeline.rs:873 already treats Kafka | None as "no persister" — so it's currently a no-op enum variant that
+  looks like a feature. Removal is a rename + test/bench cleanup, no behavioral loss.
+
+  On (3) WAL as L3 fallback — that is not how the code works today. Wal and StateStore are peers in delivery.rs:60 + pipeline.rs:834-873; picking StateStore
+   without an l3_checkpoint_store just logs a warning and silently persists nothing. So this is a new design constraint to encode, not an existing pattern.
+  The shape it should take:
+  - backend: StateStore → try L3 first; on L3 open/write error, automatically failover to a WAL file in the state dir, log the degradation, emit a metric.
+  - backend: Wal stays available as an explicit "I want WAL, no L3" choice.
+  - backend: None stays as the durability-off escape hatch.
+  - backend: Kafka → removed.
+
+  On (4) BatchInflight/ReplayOrchestrator uniformity — one subtlety worth your input: the uniformity gain only exists when durability ≥ unorderedBatch
+  (events are in L2 anyway, so BatchInflight becomes a cursor map instead of an event holder). For durability: none, there's no L2 to read from — we either:
+  - (a) keep today's RAM-retention orchestrator as the fallback when durability is off (dual-mode code), or
+  - (b) say "no durability = no processor-disconnect replay either" — honest coupling, drop the RAM retention, T3/T4 reconnect = accept the in-flight loss.
+
+  (b) is ideologically cleaner and removes code; (a) preserves the UX of today's replay window even for users who don't want full durability. Which
+  direction do you want?
+
+  Frozen so far
+
+  - Source owns ingest UUIDv7, pull/push, Seekable.
+  - Sink owns EOS tier + native primitive (T1–T6 matrix).
+  - No intermediate pipeline topic.
+  - L2 mmap = event body spine (push-source partitions only; pull sources rely on broker + Seekable).
+  - L3 (redb/rocksdb/pluggable) = checkpoint records; WAL is automatic fallback of L3, not a peer.
+  - CheckpointBackend::Kafka → removed.
+  - Budget hierarchy: node-global cap > per-pipeline cap > per-partition soft target.
+  - Durability mode names reuse existing DeliveryStrategy enum: PerEvent / OrderedBatch / UnorderedBatch + None. Semantics extended to cover event-body
+  persistence, not just ack timing.
+  - Per-pipeline config surface (ETL framing: noisy pipelines can't starve quiet ones).
+
+  Still open
+
+  - Q4 shape above (BatchInflight uniformity: option (a) or (b)).
+  - Push-source ingest ack boundary from earlier: when a webhook POST lands, do we return 2xx after L2 append (correctness) or before (throughput)? PerEvent
+   pins this to "after." What's the default for OrderedBatch / UnorderedBatch?
+  - None mode behavior for push sources: today's PushBuffer keeps events in RAM until consumed. No change needed, but want to confirm that's the intent vs.
+  rejecting push sources entirely when durability: none.
+
+✻ Worked for 1m 2s
+
+=============================
+-> among the fronzen items, you mentioned that, "Source owns ingest UUIDv7, pull/push, Seekable". While this feels to be true, I would like to add clarity on the topic in the context of, UUIDv7 be created for each event in the source connector, while that event data be stored in pipeline-specific context, in L2 store (event body) and in L3 store (checkpoint related). While we also thought about this for push method only, if, as we thought earlier to not store events from sources (with pull method), how can we assign UUIDv7 for it? will it happen on runtime?
+
+-> for question 4, technically 4(b) is correct. But implementing 4(a) is a graceful alternative, I am not sure, how many will respect that. if they wanted durability, they need to choose other options and facilitate storage accordingly. If we keep in RAM, then, it has to be considered as so and is to be documented that, any crach light loose that data but user need not worry as this is graceful feature implementation anyway
+==============================
+claude's response:
+
+Good catches on both.
+
+  Q1: UUIDv7 for pull-source events
+
+  Right — if pull events don't hit L2, we need an identity story that survives replay. Three options:
+
+  - (A) Deterministic UUIDv7: minted at runtime from (source_name, partition, broker_offset) — hash supplies the random bits, source_ts supplies the 48-bit
+  timestamp prefix. Property: replay after crash produces the same UUID for the same logical event, so sink-side idempotency-key dedup (T4/T5) keeps working
+   without persisting anything. No storage cost.
+  - (B) Random UUIDv7 + persist mapping: mint normally, write (uuid → broker_offset) to L2 before sink. Defeats the "pull sources don't write L2" rule.
+  - (C) Drop UUIDv7 for pull sources: sink dedup falls back to broker-native identity (offset + partition). Asymmetric abstraction — sinks need two dedup
+  paths.
+
+  (A) is the right call. It preserves "one event identity" across source types, costs zero storage, and works for any source with a stable replay position
+  (Kafka offset, Postgres LSN, MySQL binlog pos, Mongo resume token, file byte offset). Push sources mint the standard random UUIDv7 since there's no broker
+   position to hash — and for them the event body hits L2 anyway, so replay reads the stored UUID.
+
+  HTTP-polling source is the one awkward case (no strict offset). Treat it like push for identity purposes: mint random, write to L2 when durability is on.
+
+  Q2: BatchInflight — 4(a) with explicit "best-effort" labeling
+
+  Frozen: keep the RAM-only ReplayOrchestrator active regardless of durability mode, but label it in code + docs as a graceful convenience for transient
+  processor disconnects only — not a durability guarantee. Crash loses events in the replay window; that's by design when durability: none. Metric + log
+  message on activation make the best-effort nature visible to operators.
+
+  Updated frozen list
+
+  - Source owns event identity: push sources mint random UUIDv7; pull sources mint deterministic UUIDv7 from hash(source, partition, offset) + source_ts;
+  both at runtime, no persistence required for pull.
+  - CheckpointBackend::Kafka removed; WAL is automatic fallback of L3 StateStore, not a peer.
+  - L2 = event bodies (push + HTTP-polling only); L3 = checkpoint records.
+  - ReplayOrchestrator stays RAM-only across all durability modes, documented as best-effort.
+  - Budget hierarchy + per-pipeline config per ETL framing.
+  - Durability modes reuse DeliveryStrategy enum (PerEvent / OrderedBatch / UnorderedBatch / None), semantics extended to cover event-body persistence.
+
+  Still open
+
+  1. Push-source ack boundary: webhook/WS/WT acking 2xx/pong before vs after L2 append. PerEvent pins to "after." Default for OrderedBatch and
+  UnorderedBatch — after (safe) or before (throughput)?
+  2. None mode + push sources: confirm today's PushBuffer RAM-only behavior is the intent, no special rejection.
+  3. Deterministic UUIDv7 for pull — do we expose the derivation as a connector-pluggable hook (so e.g. Kafka source can use (topic, partition, offset) but
+  Postgres CDC can use LSN directly) or bake a single hash(source+partition+offset) formula?
+
+✻ Worked for 49s
+
+
+===========================
+this is for UUIDv7 generation,
+-> in pull sources scenario, if upstream provides some offset in respective source connector then, it will be ok if that offset is used as random part in addition to time, to generate UUID. Technically, using source identifier, offset as two inputs to current microtime and incremented number at 20 million events per second scale, may be helpful? while this may be deterministic, without microtime and any additional increments, the generated UUIDv7 cannot be incremental in nature. Do think and share your inputs
+-> for all push sources,  UUIDv7 is ok.
+
+-> for http-polling source, if we consider as push, this being pull context-wise, we need to create another sub-classification, to mark that as so and we cannot just like that, mark as push source.
+-----------
+the confirmation request about "None mode + push sources: confirm today's PushBuffer RAM-only behavior is the intent, no special rejection", is it about durability:none setting that we have discussed, coming to an inference that it will be available in RAM and if lost is lost, and have to be documented in code and documents both know
+--------------
+coming to Push-source ack boundary, as long as we are storing safely, acknowledgement is fine at source connector naturally, for webhooks/websockets/webtransport. I am reminding multiple times about durability, so we can provide acknowledgement comfortably to the source upstream appropriately
+-------------
+
+=============================
+claude's response:
+
+ Three good points. Let me work through them.
+
+  UUIDv7 for pull sources — the determinism vs monotonicity tradeoff
+
+  You identified the exact tension: pure determinism gives you replay identity, microtime+counter gives you sort-order, but they fight each other — adding
+  current-microtime breaks replay identity (same event crashes, re-polls, gets a new UUID → sink dedup fails).
+
+  But we don't have to pick. UUIDv7 has room for both if we use the source event's timestamp, not processing microtime:
+
+  UUIDv7 layout (128 bits):
+   [ unix_ts_ms : 48 ][ ver:4 ][ rand_a:12 ][ var:2 ][ rand_b:62 ]
+
+  Proposed derivation for pull sources:
+  - unix_ts_ms (48) ← source event timestamp (Kafka record ts, Postgres LSN→ts, MySQL binlog ts, Mongo oplog ts). Time-ordered, monotonic by source,
+  preserved across replay.
+  - rand_a (12) ← (broker_offset & 0xFFF). Monotonic within-partition (offsets always increase), covers 4096 events per ms per partition — comfortably above
+   20M/s divided across partitions.
+  - rand_b (62) ← SHA-256 of (source_name ‖ partition ‖ offset) truncated to 62 bits. Collision-resistant, deterministic.
+
+  Properties:
+  - Time-sortable by source event time (the correct reference frame — processing time is irrelevant to event order).
+  - Within-partition monotonic via offset in rand_a, so replay still produces an ordered stream.
+  - Fully deterministic — same (source, partition, offset) → same UUID forever, across crashes and reassignments. Sink idempotency-key dedup works.
+  - No microtime, no counter, no persisted state. Cost is one SHA-256 per event — already cheap enough at 20M ev/s (hardware-accelerated, ~30 ns).
+
+  Your instinct about microtime+counter is right for push sources (no broker offset to hash), and that's what I already proposed. The split is clean:
+
+  ┌──────────────────────────────────────────────┬───────────────────┬────────────────────────────────────────────────────┐
+  │                 Source mode                  │ UUIDv7 timestamp  │                 UUIDv7 random bits                 │
+  ├──────────────────────────────────────────────┼───────────────────┼────────────────────────────────────────────────────┤
+  │ Pull (Kafka, CDC, Redis, file)               │ source event ts   │ offset in rand_a + hash(src,part,offset) in rand_b │
+  ├──────────────────────────────────────────────┼───────────────────┼────────────────────────────────────────────────────┤
+  │ Push (WS, WT, webhook, MQTT, RabbitMQ, QUIC) │ current microtime │ standard PRNG + sub-ms counter for monotonicity    │
+  ├──────────────────────────────────────────────┼───────────────────┼────────────────────────────────────────────────────┤
+  │ Poll (see below)                             │ current microtime │ standard PRNG + sub-ms counter                     │
+  └──────────────────────────────────────────────┴───────────────────┴────────────────────────────────────────────────────┘
+
+  HTTP-polling as a third sub-classification
+
+  Agreed — it's not push, and it's pull-shaped but without a durable broker offset to hash. Proposing a third category:
+
+  - pull — Aeon polls, broker has durable position (Kafka offset, CDC LSN, Redis stream ID, file byte offset). No L2 body storage; replay via Seekable.
+  - push — upstream initiates (WS, WT, webhook, MQTT, RabbitMQ push, QUIC). L2 body storage required for durability.
+  - poll — Aeon polls, but no durable upstream position (HTTP poll against arbitrary REST endpoints, DNS poll, any time-sampled source). L2 body storage
+  required, identity minted like push.
+
+  This maps cleanly onto existing trait: Source stays as the trait; add a source_kind() -> SourceKind { Pull, Push, Poll } method so the pipeline runner
+  knows whether to engage the L2 write path.
+
+  None mode clarification — yes
+
+  You read it correctly. durability: none means:
+  - Push sources: events in PushBuffer RAM only, lost on crash.
+  - Poll sources: same.
+  - Pull sources: always safe because broker is the buffer of record.
+  - ReplayOrchestrator stays RAM-only (the 4(a) graceful path).
+
+  All documented in code comments + docs as "best-effort, not durable." Crash in this mode = accepted loss.
+
+  Push-source ack boundary — yes
+
+  Your rule is now frozen: ack to upstream (webhook 2xx / WS pong / WT stream continue / MQTT PUBACK / AMQP ack) happens after L2 append completes, in any
+  mode where durability is enabled. This is what makes the durability claim honest — the upstream only learns we have it when we actually do.
+
+  For durability: none on push sources: ack immediately, accept the RAM-loss risk.
+
+  Updated frozen list
+
+  - Source kinds: Pull / Push / Poll (third category added).
+  - UUIDv7 derivation:
+    - Pull: source_ts + offset-in-rand_a + hash-in-rand_b → deterministic + time-ordered + within-partition monotonic.
+    - Push/Poll: current microtime + PRNG + sub-ms counter → monotonic, standard UUIDv7.
+  - Push/Poll ack boundary: after L2 append (when durability on); immediate (when durability off).
+  - None mode: RAM-only PushBuffer + ReplayOrchestrator, documented as best-effort.
+  - All prior frozen items (sink tiers, L2/L3 split, WAL as L3 fallback, no Kafka backend, budget hierarchy, ETL framing).
+
+  Still open
+
+  1. Derivation formula as a connector-pluggable hook vs a single hardcoded hash(source+partition+offset) — lets Postgres CDC use LSN natively instead of
+  synthetic offset.
+  2. SHA-256 vs a cheaper hash (xxhash3, wyhash) for the rand_b bits. Not security-critical here — we just need collision resistance within a pipeline.
+  xxhash3 is ~3–5× faster than hardware SHA-256. Does collision resistance matter, or is rand_b = 62-bit xxhash3(...) fine?
+  3. What happens when source_ts is absent (some brokers don't emit it, or it's lying/zero)? Fallback to current microtime for the 48-bit prefix? This
+  breaks pure determinism for those sources — acceptable?
+
+✻ Sautéed for 1m 19s
+
+※ recap: We're designing Aeon's native durability layer (L2 event bodies + L3 checkpoints, per-pipeline configurable) to replace Kafka-biased EOS
+  assumptions. Next: your call on three open items — pluggable UUIDv7 derivation per connector, SHA-256 vs xxhash3 for rand_b, and fallback when source_ts
+  is absent.
+  
+=============================
+-> happy to see new source method named "poll". Thanks for the extra classification, that cleared the air in that context, even though it brings in more configuration options for POLL source method, which has to be done as configuration option accordingly in source connector
+
+-> when it comes to point w.r.t. "Derivation formula as a connector-pluggable hook vs a single hardcoded hash(source+partition+offset) — lets Postgres CDC use LSN natively instead of   synthetic offset", please donot forget, if multiple sources are there in a pipeline configuration then, how will sequence be know and how the messages be sorted, if at all needed?
+
+-> SHA-256 is good.
+-> when it comes to missing source_ts, we need to be prepared. Too many exceptions instead of configurations leaves room for error even though multiple conventions are a different thing, that eases code, for understood concepts and conventions. Let us provide for configuration and I am thinking to keep this optional stuff minimal or a clear local Aeon-specific alternative while validating how much that costs in terms of processing time and overall, throughput possibilities.
+
+=================================
+ 
+claude's response:
+
+ Three good challenges. Let me address each.
+
+  Poll source config surface
+
+  Agreed — poll brings config weight. Minimum needed per Poll source:
+
+  ┌──────────────┬───────────────────────────────────────────────────────────────────────┬───────────────┐
+  │    Config    │                                Purpose                                │    Example    │
+  ├──────────────┼───────────────────────────────────────────────────────────────────────┼───────────────┤
+  │ interval     │ Poll cadence                                                          │ 5s            │
+  ├──────────────┼───────────────────────────────────────────────────────────────────────┼───────────────┤
+  │ jitter       │ Avoid synchronized thundering herd                                    │ 10%           │
+  ├──────────────┼───────────────────────────────────────────────────────────────────────┼───────────────┤
+  │ timeout      │ Per-poll timeout                                                      │ 3s            │
+  ├──────────────┼───────────────────────────────────────────────────────────────────────┼───────────────┤
+  │ dedup_window │ Duplicate suppression when upstream re-serves same data               │ 60s           │
+  ├──────────────┼───────────────────────────────────────────────────────────────────────┼───────────────┤
+  │ pagination   │ Cursor/page/offset header name if upstream supports it                │ X-Next-Cursor │
+  ├──────────────┼───────────────────────────────────────────────────────────────────────┼───────────────┤
+  │ durability   │ Event-body L2 persistence (inherits pipeline default but overridable) │ orderedBatch  │
+  └──────────────┴───────────────────────────────────────────────────────────────────────┴───────────────┘
+
+  The dedup_window is the key one — poll sources often re-serve the same rows; we need a small L2-backed seen-set keyed by content hash to avoid emitting
+  duplicates downstream.
+
+  Multi-source ordering in one pipeline
+
+  This is the important catch. Timestamps from different sources are incomparable — Kafka broker time, Postgres LSN→ts, and webhook arrival time don't share
+   a clock or even a clock discipline. There is no honest way to merge-sort them.
+
+  Aeon's honest guarantee, frozen:
+
+  - Within a single source partition: strict order preserved (broker order + offset-in-rand_a UUID). This is always true.
+  - Across partitions within a source: no order (same rule Kafka enforces).
+  - Across sources in a multi-source pipeline: arrival order at the processor's input ring only. No semantic ordering promise.
+
+  If a user actually needs total order across sources, Aeon is the wrong layer — they should merge upstream (into a Kafka topic, for example) and have Aeon
+  consume the merged stream as a single source.
+
+  Documented explicitly in the manifest schema + CONNECTORS.md so it's not a surprise. Sinks that need ordering (e.g. DB writes requiring causal order) get
+  it per-partition, not per-pipeline.
+
+  Pluggable identity with centralized hashing (not pluggable hashing)
+
+  Compromise that keeps config minimal but respects source-native identity:
+
+  trait Source {
+      fn source_kind() -> SourceKind;
+      // Returns canonical identity bytes for this event —
+      // Kafka: topic||partition||offset
+      // Postgres CDC: LSN
+      // Mongo: resume_token
+      // File: byte_offset
+      // HTTP poll: content_hash (for dedup) + poll_index
+      fn event_identity(ev: &RawEvent) -> Bytes;
+  }
+
+  Pipeline runner centralizes: rand_b = SHA256(source_name ‖ source.event_identity(ev)).take(62 bits). One hashing path, each connector contributes its
+  natural identity. Postgres uses LSN natively; Kafka uses topic+partition+offset; Mongo uses resume_token — no synthetic "offset" forced on anyone.
+
+  Missing source_ts — configuration, not exception
+
+  Your rule: minimal config surface, document clearly, measure cost.
+
+  source:
+    - kind: kafka
+      event_time: broker     # use broker-provided timestamp (default when available)
+    - kind: http_polling
+      event_time: aeon_ingest  # no upstream ts — mint at ingest (explicitly non-deterministic)
+    - kind: webhook
+      event_time: header:X-Event-Time  # pull from named header
+
+  Three values, explicit choice:
+  - broker: source provides ts. Deterministic on replay. Default for connectors that expose it.
+  - aeon_ingest: we stamp at ingest. Required for push + most poll sources. Loses cross-replay determinism (explicitly flagged in docs).
+  - header:<name>: pull from a named metadata header. For webhooks/WS that carry upstream-authored timestamps.
+
+  Cost:
+  - broker: zero additional work (we're reading the event anyway).
+  - aeon_ingest: one Instant::now() call per event ≈ 20 ns on x86_64 (TSC-backed). Within budget.
+  - header:<name>: one SmallVec lookup + parse ≈ 50 ns. Also fine.
+
+  No exception paths, no silent fallback. If broker is configured on a connector that can't provide ts, pipeline fails at start with a clear error — not at
+  runtime.
+
+  Updated frozen list
+
+  - SourceKind: Pull / Push / Poll.
+  - Multi-source ordering: per-partition-within-source only; no cross-source merge; documented.
+  - Identity: Source::event_identity() -> Bytes trait method; hashing centralized with SHA-256.
+  - event_time config: broker / aeon_ingest / header:<name>; pipeline fails at start if misconfigured.
+  - Poll config minimums: interval, jitter, timeout, dedup_window, pagination, durability.
+  - All prior frozen items stand.
+
+  Still open
+
+  1. Content-hash dedup window for poll sources — is this Aeon-owned (hash ring in L2) or do we push it to users via an IdempotencyKey that their HTTP
+  response must emit? Aeon-owned is more "just works"; user-owned is more honest.
+  2. Cross-partition within a source — any user demand you're aware of for merge-sort by source_ts within one source across partitions? Kafka doesn't do it,
+   but we've seen the question in design reviews.
+
+✻ Sautéed for 1m 6s
+=============================
+-> will upstream provide "Content-hash dedup window for poll sources"?
+-> not a documented one as of "Cross-partition within a source" currently, unless we choose to deal with single consumer or with consumer group (which is stream-specific option)? how do you think?
+
+================================
+claude's response:
+
+ Both questions have "it depends, but here's the honest default" answers.
+
+  Content-hash dedup for poll sources — upstream rarely provides
+
+  Reality check on what HTTP APIs actually expose:
+
+  ┌───────────────────────────────────────────────────────┬───────────────────────────────────────────────────────────┬────────────────────────────────┐
+  │                   Upstream pattern                    │                        What we get                        │          Reliability           │
+  ├───────────────────────────────────────────────────────┼───────────────────────────────────────────────────────────┼────────────────────────────────┤
+  │ Well-designed REST with pagination                    │ ETag, Last-Modified, cursor token, X-Next-Page            │ Good — use as identity         │
+  │                                                       │                                                           │ directly                       │
+  ├───────────────────────────────────────────────────────┼───────────────────────────────────────────────────────────┼────────────────────────────────┤
+  │ Polling a changelog endpoint                          │ Cursor advances, upstream is the source of truth          │ Excellent                      │
+  │ (/changes?since=<cursor>)                             │                                                           │                                │
+  ├───────────────────────────────────────────────────────┼───────────────────────────────────────────────────────────┼────────────────────────────────┤
+  │ Polling a "current state" endpoint                    │ Whole payload every time, no identity, frequent           │ None                           │
+  │                                                       │ duplicates                                                │                                │
+  ├───────────────────────────────────────────────────────┼───────────────────────────────────────────────────────────┼────────────────────────────────┤
+  │ Internal/legacy APIs                                  │ Varies wildly, often no metadata at all                   │ None                           │
+  └───────────────────────────────────────────────────────┴───────────────────────────────────────────────────────────┴────────────────────────────────┘
+
+  The majority of real-world poll targets fall in the bottom two rows. So if we require upstream cooperation, poll sources will often ship broken.
+
+  Proposal — hybrid, config-driven, prefer upstream when it exists:
+
+  source:
+    - kind: http_polling
+      url: https://api.example.com/events
+      identity:
+        mode: cursor           # cursor | etag | content_hash | compound
+        cursor_path: $.next    # JSONPath or header name
+
+  - cursor / etag — zero-cost, upstream is authoritative. Use when available.
+  - content_hash — Aeon-owned dedup via xxhash3 of normalized payload into a bounded L2 seen-set with TTL window. Cost: ~30 ns/event + L2 write. Only path
+  that works when upstream is uncooperative.
+  - compound — both, with cursor as primary and content_hash as safety net (recommended default for unknown APIs).
+
+  Default is compound because it degrades gracefully: if upstream gives us a cursor we trust it; if not, content_hash catches duplicates.
+
+  Cross-partition ordering within a source — Aeon isn't consumer-grouped anyway
+
+  You're right that "consumer group" is the wrong lens for Aeon. Per CLAUDE.md the decision is already frozen: manual partition assign, no consumer groups.
+  Each partition has exactly one owner node; partition count is immutable after pipeline creation.
+
+  That gives us a clean framing independent of Kafka's terminology:
+
+  ┌──────────────────────────────────┬──────────────────────────┬──────────────────────────────────────────────┐
+  │    Pipeline partition config     │    Ordering property     │                  Throughput                  │
+  ├──────────────────────────────────┼──────────────────────────┼──────────────────────────────────────────────┤
+  │ partitions: 1 (single consumer)  │ Total order preserved    │ Bounded by one core                          │
+  ├──────────────────────────────────┼──────────────────────────┼──────────────────────────────────────────────┤
+  │ partitions: N (default parallel) │ Per-partition order only │ Scales linearly (target: 2.5M ev/s/core × N) │
+  └──────────────────────────────────┴──────────────────────────┴──────────────────────────────────────────────┘
+
+  My recommendation: ship only these two today. Don't build cross-partition merge-by-source-ts until a user actually asks. Reasons:
+
+  - Partition is already the parallelism unit — adding bounded merge-wait reintroduces the serialization we deliberately designed out.
+  - A laggard partition would stall the merge window, defeating Aeon's "never the bottleneck" target.
+  - Users who need total order have two well-documented paths: set partitions: 1, or re-partition upstream so order-sensitive events share a partition key
+  (standard streaming practice).
+
+  If a real demand lands later, it can be added as a per-pipeline opt-in flag with a documented latency-for-order tradeoff. No need to speculatively build
+  it now.
+
+  Updated frozen list
+
+  - Poll source identity: config-driven cursor / etag / content_hash / compound, default compound; content_hash path uses L2-backed bounded seen-set with
+  TTL.
+  - Partition ordering: per-partition order only; partitions: 1 for total-order pipelines; no cross-partition merge, no consumer groups.
+  - All prior frozen items stand.
+
+  Still open (the short list now)
+
+  1. Pipeline config manifest shape — once the semantics are locked, what does the YAML actually look like end-to-end for a real multi-source + multi-sink
+  pipeline? A concrete example would catch any remaining ambiguity.
+  2. Backpressure signaling chain in multi-sink pipelines — if one sink stalls but others are keeping up, do we stall the whole pipeline (preserves ledger
+  semantics) or let fast sinks race ahead (splits the L2 GC cursor)? Tends to fall out of the design but worth naming.
+  3. Prior L3-ACK-TTL code — I still haven't gone back through to see what of the old implementation survives. Want me to do that pass now, or hold until
+  we've nailed the remaining config/backpressure questions?
+
+✻ Sautéed for 43s
+
+
+※ recap: We're designing Aeon's EOS durability layer — L2 for event bodies, L3 for checkpoints, per-pipeline configurable. Next: decide backpressure
+  behavior when one sink in a multi-sink pipeline stalls while others keep up.
+
+============================
+-> please generate one w.r.t. "Pipeline config manifest shape"
+-> agree with your perspective w.r.t. "Backpressure signaling chain in multi-sink pipelines"
+-> pause discussion w.r.t. " Prior L3-ACK-TTL code" for now
+===============================
+claude's response:
+
+ Here's a concrete manifest that exercises every decision we've frozen. Shape evolves today's single-source/sink structure into arrays, adds durability,
+  per-source kind/event_time/identity, and per-sink EOS declaration — without changing unrelated fields.
+
+  pipelines:
+    - name: orders-enrichment
+      # ─── Durability (pipeline-level, inherits to sources/sinks) ─────────
+      durability:
+        mode: ordered_batch        # none | unordered_batch | ordered_batch | per_event
+        l2_max_bytes: 8Gi          # per-pipeline cap; per-partition soft target derived
+        checkpoint:
+          backend: state_store     # state_store (primary, L3 redb) | wal (explicit) | none
+                                   # state_store auto-falls-back to wal on L3 error
+          interval: 1s
+          retention: 24h
+        flush:
+          max_pending: 50000
+          adaptive: true
+
+      # ─── Partitioning ───────────────────────────────────────────────────
+      partitions: 8                # immutable after creation
+
+      # ─── Sources (one or many) ──────────────────────────────────────────
+      sources:
+        # Pull source — deterministic UUIDv7 from (source, partition, offset)
+        - name: orders-kafka
+          type: kafka
+          kind: pull                         # pull | push | poll
+          topics: [orders]
+          partitions: [0, 1, 2, 3, 4, 5, 6, 7]
+          identity:
+            mode: native                     # use broker-native offset for rand_b
+          event_time: broker                 # broker | aeon_ingest | header:<name>
+          config:
+            bootstrap.servers: "redpanda:9092"
+
+        # Push source — random UUIDv7, ack-after-L2
+        - name: returns-webhook
+          type: webhook
+          kind: push
+          listen: "0.0.0.0:8080"
+          path: /returns
+          identity:
+            mode: random                     # random UUIDv7 (push default)
+          event_time: header:X-Event-Time    # fall back to aeon_ingest if header absent? NO — fail at start
+          ack_boundary: after_l2             # implicit when durability != none
+          backpressure:
+            phase1_buffer: 1024              # bounded mpsc
+            phase3_threshold: 0.8            # → protocol-level flow control (reject with 503)
+
+        # Poll source — content-hash dedup, L2-backed seen-set
+        - name: weather-api
+          type: http_polling
+          kind: poll
+          url: "https://api.weather.example/current"
+          interval: 30s
+          jitter: 10%
+          timeout: 5s
+          identity:
+            mode: compound                   # cursor | etag | content_hash | compound
+            cursor_path: $.next_cursor       # primary when present
+            content_hash:
+              algorithm: xxhash3_64          # safety-net dedup when cursor absent
+              window: 5m                     # L2-backed seen-set TTL
+          event_time: aeon_ingest            # explicit — upstream provides none
+
+      # ─── Processor (exactly one) ────────────────────────────────────────
+      processor:
+        name: orders-enricher
+        version: "1.4.2"
+        tier: t2_wasm                        # t1_native | t2_wasm | t3_webtransport | t4_websocket
+        # tier-specific config (wasm here; t3/t4 would have endpoint + auth)
+        runtime:
+          fuel: 10_000_000
+          memory_pages: 256
+
+      # ─── Sinks (one or many) ────────────────────────────────────────────
+      # Sink L2 GC cursor = min(per_sink_ack_seq across all sinks).
+      # One slow sink stalls the whole pipeline — by design, correctness first.
+      sinks:
+        # T2 transactional stream — Kafka exactly-once via producer transactions
+        - name: enriched-kafka
+          type: kafka
+          eos_tier: t2_transactional_stream
+          topic: orders-enriched
+          config:
+            bootstrap.servers: "redpanda:9092"
+            transactional.id: "aeon-orders-enrichment-enriched"
+
+        # T4 dedup-keyed — Redis Streams with SETNX dedup
+        - name: cache-redis
+          type: redis_streams
+          eos_tier: t4_dedup_keyed
+          stream: orders:enriched
+          dedup:
+            key_prefix: "aeon:dedup:"
+            ttl: 1h                          # must exceed replay window + max checkpoint interval
+          config:
+            url: "redis://cache:6379"
+
+        # T5 idempotency-key receiver — webhook, correctness depends on receiver
+        - name: partner-webhook
+          type: webhook_sink
+          eos_tier: t5_idempotency_key       # documented as best-effort unless receiver honors header
+          url: "https://partner.example/events"
+          headers:
+            Idempotency-Key: "{event.id}"    # UUIDv7 flows through
+          retry:
+            max_attempts: 5
+            backoff: { initial: 100ms, max: 30s, jitter: 20% }
+
+      # ─── Upgrade / deployment strategy ──────────────────────────────────
+      upgrade_strategy: blue_green           # drain_swap | blue_green | canary
+
+  What this manifest makes explicit
+
+  - Three source kinds coexist in one pipeline — Kafka pull, webhook push, HTTP poll — each with the right identity/event_time combo. Multi-source ordering
+  is per-partition per-source only; documented in the schema, not hidden.
+  - Durability at pipeline level, inherited; sources can override if needed later, but default inheritance keeps the common case terse.
+  - Sink EOS tiers are declared, not inferred — the engine matches eos_tier against the connector's actual capability at start; mismatch = fail fast.
+  - L2 GC cursor = min(per-sink ack) is a consequence of the sinks-array shape; the slow-sink-stalls-pipeline rule falls out naturally.
+  - Kafka checkpoint backend is absent — only state_store / wal / none. The deprecation is visible in the schema.
+
+  Two things I deliberately left out (check these are right)
+
+  1. No state.l2.node_max_bytes in the pipeline manifest — that belongs in the Aeon node config (/etc/aeon/config.yaml or env), not in per-pipeline
+  manifests. Operators own node-level caps; pipeline authors own pipeline-level caps.
+  2. ack_boundary: after_l2 on the webhook source is shown explicitly for illustration. In practice it's implicit from durability.mode != none — we don't
+  expect users to set it. Remove from the default schema?
+
+  Want me to refine any section, or are we ready to call the design frozen and start planning the implementation phases?
+
+✻ Crunched for 1m 43s
+
+
+=============================
+ it looks good. I am once again, thinking about multiple source upstreams & sink downstreams, and their utility for a single pipeline with single
+  processor. How do you think? do you find any similar usecases?
+
+==============================
+claude's response:
+
+Honest answer: multi-source is strongly justified; multi-sink is justified but comes with tradeoffs worth naming so users don't over-use it.
+
+  Multi-source — real use cases
+
+  ┌────────────────────┬─────────────────────────────────────────────────────────────────────┬──────────────────────────────────────────────────────────┐
+  │      Pattern       │                               Example                               │                   Why single pipeline?                   │
+  ├────────────────────┼─────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────┤
+  │ CDC fan-in         │ Postgres CDC + MySQL CDC + Mongo oplog → unified schema normalizer  │ All 3 feed the same normalization logic; stateful joins  │
+  │                    │                                                                     │ across them                                              │
+  ├────────────────────┼─────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────┤
+  │ Event enrichment   │ Orders (Kafka pull) + returns (webhook push) + inventory (HTTP      │ Processor state maintained across all three streams      │
+  │ merge              │ poll) → enrichment processor                                        │ (e.g. "order_id → enriched record")                      │
+  ├────────────────────┼─────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────┤
+  │ Log/metric         │ App logs (push) + syscall metrics (pull) + audit events (CDC) →     │ One parsing/tagging engine, one output shape             │
+  │ aggregation        │ single normalizer → observability backend                           │                                                          │
+  ├────────────────────┼─────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────┤
+  │ Migration /        │ Old system (Kafka) + new system (Kafka) → reconciler → diff sink    │ Processor compares the two streams live                  │
+  │ dual-read          │                                                                     │                                                          │
+  ├────────────────────┼─────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────┤
+  │ Cross-domain       │ Click events + purchase events → fraud/attribution processor        │ Requires joined state                                    │
+  │ correlation        │                                                                     │                                                          │
+  └────────────────────┴─────────────────────────────────────────────────────────────────────┴──────────────────────────────────────────────────────────┘
+
+  Competitive analogs shipping this pattern today: Vector.dev (DAG, huge real-world log-pipeline deployments), Benthos/Bento (broker input composition),
+  Apache Flink (union), Logstash (multi-input). Kafka Streams and Kafka Connect don't — but both are criticized for that limitation, which is why Flink and
+  Vector beat them for complex topologies.
+
+  Multi-sink — real use cases, with tradeoffs
+
+  ┌────────────────────────────────┬──────────────────────────────────────────────────────────────────────────────────────┐
+  │            Pattern             │                                       Example                                        │
+  ├────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────┤
+  │ Fan-out to different consumers │ Enriched events → Kafka (downstream streams) + Elasticsearch (search) + S3 (archive) │
+  ├────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────┤
+  │ Tiered storage                 │ Hot (Redis) + warm (Kafka) + cold (S3) from same stream                              │
+  ├────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────┤
+  │ Audit + primary                │ Primary write (Postgres) + immutable audit log (Merkle-chained Kafka topic)          │
+  ├────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────┤
+  │ Multi-region replication       │ Single processor → us-east sink + eu-west sink + ap-south sink                       │
+  ├────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────┤
+  │ Dev/staging mirroring          │ Prod sink + shadow staging sink for testing new processor logic                      │
+  └────────────────────────────────┴──────────────────────────────────────────────────────────────────────────────────────┘
+
+  But multi-sink carries two real costs that single-sink doesn't:
+
+  1. Slowest sink paces the whole pipeline (frozen: L2 GC = min ack cursor). A flaky partner webhook stalls the hot Kafka sink behind it.
+  2. Upgrade granularity is pipeline-wide. Blue-green on a 3-sink pipeline cuts over all 3 at once. If only the Elasticsearch mapping changed, you'd still
+  drain and re-route the Kafka + S3 sinks too.
+
+  The "when NOT to use multi-sink" guidance
+
+  When each sink has independent consumers, independent failure modes, and independent upgrade cadences — run them as separate pipelines sharing a source.
+  Example: don't put "partner-webhook-1" and "partner-webhook-2" in the same pipeline; run two pipelines reading the same Kafka topic.
+
+  When sinks have the same event semantics and couple naturally (primary+audit, hot+warm+cold storage, multi-region same-event) — multi-sink in one pipeline
+   is the right call, tradeoffs accepted.
+
+  So the design supports both, with docs steering users:
+
+  - Multi-source: use liberally when processor state requires it.
+  - Multi-sink: use when sinks are semantically coupled; split into separate pipelines when they're not.
+
+  Frozen addition
+
+  - Multi-source and multi-sink both first-class in pipeline manifest (per current shape).
+  - Docs-level guidance: docs/PIPELINE-DESIGN-GUIDE.md (to be written) covers the "when multi-sink vs multiple pipelines" decision with the tradeoff matrix
+  above.
+  - No schema change needed — the shape we froze already expresses it correctly.
+
+  Does this settle the multi-source/sink question, or is there a specific use case you're still weighing?
+
+✻ Worked for 50s
+
+==========================
+claude's response:
+
+ Honest answer: multi-source is strongly justified; multi-sink is justified but comes with tradeoffs worth naming so users don't over-use it.
+
+  Multi-source — real use cases
+
+  ┌────────────────────┬─────────────────────────────────────────────────────────────────────┬──────────────────────────────────────────────────────────┐
+  │      Pattern       │                               Example                               │                   Why single pipeline?                   │
+  ├────────────────────┼─────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────┤
+  │ CDC fan-in         │ Postgres CDC + MySQL CDC + Mongo oplog → unified schema normalizer  │ All 3 feed the same normalization logic; stateful joins  │
+  │                    │                                                                     │ across them                                              │
+  ├────────────────────┼─────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────┤
+  │ Event enrichment   │ Orders (Kafka pull) + returns (webhook push) + inventory (HTTP      │ Processor state maintained across all three streams      │
+  │ merge              │ poll) → enrichment processor                                        │ (e.g. "order_id → enriched record")                      │
+  ├────────────────────┼─────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────┤
+  │ Log/metric         │ App logs (push) + syscall metrics (pull) + audit events (CDC) →     │ One parsing/tagging engine, one output shape             │
+  │ aggregation        │ single normalizer → observability backend                           │                                                          │
+  ├────────────────────┼─────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────┤
+  │ Migration /        │ Old system (Kafka) + new system (Kafka) → reconciler → diff sink    │ Processor compares the two streams live                  │
+  │ dual-read          │                                                                     │                                                          │
+  ├────────────────────┼─────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────┤
+  │ Cross-domain       │ Click events + purchase events → fraud/attribution processor        │ Requires joined state                                    │
+  │ correlation        │                                                                     │                                                          │
+  └────────────────────┴─────────────────────────────────────────────────────────────────────┴──────────────────────────────────────────────────────────┘
+
+  Competitive analogs shipping this pattern today: Vector.dev (DAG, huge real-world log-pipeline deployments), Benthos/Bento (broker input composition),
+  Apache Flink (union), Logstash (multi-input). Kafka Streams and Kafka Connect don't — but both are criticized for that limitation, which is why Flink and
+  Vector beat them for complex topologies.
+
+  Multi-sink — real use cases, with tradeoffs
+
+  ┌────────────────────────────────┬──────────────────────────────────────────────────────────────────────────────────────┐
+  │            Pattern             │                                       Example                                        │
+  ├────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────┤
+  │ Fan-out to different consumers │ Enriched events → Kafka (downstream streams) + Elasticsearch (search) + S3 (archive) │
+  ├────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────┤
+  │ Tiered storage                 │ Hot (Redis) + warm (Kafka) + cold (S3) from same stream                              │
+  ├────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────┤
+  │ Audit + primary                │ Primary write (Postgres) + immutable audit log (Merkle-chained Kafka topic)          │
+  ├────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────┤
+  │ Multi-region replication       │ Single processor → us-east sink + eu-west sink + ap-south sink                       │
+  ├────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────┤
+  │ Dev/staging mirroring          │ Prod sink + shadow staging sink for testing new processor logic                      │
+  └────────────────────────────────┴──────────────────────────────────────────────────────────────────────────────────────┘
+
+  But multi-sink carries two real costs that single-sink doesn't:
+
+  1. Slowest sink paces the whole pipeline (frozen: L2 GC = min ack cursor). A flaky partner webhook stalls the hot Kafka sink behind it.
+  2. Upgrade granularity is pipeline-wide. Blue-green on a 3-sink pipeline cuts over all 3 at once. If only the Elasticsearch mapping changed, you'd still
+  drain and re-route the Kafka + S3 sinks too.
+
+  The "when NOT to use multi-sink" guidance
+
+  When each sink has independent consumers, independent failure modes, and independent upgrade cadences — run them as separate pipelines sharing a source.
+  Example: don't put "partner-webhook-1" and "partner-webhook-2" in the same pipeline; run two pipelines reading the same Kafka topic.
+
+  When sinks have the same event semantics and couple naturally (primary+audit, hot+warm+cold storage, multi-region same-event) — multi-sink in one pipeline
+   is the right call, tradeoffs accepted.
+
+  So the design supports both, with docs steering users:
+
+  - Multi-source: use liberally when processor state requires it.
+  - Multi-sink: use when sinks are semantically coupled; split into separate pipelines when they're not.
+
+  Frozen addition
+
+  - Multi-source and multi-sink both first-class in pipeline manifest (per current shape).
+  - Docs-level guidance: docs/PIPELINE-DESIGN-GUIDE.md (to be written) covers the "when multi-sink vs multiple pipelines" decision with the tradeoff matrix
+  above.
+  - No schema change needed — the shape we froze already expresses it correctly.
+
+  Does this settle the multi-source/sink question, or is there a specific use case you're still weighing?
+
+✻ Worked for 50s
+
+
+※ recap: Designing Aeon's exactly-once durability layer (L2 event bodies + L3 checkpoints, multi-source/sink pipeline manifest) before writing code. Just
+  confirmed multi-source and multi-sink are both justified with docs guiding when to split. Next: confirm design is frozen and move to implementation
+  phasing.
+============================
+this looks good. any other observations?
+please document all this clearly without losing points, then, summarize the plan for tracking and add to roadmap document.
+=========================================
+claude's response:
+
+ Before documenting, let me surface the observations I've been holding back:
+
+  Other observations worth capturing:
+
+  1. L2 coupling to partition transfer (CL-6): L2 segments are per-partition. When a partition migrates (CL-6a/b/c), its L2 segments must move too. This
+  couples EO-2 work to CL-6 in ways the current Pillar-3 plan doesn't reflect.
+  2. Large-event handling: multi-MB events need L2 segment rollover to tolerate events exceeding nominal segment size.
+  3. Backwards compatibility: existing pipelines must default to durability: none to preserve current behavior. Opt-in, not opt-out.
+  4. Transactional multi-sink is NOT in scope: if sink A commits and sink B fails, we don't rollback sink A. Per-sink EOS only; cross-sink atomicity
+  requires two-phase commit across heterogeneous systems — explicitly out of scope.
+  5. Format versioning: L2 files need magic + version bytes (already in l2.rs for KV format, need same discipline for event-body format).
+  6. Pipeline-level vs node-level config split: node-global L2 cap + L3 backend choice live in node config; per-pipeline caps + durability mode live in
+  manifest. Two distinct config surfaces — worth calling out explicitly.
+
+  Let me verify current ROADMAP Pillar 5 entry, then write the design doc and update ROADMAP.
+
+
+ docs\EO-2-DURABILITY-DESIGN.md
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+    1 # EO-2 — Aeon-Native Event Durability Design
+    2
+    3 > Status: **Design frozen (2026-04-15).** No code yet. This doc captures the
+    4 > agreed shape from the design discussion; implementation phases at the end.
+    5 > Supersedes the sink-participating framing in `FAULT-TOLERANCE-ANALYSIS.md §7 Pillar 5`.
+    6
+    7 ---
+    8
+    9 ## 1. Goals & Non-Goals
+   10
+   11 ### Goals
+   12
+   13 1. **Zero event loss** across crashes, restarts, and partition migrations,
+   14    without requiring cooperation from the source upstream or sink downstream.
+   15 2. **Aeon owns the durable sequence.** Not Kafka, not any specific broker.
+   16    Every supported source/sink combination gets the same correctness story.
+   17 3. **No hot-path penalty** at the 20M events/sec target. Durability cost
+   18    amortises at checkpoint cadence.
+   19 4. **Per-pipeline configurability** so operators pay only for the durability
+   20    they actually need (the ETL framing: noisy pipelines don't starve quiet
+   21    ones; single-big-pipeline deployments need zero extra config).
+   22
+   23 ### Non-Goals
+   24
+   25 - **Cross-sink atomicity.** If sink A commits and sink B fails, sink A is
+   26   *not* rolled back. Per-sink EOS only. Cross-sink atomicity would require
+   27   two-phase commit across heterogeneous systems — out of scope.
+   28 - **Cross-source total order.** Timestamps from different upstreams are
+   29   incomparable. Aeon preserves per-partition order within each source; it
+   30   does not merge-sort across sources.
+   31 - **Transactional pipelines over multiple hosts.** Partition is the unit of
+   32   ownership; each partition is single-owner at any moment.
+   33
+   34 ---
+   35
+   36 ## 2. Architecture Overview
+   37
+   38 ```
+   39  ┌──────────┐      ┌─────────────┐     ┌──────────┐     ┌─────────────┐    ┌────────┐
+   40  │ Source   │─────▶│ SPSC ring   │────▶│Processor │────▶│ SPSC ring   │───▶│ Sinks  │
+   41  │ (N kinds)│      └─────────────┘     │ (1 job)  │     └─────────────┘    │(M of   │
+   42  └──────────┘             │            └──────────┘            │           │ kinds) │
+   43        │                  ▼                                    ▼           └────────┘
+   44        │            ┌──────────────────────────────────────────────┐            │
+   45        │            │           L2 event-body store                │            │
+   46        │            │  (append-only mmap, per-partition, push+poll │            │
+   47        │            │   only; pull sources use broker as buffer)   │            │
+   48        │            └──────────────────────────────────────────────┘            │
+   49        │                              │                                         │
+   50        │                              ▼                                         │
+   51        │            ┌──────────────────────────────────────────────┐            │
+   52        └───────────▶│      L3 checkpoint store (redb/rocksdb)      │◀───────────┘
+   53                     │   per-partition cursors: source offsets +    │
+   54                     │   per-sink ACK seq + pending_event_ids       │
+   55                     │   WAL fallback if L3 unavailable             │
+   56                     └──────────────────────────────────────────────┘
+   57 ```
+   58
+   59 Three persistent tiers of concern:
+   60
+   61 - **L2**: append-only mmap log, holds event bodies for push + poll sources
+   62   when durability is on. Pull sources skip L2 (broker replay via `Seekable`).
+   63 - **L3**: transactional KV (redb default, RocksDB alternative via
+   64   pluggable `L3Store` trait), holds checkpoint records — tiny, metadata only.
+   65 - **WAL** (`CheckpointWriter` on `checkpoint.rs`): automatic fallback of the
+   66   L3 checkpoint store when L3 is unavailable or write-errors. **Not a peer
+   67   option** — removing the symmetry that existed before this design.
+   68
+   69 ---
+   70
+   71 ## 3. Source Model — Three Kinds
+   72
+   73 | Kind | Examples | Characteristic | L2 used? | Identity strategy |
+   74 |------|----------|----------------|----------|-------------------|
+   75 | **Pull** | Kafka, Redis Streams, Postgres/MySQL/Mongo CDC, file, Redpanda | Aeon polls; upstream has a durable replay position (offset/LSN/resume
+      -token/byte-offset) | **No** — broker is the buffer of record | Deterministic UUIDv7 from `(source, partition, offset)` |
+   76 | **Push** | WebSocket, WebTransport, webhook/HTTP ingress, MQTT, RabbitMQ, QUIC | Upstream pushes; Aeon cannot tell it to pause at the wire; no du
+      rable replay position | **Yes** when `durability != none` | Random UUIDv7 with sub-ms monotonic counter |
+   77 | **Poll** | HTTP polling against arbitrary REST endpoints, DNS poll, any time-sampled source | Aeon polls; **no durable upstream position** | **Ye
+      s** when `durability != none` | Content-hash or cursor-based; see §5.3 |
+   78
+   79 Exposed on the `Source` trait as:
+   80
+   81 ```rust
+   82 pub trait Source: Send + Sync {
+   83     fn source_kind() -> SourceKind;
+   84     async fn next_batch(&mut self) -> Result<Vec<Event>, AeonError>;
+   85     fn event_identity(ev: &RawEvent) -> Bytes;   // for deterministic UUIDv7
+   86     // existing: pause(), resume(), Seekable for pull
+   87 }
+   88
+   89 pub enum SourceKind { Pull, Push, Poll }
+   90 ```
+   91
+   92 Poll is **new**; previously collapsed into pull. The distinction matters because
+   93 poll has no durable upstream position, so it needs Aeon-side L2 persistence
+   94 even though it's pull-shaped at the wire.
+   95
+   96 ---
+   97
+   98 ## 4. UUIDv7 Identity
+   99
+  100 Event identity is minted by the source connector at ingest. The `Event.id`
+  101 field is a standard 128-bit UUIDv7. Derivation differs by source kind:
+  102
+  103 ### 4.1 Pull sources — deterministic
+  104
+  105 ```
+  106 UUIDv7 layout:  [ unix_ts_ms : 48 ][ ver:4 ][ rand_a:12 ][ var:2 ][ rand_b:62 ]
+  107
+  108 Pull derivation:
+  109   unix_ts_ms  ← source event timestamp (Kafka ts, LSN→ts, binlog ts, oplog ts)
+  110   rand_a (12) ← (broker_offset & 0xFFF)      — within-partition monotonic
+  111   rand_b (62) ← SHA-256(source_name ‖ source.event_identity(ev)).take(62 bits)
+  112 ```
+  113
+  114 Properties:
+  115
+  116 - **Deterministic on replay.** Same `(source, partition, offset)` always
+  117   produces the same UUID, across crashes, restarts, and partition
+  118   reassignments. Sink idempotency-key dedup works without persisting a mapping.
+  119 - **Time-ordered** by source event time — the correct reference frame.
+  120 - **Within-partition monotonic** via offset in `rand_a`. Up to 4096 events
+  121   per ms per partition before rand_a collisions — comfortably above 20M/s
+  122   distributed across partitions.
+  123 - **Zero storage cost.** Pure function of source-native identity.
+  124
+  125 Cost: one SHA-256 per event (~30 ns with hardware acceleration).
+  126
+  127 ### 4.2 Push sources — random + monotonic
+  128
+  129 Standard RFC 9562 UUIDv7 generation with current microtime for the 48-bit
+  130 prefix and sub-ms counter in rand_a for within-ms monotonicity. Existing
+  131 implementation.
+  132
+  133 ### 4.3 Poll sources — identity config
+  134
+  135 Poll sources have no upstream offset, so identity is config-driven:
+  136
+  137 ```yaml
+  138 identity:
+  139   mode: compound           # cursor | etag | content_hash | compound
+  140   cursor_path: $.next      # primary when present
+  141   content_hash:
+  142     algorithm: xxhash3_64
+  143     window: 5m             # L2-backed bounded seen-set TTL
+  144 ```
+  145
+  146 - `cursor` / `etag` — upstream-authoritative; zero Aeon-side dedup cost.
+  147 - `content_hash` — Aeon-owned, bounded seen-set in L2. xxhash3_64 of
+  148   normalised payload; ~30 ns/event + one L2 write.
+  149 - `compound` (default) — cursor primary, content_hash safety net. Degrades
+  150   gracefully for uncooperative upstreams.
+  151
+  152 ### 4.4 `event_time` configuration — no silent fallbacks
+  153
+  154 Timestamp source is explicit per connector config, no exceptions:
+  155
+  156 ```yaml
+  157 event_time: broker                  # broker ts (default for connectors that expose it)
+  158 event_time: aeon_ingest             # Aeon microtime (loses cross-replay determinism)
+  159 event_time: header:X-Event-Time     # pull from named metadata header
+  160 ```
+  161
+  162 Pipeline **fails at start** if `broker` is configured on a connector that
+  163 cannot produce it. No runtime fallback.
+  164
+  165 Cost:
+  166 - `broker`: free (already read).
+  167 - `aeon_ingest`: one `Instant::now()` ≈ 20 ns.
+  168 - `header:<name>`: SmallVec lookup + parse ≈ 50 ns.
+  169
+  170 ---
+  171
+  172 ## 5. L2 — Event Body Store
+  173
+  174 Reuses the existing `aeon-state/src/l2.rs` (646 lines, 10 tests — append-only
+  175 mmap with index + recovery + compaction). Extended for event-body workload:
+  176
+  177 - **Segment-rolled**: new segment every 256 MB (config: `l2.segment_bytes`).
+  178   Oversized single events roll to a dedicated segment so large events don't
+  179   force all segments up.
+  180 - **Per-partition per-pipeline**: `$STATE/l2/<pipeline>/<partition>/<seq>.seg`.
+  181   Directory layout maps 1:1 to partition-single-owner model.
+  182 - **Append-only from pipeline runner**: writer is the source task; readers
+  183   are sink tasks + (future) `ReplayOrchestrator`.
+  184 - **GC cursor**: segment `S` is deleted when
+  185   `min(per_sink_ack_seq) > max_event_seq_in(S)`. Slowest sink holds the log
+  186   — by design, falls out of the multi-sink correctness story.
+  187 - **fsync cadence** is durability-mode-driven (§7): `per_event` syncs each
+  188   append; `ordered_batch` syncs at batch boundary; `unordered_batch` syncs
+  189   at checkpoint cadence; `none` does not write L2 at all.
+  190 - **Format versioning**: 8-byte magic `AEON-L2B` + 2-byte version. Matches
+  191   the discipline in the existing KV l2.rs format.
+  192
+  193 ### 5.1 Recovery flow
+  194
+  195 On pipeline start (or partition migration):
+  196
+  197 1. Read L3 checkpoint for this partition. Get `source_offsets` + per-sink
+  198    `ack_seq` values + `pending_event_ids`.
+  199 2. For **pull source partitions**: `Seekable::seek(source_offsets)`, drop
+  200    any `pending_event_ids` that didn't make the last commit (sink dedups
+  201    them on replay via EO-1/EO-3).
+  202 3. For **push/poll source partitions**: scan L2 from
+  203    `min(per_sink_ack_seq) + 1` forward. Re-deliver to each sink that hadn't
+  204    ack'd past that seq. Sink dedups.
+  205 4. Resume normal operation once all sinks are caught up to the head of L2.
+  206
+  207 ### 5.2 Large-event tolerance
+  208
+  209 Events larger than `l2.segment_bytes` get their own dedicated segment; the
+  210 current segment is sealed early. Prevents pathological "one huge event
+  211 wedges segment allocation."
+  212
+  213 ---
+  214
+  215 ## 6. L3 — Checkpoint Store
+  216
+  217 Reuses existing `aeon-engine/src/checkpoint.rs` — `CheckpointRecord` +
+  218 `L3CheckpointStore` (backed by `L3Store` trait, redb default, RocksDB alt).
+  219
+  220 ### 6.1 Record shape (extended from current)
+  221
+  222 ```rust
+  223 pub struct CheckpointRecord {
+  224     pub checkpoint_id: u64,
+  225     pub timestamp_nanos: i64,
+  226     pub source_offsets: HashMap<u16, i64>,        // per-partition broker offsets
+  227     pub per_sink_ack_seq: HashMap<String, u64>,   // NEW — per-sink ack cursors
+  228     pub pending_event_ids: Vec<[u8; 16]>,
+  229     pub delivered_count: u64,
+  230     pub failed_count: u64,
+  231 }
+  232 ```
+  233
+  234 Addition over today: `per_sink_ack_seq` — required for the GC cursor
+  235 computation in §5 and for recovery in §5.1.
+  236
+  237 ### 6.2 WAL as automatic fallback
+  238
+  239 Current code has `CheckpointBackend::{Wal, StateStore, Kafka, None}` as
+  240 peers (`pipeline.rs:834-873`). Design change:
+  241
+  242 - **Remove `Kafka`** variant entirely. Today it's already a no-op
+  243   (`pipeline.rs:873` matches it the same as `None`). Removal is cosmetic.
+  244 - **`StateStore` becomes primary**. On L3 open/write error: log degradation,
+  245   emit metric `aeon_checkpoint_fallback_wal{pipeline="..."}`, transparently
+  246   begin writing to a WAL file in the state dir. Next successful L3 probe
+  247   reverses the fallback.
+  248 - **`Wal`** remains as an explicit "I don't want L3" choice (small
+  249   single-node deployments with no redb/rocksdb dependency).
+  250 - **`None`** remains as the durability-off escape hatch.
+  251
+  252 ---
+  253
+  254 ## 7. Durability Modes
+  255
+  256 Reuses existing `DeliveryStrategy` enum (`aeon-types/src/delivery.rs:60`).
+  257 Semantics extended from "ack timing" to also cover "event-body persistence".
+  258
+  259 | Mode | L2 write | L2 fsync | Sink ack | Use case |
+  260 |------|----------|----------|----------|----------|
+  261 | `none` | skipped | n/a | immediate | Best throughput, fire-and-forget, lossy on crash (documented, best-effort) |
+  262 | `unordered_batch` | append | at checkpoint (1–10 Hz) | batch-boundary | Max throughput with durability; within-batch order not guaranteed |
+  263 | `ordered_batch` (**default for EOS**) | append | at batch boundary + checkpoint | batch-boundary | Per-partition ordered delivery, EOS via sink d
+      edup |
+  264 | `per_event` | append + fsync per event | every event | per-event | Regulated/financial workloads; budget deliberately blown |
+  265
+  266 ### 7.1 Push-source ack boundary
+  267
+  268 When `durability != none`, acknowledgement to upstream (webhook 2xx /
+  269 WebSocket pong / WT stream continue / MQTT PUBACK / AMQP ack) happens
+  270 **after** L2 append completes. Honest: upstream only learns we have the
+  271 event when we actually do.
+  272
+  273 When `durability == none`, ack immediately — the RAM loss is accepted.
+  274
+  275 ### 7.2 Backwards compatibility
+  276
+  277 Existing pipelines **default to `durability: none`** to preserve today's
+  278 behavior exactly. Opt-in only — no silent semantic change.
+  279
+  280 ---
+  281
+  282 ## 8. Sink EOS Tiers
+  283
+  284 Each sink declares its tier via `TransactionalSink::eos_tier()`. Engine
+  285 matches declaration against connector capability at pipeline start;
+  286 mismatch = fail fast.
+  287
+  288 | Tier | Examples | Native primitive |
+  289 |------|----------|------------------|
+  290 | **T1** Transactional DBs | Postgres, MySQL, SQLite, Mongo | tx COMMIT + `ON CONFLICT DO NOTHING` |
+  291 | **T2** Transactional streams | Kafka, Redpanda | `commit_transaction` + `send_offsets_to_transaction` |
+  292 | **T3** Atomic-rename files | File sink | write `.tmp` → rename |
+  293 | **T4** Dedup-keyed | Redis Streams, NATS JetStream | `SETNX + EX` / `Nats-Msg-Id` within `duplicate_window` |
+  294 | **T5** Idempotency-Key receivers | Webhook, WS, WT | `Idempotency-Key: <source_event_id>` — correctness **depends on receiver** |
+  295 | **T6** Fire-and-forget | Stdout, Blackhole | N/A — EOS not meaningful |
+  296
+  297 T5 caveat explicit in docs: EOS is receiver-dependent. If the webhook
+  298 target ignores the `Idempotency-Key` header, the honest ceiling is
+  299 at-least-once. Aeon doesn't silently claim more.
+  300
+  301 ---
+  302
+  303 ## 9. Multi-Source and Multi-Sink
+  304
+  305 ### 9.1 Multi-source
+  306
+  307 Strongly justified. Use liberally when the processor's state requires
+  308 streams to merge. Competitive analogs: Vector.dev, Benthos/Bento, Flink,
+  309 Logstash.
+  310
+  311 **Ordering guarantees:**
+  312 - Within one source partition: strict.
+  313 - Across partitions within one source: none (matches Kafka).
+  314 - **Across sources: arrival order at processor input ring only. No semantic
+  315   order promise.** If a user needs total order across sources, they must
+  316   merge upstream (e.g. into a Kafka topic) and consume the merged stream.
+  317
+  318 Documented in the manifest schema + `docs/CONNECTORS.md`.
+  319
+  320 ### 9.2 Multi-sink
+  321
+  322 Justified but with honest tradeoffs:
+  323
+  324 - **Slowest sink stalls the pipeline** (L2 GC cursor = `min(per_sink_ack)`).
+  325 - **Upgrade granularity is pipeline-wide.** Blue-green cuts over all sinks
+  326   together.
+  327
+  328 **When to use multi-sink in one pipeline:** semantically coupled sinks —
+  329 primary+audit, hot+warm+cold tiered storage, multi-region same-event
+  330 replication.
+  331
+  332 **When to use separate pipelines instead:** independent consumers with
+  333 independent failure modes and upgrade cadences — e.g., two partner
+  334 webhooks with different reliability profiles.
+  335
+  336 This guidance goes in `docs/PIPELINE-DESIGN-GUIDE.md` (to be written).
+  337
+  338 ---
+  339
+  340 ## 10. Budget Hierarchy
+  341
+  342 Three levels; single-pipeline deployments set nothing.
+  343
+  344 | Level | Purpose | Config | Default |
+  345 |-------|---------|--------|---------|
+  346 | Node-global cap | Disk-size safety net | `state.l2.node_max_bytes` (node config) | 80% of state dir volume |
+  347 | Per-pipeline cap | Fair-share ceiling, SLO envelope | `pipeline.durability.l2_max_bytes` (manifest) | unset → inherits node-global |
+  348 | Per-partition soft target | Early-warning threshold | derived = `pipeline_cap / partitions` | auto |
+  349
+  350 ### 10.1 Backpressure escalation
+  351
+  352 1. Partition exceeds soft target → slow that partition's source only.
+  353    - Push: Phase 3 `PushBuffer` protocol-level flow control (reject 503, `basic.cancel`, etc.).
+  354    - Pull: stop polling, broker queues up.
+  355    - Poll: increase poll interval / skip poll.
+  356 2. Pipeline approaches its cap → throttle all partitions in that pipeline.
+  357 3. Node approaches global cap → throttle all pipelines, emit
+  358    `aeon_l2_pressure{level="node"}` alert.
+  359
+  360 ### 10.2 Node vs pipeline config surfaces
+  361
+  362 Explicit split — two different audiences:
+  363 - **Node config** (`/etc/aeon/config.yaml` or env): L3 backend choice,
+  364   node-global L2 cap, state dir path. Owned by ops.
+  365 - **Pipeline manifest** (YAML applied via `aeon apply`): per-pipeline
+  366   durability mode, L2 cap, sources/sinks/processor. Owned by pipeline
+  367   author.
+  368
+  369 ---
+  370
+  371 ## 11. Pipeline Manifest Shape
+  372
+  373 See the full annotated example committed in §12 below. Summary of new
+  374 fields relative to today's manifest:
+  375
+  376 - `durability` block (mode, l2_max_bytes, checkpoint backend, flush).
+  377 - `sources` is now a **list** (was single).
+  378 - Each source: `kind: pull|push|poll`, `identity`, `event_time`.
+  379 - `sinks` is now a **list** (was single).
+  380 - Each sink: `eos_tier` declaration.
+  381 - `CheckpointBackend::Kafka` removed from schema.
+  382
+  383 ---
+  384
+  385 ## 12. Annotated Example
+  386
+  387 ```yaml
+  388 pipelines:
+  389   - name: orders-enrichment
+  390     # ─── Durability (pipeline-level, inherits to sources/sinks) ─────────
+  391     durability:
+  392       mode: ordered_batch        # none | unordered_batch | ordered_batch | per_event
+  393       l2_max_bytes: 8Gi          # per-pipeline cap; per-partition soft target derived
+  394       checkpoint:
+  395         backend: state_store     # state_store (primary) | wal | none
+  396                                  # state_store auto-falls-back to wal on L3 error
+  397         interval: 1s
+  398         retention: 24h
+  399       flush:
+  400         max_pending: 50000
+  401         adaptive: true
+  402
+  403     partitions: 8                # immutable after creation
+  404
+  405     sources:
+  406       # Pull source — deterministic UUIDv7 from (source, partition, offset)
+  407       - name: orders-kafka
+  408         type: kafka
+  409         kind: pull
+  410         topics: [orders]
+  411         partitions: [0, 1, 2, 3, 4, 5, 6, 7]
+  412         identity: { mode: native }
+  413         event_time: broker
+  414         config:
+  415           bootstrap.servers: "redpanda:9092"
+  416
+  417       # Push source — random UUIDv7, ack-after-L2
+  418       - name: returns-webhook
+  419         type: webhook
+  420         kind: push
+  421         listen: "0.0.0.0:8080"
+  422         path: /returns
+  423         identity: { mode: random }
+  424         event_time: header:X-Event-Time
+  425         backpressure:
+  426           phase1_buffer: 1024
+  427           phase3_threshold: 0.8
+  428
+  429       # Poll source — compound identity, L2-backed dedup window
+  430       - name: weather-api
+  431         type: http_polling
+  432         kind: poll
+  433         url: "https://api.weather.example/current"
+  434         interval: 30s
+  435         jitter: 10%
+  436         timeout: 5s
+  437         identity:
+  438           mode: compound
+  439           cursor_path: $.next_cursor
+  440           content_hash:
+  441             algorithm: xxhash3_64
+  442             window: 5m
+  443         event_time: aeon_ingest
+  444
+  445     processor:
+  446       name: orders-enricher
+  447       version: "1.4.2"
+  448       tier: t2_wasm
+  449       runtime:
+  450         fuel: 10_000_000
+  451         memory_pages: 256
+  452
+  453     sinks:
+  454       - name: enriched-kafka
+  455         type: kafka
+  456         eos_tier: t2_transactional_stream
+  457         topic: orders-enriched
+  458         config:
+  459           bootstrap.servers: "redpanda:9092"
+  460           transactional.id: "aeon-orders-enrichment-enriched"
+  461
+  462       - name: cache-redis
+  463         type: redis_streams
+  464         eos_tier: t4_dedup_keyed
+  465         stream: orders:enriched
+  466         dedup:
+  467           key_prefix: "aeon:dedup:"
+  468           ttl: 1h
+  469
+  470       - name: partner-webhook
+  471         type: webhook_sink
+  472         eos_tier: t5_idempotency_key
+  473         url: "https://partner.example/events"
+  474         headers:
+  475           Idempotency-Key: "{event.id}"
+  476         retry:
+  477           max_attempts: 5
+  478           backoff: { initial: 100ms, max: 30s, jitter: 20% }
+  479
+  480     upgrade_strategy: blue_green
+  481 ```
+  482
+  483 ---
+  484
+  485 ## 13. Coupling to Other Work
+  486
+  487 - **CL-6 partition transfer** (Pillar 3): L2 segments are per-partition.
+  488   When a partition migrates, its L2 segments must stream to the target
+  489   node as part of CL-6a (bulk sync). EO-2 pipeline wiring should land
+  490   before or alongside CL-6a, or CL-6a needs to be L2-aware from the start.
+  491 - **`BatchInflight` / `ReplayOrchestrator`**: stays RAM-only across all
+  492   durability modes. Labeled in code + docs as "best-effort convenience for
+  493   transient processor disconnects," not a durability guarantee. When
+  494   `durability: none`, it's the *only* retention mechanism — loss on crash
+  495   is accepted.
+  496 - **EO-1 Kafka `IdempotentSink`**: already shipped. Stays the dedup path
+  497   for T2 sinks on replay.
+  498 - **EO-3 Redis/NATS `IdempotentSink`**: already shipped. Stays the dedup
+  499   path for T4 sinks on replay.
+  500 - **FT-3 L3 checkpoint store**: already shipped. Extended with
+  501   `per_sink_ack_seq` field (§6.1).
+  502 - **TR-1 `ReplayOrchestrator`**: stays as today; future refactor to read
+  503   from L2 when durability is on is a nice-to-have, not blocking.
+  504
+  505 ---
+  506
+  507 ## 14. Deprecations
+  508
+  509 - `CheckpointBackend::Kafka` — removed from the enum. Already a silent
+  510   no-op at `pipeline.rs:873`; removal is rename + test/bench cleanup.
+  511
+  512 ---
+  513
+  514 ## 15. Observability
+  515
+  516 New metrics (all per-pipeline, per-partition where relevant):
+  517
+  518 | Metric | Type | Labels | Purpose |
+  519 |--------|------|--------|---------|
+  520 | `aeon_l2_bytes` | gauge | `pipeline`, `partition` | Current L2 size per partition |
+  521 | `aeon_l2_segments` | gauge | `pipeline`, `partition` | Active segment count |
+  522 | `aeon_l2_gc_lag_seq` | gauge | `pipeline`, `partition` | `max_seq − min(per_sink_ack)` — how far behind the slowest sink is |
+  523 | `aeon_l2_pressure` | gauge | `level=partition|pipeline|node` | 0–1 fill ratio; ≥1 triggers backpressure |
+  524 | `aeon_sink_ack_seq` | gauge | `pipeline`, `partition`, `sink` | Per-sink ack cursor |
+  525 | `aeon_checkpoint_fallback_wal` | counter | `pipeline` | L3 → WAL fallback events |
+  526 | `aeon_uuid_identity_collisions` | counter | `pipeline`, `source` | Hash collision detection (should stay 0) |
+  527
+  528 ---
+  529
+  530 ## 16. Testing Plan
+  531
+  532 - **Unit**: L2 segment rollover, GC cursor computation, UUIDv7 determinism
+  533   (same input → same UUID, replay roundtrip), `event_time` validation
+  534   failures, `CheckpointBackend::Kafka` absent from enum.
+  535 - **Integration**: crash-recovery test (kill during batch, restart, verify
+  536   no loss + no duplicates), slow-sink backpressure test (multi-sink with
+  537   one stalled; verify L2 GC holds; fast sinks don't race), multi-source
+  538   interleaving test (pull + push + poll into one processor), L3-to-WAL
+  539   failover test (corrupt L3, verify transparent WAL fallback + metric
+  540   emission).
+  541 - **Benchmarks**: per-event overhead with each durability mode, L2 write
+  542   throughput at 20M ev/s, fsync amortisation at various checkpoint
+  543   cadences, content-hash dedup cost per poll source.
+  544
+  545 ---
+  546
+  547 ## 17. Implementation Phases
+  548
+  549 | Phase | Scope | Depends on | Notes |
+  550 |-------|-------|------------|------|
+  551 | **P1** | Schema & config: extend `DeliveryStrategy` semantics, add `SourceKind` enum, extend `CheckpointRecord` with `per_sink_ack_seq`, remove `
+      CheckpointBackend::Kafka` | — | Non-functional prep. |
+  552 | **P2** | UUIDv7 derivation — per-source-kind; `event_identity()` trait method; `event_time` config validation | P1 | Unit-testable standalone. |
+  553 | **P3** | L2 event-body store — segment rollover, per-partition paths, append API, GC cursor | P1 | Builds on `aeon-state/src/l2.rs`. |
+  554 | **P4** | Pipeline runner wiring — L2 write on source batch (push+poll), L2 read on sink task, GC sweep, fsync cadence by mode | P2, P3 | Ties int
+      o `pipeline.rs` `run_buffered_*` variants. |
+  555 | **P5** | L3 → WAL fallback orchestration; `per_sink_ack_seq` persistence; recovery flow | P1 | Extends `checkpoint.rs` `L3CheckpointStore`. |
+  556 | **P6** | Multi-source + multi-sink manifest shape (arrays); validation (EOS tier declaration matches connector capability) | P1 | Manifest parser
+       + `aeon apply` changes. |
+  557 | **P7** | Backpressure hierarchy (partition → pipeline → node); escalation paths per source kind | P3, P4 | Wires `PushBuffer` Phase 3 + pull stop
+      -polling + poll interval scaling. |
+  558 | **P8** | Observability — all metrics listed in §15 | P3, P4, P5 | Hooks into existing `PipelineObservability`. |
+  559 | **P9** | Integration tests: crash-recovery, slow-sink, multi-source, L3→WAL failover | P4, P5 | Pre-merge gate. |
+  560 | **P10** | Benchmarks — validate per-event cost, fsync amortisation, 20M/s target still holds | P4 | Gate on performance regression. |
+  561 | **P11** | Docs: `PIPELINE-DESIGN-GUIDE.md` (multi-sink vs multi-pipeline), `CONNECTORS.md` source_kind matrix, migration guide for existing pipel
+      ines | — | Written alongside implementation. |
+  562 | **P12** | CL-6a coordination — ensure partition transfer moves L2 segments | Pillar 3 CL-6a | Shared design effort with cluster team. |
+  563
+  564 **Recommended landing order**: P1 → P2 → P3 → P5 → P4 → P6 → P7 → P8 → P9
+  565 → P10 → P11 → P12. Each phase is independently testable; no phase lands
+  566 without its tests.
+  567
+  568 ---
+  569
+  570 ## 18. Open Items
+  571
+  570 ## 18. Open Items
+  571
+  572 Nothing blocking. All design questions from the 2026-04-15 discussion are
+  573 resolved. Items that will surface during implementation:
+  574
+  575 - Exact L2 segment size default (256 MB proposed; may tune after P10 benchmarks).
+  576 - Whether `ReplayOrchestrator` refactors to read from L2 — deferred
+  577   post-implementation; cleanup, not correctness.
+  578 - Prior L3-ACK-TTL code review — deferred per user direction; revisit if
+  579   anything in the shipped code conflicts with this design during P1.
+  580
+  581 ---
+  582
+  583 ## 19. Frozen Decisions Checklist
+  584
+  585 | # | Decision | Locked |
+  586 |---|----------|--------|
+  587 | 1 | Source owns identity; sink owns EOS tier primitive | ✅ |
+  588 | 2 | Three source kinds: Pull / Push / Poll | ✅ |
+  589 | 3 | UUIDv7 deterministic for Pull; random for Push; config for Poll | ✅ |
+  590 | 4 | `event_time` config: broker \| aeon_ingest \| header:<name>, no silent fallback | ✅ |
+  591 | 5 | L2 = event bodies (push+poll only); L3 = checkpoints | ✅ |
+  592 | 6 | WAL = automatic fallback of L3, not a peer | ✅ |
+  593 | 7 | `CheckpointBackend::Kafka` removed | ✅ |
+  594 | 8 | Durability modes reuse `DeliveryStrategy`: none / unordered_batch / ordered_batch / per_event | ✅ |
+  595 | 9 | Existing pipelines default to `durability: none` (backwards compat) | ✅ |
+  596 | 10 | Push ack boundary: after L2 when durability on; immediate when off | ✅ |
+  597 | 11 | Multi-source first-class; per-partition order only; no cross-source merge | ✅ |
+  598 | 12 | Multi-sink first-class; slowest sink paces pipeline; separate-pipeline guidance for independent sinks | ✅ |
+  599 | 13 | Budget hierarchy: node-global → per-pipeline → per-partition | ✅ |
+  600 | 14 | Node vs pipeline config surfaces split explicitly | ✅ |
+  601 | 15 | No cross-sink atomicity (per-sink EOS only) | ✅ |
+  602 | 16 | `ReplayOrchestrator` stays RAM-only across all modes, documented best-effort | ✅ |
+  603 | 17 | `partitions` immutable after pipeline creation; no cross-partition merge | ✅ |
+  604 | 18 | Deterministic UUIDv7 identity via centralized SHA-256 hashing over per-connector `event_identity()` bytes | ✅ |
+  
+   Done. Here's what landed:
+
+  Documents written
+
+  - docs/EO-2-DURABILITY-DESIGN.md (new, 19 sections) — full frozen design with every decision from the discussion captured: architecture overview, three
+  source kinds, UUIDv7 derivation (pull/push/poll), L2 event-body store, L3 checkpoint + WAL fallback, durability modes, sink EOS tiers (T1–T6),
+  multi-source/multi-sink guidance, budget hierarchy, annotated manifest example, deprecations, observability metrics, testing plan, implementation phases
+  (P1–P12), open items, frozen-decisions checklist (18 items).
+  - docs/ROADMAP.md (updated):
+    - Pillar 5 row rewritten to reflect the reframe + point at the new design doc.
+    - New section "EO-2 Implementation Phases" added with P1–P12 tracking table, landing order, and frozen-decisions summary.
+  - Memory — saved project_eo2_design_frozen.md and indexed in MEMORY.md so future sessions pick up the frozen constraints (including "don't bring back
+  Kafka-biased framings").
+
+  Summary of the plan
+
+  EO-2 moves from sink-participating to Aeon-native durability: L2 mmap owns event bodies (push+poll sources only), L3 redb/rocksdb owns checkpoint records,
+   WAL is automatic fallback of L3. Three source kinds (Pull/Push/Poll) with matching identity strategies. Six sink EOS tiers. Per-pipeline durability
+  config reusing existing DeliveryStrategy enum. Multi-source + multi-sink first-class with documented tradeoffs. CheckpointBackend::Kafka deprecated. 12
+  implementation phases, P1 starts with schema/config (no hot-path changes yet), P10 gates on 20M ev/s benchmark regression.
+
+  Ready to start P1 whenever you are.
+
+✻ Cooked for 1m 29s
+
+
+※ recap: We froze the EO-2 design as Aeon-native durability (L2 event bodies, L3 checkpoints, WAL fallback), wrote docs/EO-2-DURABILITY-DESIGN.md, and added
+   P1–P12 phase tracking to ROADMAP. Next action is starting P1 (schema and config changes).
+
+
+  =============================
+  before we start, thinking about "WAL is automatic fallback of L3". While I mentioned about this, thinking about data storage of this, WAL will be written to disk or memory? while L3 store writes to disk (redb/rocksdb/other) know
+  
+  ================================
+  claude's response:
+  
+ Good catch — this is the kind of ambiguity that bites later. Let me think through it carefully.
+
+  The honest answer
+
+  WAL writes to disk. If WAL were in memory, it wouldn't be a fallback for L3 (which is disk-backed) — it'd just be a faster cache that loses everything on
+  crash, defeating the whole point of falling back.
+
+  Evidence from existing code: CheckpointWriter in aeon-engine/src/checkpoint.rs is a file-backed append-only log with magic "AEON-CKP" + version + CRC32
+  per record. It's already on disk today. The "fallback" we discussed is keeping that disk-backed path alive when L3 open/write fails.
+
+  Why WAL-on-disk is actually different from L3-on-disk
+
+  Both are on disk, but they serve different roles — otherwise we'd just have one tier. Three real differences:
+
+  ┌───────────────┬──────────────────────────────────────────────────────────┬────────────────────────────────────────────────────┐
+  │    Aspect     │                    L3 (redb/rocksdb)                     │               WAL (append-only file)               │
+  ├───────────────┼──────────────────────────────────────────────────────────┼────────────────────────────────────────────────────┤
+  │ Write pattern │ Random-access KV with transactions                       │ Pure sequential append                             │
+  ├───────────────┼──────────────────────────────────────────────────────────┼────────────────────────────────────────────────────┤
+  │ Read pattern  │ Point lookup + scan by key prefix                        │ Sequential scan from head                          │
+  ├───────────────┼──────────────────────────────────────────────────────────┼────────────────────────────────────────────────────┤
+  │ Dependencies  │ redb/rocksdb crate, more lines, more failure modes       │ Just std::fs + our format (minimal surface)        │
+  ├───────────────┼──────────────────────────────────────────────────────────┼────────────────────────────────────────────────────┤
+  │ Failure modes │ Corrupted page, full txn log, lock contention, crate bug │ Disk full, fsync fail — that's it                  │
+  ├───────────────┼──────────────────────────────────────────────────────────┼────────────────────────────────────────────────────┤
+  │ Recovery      │ Open txn store, resume                                   │ Scan file, validate CRCs, skip trailing corruption │
+  └───────────────┴──────────────────────────────────────────────────────────┴────────────────────────────────────────────────────┘
+
+  So WAL fallback isn't "same thing, different drive" — it's "if the sophisticated store breaks, write to a simpler format we control end-to-end so we don't
+   lose checkpoints while we're degraded."
+
+  What "fallback" actually means operationally
+
+  When backend: state_store is configured and L3 open or write fails:
+
+  1. Emit aeon_checkpoint_fallback_wal{pipeline} counter, log WARN once.
+  2. Open a WAL file at $STATE/checkpoints/<pipeline>.wal (same directory as L3).
+  3. All subsequent checkpoints append to WAL.
+  4. Background task periodically re-probes L3. On success: replay WAL → L3, delete WAL, go back to L3 mode.
+
+  On restart with both present: prefer L3 if healthy; if WAL has records beyond L3's last ID, merge WAL into L3 first.
+
+  What we should not do
+
+  - WAL in RAM — not durable, not a fallback, would be lying to operators.
+  - WAL as primary + L3 async — different design (write-behind caching), not what you asked for.
+  - Two parallel disk writes — doubles IO cost; only the fallback path writes.
+
+  Frozen clarification
+
+  - WAL is on disk, append-only file format (existing CheckpointWriter).
+  - Fallback is automatic and transient: L3 is primary, WAL activates on L3 error, WAL replays back into L3 when L3 recovers.
+  - On-disk storage split: L2 (event bodies, mmap), L3 (checkpoints, transactional KV), WAL (checkpoints, append-only) — all three are disk-backed.
+
+  Want me to patch the design doc + ROADMAP to add this explicit clarification (disk-backed, transient-activation semantics)? Small edit, worth doing so the
+   next reader doesn't hit the same question.
+
+=====================================
+ hope this still caters our throughput goals, as long as SSD is in play and data gets processed in multiple partitions, thinking....
+
+========================================
+claude's response:
+
+Honest answer: yes for pull pipelines, yes for push/poll at realistic rates, with one mode that's deliberately outside the budget. Let me show the math so
+   it's not hand-waved.
+
+  The 20M ev/s target by source kind
+
+  The ceiling is almost always hit by pull pipelines (Kafka→Kafka, CDC→sink). Those don't write L2 at all — broker is the buffer of record. Whether WAL
+  exists or not doesn't touch that hot path.
+
+  ┌────────────────────────────────────────────────┬────────────┬──────────────────────────────────────────────────────────────────────┐
+  │                    Scenario                    │ L2 writes? │                               Ceiling                                │
+  ├────────────────────────────────────────────────┼────────────┼──────────────────────────────────────────────────────────────────────┤
+  │ Pull-only (Kafka, CDC) at any durability mode  │ No         │ Full 20M/s holds — we're just writing tiny L3 checkpoints at 1–10 Hz │
+  ├────────────────────────────────────────────────┼────────────┼──────────────────────────────────────────────────────────────────────┤
+  │ Push/poll at typical rates (webhook 100k–1M/s) │ Yes        │ NVMe idle; comfortable                                               │
+  ├────────────────────────────────────────────────┼────────────┼──────────────────────────────────────────────────────────────────────┤
+  │ Push/poll at extreme rates (20M/s single node) │ Yes        │ NVMe-bound, not CPU-bound — see below                                │
+  ├────────────────────────────────────────────────┼────────────┼──────────────────────────────────────────────────────────────────────┤
+  │ Any source with per_event fsync mode           │ Yes        │ Deliberately outside 20M budget (regulated workloads only)           │
+  └────────────────────────────────────────────────┴────────────┴──────────────────────────────────────────────────────────────────────┘
+
+  Push/poll at 20M ev/s — what the disk actually does
+
+  At 20M events × 256 B avg = 5 GB/s raw bytes. Against NVMe:
+
+  ┌────────────────────────────┬─────────────┬────────────────────┐
+  │         NVMe class         │  Seq write  │ Headroom at 5 GB/s │
+  ├────────────────────────────┼─────────────┼────────────────────┤
+  │ Consumer Gen3 (3.5 GB/s)   │ tight       │ 0.7× — not enough  │
+  ├────────────────────────────┼─────────────┼────────────────────┤
+  │ Consumer Gen4 (7 GB/s)     │ ok          │ 1.4×               │
+  ├────────────────────────────┼─────────────┼────────────────────┤
+  │ Enterprise Gen4 (10 GB/s)  │ comfortable │ 2×                 │
+  ├────────────────────────────┼─────────────┼────────────────────┤
+  │ Enterprise Gen5 (13+ GB/s) │ comfortable │ 2.6×+              │
+  └────────────────────────────┴─────────────┴────────────────────┘
+
+  Realistic ceiling for push/poll at 20M/s on a single node: Gen4+ NVMe required. Honest documentation — don't pretend commodity drives hit it.
+
+  Per-event append cost (separate from bandwidth): sequential mmap write is ~20–50 ns (memcpy to already-mapped page). Fits inside the 400 ns/core budget.
+
+  fsync amortization by mode
+
+  ┌─────────────────┬─────────────────────────────────────────────┬──────────────────────────────────────────────────────────────┐
+  │      Mode       │                fsync cadence                │                        Cost at 20M/s                         │
+  ├─────────────────┼─────────────────────────────────────────────┼──────────────────────────────────────────────────────────────┤
+  │ none            │ never                                       │ 0 ns/event                                                   │
+  ├─────────────────┼─────────────────────────────────────────────┼──────────────────────────────────────────────────────────────┤
+  │ unordered_batch │ at checkpoint (1–10 Hz)                     │ 20k fsyncs/s max, ~1 μs each = <0.1% wall time → ~0 ns/event │
+  ├─────────────────┼─────────────────────────────────────────────┼──────────────────────────────────────────────────────────────┤
+  │ ordered_batch   │ at batch boundary (~1k events) + checkpoint │ 20k fsyncs/s, same math → ~0 ns/event                        │
+  ├─────────────────┼─────────────────────────────────────────────┼──────────────────────────────────────────────────────────────┤
+  │ per_event       │ every event                                 │ 20M fsyncs/s — impossible on any disk                        │
+  └─────────────────┴─────────────────────────────────────────────┴──────────────────────────────────────────────────────────────┘
+
+  per_event is the regulated-workload escape hatch; it explicitly blows the Gate 1 budget. The design doc already states this; worth making sure users see
+  it before they turn the knob.
+
+  Partition parallelism is what makes it work
+
+  ┌────────────┬─────────────────────────┬──────────────────────────────────────────────┐
+  │ Partitions │     Writer streams      │                Effect on NVMe                │
+  ├────────────┼─────────────────────────┼──────────────────────────────────────────────┤
+  │ 1          │ 1 sequential writer     │ Single queue, underutilizes NVMe parallelism │
+  ├────────────┼─────────────────────────┼──────────────────────────────────────────────┤
+  │ 8          │ 8 independent writers   │ Deep queue depth, near-peak NVMe bandwidth   │
+  ├────────────┼─────────────────────────┼──────────────────────────────────────────────┤
+  │ 16+        │ 16+ independent writers │ Near-saturation on Gen4+                     │
+  └────────────┴─────────────────────────┴──────────────────────────────────────────────┘
+
+  Each partition owns its own L2 segment file + writer task + CPU core. No cross-partition coordination, no shared lock. Modern NVMe wants deep queue depth
+  (32+ concurrent writes) — 8–16 partitions provides exactly that.
+
+  This is why we locked per-partition single-owner earlier — it falls out of the disk-throughput story, not just the Raft/consensus story.
+
+  WAL fallback doesn't change the math
+
+  When WAL activates, it's writing the same small checkpoint records (~100–200 B, 1–10 Hz) that L3 would have written. Not 5 GB/s of event bodies —
+  checkpoints only. Throughput implication is zero.
+
+  Honest risks to document (ones I'd call out in the design doc)
+
+  1. HDD is unsupported for any durability mode except none. Random fsyncs on HDD = death. Aeon will probably still run but miss every SLA.
+  2. per_event mode is explicitly non-throughput-optimal. Document the cost — operators should only pick it when regulations require it.
+  3. L2 GC cursor stalls can turn disk-full scenarios into backpressure. If the slowest sink goes offline for hours, L2 fills until cap is hit → Phase 3
+  protocol-level flow control → upstream feels it. Correct by design, but worth naming so operators know "slow sink → upstream sees 503s" is expected
+  behavior.
+  4. Push/poll at 20M/s single-node needs Gen4+ NVMe. Document the hardware floor, don't let benchmarks run on Gen3 and then have users blame Aeon.
+
+  Does this change any frozen decision?
+
+  No — the math validates what we already locked. What it does change is how honestly we document the throughput claim:
+
+  - Pull pipelines: 20M/s aggregate, unconditionally (already benchmarked at 849k buffered / 1.6M direct / 3.4M blackhole on current hardware; the 20M
+  target is multi-node).
+  - Push/poll pipelines at ordered_batch: 20M/s requires Gen4+ NVMe and ≥8 partitions.
+  - per_event mode: deliberately below target, for compliance workloads.
+
+  Want me to patch the design doc §10 Budget Hierarchy with a new subsection on "Hardware assumptions and per-mode throughput ceilings" capturing the table
+  above? Small addition, but it's the kind of thing that prevents "Aeon doesn't hit 20M/s!" bug reports on Gen3 consumer SSDs.
+
+✻ Baked for 57s
+
+=====================
+proceed
+
+======================
+claude's response:
+
+    Done. Design doc now has:
+
+  - §6.3 — explicit "WAL is disk-backed, not in-memory" with the L3-vs-WAL comparison table explaining why both on-disk tiers are still different.
+  - §6.4 — operational semantics: activation, replay-back into L3 on recovery, restart merge rules.
+  - §10.3 — hardware assumptions + per-mode throughput ceilings: per-source-kind table, SSD class requirements (Gen3 insufficient, Gen4+ required, HDD
+  unsupported), fsync cost by mode, partition parallelism rationale, documented operational risks, honest summary claim operators can cite.
+  - Frozen checklist extended to 20 items (added WAL disk-backed + hardware ceilings).
+
+  ROADMAP's EO-2 frozen decisions updated to mirror these two clarifications.
+
+  Ready to start P1 when you are.
+
+✻ Worked for 1m 44s
+
+
+※ recap: Goal: design Aeon-native durability (EO-2) so any source/sink combo gets exactly-once without upstream or downstream cooperation. Design is frozen
+  and documented in docs/EO-2-DURABILITY-DESIGN.md with 12 phases tracked in ROADMAP. Next: start P1 (schema and config changes).
+
+
+========================
+continue
+==========================
+claude's response:
+
+ Starting P1 — schema & config changes (no behavioral changes, just scaffolding).
+
+P1 complete. Summary:
+
+  - CheckpointRecord now carries per_sink_ack_seq: HashMap<String, u64> with #[serde(default)]; existing new() callers unchanged, new builder
+  with_per_sink_ack_seq() added.
+  - WAL_VERSION bumped 1→2 (clean break, pre-1.0).
+  - SourceKind enum + source_kind() default on Source trait (done earlier this task).
+  - CheckpointBackend::Kafka variant removed; pipeline match arm, 3 test sites fixed.
+  - cargo check --workspace --all-features clean; cargo test -p aeon-types -p aeon-engine 122 passing.
+
+  P1 scaffolding complete — no behavioral change. Ready for P2 (SourceKind wiring through connectors + UUIDv7 generators) when you say go.
+
+✻ Cogitated for 10m 34s
+
+============================
+continue
+==============================
+claude's response:
+
+ P2 complete. Summary:
+
+  - aeon-types::derive_pull_uuid_v7(source_name, identity, unix_ts_ms, offset) -> Uuid — deterministic RFC-9562 UUIDv7 derivation: 48-bit source ts, 12-bit
+  offset in rand_a (within-ms monotonic), 62-bit SHA-256(source‖0x1f‖identity) in rand_b. 8 unit tests covering determinism, ordering, masking, separator
+  collisions.
+  - aeon-types::EventTime enum: Broker | AeonIngest | Header { name } with serde tagged-enum YAML/JSON shape; 3 tests.
+  - Source::supports_broker_event_time() trait hook (default false) — pipeline start-time validator in P4/P6 will fail-fast when event_time: broker +
+  connector returns false.
+  - sha2 dependency added to aeon-types.
+  - cargo test -p aeon-types: 134 passed (12 new); workspace compiles clean.
+  - ROADMAP P1 + P2 marked ✅.
+
+  Poll-source identity config (cursor/etag/content_hash) deliberately deferred to P4 connector wiring — it's connector-side, not a core-types primitive.
+  Ready for P3 (L2 event-body store) when you say go.
+
+✻ Baked for 3m 18s
+
+
+※ recap: Building EO-2 Aeon-native durability layer; P1 (schema scaffolding) and P2 (pull UUIDv7 derivation, EventTime enum, broker-ts trait hook) are
+  landed and green. Next: start P3, the L2 event-body mmap segment store.
+
+============================
+continue
+==============================
+claude's response:
+
+ P3 complete. Summary:
+
+  - New aeon_engine::l2_body module — EO-2 event-body durable log, distinct from the aeon-state KV L2.
+  - Segment file format: AEON-L2B magic + u16 version + [seq:u64][crc32:u32][len:u32][MsgPack(Event):len] records. Truncation/corruption-safe reader stops
+  cleanly at first bad record.
+  - L2BodySegment: create/open/append/fsync/iter_records; rejects non-monotonic seq; recovers max_seq from disk on reopen.
+  - L2BodyStore: per-partition multi-segment manager; auto-rollover at segment_bytes (default 256 MiB); append assigns monotonic seq; gc_up_to(min_ack_seq)
+  drops fully-acked historical segments but preserves writable tail; iter_from(seq) for recovery replay; next_seq resumes across reopens.
+  - 9 unit tests covering append/iter, reopen recovery, monotonicity enforcement, rollover, GC cursor respect, full-GC sweep, iter_from, truncation
+  recovery.
+  - ROADMAP P3 ✅.
+
+  Pipeline-runner wiring (P4) — push/poll ingest path that writes to L2 before acking upstream, sink ack-seq tracker, fsync cadence by durability mode — is
+  the next phase. Ready when you say go.
+
+✻ Baked for 8m 43s
+
+=============================
+continue
+================================
+claude's response:
+
+ Clean. Pausing before the runner wiring — this is the right checkpoint to align.
+
+  P4 data-plane surface landed (scaffolding):
+  - aeon_types::DurabilityMode enum: None (default) / UnorderedBatch / OrderedBatch / PerEvent with requires_l2_body_store(), fsync_per_event(), tag()
+  helpers. 5 tests.
+  - aeon_engine::delivery::L2BodyStoreConfig { root, segment_bytes } + extended DeliveryConfig with durability + l2_body fields.
+  - Workspace clean, 139 aeon-types tests + engine lib tests passing.
+
+  P4 runner wiring — needs your call before I touch pipeline.rs (4000 lines, 4 entry points). Three design questions that shape the invasive part:
+
+  1. L2 store ownership. Put an Option<Arc<Mutex<L2BodyStore>>> on SinkTaskCtx and create one per-partition at pipeline start, or introduce a
+  PipelineL2Registry (HashMap<(pipeline, partition), L2BodyStore>) that both source and sink tasks share?
+  2. Source-side hook. Push/poll sources currently flow into the SPSC ring buffer straight from next_batch. For ack-after-L2, do we wrap the source in an
+  L2WritingSource adapter, or add an L2 append step inside run_buffered's source pump between next_batch and the ring push?
+  3. Ack-seq tracking. per_sink_ack_seq — tracked in SinkTaskCtx as a HashMap<sink_name, u64>, updated on each successful ack, and written into
+  CheckpointRecord via with_per_sink_ack_seq?
+
+  My preferred answers: (1) shared registry, (2) adapter wrap, (3) yes. Let me know — or say "you pick" and I'll proceed.
+
+✻ Crunched for 2m 55s
+
+
+================================
+proceed
+====================================
+claude's response:
+
+ Going with: (1) shared registry, (2) source adapter, (3) ack-seq tracker. I'll land them as tested primitives + a surgical edit in pipeline.rs for
+  per_sink_ack_seq persistence. Full pump-path integration stays small and bounded.
+
+
+ P4 primitives landed + one bounded pipeline.rs touchpoint:
+
+  New module aeon_engine::eo2:
+  - PipelineL2Registry — shared per-(pipeline, partition) L2BodyStore handles; dedupes via lock + HashMap. Root dir resolved from L2BodyStoreConfig.
+  - L2WritingSource<S: Source> — generic adapter; wraps any Source; writes bodies to L2 for Push/Poll kinds when mode.requires_l2_body_store(), skips for
+  Pull or None; exposes take_last_seqs() for downstream ack-seq tracking; fsync-per-event honored when mode == PerEvent.
+  - AckSeqTracker — per-sink monotonic seq map with min_across_sinks() cursor for GC; snapshot() for checkpoint records.
+
+  pipeline.rs surgical edits:
+  - SinkTaskCtx::eo2_ack_tracker: Option<AckSeqTracker> — auto-created by build_sink_task_ctx when durability != None.
+  - write_checkpoint now stamps per_sink_ack_seq via CheckpointRecord::with_per_sink_ack_seq(tracker.snapshot()) on all three call sites.
+
+  Tests: 9 new (pull passthrough, push writes L2, None passthrough, poll writes, registry dedup, ack monotonic + min + none + snapshot), all green. Full
+  aeon-engine: 313 passing. Workspace clean.
+
+  What's left for P4 (🟡 in ROADMAP) — genuine hot-path changes best done in a separate coherent edit:
+  - Wrap source with L2WritingSource inside run_buffered + run_buffered_transport + run_buffered_managed when the config demands it.
+  - Call ack_tracker.record_ack(sink_name, seq) in the sink dispatch path after successful delivery.
+  - Drive periodic gc_up_to(tracker.min_across_sinks()) from the sink task's flush loop.
+
+  Say the word to push through those last three, or we can move to P5 (L3→WAL fallback + recovery) which is independent.
+
+✻ Churned for 3m 57s
+
+================================
+ continue to handle P5 while marking pending activities of P4
+
+==================================
+claude's response:
+
+P5 primitives landed. Summary:
+
+  New module aeon_engine::eo2_recovery:
+
+  - FallbackCheckpointStore — wraps any Box<dyn CheckpointPersist> primary with a file-backed WalCheckpointStore fallback. On primary append error:
+  lazy-opens WAL, flips in_fallback flag, increments fallback_transitions counter (maps to aeon_checkpoint_fallback_wal metric, §15), logs WARN once per
+  transition. read_last prefers primary but returns WAL if it's ahead (recovery scenario). try_recover_primary() is caller-driven (no background task —
+  deterministic for tests, single runtime owner): replays the latest WAL record into the primary when primary heals; clears fallback; drops WAL handle.
+  - RecoveryPlan::from_last(Option<&CheckpointRecord>) → struct exposing pull_seek_offsets, l2_replay_start_seq = min(per_sink_ack_seq),
+  source_checkpoint_id.
+  - RecoveryAction::{SeekPartitions(HashMap<PartitionId,i64>), ReplayL2From(u64)} — dispatched by plan.action_for(source_kind): pull → seek; push/poll → L2
+  iter-from the min-ack frontier.
+
+  Tests (10/10): healthy passthrough, primary-error engagement, transition counter is distinct-events (not per-write), read_last prefers WAL when ahead,
+  try_recover happy path + stays-in-fallback path, plan from None is fresh, pull uses partition offsets, push/poll replay from min, empty ack map → 0.
+
+  Status: aeon-engine 323 lib tests passing; workspace clean.
+
+  ROADMAP: P5 marked 🟡 — primitives shipped + tested; the two remaining 🟡 items are both pipeline.rs wiring:
+  - P4 🟡: wrap source in L2WritingSource inside run_buffered*, call AckSeqTracker::record_ack in sink dispatch, drive gc_up_to(min_ack) from flush loop.
+  - P5 🟡: thread FallbackCheckpointStore as default wrapper in build_sink_task_ctx; call RecoveryPlan::action_for at pipeline start for seek/replay.
+
+  P6 (multi-source + multi-sink manifest shape + eos_tier validation) is independent and next — ready when you are.
+
+✻ Churned for 2m 58s
+
+
+※ recap: Building EO-2 exactly-once durability for Aeon; P1–P3 complete, P4 and P5 primitives shipped and tested (323 tests passing) but marked 🟡 pending
+  pipeline.rs hot-path wiring. Next: tackle P6 (multi-source/multi-sink manifest shape with eos_tier validation), or finish the P4/P5 runner wiring.
+
+
+================================
+continue
+==================================
+claude's response:
+
+ P6 primitives landed.
+
+  Summary:
+  - crates/aeon-types/src/manifest.rs (NEW, 19 tests passing): typed PipelineManifest schema covering §11–§12 of the design — sources/sinks as lists,
+  DurabilityBlock + CheckpointBlock + FlushBlock, IdentityConfig (Native/Random/Compound), BackpressureConfig, SinkTierDecl with bidirectional SinkEosTier
+  mapping.
+  - Fail-fast validators: validate_sink_tier (declared vs runtime tier), validate_source_shape (broker-ts support + kind↔identity invariants),
+  validate_pipeline_shape (non-empty lists, unique names, partitions > 0).
+  - SourceKind now derives Serialize/Deserialize with snake_case rename.
+  - ROADMAP P6 → 🟡 with remaining scope called out: CLI YAML loader swap + runtime topology refactor (current PipelineConfig<S,P,K> generics are
+  single-source/single-sink).
+
+  Workspace cargo check --all-features clean; all 19 new tests pass. Ready for P7.
+
+✻ Churned for 5m 40s
+
+================================
+continue
+====================================
+claude's response:
+
+ P7 primitives landed.
+
+  Summary:
+  - crates/aeon-engine/src/eo2_backpressure.rs (NEW, 14 tests passing): BudgetCaps with derived per-partition soft target, shared NodeBudget, per-pipeline
+  PipelineBudget with sparse per-partition byte accounting. PressureLevel (Partition/Pipeline/Node) + BackpressureDecision::{PushReject, PullPause,
+  PollSkip} mapped via for_kind(SourceKind, level). Escalation honors severity: node > pipeline > partition at a 95 % trigger threshold.
+  - ROADMAP P7 → 🟡; remaining scope is wiring adjust() into L2BodyStore create/GC and calling decide() from source tasks to enact the per-kind remedy.
+
+  Ready for P8 (observability metrics).
+
+✻ Baked for 2m 3s
+
+======================================
+continue
+========================================
+claude's response:
+
+ P8 primitives landed.
+
+  Summary:
+  - crates/aeon-engine/src/eo2_metrics.rs (NEW, 11 tests passing): Eo2Metrics registry covering all seven P8 metrics — L2 bytes/segments/gc_lag_seq
+  (pipeline×partition gauges), aeon_l2_pressure{level} pre-populated to zero, aeon_sink_ack_seq{pipeline,sink}, and _total counters for WAL fallback + UUID
+  collisions. Hand-crafted Prometheus text output with deterministic BTreeMap ordering and HELP/TYPE headers for every series.
+  - ROADMAP P8 → 🟡; remaining scope is wiring the registry updates into L2BodyStore / PipelineBudget / FallbackCheckpointStore and splicing
+  render_prometheus() into the existing metrics_server.
+
+  Ready for P9 (integration tests) — note P9 depends on P4/P5 runtime wiring, so that may need to land first.
+
+✻ Crunched for 1m 57s
+
+
+※ recap: Shipping EO-2 (exactly-once durability) phase by phase as primitives-first scaffolding; just finished P8 observability metrics with 11 passing
+  tests. Next: start P9 integration tests, though P9 depends on P4/P5 runtime wiring into pipeline.rs still being pending.
+
+========================================
+continue
+==========================================
+claude's response:
+
+ P11 primary doc landed.
+
+  Summary:
+  - docs/PIPELINE-DESIGN-GUIDE.md (NEW, 8 sections): source-kind decision matrix (Pull/Push/Poll with L2/identity/backpressure columns), durability mode
+  matrix with "when to use" guidance, event_time rules (including the no-silent-fallback invariant), multi-source ordering guarantees, multi-sink vs
+  separate-pipeline rubric with concrete good-fit / anti-pattern examples, eos_tier reference table, capacity planning quick-reference, partition-count
+  guidance.
+  - ROADMAP P11 → 🟡; remaining is the CONNECTORS.md per-connector source_kind patch and the migration note.
+
+  Status check — stacking pattern: P4, P5, P6, P7, P8, P11 now all sit at 🟡. P4/P5 are blocked on the same invasive pipeline.rs (4026-line) wiring pass;
+  P6/P7/P8 runtime hookups flow from that same pass; P9/P10 genuinely cannot ship until it lands. Worth naming so we decide consciously: keep scaffolding
+  forward (P12 coordination note is trivially doable), or commit a session to the pipeline.rs landing that unlocks the whole green column. Your call.
+
+✻ Cogitated for 2m 7s
+
+========================================
+ let us work on pipeline.rs
+
+==========================================
+claude's response:
+
+ pipeline.rs wiring pass landed.
+
+  Summary of what shipped:
+  - crates/aeon-engine/src/eo2.rs — new MaybeL2Wrapped<S> enum with Source impl so the runtime can apply L2WritingSource without changing run_buffered's
+  generic signature. One-time match at wrap time; compiler monomorphises.
+  - crates/aeon-engine/src/pipeline.rs:
+    - PipelineConfig.pipeline_name: String + PipelineConfig.l2_registry: Option<PipelineL2Registry> (with Default updates and MultiPartitionConfig clone
+  site).
+    - run_buffered wraps the source via MaybeL2Wrapped::wrap(…) before spawning the source task. Pull sources and DurabilityMode::None pass through
+  untouched.
+    - build_sink_task_ctx wraps the L3-primary CheckpointPersist in FallbackCheckpointStore whenever StateStore + durability != None, with a fallback.wal
+  sidecar in the checkpoint dir.
+    - 4 new tests in eo2_wiring: push-source writes L2, pull-source skips L2, DurabilityMode::None passthrough, missing-registry passthrough.
+  - ROADMAP P4/P5 updated to reflect what's landed vs what's left.
+
+  Results: 352 engine tests pass (+4 from baseline 348). Workspace cargo check --all-features clean.
+
+  Remaining P4 work (scoped for a follow-up pass): mirror the wrap into run_buffered_transport / run_buffered_managed / run_multi_partition; propagate L2
+  seq through Event/Output so record_ack can fire on successful delivery; drive GC sweep from the sink flush loop. Remaining P5: call
+  RecoveryPlan::action_for at pipeline start; periodic try_recover_primary().
+
+✻ Cooked for 9m 19s
+
+
+==========================================
+ proceed with p4 and p5
+ =============================================
+ claude's response:
+ 
+  All green — aeon-engine now at 355 lib tests (was 352). P4 is shipped end-to-end.
+
+  Summary of P4 completion
+
+  Wire path: L2WritingSource stamps Event.l2_seq = Some(seq) on append → propagates through WireEvent + WireOutput (both now carry l2_seq) → processors copy
+   via with_event_identity → sink task builds pre-move {event_id → l2_seq} map, advances AckSeqTracker::record_ack(sink, max_delivered_seq) on each batch,
+  and calls eo2_gc_sweep across registered partitions at every flush + final shutdown.
+
+  Changes:
+  - aeon-types/src/event.rs — l2_seq: Option<u64> added to Event/Output, builders updated
+  - aeon-types/src/transport_codec.rs — WireEvent/WireOutput carry l2_seq with skip_serializing_if for backward-compat wire size
+  - aeon-engine/src/eo2.rs — L2WritingSource::next_batch stamps the event
+  - aeon-engine/src/pipeline.rs — SinkTaskCtx now carries sink_name/pipeline_name/l2_registry; run_buffered_transport wraps source too; eo2_gc_sweep helper
+  drives GC on flush
+  - New test push_source_drives_l2_gc_after_successful_delivery
+  - aeon-wasm + aeon-connectors/http struct literals updated for new field
+  - ROADMAP P4 flipped to ✅
+
+  Deferred: run_buffered_managed stays unwrapped (hot-swap downcast needs concrete S); P5 RecoveryPlan dispatch at pipeline start + periodic
+  try_recover_primary hook still outstanding.
+
+✻ Crunched for 13m 52s
+
+※ recap: Continuing EO-2 Pillar 5 phase-by-phase; P4 (runtime wiring for L2 seq propagation, per-sink ack tracking, and GC on flush) just shipped with 5
+  eo2_wiring tests green. Next: P5 RecoveryPlan dispatch at pipeline start plus periodic try_recover_primary hook in the sink flush loop.
+
+============================================
+continue
+============================================
+
+claude's response:
+
+ P5 shipped. Summary:
+
+  P5 completion
+
+  Changes:
+  - aeon-types/src/traits.rs — added Source::on_recovery_plan(&pull_offsets, replay_from_l2_seq) with default no-op; connectors opt in
+  - aeon-engine/src/checkpoint.rs — added CheckpointPersist::try_recover_primary() trait method with default Ok(true)
+  - aeon-engine/src/eo2_recovery.rs — FallbackCheckpointStore overrides try_recover_primary to dispatch to the inherent impl
+  - aeon-engine/src/eo2.rs — L2WritingSource + MaybeL2Wrapped forward on_recovery_plan to the inner source
+  - aeon-engine/src/pipeline.rs — load_recovery_plan reads last checkpoint sync; dispatch_recovery_plan fires on_recovery_plan before the source task spawns
+   in run_buffered + run_buffered_transport; sink task calls try_recover_primary every 16 flushes
+  - New test recovery_plan_dispatches_to_source_on_pipeline_start seeds a persisted per_sink_ack_seq = 42 record, verifies the source's recovery hook fires
+  once with that seq
+
+  Workspace: 356 aeon-engine lib tests, all green. ROADMAP P5 flipped to ✅.
+
+✻ Cogitated for 8m 39s
+
+
+==========================================
+continue
+=============================================
+claude's response:
+
+
+● Remaining EO-2 phases: P6 (multi-source CLI+topology — large), P7 (backpressure wiring), P8 (metrics splice), P11 (CONNECTORS.md). Let me tackle P8 —
+  metrics wiring since primitives are built and integration points are concrete.
+
+All green — 0 failures across the entire workspace (704+ tests total).
+
+  P8 (Observability wiring) is complete. Changes:
+
+  - PipelineConfig.eo2_metrics + Default impl (None) — threaded through MultiPartitionConfig and build_sink_task_ctx into SinkTaskCtx
+  - Sink task: set_sink_ack_seq(pipeline, sink, seq) on every record_ack advance
+  - eo2_gc_sweep: set_l2_bytes, set_l2_segments, set_l2_gc_lag_seq per partition on every sweep
+  - FallbackCheckpointStore::with_metrics() + engage_fallback calls inc_checkpoint_fallback_wal() on first transition
+  - MetricsConfig.eo2_metrics splices render_prometheus() into /metrics endpoint
+  - 2 new tests: fallback_transition_bumps_metrics_counter, eo2_metrics_published_on_ack_and_gc
+  - ROADMAP P8 flipped 🟡 → ✅
+
+  Remaining EO-2 phases: P6 (multi-source/sink topology — large), P7 (backpressure wiring), P9 (integration tests), P10 (benchmarks), P11 (docs patch), P12
+  (CL-6a coordination).
+
+✻ Crunched for 4m 16s
+
+
+==================================
+proceed
+====================================
+claude's response:
+
+ P7 (backpressure wiring) is next — primitives are built, just needs wiring into source tasks and L2 paths. Let me check what's available.
+
+
+ Now let me understand where to wire this. The source task in run_buffered is where next_batch is called — that's where we check PipelineBudget::decide
+  before polling. And L2BodyStore::append / gc_up_to need PipelineBudget::adjust calls.
+
+
+● Now let me look at the PipelineConfig struct to understand where to add the budget field.
+
+===================================
+
+ can we consider referring to throughput preparation as so, instead of budget, as not many may understand the terminology immediately, think about
+====================================
+claude's response:
+
+ Good point to pause on. The current naming (PipelineBudget, BudgetCaps, NodeBudget) is internal/systems jargon — "budget" makes sense to infrastructure
+  engineers but not necessarily to users writing pipeline manifests.
+
+  Two things to weigh:
+
+  1. Internal code (eo2_backpressure module): Budget maps well to the byte-accounting semantics (allocate, spend, reclaim). Renaming here touches ~30 sites
+  across the existing module + tests.
+  2. User-facing config/metrics: This is where "throughput" or a clearer term matters most. The YAML keys (l2_budget_bytes, pipeline_max_bytes) and
+  Prometheus metric names (aeon_l2_pressure) are what operators actually see.
+
+  A middle ground: keep Budget/PipelineBudget internally (it's the right domain term for the accounting pattern), but use clearer names at the
+  config/metrics boundary — e.g. throughput_cap or capacity in YAML, aeon_l2_pressure stays (already clear). The config layer in P6 (manifest loader) would
+  be the natural place for that mapping.
+
+  Want me to rename the internal types now, or keep them as-is and ensure the user-facing layer (P6 config + metrics) uses friendlier terminology?
+
+✻ Brewed for 4m 1s
+
+
+※ recap: Wiring EO-2 exactly-once delivery into the pipeline runtime, phase by phase. P8 metrics is done, currently midway through P7 backpressure wiring.
+  Next action: finish threading the budget into the two MaybeL2Wrapped::wrap call sites.
+
+==================================
+your thought process is reasonable. While I am not worried about changing in multiple places, as long as mapping is correctly there, it is still fine. throughput_cap is good and capacity is also ok. Since we believe in domain driven design (DDD) philosophy, as long as mapping is correctly done and described it is fine but think how this will be if we call PipelineThroughput, ThroughputCaps, NodeThroughput kind of? I am thinking Aeon developers, Devops team's context and Aeon users's who will create pipeline configurations and develop/deploy processor jobs. We need to take calls after analysis, for longterm. Simpler terminoplogy is always good, thinking how much this may fit.
+===================================
+claude's response:
+
+ Good call to analyze this properly — naming sticks for the life of the project. Let me walk through each stakeholder's mental model against the
+  candidates.
+
+  What the types actually represent: byte counts of L2 data buffered on disk, not yet GC'd. The decision logic is "if buffered bytes exceed cap → engage
+  backpressure." It's a water-tank-level concept, not a flow-rate concept.
+
+  The "Throughput" problem:
+
+  ┌────────────────┬────────────────────────────────────────────────┬────────────────────────────────────────────────────┐
+  │  Stakeholder   │ Sees PipelineThroughput / throughput_cap: 10GB │               Likely interpretation                │
+  ├────────────────┼────────────────────────────────────────────────┼────────────────────────────────────────────────────┤
+  │ Aeon developer │ Reads the code, understands quickly            │ "Max buffered bytes" (correct after reading impl)  │
+  ├────────────────┼────────────────────────────────────────────────┼────────────────────────────────────────────────────┤
+  │ DevOps         │ YAML config + Grafana dashboards               │ "10GB/sec max?" — ambiguous, could mean rate       │
+  ├────────────────┼────────────────────────────────────────────────┼────────────────────────────────────────────────────┤
+  │ Pipeline user  │ Writing YAML manifest                          │ "My pipeline can process 10GB per second?" — wrong │
+  └────────────────┴────────────────────────────────────────────────┴────────────────────────────────────────────────────┘
+
+  Throughput strongly implies rate (events/sec, bytes/sec) in data engineering. When an operator sees throughput_cap next to aeon_l2_bytes (a gauge, not a
+  rate), the disconnect could cause real misconfiguration — someone sets it thinking it's a rate limit when it's actually a buffer ceiling.
+
+  Better candidates:
+
+  ┌────────────┬──────────────────────────────┬───────────────────────────┬─────────────────────────────────────────────┬──────────────────────────────┐
+  │    Term    │            Types             │        Config YAML        │                    Pros                     │             Cons             │
+  ├────────────┼──────────────────────────────┼───────────────────────────┼─────────────────────────────────────────────┼──────────────────────────────┤
+  │            │ PipelineCapacity,            │ capacity: {               │ Accurate (it IS "how much can be held"),    │                              │
+  │ Capacity   │ NodeCapacity, CapacityLimits │ pipeline_max_bytes: 10GB  │ intuitive to all 3 audiences, natural       │ Slightly generic             │
+  │            │                              │ }                         │ English ("at capacity" = backpressure)      │                              │
+  ├────────────┼──────────────────────────────┼───────────────────────────┼─────────────────────────────────────────────┼──────────────────────────────┤
+  │            │ PipelineQuota, NodeQuota,    │ quota: {                  │ K8s-familiar (resource quotas), clear       │ Less intuitive for non-K8s   │
+  │ Quota      │ QuotaLimits                  │ pipeline_max_bytes: 10GB  │ enforcement semantics                       │ users                        │
+  │            │                              │ }                         │                                             │                              │
+  ├────────────┼──────────────────────────────┼───────────────────────────┼─────────────────────────────────────────────┼──────────────────────────────┤
+  │            │ PipelineBuffer, NodeBuffer,  │ buffer_limits: {          │                                             │ Could confuse with SPSC ring │
+  │ Buffer     │ BufferLimits                 │ pipeline_max_bytes: 10GB  │ Describes exactly what's being measured     │  buffers already in the      │
+  │            │                              │ }                         │                                             │ codebase                     │
+  ├────────────┼──────────────────────────────┼───────────────────────────┼─────────────────────────────────────────────┼──────────────────────────────┤
+  │            │ PipelineThroughput,          │                           │                                             │ Rate vs. capacity ambiguity  │
+  │ Throughput │ NodeThroughput,              │ throughput_cap: 10GB      │ Familiar marketing term                     │ — real misconfiguration risk │
+  │            │ ThroughputCaps               │                           │                                             │                              │
+  └────────────┴──────────────────────────────┴───────────────────────────┴─────────────────────────────────────────────┴──────────────────────────────┘
+
+  My recommendation: Capacity.
+
+  - "The pipeline is at capacity" → backpressure engaged. Natural.
+  - pipeline_max_bytes: 10GB under a capacity: block — DevOps reads it right immediately.
+  - PipelineCapacity.decide() → "check if we have capacity" — reads well in Rust.
+  - No collision with existing codebase terms (unlike "buffer" which could confuse with source_buffer_capacity).
+  - CapacityLimits replaces BudgetCaps — no redundancy, clear meaning.
+
+  The mapping for DDD would be:
+
+  Internal (Rust)          Config (YAML)                  Metrics (Prometheus)
+  ─────────────────────    ──────────────────────────      ─────────────────────
+  NodeCapacity             node.capacity.max_bytes         aeon_l2_pressure{level="node"}
+  PipelineCapacity         pipeline.capacity.max_bytes     aeon_l2_pressure{level="pipeline"}
+  CapacityLimits           (derived at startup)            aeon_l2_pressure{level="partition"}
+
+  Want me to proceed with the Capacity rename across eo2_backpressure, then continue wiring P7?
+
+✻ Churned for 49s
+
+
+================================
+ proceed with the renaming activity from Budget to Capacity in applicable places. Then we will proceed with P7 that we were earlier working upon
+
+==================================
+claude's response:
+
+
+● Now let me find all references to Budget/budget across the codebase to plan the rename scope.
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+● Good — contained to 5 files, and docs/aeon-dev-notes.txt is the user's notebook (read-only per memory). Let me rename in the 4 editable files. I'll start
+  with the core module.
+
+
+ Now update the doc comment on the field to match the new name.
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+● Good. Now check the wrap call that passes eo2_budget → should now be eo2_capacity.
+
+  Searched for 2 patterns (ctrl+o to expand)
+
+● Hmm — the wrap calls don't have the 5th budget param yet, because my earlier edit failed due to duplicate matches. Let me check the current wrap signature
+   and update both call sites.
+
+
+ Also update the "Budget hierarchy" line in the frozen decisions section.
+
+
+Only in aeon-dev-notes.txt which is read-only per memory. Let me also check the EO-2 design doc.
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+● Good — design doc doesn't reference the old names. Now compile.
+
+ Rename complete. Budget → Capacity across all 4 editable files:
+
+  - eo2_backpressure.rs: BudgetCaps → CapacityLimits, NodeBudget → NodeCapacity, PipelineBudget → PipelineCapacity, all internal Inner structs + doc
+  comments + test names updated
+  - eo2.rs: L2WritingSource.budget → .capacity, with_budget() → with_capacity(), MaybeL2Wrapped::wrap() param renamed
+  - pipeline.rs: eo2_budget → eo2_capacity field + Default + MultiPartitionConfig + wrap() call sites
+  - ROADMAP.md: P7/P8/frozen-decisions references updated
+
+  356 tests passing, clean compile. Ready to continue P7 wiring when you say go.
+
+✻ Crunched for 7m 4s
+
+===================================
+continue
+=====================================
+claude's response:
+
+ Wiring P7: GC-side capacity release in eo2_gc_sweep, source-task decide() check before next_batch, and pressure metric flip.
+
+
+ Good — l2_seq is copied. Now let me check what BlackholeSink::write_batch returns.
+
+  Searched for 2 patterns (ctrl+o to expand)
+
+● OK the flow looks correct. The real issue must be timing. Let me look more carefully. With #[tokio::test] (current_thread), tasks are cooperative. The
+  source task sleeps 1ms, then wakes and checks. But does the sink task get enough opportunity to flush + gc_sweep?
+
+  The sink task uses flush_interval = 1ms with tokio::time::sleep_until. On current_thread runtime, the source's 1ms sleep and the sink's timer both
+  resolve, tasks run in order. The GC sweep should reclaim.
+
+  Let me check: maybe the problem is that the PushSource delivers all 30 events in one next_batch, L2 appends them all at once (inside
+  L2WritingSource::next_batch), and the capacity check only runs BEFORE the next loop iteration. So the first batch goes through, fills L2 way past cap, the
+   source then blocks on capacity, and the sink eventually delivers and GC runs. But the critical question: does eo2_gc_sweep in the sink actually reclaim
+  enough?
+
+  The 30 events × ~64-byte payloads = ~2000+ bytes of L2 data across ~8 segments (256 bytes each). After full GC (all 30 acked, gc_up_to(30)), all sealed
+  segments are removed, but the active segment keeps any trailing records. Actually wait — gc_up_to(30) removes segments whose max_seq < 30. The last
+  segment might have seq=30 in it, so it's NOT removed. That segment could be ~256 bytes.
+
+  partition_soft_target = 512/1 = 512. After GC, remaining ≈ 256 bytes. 256 < 512, so should clear.
+
+  Let me add a multi-thread attribute to the test to eliminate scheduler starvation.
+
+
+ Stale process lock. Let me kill it and wait.
+
+
+ The issue is clear now. gc_up_to(min_ack_seq) removes segments where max_seq < min_ack_seq. When min_ack_seq = 30 and all 30 events fill multiple
+  segments, all sealed segments except the very last will be removed. The remaining bytes should be < 512.
+
+  The real problem is likely that on current_thread runtime (even with my multi_thread fix), the stale binary from previous run prevented building. Let me
+  wait and retry.
+
+  Read 1 file (ctrl+o to expand)
+
+● OK the kill succeeded but the cargo command may have run before the lock released. Let me retry now.
+
+
+All green — 0 failures across the entire workspace. 357 in aeon-engine alone.
+
+  P7 (Backpressure wiring) and Budget→Capacity rename are complete.
+
+  Summary of this session:
+
+  P8 (Observability) — ✅ shipped:
+  - eo2_metrics threaded through PipelineConfig → SinkTaskCtx, publish set_sink_ack_seq / set_l2_bytes / set_l2_segments / set_l2_gc_lag_seq on ack/GC,
+  FallbackCheckpointStore::with_metrics bumps fallback counter, spliced into /metrics endpoint
+
+  Budget → Capacity rename — complete across 4 files:
+  - BudgetCaps → CapacityLimits, NodeBudget → NodeCapacity, PipelineBudget → PipelineCapacity
+
+  P7 (Backpressure wiring) — ✅ shipped:
+  - L2WritingSource.with_capacity() adjusts +bytes on append
+  - eo2_gc_sweep adjusts -bytes on GC reclaim
+  - Source task checks decide() before next_batch, sleeps until capacity clears
+  - Blocking strategies get per-batch GC sweep to prevent deadlock
+  - Pressure metric flipped via set_l2_pressure on engage/disengage
+
+  357 tests passing, clean workspace build. Remaining EO-2: P6 (multi-source topology), P9 (integration tests), P10 (benchmarks), P11 (docs), P12 (CL-6a).
+
+✻ Worked for 29m 17s
+==========================
+continue
+===========================
+claude's response:
+
+ Now update the dev-notes to reflect P11 completion. Let me check current state.
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+● The dev-notes file is the user's personal notebook (read-only per memory). I won't edit it.
+
+  Let me also verify the CONNECTORS.md changes look correct by spot-checking the matrix header.
+
+  Read 1 file (ctrl+o to expand)
+
+● Now let me also check the ROADMAP pillar rollup table to sync P11 from 🟡 to ✅.
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+● Good — no stale 🟡 references for P11 remain. Let me also check if there's a pillar summary table that lists P11.
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+● Only 2 hits, both already updated. Now let me check the pillar rollup table higher in the ROADMAP to see if P11 appears there.
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+● No rollup table entry for P11 — it only lives in the detail table (already ✅). Now let me also check the hanging test issue mentioned in the session
+  summary. Let me verify the capacity_gate test compiles and passes now.
+
+
+ Test passes. P11 is complete.
+
+  P11 done. Three edits to docs/CONNECTORS.md:
+  1. Overview — replaced two-kind (Pull/Push) taxonomy with three-kind (Pull/Push/Poll), including backpressure behavior per kind
+  2. Connector Matrix — added Source Kind column with labels for all 18 connectors
+  3. New §7 "EO-2 Durability — Migration Note" — documents durability: none default, backpressure remedy table per source kind, and SourceKind default
+  behavior
+
+  ROADMAP P11 flipped to ✅. The capacity_gate test that was hanging last session now passes in 0.03s.
+
+  Remaining EO-2 phases: P6 (multi-source/sink CLI topology), P9 (integration tests), P10 (benchmarks), P12 (CL-6a coordination).
+
+✻ Baked for 9m 14s
+
+
+=======================
+continue
+
+=======================
+claude's response:
+
+ Next in recommended order is P9 (integration tests). Two of the four test scenarios are unblocked now — crash-recovery and L3→WAL failover. The
+  multi-source and multi-sink tests need P6. Let me scope out the existing test infrastructure.
+
+  Searched for 2 patterns, read 1 file (ctrl+o to expand)
+
+● Now let me look at the existing EO-2 test infrastructure — particularly how run_buffered and the L2/checkpoint stores are set up in tests.
+
+  Searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+● Now let me understand the L3/checkpoint setup and the FallbackCheckpointStore to plan the integration tests.
+
+  Searched for 2 patterns, read 1 file (ctrl+o to expand)
+
+● Now let me look at what run_buffered signature looks like and how recovery + L2 + checkpoint wiring is done, to understand how to build end-to-end
+  integration tests.
+
+  Searched for 3 patterns, read 1 file (ctrl+o to expand)
+
+● Now let me also look at the checkpoint/L3 structures to understand what we need for the tests.
+
+  Searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+● Let me check the L2 body store API — specifically the iter_from for replaying events during recovery.
+
+  Searched for 2 patterns, read 1 file (ctrl+o to expand)
+
+● Good — iter_from returns Vec<(u64, Event)> so we can replay events from L2. Now let me check the checkpoint structures to understand what we persist and
+  recover.
+
+ Now I have a clear picture. Let me also look at the existing PushSource test helper to understand what event helpers are available.
+
+  Searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+● Now let me check the exports from aeon_engine to see what's publicly available for integration tests.
+
+  Searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+● Good. Now I have everything I need. Let me also check what's exported from eo2/checkpoint/l2_body modules for public test use.
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+● Now let me create the P9 integration test file. I'll implement:
+
+  1. Crash-recovery test: Push events → partial delivery → abort → restart with L2 replay → verify all events arrive exactly once
+  2. L3→WAL failover test: Pipeline with faulty L3 → checkpoint fallback to WAL → heal L3 → verify WAL drains back
+
+  Searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+● Now let me look at the CheckpointPersist trait to understand what integration test fakes need to implement.
+
+
+======================
+continue
+======================
+claude's response: 
+
+ P9 integration tests landed. Six tests in crates/aeon-engine/tests/eo2_integration.rs, all passing:
+
+  1. crash_recovery_push_source_no_loss_no_duplicates — full pipeline run, checkpoint verification, L2 replay derivation
+  2. crash_mid_batch_l2_replay_fills_gap — source aborts at 25/50 events, L2 captures pre-crash events, replay fills the gap
+  3. l3_wal_failover_and_recovery — faulty L3 primary triggers WAL fallback, healthy restart reads WAL independently
+  4. slow_sink_backpressure_completes_under_capacity — 5ms-per-batch sink with 512-byte cap, source yields under pressure, completes with all capacity
+  reclaimed
+  5. l2_gc_reclaims_after_full_delivery — 100 events through tiny segments, GC sweep after delivery
+  6. recovery_plan_from_multi_sink_checkpoint — 3-sink checkpoint, plan derives min-ack as L2 replay start
+
+  ROADMAP P9 → 🟡. Two scenarios remain blocked on P6 (multi-sink stall, multi-source interleaving). Remaining: P6, P9 remainder, P10, P12.
+
+✻ Worked for 11m 4s
+
+============================
+continue
+=============================
+claude's response:
+
+ Working — 146K events/sec for 64-byte payload L2 append on Windows (debug-unoptimized disk I/O dominated). Let me also run the durability mode overhead
+  bench quickly.
+
+ Excellent results. None mode: ~2.5M events/sec. OrderedBatch with L2: ~124K events/sec — the ~20x cost is almost entirely L2 disk I/O (expected on a local
+   Windows disk). This gives us a clear baseline.
+
+  Now let me verify all existing tests still pass and update the ROADMAP.
+
+ P10 benchmarks landed. Four benchmark groups in benches/eo2_durability_bench.rs:
+
+  1. Durability mode overhead — None (2.5M ev/s) vs OrderedBatch (124K ev/s), isolating L2 write cost
+  2. L2 raw append throughput — 64B / 256B / 1KB / 4KB payloads
+  3. Checkpoint cadence fsync amortisation — 1ms / 10ms / 100ms / 500ms flush intervals
+  4. Capacity tracking overhead — with vs without PipelineCapacity accounting
+
+  ROADMAP P10 → 🟡. Content-hash dedup benchmark deferred (no runtime implementation yet).
+
+  EO-2 status: P1-P5 ✅, P6 🟡 (primitives landed, CLI+topology remaining), P7-P8 ✅, P9 🟡 (6/8 tests, 2 blocked on P6), P10 🟡 (4/5 benchmarks, 1 blocked
+  on content-hash), P11 ✅, P12 ⬜ (blocked on Pillar 3).
+
+✻ Brewed for 8m 42s
+
+
+================================
+continue
+=================================
+claude's response:
 
 
 

@@ -18,6 +18,7 @@
 4. [Advanced Connectors](#advanced-connectors)
 5. [Feature Flags](#feature-flags)
 6. [Configuration — Docker Compose Services](#configuration--docker-compose-services)
+7. [EO-2 Durability — Migration Note](#eo-2-durability--migration-note)
 
 ---
 
@@ -40,7 +41,10 @@ pub trait Sink: Send + Sync {
 
 - **Batch-first APIs.** `Source::next_batch()` returns `Vec<Event>`, `Sink::write_batch()` accepts `Vec<Output>`. No per-event channel overhead.
 - **Feature-gated.** Every connector is behind a Cargo feature flag. Only `memory`, `blackhole`, and `stdout` are enabled by default.
-- **Pull vs. push sources.** Pull sources (Kafka, File, HTTP Polling, Redis Streams, NATS) issue fetch/read calls inside `next_batch()`. Push sources (WebSocket, HTTP Webhook, MQTT, RabbitMQ, QUIC, WebTransport, MongoDB CDC) run a background receive task that feeds a `PushBuffer`, and `next_batch()` drains the buffer.
+- **Three source kinds.** Every source is classified by its `SourceKind`, which determines backpressure behavior under EO-2 capacity limits:
+  - **Pull** — issues fetch/read calls inside `next_batch()`. Backpressure pauses polling. (Kafka, File, Redis Streams, NATS)
+  - **Push** — runs a background receive task that feeds a `PushBuffer`; `next_batch()` drains the buffer. Backpressure rejects new messages at the protocol level. (WebSocket, HTTP Webhook, MQTT, RabbitMQ, QUIC, WebTransport, MongoDB CDC)
+  - **Poll** — periodically fetches from an external system. Backpressure skips the next poll cycle. (HTTP Polling, PostgreSQL CDC, MySQL CDC)
 - **Three-phase backpressure** for push sources: (1) in-memory bounded channel, (2) spill counter when channel is full, (3) protocol-level flow control signal (`is_overloaded()`) that tells the connector to pause reading.
 - **Delivery strategies** for sinks that support them: `PerEvent`, `OrderedBatch` (default), `UnorderedBatch`. Controls how and when write acknowledgments are awaited.
 
@@ -48,26 +52,26 @@ pub trait Sink: Send + Sync {
 
 ## Connector Matrix
 
-| Connector | Source | Sink | Feature Flag | Crate Dependency | Status |
-|-----------|--------|------|-------------|------------------|--------|
-| Memory | `MemorySource` | `MemorySink` | `memory` (default) | -- | Stable |
-| Blackhole | -- | `BlackholeSink` | `blackhole` (default) | -- | Stable |
-| Stdout | -- | `StdoutSink` | `stdout` (default) | -- | Stable |
-| Kafka / Redpanda | `KafkaSource` | `KafkaSink` | `kafka` | `rdkafka` | Stable |
-| File | `FileSource` | `FileSink` | `file` | `tokio` | Stable |
-| HTTP Polling | `HttpPollingSource` | -- | `http` | `reqwest` | Phase 11a |
-| HTTP Webhook | `HttpWebhookSource` | -- | `http` | `axum` | Phase 11a |
-| WebSocket | `WebSocketSource` | `WebSocketSink` | `websocket` | `tokio-tungstenite` | Phase 11a |
-| Redis Streams | `RedisStreamsSource` | `RedisStreamsSink` | `redis-streams` | `redis` | Phase 11a |
-| NATS JetStream | `NatsSource` | `NatsSink` | `nats` | `async-nats` | Phase 11a |
-| MQTT | `MqttSource` | `MqttSink` | `mqtt` | `rumqttc` | Phase 11a |
-| RabbitMQ | `RabbitMqSource` | `RabbitMqSink` | `rabbitmq` | `lapin` | Phase 11a |
-| QUIC | `QuicSource` | `QuicSink` | `quic` | `quinn`, `rustls` | Phase 11b |
-| WebTransport (Streams) | `WebTransportSource` | `WebTransportSink` | `webtransport` | `wtransport` | Phase 11b |
-| WebTransport (Datagrams) | `WebTransportDatagramSource` | -- | `webtransport` | `wtransport` | Phase 11b |
-| PostgreSQL CDC | `PostgresCdcSource` | -- | `postgres-cdc` | `tokio-postgres` | Phase 11b |
-| MySQL CDC | `MysqlCdcSource` | -- | `mysql-cdc` | `mysql_async` | Phase 11b |
-| MongoDB CDC | `MongoDbCdcSource` | -- | `mongodb-cdc` | `mongodb` | Phase 11b |
+| Connector | Source | Sink | Source Kind | Feature Flag | Crate Dependency | Status |
+|-----------|--------|------|------------|-------------|------------------|--------|
+| Memory | `MemorySource` | `MemorySink` | Pull | `memory` (default) | -- | Stable |
+| Blackhole | -- | `BlackholeSink` | -- | `blackhole` (default) | -- | Stable |
+| Stdout | -- | `StdoutSink` | -- | `stdout` (default) | -- | Stable |
+| Kafka / Redpanda | `KafkaSource` | `KafkaSink` | Pull | `kafka` | `rdkafka` | Stable |
+| File | `FileSource` | `FileSink` | Pull | `file` | `tokio` | Stable |
+| HTTP Polling | `HttpPollingSource` | -- | Poll | `http` | `reqwest` | Phase 11a |
+| HTTP Webhook | `HttpWebhookSource` | -- | Push | `http` | `axum` | Phase 11a |
+| WebSocket | `WebSocketSource` | `WebSocketSink` | Push | `websocket` | `tokio-tungstenite` | Phase 11a |
+| Redis Streams | `RedisStreamsSource` | `RedisStreamsSink` | Pull | `redis-streams` | `redis` | Phase 11a |
+| NATS JetStream | `NatsSource` | `NatsSink` | Pull | `nats` | `async-nats` | Phase 11a |
+| MQTT | `MqttSource` | `MqttSink` | Push | `mqtt` | `rumqttc` | Phase 11a |
+| RabbitMQ | `RabbitMqSource` | `RabbitMqSink` | Push | `rabbitmq` | `lapin` | Phase 11a |
+| QUIC | `QuicSource` | `QuicSink` | Push | `quic` | `quinn`, `rustls` | Phase 11b |
+| WebTransport (Streams) | `WebTransportSource` | `WebTransportSink` | Push | `webtransport` | `wtransport` | Phase 11b |
+| WebTransport (Datagrams) | `WebTransportDatagramSource` | -- | Push | `webtransport` | `wtransport` | Phase 11b |
+| PostgreSQL CDC | `PostgresCdcSource` | -- | Poll | `postgres-cdc` | `tokio-postgres` | Phase 11b |
+| MySQL CDC | `MysqlCdcSource` | -- | Poll | `mysql-cdc` | `mysql_async` | Phase 11b |
+| MongoDB CDC | `MongoDbCdcSource` | -- | Push | `mongodb-cdc` | `mongodb` | Phase 11b |
 
 ---
 
@@ -888,3 +892,19 @@ The following must be set (via `.env` file or shell):
 | `MYSQL_PASSWORD` | `mysql` | `aeon_dev` |
 | `RABBITMQ_PASSWORD` | `rabbitmq` | `aeon_dev` |
 | `GRAFANA_ADMIN_PASSWORD` | `grafana` | `admin` |
+
+---
+
+## EO-2 Durability — Migration Note
+
+Aeon's EO-2 durability layer (L2 body store, L3 checkpoint, capacity-based backpressure) is opt-in per pipeline. Existing pipeline manifests that omit the `durability` key default to `durability: none` — no L2 writes, no capacity tracking, no backpressure gating. This preserves backwards compatibility and zero overhead for pipelines that don't need exactly-once guarantees.
+
+When `durability` is enabled, the `source_kind` classification (Pull / Push / Poll) determines how backpressure is applied when L2 capacity limits are reached:
+
+| Source Kind | Backpressure Remedy | Effect |
+|-------------|---------------------|--------|
+| **Pull** | `PullPause` | Source task sleeps until capacity is reclaimed by GC |
+| **Push** | `PushReject` | Protocol-level rejection (e.g., HTTP 429, MQTT disconnect) |
+| **Poll** | `PollSkip` | Next poll cycle is skipped, timer continues |
+
+Connectors that don't override `fn source_kind()` default to `SourceKind::Pull`. See `aeon-types` for the trait definition and `eo2_backpressure` in `aeon-engine` for the capacity hierarchy.

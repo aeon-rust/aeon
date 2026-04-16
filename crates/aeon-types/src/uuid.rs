@@ -192,6 +192,66 @@ impl CoreLocalUuidGenerator {
     }
 }
 
+// ── EO-2 P2: deterministic pull-source UUIDv7 derivation ────────────────
+//
+// Layout (RFC 9562 UUIDv7):
+//   [ unix_ts_ms : 48 ][ ver:4 = 0x7 ][ rand_a:12 ][ var:2 = 0b10 ][ rand_b:62 ]
+//
+// For pull sources:
+//   unix_ts_ms  ← source event timestamp (Kafka ts / CDC ts / …)
+//   rand_a (12) ← broker_offset & 0xFFF        — within-partition monotonic
+//   rand_b (62) ← SHA-256(source_name ‖ identity).take(62 bits)
+//
+// Same `(source_name, offset, identity, ts)` ⇒ same UUID across crashes,
+// restarts, and partition reassignments. See
+// `docs/EO-2-DURABILITY-DESIGN.md` §4.1.
+
+/// Derive a deterministic UUIDv7 from pull-source-native identity.
+///
+/// Pure function — zero allocation on the hot path beyond the SHA-256
+/// state on the stack. ~30 ns on HW-accelerated SHA platforms.
+///
+/// `source_name` should be the interned source ident (e.g. the pipeline's
+/// source key) — stable across restarts. `identity` is source-native bytes
+/// uniquely identifying the event (for Kafka: partition+offset+topic; for
+/// CDC: LSN or binlog position). `offset` is the within-partition monotonic
+/// number (Kafka offset, LSN truncated, …) — its low 12 bits populate
+/// `rand_a` for within-ms ordering.
+#[inline]
+pub fn derive_pull_uuid_v7(
+    source_name: &str,
+    identity: &[u8],
+    unix_ts_ms: u64,
+    offset: u64,
+) -> uuid::Uuid {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(source_name.as_bytes());
+    hasher.update(b"\x1f"); // ASCII Unit Separator — avoids prefix collisions
+    hasher.update(identity);
+    let digest = hasher.finalize();
+
+    let rand_a: u16 = (offset as u16) & 0x0FFF;
+
+    let mut bytes = [0u8; 16];
+
+    // Bytes 0..5 — 48-bit ms timestamp
+    let ts = unix_ts_ms.to_be_bytes();
+    bytes[0..6].copy_from_slice(&ts[2..8]);
+
+    // Bytes 6..7 — version (0x7) in high nibble of byte 6 + rand_a (12 bits)
+    let ver_rand_a = (0x7u16 << 12) | rand_a;
+    bytes[6..8].copy_from_slice(&ver_rand_a.to_be_bytes());
+
+    // Bytes 8..15 — variant (0b10) in top 2 bits of byte 8 + 62 bits of hash
+    // Take 8 bytes of digest and mask the variant.
+    bytes[8..16].copy_from_slice(&digest[0..8]);
+    bytes[8] = 0b1000_0000 | (bytes[8] & 0b0011_1111);
+
+    uuid::Uuid::from_bytes(bytes)
+}
+
 impl std::fmt::Debug for CoreLocalUuidGenerator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CoreLocalUuidGenerator")
@@ -234,6 +294,73 @@ mod tests {
         let u1 = CoreLocalUuidGenerator::build_uuid(1000, 0, 0, 0);
         let u2 = CoreLocalUuidGenerator::build_uuid(1000, 1, 0, 0);
         assert!(u1 < u2);
+    }
+
+    // ── EO-2 P2: deterministic pull-source derivation ────────────────────
+
+    #[test]
+    fn derive_pull_uuid_is_deterministic() {
+        let u1 = derive_pull_uuid_v7("kafka://orders", b"part=0/off=42", 1_700_000_000_000, 42);
+        let u2 = derive_pull_uuid_v7("kafka://orders", b"part=0/off=42", 1_700_000_000_000, 42);
+        assert_eq!(u1, u2, "same inputs must yield same UUID across calls");
+    }
+
+    #[test]
+    fn derive_pull_uuid_differs_on_source_name() {
+        let a = derive_pull_uuid_v7("kafka://a", b"id", 1_700_000_000_000, 0);
+        let b = derive_pull_uuid_v7("kafka://b", b"id", 1_700_000_000_000, 0);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn derive_pull_uuid_differs_on_identity() {
+        let a = derive_pull_uuid_v7("s", b"id-a", 1_700_000_000_000, 0);
+        let b = derive_pull_uuid_v7("s", b"id-b", 1_700_000_000_000, 0);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn derive_pull_uuid_is_valid_v7() {
+        let u = derive_pull_uuid_v7("s", b"id", 1_700_000_000_000, 42);
+        assert_eq!(u.get_version(), Some(uuid::Version::SortRand));
+        assert_eq!(u.get_variant(), uuid::Variant::RFC4122);
+    }
+
+    #[test]
+    fn derive_pull_uuid_ts_ordering() {
+        let early = derive_pull_uuid_v7("s", b"id", 1_700_000_000_000, 0);
+        let later = derive_pull_uuid_v7("s", b"id", 1_700_000_001_000, 0);
+        assert!(early < later, "ts ordering must be preserved lexicographically");
+    }
+
+    #[test]
+    fn derive_pull_uuid_within_partition_monotonic_on_offset_low_bits() {
+        // Same ts + same identity + offsets differing only in low 12 bits
+        // should still produce different, ordered UUIDs via rand_a.
+        let a = derive_pull_uuid_v7("s", b"i", 1_700_000_000_000, 1);
+        let b = derive_pull_uuid_v7("s", b"i", 1_700_000_000_000, 2);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn derive_pull_uuid_offset_masked_to_12_bits() {
+        // Offsets 0 and 4096 have the same low-12-bits (0). Deterministic
+        // collisions on exact identity are acceptable — the design caps
+        // per-ms-per-partition throughput at 4096 events before rand_a
+        // collisions, well above the 20M/s target distributed across
+        // partitions (see EO-2-DURABILITY-DESIGN.md §4.1).
+        let a = derive_pull_uuid_v7("s", b"i", 1_700_000_000_000, 0);
+        let b = derive_pull_uuid_v7("s", b"i", 1_700_000_000_000, 4096);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn derive_pull_uuid_separator_prevents_prefix_collision() {
+        // "ab" ‖ "cd" must not equal "a" ‖ "bcd" — the 0x1f separator
+        // guards against this class of identity collision.
+        let a = derive_pull_uuid_v7("ab", b"cd", 1_700_000_000_000, 0);
+        let b = derive_pull_uuid_v7("a", b"bcd", 1_700_000_000_000, 0);
+        assert_ne!(a, b);
     }
 
     #[test]

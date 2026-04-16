@@ -124,6 +124,35 @@ pub struct PipelineConfig {
     /// `Arc<dyn L3Store>` used for Raft log/snapshot (FT-1/FT-2), so the
     /// whole node shares one durable handle.
     pub l3_checkpoint_store: Option<Arc<dyn aeon_types::L3Store>>,
+    /// EO-2: pipeline name used for L2 body-store directory scoping and
+    /// the `pipeline` label on all EO-2 metrics. Empty default is fine
+    /// for legacy single-pipeline callers; multi-pipeline deployments
+    /// must set this to a stable unique string.
+    pub pipeline_name: String,
+    /// EO-2: shared per-partition L2 body-store registry. When `Some`
+    /// AND `delivery.durability != None`, the pipeline wraps the source
+    /// in `L2WritingSource` so push/poll events are persisted before the
+    /// upstream is acked. `None` disables L2 body persistence entirely
+    /// regardless of `durability`.
+    pub l2_registry: Option<crate::eo2::PipelineL2Registry>,
+    /// EO-2: sink name used as the key in `AckSeqTracker` and as the
+    /// `sink` label on metrics. Defaults to `"sink"` for single-sink
+    /// pipelines. Multi-sink deployments must override per sink task.
+    pub sink_name: String,
+    /// EO-2 P8: optional observability registry. When `Some`, the source
+    /// task publishes `aeon_l2_bytes`/`aeon_l2_segments` after each batch
+    /// append, the sink task publishes `aeon_sink_ack_seq` on each ack
+    /// advancement and `aeon_l2_gc_lag_seq` on every GC sweep, and the
+    /// `FallbackCheckpointStore` increments
+    /// `aeon_checkpoint_fallback_wal_total` on first transition. `None`
+    /// disables EO-2 metrics entirely — safe default for tests/benches.
+    pub eo2_metrics: Option<Arc<crate::eo2_metrics::Eo2Metrics>>,
+    /// EO-2 P7: optional per-pipeline L2 byte budget. When `Some`, the source
+    /// task checks `decide()` before each `next_batch` and enacts the
+    /// appropriate backpressure remedy (pause/skip/reject). `L2WritingSource`
+    /// calls `adjust(+bytes)` on append; `eo2_gc_sweep` calls
+    /// `adjust(-bytes)` on GC reclaim. `None` disables backpressure entirely.
+    pub eo2_capacity: Option<crate::eo2_backpressure::PipelineCapacity>,
 }
 
 impl Default for PipelineConfig {
@@ -137,6 +166,11 @@ impl Default for PipelineConfig {
             #[cfg(feature = "processor-auth")]
             poh: None,
             l3_checkpoint_store: None,
+            pipeline_name: String::new(),
+            l2_registry: None,
+            sink_name: String::from("sink"),
+            eo2_metrics: None,
+            eo2_capacity: None,
         }
     }
 }
@@ -505,7 +539,7 @@ async fn handle_batch_failures<K: Sink>(
 /// buffer fills, the processor pauses, the source→processor buffer fills,
 /// and the source stops polling. No data is ever dropped.
 pub async fn run_buffered<S, P, K>(
-    mut source: S,
+    source: S,
     processor: P,
     sink: K,
     config: PipelineConfig,
@@ -520,6 +554,17 @@ where
 {
     let core_assignment = config.core_pinning.resolve();
 
+    // EO-2: conditionally wrap the source so push/poll events land in L2
+    // before the upstream is acked. Pull sources and `DurabilityMode::None`
+    // pass through untouched — `MaybeL2Wrapped::wrap` handles both.
+    let mut source = crate::eo2::MaybeL2Wrapped::wrap(
+        source,
+        &config.pipeline_name,
+        config.l2_registry.as_ref(),
+        config.delivery.durability,
+        config.eo2_capacity.as_ref(),
+    );
+
     // Initialize PoH chain if configured
     #[cfg(feature = "processor-auth")]
     let poh_state = create_poh_state(&config);
@@ -531,8 +576,17 @@ where
     let (mut sink_prod, sink_cons) =
         rtrb::RingBuffer::<Vec<Output>>::new(config.sink_buffer_capacity);
 
+    // EO-2 P5: build sink context first so we can read the last persisted
+    // checkpoint and apply a recovery plan to the source before the source
+    // task starts pulling events.
+    let sink_ctx = build_sink_task_ctx(&config, core_assignment.map(|c| c.sink));
+    let recovery_plan = load_recovery_plan(&sink_ctx.checkpoint_writer);
+    dispatch_recovery_plan(&mut source, recovery_plan).await;
+
     let shutdown_src = Arc::clone(&shutdown);
     let metrics_src = Arc::clone(&metrics);
+    let src_capacity = config.eo2_capacity.clone();
+    let src_eo2_metrics = config.eo2_metrics.clone();
 
     // Source task: poll source, push event batches into SPSC
     let source_core = core_assignment.map(|c| c.source);
@@ -540,7 +594,33 @@ where
         if let Some(core) = source_core {
             pin_to_core(core);
         }
+        let source_kind = source.source_kind();
         while !shutdown_src.load(Ordering::Relaxed) {
+            // EO-2 P7: check capacity before pulling the next batch. When
+            // engaged, yield until GC on the sink side reclaims enough L2
+            // bytes to drop below the threshold.
+            if let Some(ref cap) = src_capacity {
+                let partition = 0u16;
+                let mut decision = cap.decide(partition, source_kind);
+                if decision.is_engaged() {
+                    if let Some(ref m) = src_eo2_metrics {
+                        if let Some(lvl) = decision.level() {
+                            m.set_l2_pressure(lvl, true);
+                        }
+                    }
+                    while decision.is_engaged() && !shutdown_src.load(Ordering::Relaxed) {
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                        decision = cap.decide(partition, source_kind);
+                    }
+                    if let Some(ref m) = src_eo2_metrics {
+                        use crate::eo2_backpressure::PressureLevel;
+                        m.set_l2_pressure(PressureLevel::Partition, false);
+                        m.set_l2_pressure(PressureLevel::Pipeline, false);
+                        m.set_l2_pressure(PressureLevel::Node, false);
+                    }
+                }
+            }
+
             let events = match source.next_batch().await {
                 Ok(events) => events,
                 Err(e) => return Err(e),
@@ -627,7 +707,6 @@ where
     });
 
     let metrics_sink = Arc::clone(&metrics);
-    let sink_ctx = build_sink_task_ctx(&config, core_assignment.map(|c| c.sink));
 
     // Sink task: pop outputs, write to sink.
     // PerEvent/OrderedBatch: write_batch blocks on delivery acks.
@@ -676,7 +755,7 @@ where
 ///   source task pauses, and ultimately the upstream broker sees TCP-window
 ///   backpressure. No events are dropped.
 pub async fn run_buffered_transport<S, T, K>(
-    mut source: S,
+    source: S,
     transport: Arc<T>,
     sink: K,
     config: PipelineConfig,
@@ -691,6 +770,16 @@ where
 {
     let core_assignment = config.core_pinning.resolve();
 
+    // EO-2 P4: wrap the source in `L2WritingSource` when durability requires
+    // body persistence, matching the run_buffered entry point.
+    let mut source = crate::eo2::MaybeL2Wrapped::wrap(
+        source,
+        &config.pipeline_name,
+        config.l2_registry.as_ref(),
+        config.delivery.durability,
+        config.eo2_capacity.as_ref(),
+    );
+
     // Initialize PoH chain if configured
     #[cfg(feature = "processor-auth")]
     let poh_state = create_poh_state(&config);
@@ -702,8 +791,15 @@ where
     let (mut sink_prod, sink_cons) =
         rtrb::RingBuffer::<Vec<Output>>::new(config.sink_buffer_capacity);
 
+    // EO-2 P5: apply recovery plan before the source task starts.
+    let sink_ctx = build_sink_task_ctx(&config, core_assignment.map(|c| c.sink));
+    let recovery_plan = load_recovery_plan(&sink_ctx.checkpoint_writer);
+    dispatch_recovery_plan(&mut source, recovery_plan).await;
+
     let shutdown_src = Arc::clone(&shutdown);
     let metrics_src = Arc::clone(&metrics);
+    let src_capacity = config.eo2_capacity.clone();
+    let src_eo2_metrics = config.eo2_metrics.clone();
 
     // Source task — identical to run_buffered.
     let source_core = core_assignment.map(|c| c.source);
@@ -711,7 +807,31 @@ where
         if let Some(core) = source_core {
             pin_to_core(core);
         }
+        let source_kind = source.source_kind();
         while !shutdown_src.load(Ordering::Relaxed) {
+            // EO-2 P7: capacity gate — see run_buffered for rationale.
+            if let Some(ref cap) = src_capacity {
+                let partition = 0u16;
+                let mut decision = cap.decide(partition, source_kind);
+                if decision.is_engaged() {
+                    if let Some(ref m) = src_eo2_metrics {
+                        if let Some(lvl) = decision.level() {
+                            m.set_l2_pressure(lvl, true);
+                        }
+                    }
+                    while decision.is_engaged() && !shutdown_src.load(Ordering::Relaxed) {
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                        decision = cap.decide(partition, source_kind);
+                    }
+                    if let Some(ref m) = src_eo2_metrics {
+                        use crate::eo2_backpressure::PressureLevel;
+                        m.set_l2_pressure(PressureLevel::Partition, false);
+                        m.set_l2_pressure(PressureLevel::Pipeline, false);
+                        m.set_l2_pressure(PressureLevel::Node, false);
+                    }
+                }
+            }
+
             let events = match source.next_batch().await {
                 Ok(events) => events,
                 Err(e) => return Err(e),
@@ -797,7 +917,6 @@ where
     });
 
     let metrics_sink = Arc::clone(&metrics);
-    let sink_ctx = build_sink_task_ctx(&config, core_assignment.map(|c| c.sink));
     let sink_ledger = ledger;
     let sink_handle = tokio::spawn(run_sink_task(
         sink,
@@ -824,20 +943,22 @@ where
 /// with identical setup.
 fn build_sink_task_ctx(config: &PipelineConfig, core: Option<usize>) -> SinkTaskCtx {
     // Initialize the checkpoint persister. FT-3: the concrete backend is
-    // chosen by `CheckpointBackend`; `None`/`Kafka` yield no persister for
-    // now (Kafka-topic checkpointing is a separate follow-up).
-    let checkpoint_writer: Option<Box<dyn CheckpointPersist>> = match config
+    // chosen by `CheckpointBackend`; `None` yields no persister.
+    let checkpoint_dir = || {
+        config.delivery.checkpoint.dir.clone().unwrap_or_else(|| {
+            std::env::var("AEON_CHECKPOINT_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| std::env::temp_dir().join("aeon-checkpoints"))
+        })
+    };
+
+    let primary: Option<Box<dyn CheckpointPersist>> = match config
         .delivery
         .checkpoint
         .backend
     {
         CheckpointBackend::Wal => {
-            let dir = config.delivery.checkpoint.dir.clone().unwrap_or_else(|| {
-                std::env::var("AEON_CHECKPOINT_DIR")
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or_else(|_| std::env::temp_dir().join("aeon-checkpoints"))
-            });
-            let wal_path = dir.join("pipeline.wal");
+            let wal_path = checkpoint_dir().join("pipeline.wal");
             match WalCheckpointStore::open(&wal_path) {
                 Ok(writer) => {
                     tracing::info!(path = %wal_path.display(), "Checkpoint WAL initialized");
@@ -870,7 +991,27 @@ fn build_sink_task_ctx(config: &PipelineConfig, core: Option<usize>) -> SinkTask
                 None
             }
         },
-        CheckpointBackend::Kafka | CheckpointBackend::None => None,
+        CheckpointBackend::None => None,
+    };
+
+    // EO-2 P5: wrap the StateStore primary in `FallbackCheckpointStore` so a
+    // transient L3 write error transparently degrades to a WAL sidecar
+    // instead of stalling the sink task. WAL-native backend needs no wrap
+    // (it is already WAL), `None` stays `None`.
+    let checkpoint_writer: Option<Box<dyn CheckpointPersist>> = match (
+        primary,
+        config.delivery.checkpoint.backend,
+        config.delivery.durability,
+    ) {
+        (Some(p), CheckpointBackend::StateStore, mode)
+            if mode != aeon_types::DurabilityMode::None =>
+        {
+            let wal_path = checkpoint_dir().join("fallback.wal");
+            Some(Box::new(crate::eo2_recovery::FallbackCheckpointStore::new(
+                p, wal_path,
+            )) as Box<dyn CheckpointPersist>)
+        }
+        (other, _, _) => other,
     };
 
     SinkTaskCtx {
@@ -885,6 +1026,18 @@ fn build_sink_task_ctx(config: &PipelineConfig, core: Option<usize>) -> SinkTask
         max_retries: config.delivery.max_retries,
         retry_backoff: config.delivery.retry_backoff,
         checkpoint_writer,
+        eo2_ack_tracker: if config.delivery.durability
+            != aeon_types::DurabilityMode::None
+        {
+            Some(crate::eo2::AckSeqTracker::new())
+        } else {
+            None
+        },
+        eo2_sink_name: config.sink_name.clone(),
+        eo2_pipeline_name: config.pipeline_name.clone(),
+        eo2_l2_registry: config.l2_registry.clone(),
+        eo2_metrics: config.eo2_metrics.clone(),
+        eo2_capacity: config.eo2_capacity.clone(),
     }
 }
 
@@ -958,6 +1111,11 @@ where
             #[cfg(feature = "processor-auth")]
             poh: config.pipeline.poh.clone(),
             l3_checkpoint_store: config.pipeline.l3_checkpoint_store.clone(),
+            pipeline_name: config.pipeline.pipeline_name.clone(),
+            l2_registry: config.pipeline.l2_registry.clone(),
+            sink_name: config.pipeline.sink_name.clone(),
+            eo2_metrics: config.pipeline.eo2_metrics.clone(),
+            eo2_capacity: config.pipeline.eo2_capacity.clone(),
         };
 
         if let Some(ref assignments) = core_assignments {
@@ -1028,6 +1186,27 @@ struct SinkTaskCtx {
     max_retries: u32,
     retry_backoff: Duration,
     checkpoint_writer: Option<Box<dyn CheckpointPersist>>,
+    /// EO-2: optional per-sink ack-seq tracker. When `Some`, each checkpoint
+    /// record stamps `per_sink_ack_seq` so recovery + GC can compute the
+    /// min-ack frontier. Wired through `build_sink_task_ctx` at pipeline
+    /// start when `DurabilityMode != None`.
+    eo2_ack_tracker: Option<crate::eo2::AckSeqTracker>,
+    /// EO-2: sink name used to key the `AckSeqTracker` map. Registered at
+    /// task start so `min_across_sinks()` returns a sensible 0 baseline
+    /// before the first delivery lands.
+    eo2_sink_name: String,
+    /// EO-2: pipeline name forwarded to `PipelineL2Registry::open` when the
+    /// sink-side GC sweep runs.
+    eo2_pipeline_name: String,
+    /// EO-2: shared L2 body-store registry. When `Some` together with
+    /// `eo2_ack_tracker`, the sink task periodically calls
+    /// `L2BodyStore::gc_up_to(min_across_sinks)` on every registered
+    /// partition at flush boundaries.
+    eo2_l2_registry: Option<crate::eo2::PipelineL2Registry>,
+    /// EO-2 P8: optional metrics registry for sink-side counters.
+    eo2_metrics: Option<Arc<crate::eo2_metrics::Eo2Metrics>>,
+    /// EO-2 P7: optional capacity tracker — GC sweep calls `adjust(-reclaimed)`.
+    eo2_capacity: Option<crate::eo2_backpressure::PipelineCapacity>,
 }
 
 /// Shared sink task body for `run_buffered` / `run_buffered_transport`.
@@ -1060,7 +1239,28 @@ async fn run_sink_task<K: Sink + Send + 'static>(
         max_retries,
         retry_backoff,
         mut checkpoint_writer,
+        eo2_ack_tracker: ack_tracker,
+        eo2_sink_name: sink_name,
+        eo2_pipeline_name: pipeline_name,
+        eo2_l2_registry: l2_registry,
+        eo2_metrics: metrics,
+        eo2_capacity: capacity,
     } = ctx;
+
+    // EO-2 P4: register this sink with the ack tracker so
+    // `min_across_sinks()` returns 0 until the first real ack arrives —
+    // avoids GC spuriously running at the max-u64 watermark.
+    if let Some(ref tracker) = ack_tracker {
+        tracker.register_sink(&sink_name);
+    }
+    // Highest l2_seq observed on this batch — the monotonic watermark we
+    // feed into `AckSeqTracker::record_ack` per sink task.
+    let mut max_acked_seq: u64 = 0;
+    // EO-2 P5: call `try_recover_primary` every N flushes. Cheap when the
+    // store is healthy (just returns Ok(true) from the default impl); only
+    // `FallbackCheckpointStore` does real work here.
+    let mut flushes_since_recovery_attempt: u32 = 0;
+    const RECOVERY_ATTEMPT_EVERY_N_FLUSHES: u32 = 16;
 
     let mut last_flush = Instant::now();
     let mut pending_count: u64 = 0;
@@ -1120,6 +1320,18 @@ async fn run_sink_task<K: Sink + Send + 'static>(
                     None
                 };
 
+                // EO-2 P4: capture (event_id → l2_seq) map before write_batch
+                // moves the outputs. Only when the pipeline tracks acks.
+                let l2_seq_by_id: Option<HashMap<uuid::Uuid, u64>> = ack_tracker.as_ref().map(|_| {
+                    outputs
+                        .iter()
+                        .filter_map(|o| match (o.source_event_id, o.l2_seq) {
+                            (Some(id), Some(seq)) => Some((id, seq)),
+                            _ => None,
+                        })
+                        .collect()
+                });
+
                 match sink.write_batch(outputs).await {
                     Ok(batch_result) => {
                         // Mark delivered outputs as acked in ledger.
@@ -1133,6 +1345,29 @@ async fn run_sink_task<K: Sink + Send + 'static>(
                             }
                             // Pending outputs remain tracked — acked at flush.
                         }
+                        // EO-2 P4: advance the per-sink ack-seq watermark for
+                        // this sink using the max l2_seq across delivered
+                        // outputs. Monotonic — stale values are ignored.
+                        if let (Some(tracker), Some(map)) =
+                            (ack_tracker.as_ref(), l2_seq_by_id.as_ref())
+                        {
+                            let mut batch_max: u64 = 0;
+                            for id in &batch_result.delivered {
+                                if let Some(&seq) = map.get(id) {
+                                    if seq > batch_max {
+                                        batch_max = seq;
+                                    }
+                                }
+                            }
+                            if batch_max > max_acked_seq {
+                                max_acked_seq = batch_max;
+                                tracker.record_ack(&sink_name, batch_max);
+                                if let Some(m) = metrics.as_ref() {
+                                    m.set_sink_ack_seq(&pipeline_name, &sink_name, batch_max);
+                                }
+                            }
+                        }
+
                         let delivered_count = batch_result.delivered.len() as u64;
                         let total_count = count;
                         metrics_sink
@@ -1179,6 +1414,20 @@ async fn run_sink_task<K: Sink + Send + 'static>(
                     }
                 }
 
+                // EO-2 P7: for blocking strategies (PerEvent/OrderedBatch),
+                // GC on every batch when capacity tracking is active. Without
+                // this, the source capacity gate deadlocks: source waits for
+                // capacity, capacity waits for GC, GC waits for sink exit.
+                if delivery_strategy.is_blocking() && capacity.is_some() {
+                    eo2_gc_sweep(
+                        &l2_registry,
+                        &pipeline_name,
+                        ack_tracker.as_ref(),
+                        metrics.as_ref().map(|m| m.as_ref()),
+                        capacity.as_ref(),
+                    );
+                }
+
                 // In Batched mode, track pending and flush at intervals
                 if !delivery_strategy.is_blocking() {
                     pending_count += count;
@@ -1211,7 +1460,24 @@ async fn run_sink_task<K: Sink + Send + 'static>(
                             &metrics_sink,
                             &mut delivered_since_checkpoint,
                             &mut failed_since_checkpoint,
+                            ack_tracker.as_ref(),
                         );
+                        eo2_gc_sweep(
+                            &l2_registry,
+                            &pipeline_name,
+                            ack_tracker.as_ref(),
+                            metrics.as_ref().map(|m| m.as_ref()),
+                            capacity.as_ref(),
+                        );
+                        flushes_since_recovery_attempt += 1;
+                        if flushes_since_recovery_attempt >= RECOVERY_ATTEMPT_EVERY_N_FLUSHES {
+                            flushes_since_recovery_attempt = 0;
+                            if let Some(w) = checkpoint_writer.as_mut() {
+                                if let Err(e) = w.try_recover_primary() {
+                                    tracing::warn!("try_recover_primary failed: {e}");
+                                }
+                            }
+                        }
                         pending_count = 0;
                         last_flush = Instant::now();
                         acked_since_last_flush = 0;
@@ -1259,7 +1525,24 @@ async fn run_sink_task<K: Sink + Send + 'static>(
                             &metrics_sink,
                             &mut delivered_since_checkpoint,
                             &mut failed_since_checkpoint,
+                            ack_tracker.as_ref(),
                         );
+                        eo2_gc_sweep(
+                            &l2_registry,
+                            &pipeline_name,
+                            ack_tracker.as_ref(),
+                            metrics.as_ref().map(|m| m.as_ref()),
+                            capacity.as_ref(),
+                        );
+                        flushes_since_recovery_attempt += 1;
+                        if flushes_since_recovery_attempt >= RECOVERY_ATTEMPT_EVERY_N_FLUSHES {
+                            flushes_since_recovery_attempt = 0;
+                            if let Some(w) = checkpoint_writer.as_mut() {
+                                if let Err(e) = w.try_recover_primary() {
+                                    tracing::warn!("try_recover_primary failed: {e}");
+                                }
+                            }
+                        }
                         pending_count = 0;
                         last_flush = Instant::now();
                         acked_since_last_flush = 0;
@@ -1287,10 +1570,117 @@ async fn run_sink_task<K: Sink + Send + 'static>(
             &metrics_sink,
             &mut delivered_since_checkpoint,
             &mut failed_since_checkpoint,
+            ack_tracker.as_ref(),
+        );
+        eo2_gc_sweep(
+            &l2_registry,
+            &pipeline_name,
+            ack_tracker.as_ref(),
+            metrics.as_ref().map(|m| m.as_ref()),
+            capacity.as_ref(),
         );
     }
 
     Ok(())
+}
+
+/// EO-2 P5: derive a `RecoveryPlan` from the last persisted checkpoint and
+/// hand it to the source so connectors that know how to resume (Kafka
+/// `Seekable`, L2-aware push sources) can position themselves before the
+/// main loop starts. Default `Source::on_recovery_plan` is a no-op, so
+/// connectors opt in; there is no silent behaviour change for existing
+/// sources. Errors are logged and swallowed — a broken recovery plan
+/// must not stall pipeline start.
+///
+/// `dyn CheckpointPersist` is `Send` but not `Sync`, so we synchronously
+/// read the last record here and return the derived plan, letting the
+/// caller `.await` the source dispatch without holding a reference to
+/// the writer across the await point.
+fn load_recovery_plan(
+    checkpoint_writer: &Option<Box<dyn CheckpointPersist>>,
+) -> Option<crate::eo2_recovery::RecoveryPlan> {
+    let writer = checkpoint_writer.as_ref()?;
+    let last = match writer.read_last() {
+        Ok(opt) => opt,
+        Err(e) => {
+            tracing::warn!("EO-2 recovery: read_last failed: {e}");
+            return None;
+        }
+    };
+    let plan = crate::eo2_recovery::RecoveryPlan::from_last(last.as_ref());
+    if last.is_some() {
+        tracing::info!(
+            checkpoint_id = plan.source_checkpoint_id,
+            replay_from_l2_seq = plan.l2_replay_start_seq,
+            seek_partitions = plan.pull_seek_offsets.len(),
+            "EO-2: applying recovery plan from last checkpoint"
+        );
+    }
+    Some(plan)
+}
+
+async fn dispatch_recovery_plan<S: Source>(
+    source: &mut S,
+    plan: Option<crate::eo2_recovery::RecoveryPlan>,
+) {
+    let Some(plan) = plan else { return };
+    if let Err(e) = source
+        .on_recovery_plan(&plan.pull_seek_offsets, plan.l2_replay_start_seq)
+        .await
+    {
+        tracing::warn!("EO-2: source rejected recovery plan: {e}");
+    }
+}
+
+/// EO-2 P4: sweep every registered partition's L2 body store up to the
+/// current min-across-sinks ack watermark. Called at flush boundaries.
+/// No-op when durability is `None` or no L2 registry is wired.
+fn eo2_gc_sweep(
+    registry: &Option<crate::eo2::PipelineL2Registry>,
+    pipeline_name: &str,
+    tracker: Option<&crate::eo2::AckSeqTracker>,
+    metrics: Option<&crate::eo2_metrics::Eo2Metrics>,
+    capacity: Option<&crate::eo2_backpressure::PipelineCapacity>,
+) {
+    let (Some(registry), Some(tracker)) = (registry, tracker) else {
+        return;
+    };
+    let Some(min_ack) = tracker.min_across_sinks() else {
+        return;
+    };
+    if min_ack == 0 {
+        return;
+    }
+    for (pipe, part) in registry.keys() {
+        if pipe != pipeline_name {
+            continue;
+        }
+        let Ok(store) = registry.open(&pipe, part) else {
+            continue;
+        };
+        if let Ok(mut guard) = store.lock() {
+            let bytes_before = guard.disk_bytes();
+            if let Err(e) = guard.gc_up_to(min_ack) {
+                tracing::warn!(
+                    partition = %part.as_u16(),
+                    "L2 gc_up_to({min_ack}) failed: {e}"
+                );
+            }
+            let part_u16 = part.as_u16();
+            if let Some(cap) = capacity {
+                let reclaimed = bytes_before.saturating_sub(guard.disk_bytes());
+                if reclaimed > 0 {
+                    cap.adjust(part_u16, -(reclaimed as i64));
+                }
+            }
+            if let Some(m) = metrics {
+                m.set_l2_bytes(pipeline_name, part_u16, guard.disk_bytes());
+                m.set_l2_segments(pipeline_name, part_u16, guard.segment_count() as u64);
+                let lag = guard.next_seq().saturating_sub(min_ack);
+                m.set_l2_gc_lag_seq(pipeline_name, part_u16, lag);
+            }
+        }
+    }
 }
 
 /// Credit outputs that were returned as `pending` by `write_batch` but are
@@ -1329,6 +1719,7 @@ fn write_checkpoint(
     metrics: &Arc<PipelineMetrics>,
     delivered: &mut u64,
     failed: &mut u64,
+    ack_tracker: Option<&crate::eo2::AckSeqTracker>,
 ) {
     if let Some(writer) = ckpt_writer.as_mut() {
         // Populate source_offsets and pending IDs from the delivery ledger.
@@ -1345,6 +1736,10 @@ fn write_checkpoint(
             *delivered,
             *failed,
         );
+        // EO-2: attach per-sink ack cursor if the pipeline tracks it.
+        if let Some(tracker) = ack_tracker {
+            record = record.with_per_sink_ack_seq(tracker.snapshot());
+        }
         if let Err(e) = writer.append(&mut record) {
             tracing::warn!("Checkpoint write failed: {e}");
         }
@@ -3966,6 +4361,7 @@ mod tests {
                     source_event_id: None,
                     source_partition: None,
                     source_offset: None,
+                    l2_seq: None,
                 },
                 Output {
                     destination: Arc::clone(&dest),
@@ -3976,6 +4372,7 @@ mod tests {
                     source_event_id: None,
                     source_partition: None,
                     source_offset: None,
+                    l2_seq: None,
                 },
             ];
 
@@ -4001,5 +4398,420 @@ mod tests {
             let chain = poh.lock().await;
             assert_eq!(chain.sequence(), 0);
         }
+    }
+
+    // ── EO-2 P4/P5 runtime wiring ──────────────────────────────────────
+
+    mod eo2_wiring {
+        use super::*;
+        use crate::delivery::L2BodyStoreConfig;
+        use crate::eo2::PipelineL2Registry;
+        use aeon_types::{DurabilityMode, SourceKind};
+
+        /// Minimal push-kind test source — emits one batch, then EOF.
+        struct PushSource {
+            batch: Option<Vec<Event>>,
+        }
+        impl Source for PushSource {
+            fn next_batch(
+                &mut self,
+            ) -> impl std::future::Future<Output = Result<Vec<Event>, AeonError>> + Send
+            {
+                let b = self.batch.take().unwrap_or_default();
+                async move { Ok(b) }
+            }
+            fn source_kind(&self) -> SourceKind {
+                SourceKind::Push
+            }
+        }
+
+        fn push_events(n: usize) -> Vec<Event> {
+            let src: Arc<str> = Arc::from("webhook");
+            (0..n)
+                .map(|i| {
+                    Event::new(
+                        uuid::Uuid::now_v7(),
+                        i as i64,
+                        Arc::clone(&src),
+                        PartitionId::new(0),
+                        Bytes::from(format!("push-{i}")),
+                    )
+                })
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn push_source_writes_l2_when_durability_requires_it() {
+            let tmp = tempfile::tempdir().unwrap();
+            let registry = PipelineL2Registry::new(L2BodyStoreConfig {
+                root: Some(tmp.path().to_path_buf()),
+                segment_bytes: 4096,
+            });
+
+            let source = PushSource {
+                batch: Some(push_events(50)),
+            };
+            let processor = PassthroughProcessor::new(Arc::from("out"));
+            let sink = BlackholeSink::new();
+            let mut config = PipelineConfig::default();
+            config.pipeline_name = "eo2-push-test".into();
+            config.l2_registry = Some(registry.clone());
+            config.delivery.durability = DurabilityMode::OrderedBatch;
+
+            let metrics = Arc::new(PipelineMetrics::new());
+            let shutdown = Arc::new(AtomicBool::new(false));
+
+            run_buffered(source, processor, sink, config, metrics.clone(), shutdown, None)
+                .await
+                .unwrap();
+
+            assert_eq!(metrics.events_received.load(Ordering::Relaxed), 50);
+            // Registry must have opened a store for partition 0.
+            let keys = registry.keys();
+            assert_eq!(keys.len(), 1);
+            let (_p, part) = &keys[0];
+            assert_eq!(*part, PartitionId::new(0));
+
+            // Open a second reader to confirm events were actually persisted.
+            let store_handle = registry
+                .open("eo2-push-test", PartitionId::new(0))
+                .unwrap();
+            let guard = store_handle.lock().unwrap();
+            // next_seq = head+1 after every append; 50 events ⇒ next_seq ≥ 50.
+            assert!(
+                guard.next_seq() >= 50,
+                "expected next_seq ≥ 50, got {}",
+                guard.next_seq()
+            );
+            assert!(guard.disk_bytes() > 0);
+        }
+
+        #[tokio::test]
+        async fn pull_source_skips_l2_even_with_durability_set() {
+            let tmp = tempfile::tempdir().unwrap();
+            let registry = PipelineL2Registry::new(L2BodyStoreConfig {
+                root: Some(tmp.path().to_path_buf()),
+                segment_bytes: 4096,
+            });
+
+            // MemorySource is Pull by default.
+            let source = MemorySource::new(make_events(30), 16);
+            let processor = PassthroughProcessor::new(Arc::from("out"));
+            let sink = BlackholeSink::new();
+            let mut config = PipelineConfig::default();
+            config.pipeline_name = "eo2-pull-test".into();
+            config.l2_registry = Some(registry.clone());
+            config.delivery.durability = DurabilityMode::OrderedBatch;
+
+            let metrics = Arc::new(PipelineMetrics::new());
+            let shutdown = Arc::new(AtomicBool::new(false));
+
+            run_buffered(source, processor, sink, config, metrics.clone(), shutdown, None)
+                .await
+                .unwrap();
+
+            assert_eq!(metrics.events_received.load(Ordering::Relaxed), 30);
+            // Pull sources must not touch the registry.
+            assert!(
+                registry.keys().is_empty(),
+                "pull source unexpectedly wrote L2"
+            );
+        }
+
+        #[tokio::test]
+        async fn durability_none_passthrough_even_for_push() {
+            let tmp = tempfile::tempdir().unwrap();
+            let registry = PipelineL2Registry::new(L2BodyStoreConfig {
+                root: Some(tmp.path().to_path_buf()),
+                segment_bytes: 4096,
+            });
+
+            let source = PushSource {
+                batch: Some(push_events(20)),
+            };
+            let processor = PassthroughProcessor::new(Arc::from("out"));
+            let sink = BlackholeSink::new();
+            let mut config = PipelineConfig::default();
+            config.pipeline_name = "eo2-none-test".into();
+            config.l2_registry = Some(registry.clone());
+            // Durability::None ⇒ L2 stays cold even for push sources.
+            config.delivery.durability = DurabilityMode::None;
+
+            let metrics = Arc::new(PipelineMetrics::new());
+            let shutdown = Arc::new(AtomicBool::new(false));
+
+            run_buffered(source, processor, sink, config, metrics.clone(), shutdown, None)
+                .await
+                .unwrap();
+
+            assert_eq!(metrics.events_received.load(Ordering::Relaxed), 20);
+            assert!(registry.keys().is_empty());
+        }
+
+        #[tokio::test]
+        async fn push_source_drives_l2_gc_after_successful_delivery() {
+            // End-to-end: push source under OrderedBatch writes 30 events into
+            // L2, all sink-delivered. On final flush the sink task calls
+            // `record_ack(max_l2_seq)` then `eo2_gc_sweep`, which should
+            // reclaim the segment since min_across_sinks == max_seq written.
+            let tmp = tempfile::tempdir().unwrap();
+            let registry = PipelineL2Registry::new(L2BodyStoreConfig {
+                root: Some(tmp.path().to_path_buf()),
+                // Tiny segments so the run produces multiple sealed segments
+                // and GC has real work to do.
+                segment_bytes: 256,
+            });
+
+            let source = PushSource {
+                batch: Some(push_events(30)),
+            };
+            let processor = PassthroughProcessor::new(Arc::from("out"));
+            let sink = BlackholeSink::new();
+            let mut config = PipelineConfig::default();
+            config.pipeline_name = "eo2-gc-test".into();
+            config.l2_registry = Some(registry.clone());
+            config.delivery.durability = DurabilityMode::OrderedBatch;
+            // Immediate checkpoint/flush so the final sweep runs deterministically.
+            config.delivery.flush.interval = Duration::from_millis(1);
+
+            let metrics = Arc::new(PipelineMetrics::new());
+            let shutdown = Arc::new(AtomicBool::new(false));
+
+            run_buffered(source, processor, sink, config, metrics.clone(), shutdown, None)
+                .await
+                .unwrap();
+
+            assert_eq!(metrics.events_received.load(Ordering::Relaxed), 30);
+            assert_eq!(metrics.outputs_sent.load(Ordering::Relaxed), 30);
+
+            // Registry must have been opened for partition 0.
+            let store_handle = registry
+                .open("eo2-gc-test", PartitionId::new(0))
+                .unwrap();
+            let guard = store_handle.lock().unwrap();
+            // next_seq reflects the total appended; after GC the ack watermark
+            // should have advanced to the final seq so disk can be reclaimed.
+            assert!(
+                guard.next_seq() >= 30,
+                "expected next_seq ≥ 30 after 30 events, got {}",
+                guard.next_seq()
+            );
+        }
+
+        #[tokio::test]
+        async fn eo2_metrics_published_on_ack_and_gc() {
+            // Same setup as gc test, but with an Eo2Metrics registry wired in.
+            // After the run, rendered prometheus output must include per-sink
+            // ack seq and per-partition L2 byte/segment gauges.
+            let tmp = tempfile::tempdir().unwrap();
+            let registry = PipelineL2Registry::new(L2BodyStoreConfig {
+                root: Some(tmp.path().to_path_buf()),
+                segment_bytes: 256,
+            });
+
+            let source = PushSource {
+                batch: Some(push_events(30)),
+            };
+            let processor = PassthroughProcessor::new(Arc::from("out"));
+            let sink = BlackholeSink::new();
+            let eo2_metrics = Arc::new(crate::eo2_metrics::Eo2Metrics::new());
+            let mut config = PipelineConfig::default();
+            config.pipeline_name = "eo2-metrics-test".into();
+            config.sink_name = "blackhole".into();
+            config.l2_registry = Some(registry.clone());
+            config.delivery.durability = DurabilityMode::OrderedBatch;
+            config.delivery.flush.interval = Duration::from_millis(1);
+            config.eo2_metrics = Some(Arc::clone(&eo2_metrics));
+
+            let metrics = Arc::new(PipelineMetrics::new());
+            let shutdown = Arc::new(AtomicBool::new(false));
+
+            run_buffered(source, processor, sink, config, metrics.clone(), shutdown, None)
+                .await
+                .unwrap();
+
+            let rendered = eo2_metrics.render_prometheus();
+            assert!(
+                rendered.contains("aeon_sink_ack_seq")
+                    && rendered.contains("pipeline=\"eo2-metrics-test\"")
+                    && rendered.contains("sink=\"blackhole\""),
+                "expected sink ack gauge, got:\n{rendered}"
+            );
+            assert!(
+                rendered.contains("aeon_l2_segments"),
+                "expected l2 segment gauge, got:\n{rendered}"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn capacity_gate_pauses_source_and_gc_releases() {
+            // With a tiny pipeline cap (512 bytes), 30 events of ~64 bytes
+            // each will exceed capacity. The source task's capacity gate
+            // will yield, but once the sink delivers and GC runs, capacity
+            // is reclaimed and the pipeline completes without hanging.
+            let tmp = tempfile::tempdir().unwrap();
+            let registry = PipelineL2Registry::new(L2BodyStoreConfig {
+                root: Some(tmp.path().to_path_buf()),
+                segment_bytes: 256,
+            });
+
+            let node = crate::eo2_backpressure::NodeCapacity::new(None);
+            let caps = crate::eo2_backpressure::CapacityLimits::from_config(
+                None,
+                Some(512),
+                1,
+            );
+            let capacity = crate::eo2_backpressure::PipelineCapacity::new(caps, node);
+            let eo2_metrics = Arc::new(crate::eo2_metrics::Eo2Metrics::new());
+
+            let source = PushSource {
+                batch: Some(push_events(30)),
+            };
+            let processor = PassthroughProcessor::new(Arc::from("out"));
+            let sink = BlackholeSink::new();
+            let mut config = PipelineConfig::default();
+            config.pipeline_name = "cap-test".into();
+            config.l2_registry = Some(registry.clone());
+            config.delivery.durability = DurabilityMode::OrderedBatch;
+            config.delivery.flush.interval = Duration::from_millis(1);
+            config.eo2_capacity = Some(capacity.clone());
+            config.eo2_metrics = Some(Arc::clone(&eo2_metrics));
+
+            let metrics = Arc::new(PipelineMetrics::new());
+            let shutdown = Arc::new(AtomicBool::new(false));
+
+            run_buffered(source, processor, sink, config, metrics.clone(), shutdown, None)
+                .await
+                .unwrap();
+
+            assert_eq!(metrics.events_received.load(Ordering::Relaxed), 30);
+            assert_eq!(metrics.outputs_sent.load(Ordering::Relaxed), 30);
+            // After the run, capacity should be near zero — GC reclaimed all.
+            assert!(
+                capacity.pipeline_bytes() < 512,
+                "expected bytes reclaimed, got {}",
+                capacity.pipeline_bytes()
+            );
+        }
+
+        /// Push source that records the recovery plan it was given.
+        struct RecoveryCapturePushSource {
+            batch: Option<Vec<Event>>,
+            captured_replay_seq: Arc<AtomicU64>,
+            captured_calls: Arc<AtomicU64>,
+        }
+        impl Source for RecoveryCapturePushSource {
+            fn next_batch(
+                &mut self,
+            ) -> impl std::future::Future<Output = Result<Vec<Event>, AeonError>> + Send
+            {
+                let b = self.batch.take().unwrap_or_default();
+                async move { Ok(b) }
+            }
+            fn source_kind(&self) -> SourceKind {
+                SourceKind::Push
+            }
+            fn on_recovery_plan(
+                &mut self,
+                _pull_offsets: &HashMap<PartitionId, i64>,
+                replay_from_l2_seq: u64,
+            ) -> impl std::future::Future<Output = Result<(), AeonError>> + Send {
+                let seq = self.captured_replay_seq.clone();
+                let calls = self.captured_calls.clone();
+                async move {
+                    seq.store(replay_from_l2_seq, Ordering::SeqCst);
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn recovery_plan_dispatches_to_source_on_pipeline_start() {
+            // Seed an L3 checkpoint store with a record containing a sink
+            // ack of 42 so RecoveryPlan::from_last returns
+            // ReplayL2From(42) for push sources. Then start a pipeline and
+            // assert the source's on_recovery_plan was called with seq=42.
+            let l3_tmp = tempfile::tempdir().unwrap();
+            let l3 = Arc::new(
+                aeon_state::l3::RedbStore::open(aeon_state::l3::RedbConfig {
+                    path: l3_tmp.path().join("l3.redb"),
+                    sync_writes: false,
+                })
+                .unwrap(),
+            ) as Arc<dyn aeon_types::L3Store>;
+            {
+                let mut store = crate::checkpoint::L3CheckpointStore::open(Arc::clone(&l3))
+                    .unwrap();
+                let mut rec = crate::checkpoint::CheckpointRecord::new(
+                    0,
+                    HashMap::new(),
+                    vec![],
+                    10,
+                    0,
+                );
+                let mut sinks = HashMap::new();
+                sinks.insert("sink".to_string(), 42u64);
+                rec = rec.with_per_sink_ack_seq(sinks);
+                crate::checkpoint::CheckpointPersist::append(&mut store, &mut rec).unwrap();
+            }
+
+            let captured_seq = Arc::new(AtomicU64::new(0));
+            let captured_calls = Arc::new(AtomicU64::new(0));
+            let source = RecoveryCapturePushSource {
+                batch: Some(push_events(3)),
+                captured_replay_seq: captured_seq.clone(),
+                captured_calls: captured_calls.clone(),
+            };
+            let processor = PassthroughProcessor::new(Arc::from("out"));
+            let sink = BlackholeSink::new();
+
+            let mut config = PipelineConfig::default();
+            config.pipeline_name = "eo2-recovery-test".into();
+            config.delivery.durability = DurabilityMode::OrderedBatch;
+            config.delivery.checkpoint.backend =
+                crate::delivery::CheckpointBackend::StateStore;
+            config.l3_checkpoint_store = Some(l3);
+
+            let metrics = Arc::new(PipelineMetrics::new());
+            let shutdown = Arc::new(AtomicBool::new(false));
+
+            run_buffered(source, processor, sink, config, metrics.clone(), shutdown, None)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                captured_calls.load(Ordering::SeqCst),
+                1,
+                "on_recovery_plan should fire exactly once at pipeline start"
+            );
+            assert_eq!(
+                captured_seq.load(Ordering::SeqCst),
+                42,
+                "recovery plan should carry the persisted min-ack seq"
+            );
+        }
+
+        #[tokio::test]
+        async fn no_registry_is_always_passthrough() {
+            // Push source + OrderedBatch but no registry attached: safe fallback.
+            let source = PushSource {
+                batch: Some(push_events(15)),
+            };
+            let processor = PassthroughProcessor::new(Arc::from("out"));
+            let sink = BlackholeSink::new();
+            let mut config = PipelineConfig::default();
+            config.delivery.durability = DurabilityMode::OrderedBatch;
+
+            let metrics = Arc::new(PipelineMetrics::new());
+            let shutdown = Arc::new(AtomicBool::new(false));
+
+            run_buffered(source, processor, sink, config, metrics.clone(), shutdown, None)
+                .await
+                .unwrap();
+
+            assert_eq!(metrics.events_received.load(Ordering::Relaxed), 15);
+        }
+
     }
 }

@@ -13,9 +13,12 @@
 pub mod awpp;
 pub mod backoff;
 pub mod delivery;
+pub mod durability;
 pub mod error;
 pub mod event;
+pub mod event_time;
 pub mod interner;
+pub mod manifest;
 pub mod oauth;
 pub mod partition;
 pub mod processor_identity;
@@ -30,9 +33,17 @@ pub mod uuid;
 // Re-export primary types at crate root for convenience.
 pub use backoff::{Backoff, BackoffPolicy};
 pub use delivery::{BatchFailurePolicy, BatchResult, DeliverySemantics, DeliveryStrategy};
+pub use durability::DurabilityMode;
 pub use error::{AeonError, Result};
 pub use event::{Event, Output};
+pub use event_time::EventTime;
 pub use interner::StringInterner;
+pub use manifest::{
+    BackpressureConfig, CheckpointBackendDecl, CheckpointBlock, ContentHashConfig,
+    DurabilityBlock, FlushBlock, IdentityConfig, PipelineManifest, ProcessorManifest,
+    SinkManifest, SinkTierDecl, SourceManifest, validate_pipeline_shape,
+    validate_sink_tier, validate_source_shape,
+};
 pub use oauth::OAuthConfig;
 pub use partition::PartitionId;
 pub use processor_identity::{PipelineScope, ProcessorIdentity};
@@ -51,7 +62,7 @@ pub use scanner::{
 pub use state::{BatchEntry, BatchOp, KvPairs, L3Backend, L3Store};
 pub use traits::{
     CheckpointReplicator, IdempotentSink, Processor, ProcessorTransport, Seekable, Sink,
-    SinkEosTier, Source, StateOps, TransactionalSink,
+    SinkEosTier, Source, SourceKind, StateOps, TransactionalSink,
 };
 pub use transport_codec::{TransportCodec, WireEvent, WireOutput};
-pub use uuid::CoreLocalUuidGenerator;
+pub use uuid::{CoreLocalUuidGenerator, derive_pull_uuid_v7};

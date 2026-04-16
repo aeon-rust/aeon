@@ -144,3 +144,7 @@ harness = false
 [[bench]]
 name = "gate1_steady_state"
 harness = false
+
+[[bench]]
+name = "eo2_durability_bench"
+harness = false

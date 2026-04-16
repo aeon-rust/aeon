@@ -38,6 +38,12 @@ pub struct Event {
     /// Source-system offset (e.g., Kafka message offset) for checkpoint resume.
     /// Set by source connectors; propagated to Output via `with_event_identity()`.
     pub source_offset: Option<i64>,
+    /// EO-2: per-partition L2 body-store sequence assigned by `L2WritingSource`
+    /// when the pipeline's `DurabilityMode` requires L2 persistence. `None` for
+    /// pull sources and for `DurabilityMode::None`. Propagated to `Output` by
+    /// `with_event_identity` so the sink task can feed `AckSeqTracker::record_ack`
+    /// on successful delivery, driving GC and the `per_sink_ack_seq` frontier.
+    pub l2_seq: Option<u64>,
 }
 
 /// The output envelope emitted by processors and consumed by sinks.
@@ -74,6 +80,10 @@ pub struct Output {
     /// Source offset (e.g., Kafka offset) of the originating event.
     /// Used by checkpoint to persist resume position per partition.
     pub source_offset: Option<i64>,
+    /// EO-2: propagated from `Event.l2_seq`. Drives `AckSeqTracker::record_ack`
+    /// on successful sink delivery. `None` when the source path is pass-through
+    /// (pull sources, `DurabilityMode::None`, or synthetic outputs).
+    pub l2_seq: Option<u64>,
 }
 
 impl Event {
@@ -94,6 +104,7 @@ impl Event {
             payload,
             source_ts: None,
             source_offset: None,
+            l2_seq: None,
         }
     }
 
@@ -131,6 +142,7 @@ impl Output {
             source_event_id: None,
             source_partition: None,
             source_offset: None,
+            l2_seq: None,
         }
     }
 
@@ -164,6 +176,7 @@ impl Output {
         self.source_partition = Some(event.partition);
         self.source_ts = event.source_ts;
         self.source_offset = event.source_offset;
+        self.l2_seq = event.l2_seq;
         self
     }
 
@@ -209,6 +222,7 @@ impl Output {
             payload: self.payload,
             source_ts: self.source_ts,
             source_offset: self.source_offset,
+            l2_seq: self.l2_seq,
         }
     }
 }

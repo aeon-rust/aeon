@@ -21,7 +21,14 @@ use std::sync::Arc;
 const WAL_MAGIC: &[u8; 8] = b"AEON-CKP";
 
 /// Current WAL format version.
-const WAL_VERSION: u16 = 1;
+///
+/// Version history:
+/// - 1: initial format (checkpoint_id, timestamp, source_offsets,
+///   pending_event_ids, delivered_count, failed_count).
+/// - 2: adds `per_sink_ack_seq` for EO-2 multi-sink GC cursor (P1 of
+///   `docs/EO-2-DURABILITY-DESIGN.md` implementation). V1 files are not
+///   readable — clean break, pre-1.0.
+const WAL_VERSION: u16 = 2;
 
 /// Header size: 8 (magic) + 2 (version) = 10 bytes.
 const HEADER_SIZE: usize = 10;
@@ -45,6 +52,12 @@ pub struct CheckpointRecord {
     pub delivered_count: u64,
     /// Number of events failed since last checkpoint.
     pub failed_count: u64,
+    /// EO-2 multi-sink GC cursor: per-sink highest contiguously-acked
+    /// delivery sequence number. L2 segments may be reclaimed only up to
+    /// `min()` across all sinks. Keyed by sink name (matches pipeline
+    /// manifest). Empty for pre-EO-2 pipelines / `durability: none`.
+    #[serde(default)]
+    pub per_sink_ack_seq: HashMap<String, u64>,
 }
 
 impl CheckpointRecord {
@@ -72,7 +85,14 @@ impl CheckpointRecord {
                 .collect(),
             delivered_count,
             failed_count,
+            per_sink_ack_seq: HashMap::new(),
         }
+    }
+
+    /// Attach per-sink ack sequence numbers (EO-2 multi-sink GC cursor).
+    pub fn with_per_sink_ack_seq(mut self, seq: HashMap<String, u64>) -> Self {
+        self.per_sink_ack_seq = seq;
+        self
     }
 
     /// Get source offsets as PartitionId keys.
@@ -216,6 +236,14 @@ pub trait CheckpointPersist: Send {
 
     /// Next checkpoint ID that will be assigned by `append`.
     fn next_checkpoint_id(&self) -> u64;
+
+    /// EO-2 P5: attempt to clear transient fallback state and drain any
+    /// sidecar records back into the primary store. Default no-op — only
+    /// `FallbackCheckpointStore` overrides. Returns `true` if the store is
+    /// healthy (not in fallback) after the call, `false` if still degraded.
+    fn try_recover_primary(&mut self) -> Result<bool, AeonError> {
+        Ok(true)
+    }
 }
 
 /// Adapter around [`CheckpointWriter`] so the WAL path implements

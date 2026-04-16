@@ -167,6 +167,7 @@ mod tests {
                 source_event_id: None,
                 source_partition: None,
                 source_offset: None,
+                l2_seq: None,
             })
             .collect();
 
@@ -204,6 +205,7 @@ mod tests {
             source_event_id: None,
             source_partition: None,
             source_offset: None,
+            l2_seq: None,
         }];
 
         let result = sink.write_batch(outputs).await;
