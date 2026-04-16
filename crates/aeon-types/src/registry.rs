@@ -234,12 +234,12 @@ impl std::fmt::Display for ProcessorRef {
 pub struct PipelineDefinition {
     /// Pipeline name (unique identifier).
     pub name: String,
-    /// Source configuration.
-    pub source: SourceConfig,
+    /// Source configurations. At least one required.
+    pub sources: Vec<SourceConfig>,
     /// Processor reference.
     pub processor: ProcessorRef,
-    /// Sink configuration.
-    pub sink: SinkConfig,
+    /// Sink configurations. At least one required.
+    pub sinks: Vec<SinkConfig>,
     /// Upgrade strategy.
     #[serde(default)]
     pub upgrade_strategy: UpgradeStrategy,
@@ -271,9 +271,9 @@ impl PipelineDefinition {
     ) -> Self {
         Self {
             name: name.into(),
-            source,
+            sources: vec![source],
             processor,
-            sink,
+            sinks: vec![sink],
             upgrade_strategy: UpgradeStrategy::default(),
             state: PipelineState::Created,
             created_at: now,

@@ -380,56 +380,61 @@ impl PipelineManifest {
             .unwrap_or_default()
             .as_millis() as i64;
 
-        let source = self.sources.first().map(|s| {
-            let mut config = std::collections::BTreeMap::new();
-            for (k, v) in &s.config {
-                config.insert(k.clone(), v.to_string().trim_matches('"').to_string());
-            }
-            config.insert("source_kind".into(), format!("{:?}", s.kind));
-            config.insert("identity".into(), format!("{:?}", s.identity));
-            config.insert("event_time".into(), format!("{:?}", s.event_time));
-            crate::registry::SourceConfig {
-                source_type: s.connector_type.clone(),
-                topic: config.remove("topic"),
-                partitions: vec![],
-                config,
-            }
-        }).unwrap_or_else(|| crate::registry::SourceConfig {
-            source_type: "unknown".into(),
-            topic: None,
-            partitions: vec![],
-            config: std::collections::BTreeMap::new(),
-        });
+        let sources: Vec<crate::registry::SourceConfig> = self
+            .sources
+            .iter()
+            .map(|s| {
+                let mut config = std::collections::BTreeMap::new();
+                for (k, v) in &s.config {
+                    config.insert(k.clone(), v.to_string().trim_matches('"').to_string());
+                }
+                config.insert("source_kind".into(), format!("{:?}", s.kind));
+                config.insert("identity".into(), format!("{:?}", s.identity));
+                config.insert("event_time".into(), format!("{:?}", s.event_time));
+                crate::registry::SourceConfig {
+                    source_type: s.connector_type.clone(),
+                    topic: config.remove("topic"),
+                    partitions: vec![],
+                    config,
+                }
+            })
+            .collect();
 
-        let sink = self.sinks.first().map(|s| {
-            let mut config = std::collections::BTreeMap::new();
-            for (k, v) in &s.config {
-                config.insert(k.clone(), v.to_string().trim_matches('"').to_string());
-            }
-            config.insert("eos_tier".into(), format!("{:?}", s.eos_tier));
-            crate::registry::SinkConfig {
-                sink_type: s.connector_type.clone(),
-                topic: config.remove("topic"),
-                config,
-            }
-        }).unwrap_or_else(|| crate::registry::SinkConfig {
-            sink_type: "unknown".into(),
-            topic: None,
-            config: std::collections::BTreeMap::new(),
-        });
+        let sinks: Vec<crate::registry::SinkConfig> = self
+            .sinks
+            .iter()
+            .map(|s| {
+                let mut config = std::collections::BTreeMap::new();
+                for (k, v) in &s.config {
+                    config.insert(k.clone(), v.to_string().trim_matches('"').to_string());
+                }
+                config.insert("eos_tier".into(), format!("{:?}", s.eos_tier));
+                crate::registry::SinkConfig {
+                    sink_type: s.connector_type.clone(),
+                    topic: config.remove("topic"),
+                    config,
+                }
+            })
+            .collect();
 
         let processor = crate::registry::ProcessorRef::new(
             &self.processor.name,
             self.processor.version.as_deref().unwrap_or("latest"),
         );
 
-        crate::registry::PipelineDefinition::new(
-            &self.name,
-            source,
+        crate::registry::PipelineDefinition {
+            name: self.name.clone(),
+            sources,
             processor,
-            sink,
-            now,
-        )
+            sinks,
+            upgrade_strategy: crate::registry::UpgradeStrategy::default(),
+            state: crate::registry::PipelineState::Created,
+            created_at: now,
+            updated_at: now,
+            assigned_node: None,
+            transport_codec: crate::transport_codec::TransportCodec::default(),
+            upgrade_state: None,
+        }
     }
 }
 
@@ -693,8 +698,10 @@ mod tests {
         let m = sample_manifest();
         let def = m.to_pipeline_definition();
         assert_eq!(def.name, "orders");
-        assert_eq!(def.source.source_type, "kafka");
-        assert_eq!(def.sink.sink_type, "kafka");
+        assert_eq!(def.sources.len(), 1);
+        assert_eq!(def.sources[0].source_type, "kafka");
+        assert_eq!(def.sinks.len(), 1);
+        assert_eq!(def.sinks[0].sink_type, "kafka");
         assert_eq!(def.processor.name, "p");
         assert_eq!(def.processor.version, "latest");
     }
@@ -703,13 +710,13 @@ mod tests {
     fn to_pipeline_definition_stores_source_kind_in_config() {
         let m = sample_manifest();
         let def = m.to_pipeline_definition();
-        assert_eq!(def.source.config.get("source_kind").unwrap(), "Pull");
+        assert_eq!(def.sources[0].config.get("source_kind").unwrap(), "Pull");
     }
 
     #[test]
     fn to_pipeline_definition_stores_eos_tier_in_config() {
         let m = sample_manifest();
         let def = m.to_pipeline_definition();
-        assert!(def.sink.config.get("eos_tier").unwrap().contains("T2"));
+        assert!(def.sinks[0].config.get("eos_tier").unwrap().contains("T2"));
     }
 }

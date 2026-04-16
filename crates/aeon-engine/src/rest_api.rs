@@ -2443,8 +2443,8 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
 
         let p = state.pipelines.get("reconf-src-api").await.unwrap();
-        assert_eq!(p.source.topic.as_deref(), Some("new-input"));
-        assert_eq!(p.source.partitions, vec![0, 1, 2]);
+        assert_eq!(p.sources[0].topic.as_deref(), Some("new-input"));
+        assert_eq!(p.sources[0].partitions, vec![0, 1, 2]);
     }
 
     #[tokio::test]
@@ -2467,7 +2467,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
 
         let p = state.pipelines.get("reconf-sink-api").await.unwrap();
-        assert_eq!(p.sink.topic.as_deref(), Some("new-output"));
+        assert_eq!(p.sinks[0].topic.as_deref(), Some("new-output"));
     }
 
     #[tokio::test]

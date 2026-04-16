@@ -35403,9 +35403,34 @@ Good. Now I have a clear picture. The P6 CLI loader swap has three parts:
 
 ✻ Worked for 16m 5s
 
+※ recap: EO-2 durability implementation across 12 phases. Completed P11 docs, P9 integration tests, P10 benchmarks, and P6 CLI loader swap this session.
+  Next action: P6 runtime topology refactor to wire DAG runners for multi-source/multi-sink pipelines.
+
 ======================
 continue
 ========================
+claude's response:
+
+
+● Next piece: PipelineDefinition schema upgrade from single source/sink to arrays. Let me assess the blast radius.
+
+P6 PipelineDefinition schema upgrade landed. Changes across 5 files:
+
+  - aeon-types/registry.rs: source → sources: Vec<SourceConfig>, sink → sinks: Vec<SinkConfig>. Constructor wraps single args in vec![] for backward compat.
+  - aeon-types/manifest.rs: Bridge to_pipeline_definition() now converts all sources/sinks (not just first). 3 bridge tests updated.
+  - aeon-engine/pipeline_manager.rs: reconfigure_source/sink methods index sources[0]/sinks[0]. Test assertions updated.
+  - aeon-engine/rest_api.rs: Test assertions updated to sources[0]/sinks[0].
+
+  524 tests pass across all affected crates. Clean workspace build.
+
+  P6 remaining: runtime topology refactor (wire DAG runners for multi-source/multi-sink), per-sink EO-2 AckSeqTracker extension. These are the final pieces
+  before P6 can flip to ✅.
+
+✻ Cooked for 11m 15s
+
+===========================
+continue
+============================
 claude's response:
 
 
