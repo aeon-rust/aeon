@@ -27,7 +27,9 @@ pub mod transport;
 pub use config::{ClusterConfig, TlsConfig};
 pub use snapshot::ClusterSnapshot;
 pub use types::{
-    ClusterRequest, ClusterResponse, NodeAddress, NodeId, PartitionOwnership, PartitionTable,
+    ClusterRequest, ClusterResponse, NodeAddress, NodeId, PartitionCutoverRequest,
+    PartitionCutoverResponse, PartitionOwnership, PartitionTable, PartitionTransferEnd,
+    PartitionTransferRequest, PohChainTransferRequest, PohChainTransferResponse,
 };
 
 #[cfg(feature = "cluster")]

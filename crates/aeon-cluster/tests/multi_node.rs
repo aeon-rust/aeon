@@ -69,7 +69,7 @@ fn start_server(
     let ep = Arc::clone(endpoint);
     let r = raft.clone();
     let s = Arc::clone(shutdown);
-    tokio::spawn(async move { server::serve(ep, r, s).await });
+    tokio::spawn(async move { server::serve(ep, r, s, None, None, None).await });
 }
 
 /// Poll until a leader is elected (up to timeout_secs).

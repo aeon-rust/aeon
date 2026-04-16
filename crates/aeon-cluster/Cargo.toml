@@ -43,11 +43,13 @@ dashmap = { workspace = true, optional = true }
 rcgen = { workspace = true, optional = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
 rcgen = { workspace = true }
 serde_json = { workspace = true }
 aeon-state = { workspace = true, features = ["redb"] }
+aeon-crypto = { workspace = true }
 tempfile = { workspace = true }
+bytes = { workspace = true }
 
 [[bench]]
 name = "cluster_bench"

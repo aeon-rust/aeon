@@ -370,7 +370,7 @@ mod inner {
             let server_raft = raft.clone();
             let server_shutdown = Arc::clone(&shutdown);
             tokio::spawn(async move {
-                server::serve(server_ep, server_raft, server_shutdown).await;
+                server::serve(server_ep, server_raft, server_shutdown, None, None, None).await;
             });
 
             // Build membership — use pre-computed initial_members if available,
@@ -468,7 +468,7 @@ mod inner {
             let server_raft = raft.clone();
             let server_shutdown = Arc::clone(&shutdown);
             tokio::spawn(async move {
-                server::serve(server_ep, server_raft, server_shutdown).await;
+                server::serve(server_ep, server_raft, server_shutdown, None, None, None).await;
             });
 
             let shared_state = crate::store::SharedClusterState::default();
@@ -540,7 +540,7 @@ mod inner {
             let server_raft = raft.clone();
             let server_shutdown = Arc::clone(&shutdown);
             tokio::spawn(async move {
-                server::serve(server_ep, server_raft, server_shutdown).await;
+                server::serve(server_ep, server_raft, server_shutdown, None, None, None).await;
             });
 
             // Use advertise_addr if set; otherwise fall back to bind address.

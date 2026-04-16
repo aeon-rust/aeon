@@ -6,16 +6,39 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use openraft::Raft;
 
 use crate::raft_config::AeonRaftConfig;
+use crate::transport::cutover::{CutoverCoordinator, serve_partition_cutover_with_request};
 use crate::transport::endpoint::QuicEndpoint;
 use crate::transport::framing::{self, MessageType};
 use crate::transport::health;
-use crate::types::{JoinRequest, JoinResponse, NodeId, RemoveNodeRequest, RemoveNodeResponse};
+use crate::transport::partition_transfer::{
+    PartitionTransferProvider, serve_partition_transfer_with_request,
+};
+use crate::transport::poh_transfer::{
+    PohChainProvider, serve_poh_chain_transfer_with_request,
+};
+use crate::types::{
+    JoinRequest, JoinResponse, NodeId, PartitionCutoverRequest, PartitionCutoverResponse,
+    PartitionTransferEnd, PartitionTransferRequest, PohChainTransferRequest,
+    PohChainTransferResponse, RemoveNodeRequest, RemoveNodeResponse,
+};
 
 /// Run the QUIC server accept loop, dispatching incoming RPCs to the Raft node.
+///
+/// `transfer_provider` is plugged in by the engine to service
+/// `PartitionTransferRequest` streams (CL-6a). `poh_provider` services
+/// `PohChainTransferRequest` streams (CL-6b). `cutover_coordinator`
+/// services `PartitionCutoverRequest` streams (CL-6c) — the hook that
+/// drains and freezes a partition on the source node when the target
+/// initiates handover. Pass `None` in contexts that don't own a live L2
+/// body store / PoH chain / partition-write path (tests, raft-only
+/// benches) — the relevant requests will receive a failure response.
 pub async fn serve(
     endpoint: Arc<QuicEndpoint>,
     raft: Raft<AeonRaftConfig>,
     shutdown: Arc<AtomicBool>,
+    transfer_provider: Option<Arc<dyn PartitionTransferProvider>>,
+    poh_provider: Option<Arc<dyn PohChainProvider>>,
+    cutover_coordinator: Option<Arc<dyn CutoverCoordinator>>,
 ) {
     while !shutdown.load(Ordering::Relaxed) {
         let incoming = tokio::select! {
@@ -29,6 +52,9 @@ pub async fn serve(
         };
 
         let raft = raft.clone();
+        let transfer_provider = transfer_provider.clone();
+        let poh_provider = poh_provider.clone();
+        let cutover_coordinator = cutover_coordinator.clone();
         tokio::spawn(async move {
             let connection = match incoming.await {
                 Ok(c) => c,
@@ -50,7 +76,17 @@ pub async fn serve(
                 };
 
                 let raft = raft.clone();
-                tokio::spawn(handle_stream(raft, self_id, stream));
+                let transfer_provider = transfer_provider.clone();
+                let poh_provider = poh_provider.clone();
+                let cutover_coordinator = cutover_coordinator.clone();
+                tokio::spawn(handle_stream(
+                    raft,
+                    self_id,
+                    transfer_provider,
+                    poh_provider,
+                    cutover_coordinator,
+                    stream,
+                ));
             }
         });
     }
@@ -60,8 +96,14 @@ pub async fn serve(
 async fn handle_stream(
     raft: Raft<AeonRaftConfig>,
     self_id: NodeId,
+    transfer_provider: Option<Arc<dyn PartitionTransferProvider>>,
+    poh_provider: Option<Arc<dyn PohChainProvider>>,
+    cutover_coordinator: Option<Arc<dyn CutoverCoordinator>>,
     (mut send, mut recv): (quinn::SendStream, quinn::RecvStream),
 ) {
+    // Peek the first frame's type so partition-transfer streams (which
+    // start with a request frame + continue reading from the same recv)
+    // can re-use the open stream without a second read_frame call.
     let (msg_type, payload) = match framing::read_frame(&mut recv).await {
         Ok(f) => f,
         Err(e) => {
@@ -78,6 +120,15 @@ async fn handle_stream(
         MessageType::AddNodeRequest => handle_add_node(&raft, &payload, &mut send).await,
         MessageType::RemoveNodeRequest => handle_remove_node(&raft, &payload, &mut send).await,
         MessageType::HealthPing => health::handle_health_ping(self_id, &payload, &mut send).await,
+        MessageType::PartitionTransferRequest => {
+            handle_partition_transfer(transfer_provider.as_deref(), payload, send).await
+        }
+        MessageType::PohChainTransferRequest => {
+            handle_poh_chain_transfer(poh_provider.as_deref(), payload, send).await
+        }
+        MessageType::PartitionCutoverRequest => {
+            handle_partition_cutover(cutover_coordinator.as_deref(), payload, send).await
+        }
         _ => {
             tracing::warn!("unexpected message type: {:?}", msg_type);
             Ok(())
@@ -87,6 +138,125 @@ async fn handle_stream(
     if let Err(e) = result {
         tracing::debug!("RPC handler error: {e}");
     }
+}
+
+/// Dispatch a `PartitionTransferRequest`.
+///
+/// The request frame was already consumed by `handle_stream`; deserialize
+/// it and hand off to `serve_partition_transfer_with_request`. If no
+/// provider is wired (raft-only contexts like tests/benches), reply with
+/// a failure end frame so the client surfaces a meaningful error.
+async fn handle_partition_transfer(
+    provider: Option<&dyn PartitionTransferProvider>,
+    request_payload: Vec<u8>,
+    mut send: quinn::SendStream,
+) -> Result<(), aeon_types::AeonError> {
+    let provider = match provider {
+        Some(p) => p,
+        None => {
+            let end = PartitionTransferEnd {
+                success: false,
+                message: "node has no partition-transfer provider configured".to_string(),
+            };
+            let b =
+                bincode::serialize(&end).map_err(|e| aeon_types::AeonError::Serialization {
+                    message: format!("serialize PartitionTransferEnd: {e}"),
+                    source: None,
+                })?;
+            framing::write_frame(&mut send, MessageType::PartitionTransferEndFrame, &b).await?;
+            let _ = send.finish();
+            return Ok(());
+        }
+    };
+
+    let req: PartitionTransferRequest = bincode::deserialize(&request_payload).map_err(|e| {
+        aeon_types::AeonError::Serialization {
+            message: format!("deserialize PartitionTransferRequest: {e}"),
+            source: None,
+        }
+    })?;
+    serve_partition_transfer_with_request(provider, send, &req).await
+}
+
+/// Dispatch a `PohChainTransferRequest`.
+///
+/// Same shape as `handle_partition_transfer`: the request frame was
+/// already consumed by `handle_stream`; deserialize it and hand off to
+/// `serve_poh_chain_transfer_with_request`. If no provider is wired,
+/// reply with `success = false` so the client surfaces a meaningful
+/// error instead of hanging on a half-closed stream.
+async fn handle_poh_chain_transfer(
+    provider: Option<&dyn PohChainProvider>,
+    request_payload: Vec<u8>,
+    mut send: quinn::SendStream,
+) -> Result<(), aeon_types::AeonError> {
+    let provider = match provider {
+        Some(p) => p,
+        None => {
+            let resp = PohChainTransferResponse {
+                success: false,
+                state_bytes: Vec::new(),
+                message: "node has no poh-chain provider configured".to_string(),
+            };
+            let b =
+                bincode::serialize(&resp).map_err(|e| aeon_types::AeonError::Serialization {
+                    message: format!("serialize PohChainTransferResponse: {e}"),
+                    source: None,
+                })?;
+            framing::write_frame(&mut send, MessageType::PohChainTransferResponse, &b).await?;
+            let _ = send.finish();
+            return Ok(());
+        }
+    };
+
+    let req: PohChainTransferRequest = bincode::deserialize(&request_payload).map_err(|e| {
+        aeon_types::AeonError::Serialization {
+            message: format!("deserialize PohChainTransferRequest: {e}"),
+            source: None,
+        }
+    })?;
+    serve_poh_chain_transfer_with_request(provider, send, &req).await
+}
+
+/// Dispatch a `PartitionCutoverRequest`.
+///
+/// Same shape as the partition/PoH transfer handlers: the request frame
+/// was already consumed by `handle_stream`; deserialize it and hand off
+/// to `serve_partition_cutover_with_request`. If no coordinator is
+/// wired, reply with `success = false` so the client surfaces a
+/// meaningful error.
+async fn handle_partition_cutover(
+    coordinator: Option<&dyn CutoverCoordinator>,
+    request_payload: Vec<u8>,
+    mut send: quinn::SendStream,
+) -> Result<(), aeon_types::AeonError> {
+    let coordinator = match coordinator {
+        Some(c) => c,
+        None => {
+            let resp = PartitionCutoverResponse {
+                success: false,
+                final_source_offset: -1,
+                final_poh_sequence: 0,
+                message: "node has no cutover coordinator configured".to_string(),
+            };
+            let b =
+                bincode::serialize(&resp).map_err(|e| aeon_types::AeonError::Serialization {
+                    message: format!("serialize PartitionCutoverResponse: {e}"),
+                    source: None,
+                })?;
+            framing::write_frame(&mut send, MessageType::PartitionCutoverResponse, &b).await?;
+            let _ = send.finish();
+            return Ok(());
+        }
+    };
+
+    let req: PartitionCutoverRequest = bincode::deserialize(&request_payload).map_err(|e| {
+        aeon_types::AeonError::Serialization {
+            message: format!("deserialize PartitionCutoverRequest: {e}"),
+            source: None,
+        }
+    })?;
+    serve_partition_cutover_with_request(coordinator, send, &req).await
 }
 
 async fn handle_append_entries(

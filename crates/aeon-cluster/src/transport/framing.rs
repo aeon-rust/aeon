@@ -27,6 +27,30 @@ pub enum MessageType {
     /// Request leader to remove a node from the cluster.
     RemoveNodeRequest = 15,
     RemoveNodeResponse = 16,
+    /// CL-6a partition transfer: client opens a single bidirectional
+    /// stream with a `PartitionTransferRequest` frame; server replies on
+    /// the same stream with one `PartitionTransferManifestFrame`, then a
+    /// sequence of `PartitionTransferChunkFrame`s (one per
+    /// `SegmentChunk`), then a terminal `PartitionTransferEndFrame`.
+    PartitionTransferRequest = 17,
+    PartitionTransferManifestFrame = 18,
+    PartitionTransferChunkFrame = 19,
+    PartitionTransferEndFrame = 20,
+    /// CL-6b PoH chain transfer: client opens a single bidirectional
+    /// stream with a `PohChainTransferRequest` frame; server replies on
+    /// the same stream with one terminal `PohChainTransferResponse`
+    /// frame carrying either the serialized `PohChainState` bytes or a
+    /// failure message. Chain state is small (< 16 KiB typical) so no
+    /// chunking is needed — a single round-trip is sufficient.
+    PohChainTransferRequest = 21,
+    PohChainTransferResponse = 22,
+    /// CL-6c partition cutover handshake: target opens a single
+    /// bidirectional stream with a `PartitionCutoverRequest` frame;
+    /// source drains + freezes the partition and replies with one
+    /// terminal `PartitionCutoverResponse` carrying the final source
+    /// offset and PoH sequence at the moment of freeze.
+    PartitionCutoverRequest = 23,
+    PartitionCutoverResponse = 24,
 }
 
 impl MessageType {
@@ -48,6 +72,14 @@ impl MessageType {
             14 => Some(Self::AddNodeResponse),
             15 => Some(Self::RemoveNodeRequest),
             16 => Some(Self::RemoveNodeResponse),
+            17 => Some(Self::PartitionTransferRequest),
+            18 => Some(Self::PartitionTransferManifestFrame),
+            19 => Some(Self::PartitionTransferChunkFrame),
+            20 => Some(Self::PartitionTransferEndFrame),
+            21 => Some(Self::PohChainTransferRequest),
+            22 => Some(Self::PohChainTransferResponse),
+            23 => Some(Self::PartitionCutoverRequest),
+            24 => Some(Self::PartitionCutoverResponse),
             _ => None,
         }
     }
@@ -149,12 +181,12 @@ mod tests {
 
     #[test]
     fn message_type_roundtrip() {
-        for i in 1..=16u8 {
+        for i in 1..=24u8 {
             let mt = MessageType::from_u8(i).unwrap();
             assert_eq!(mt as u8, i);
         }
         assert!(MessageType::from_u8(0).is_none());
-        assert!(MessageType::from_u8(17).is_none());
+        assert!(MessageType::from_u8(25).is_none());
     }
 
     #[test]
