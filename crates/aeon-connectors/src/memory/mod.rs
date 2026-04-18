@@ -7,4 +7,4 @@ mod sink;
 mod source;
 
 pub use sink::MemorySink;
-pub use source::MemorySource;
+pub use source::{MemorySource, StreamingMemorySource};

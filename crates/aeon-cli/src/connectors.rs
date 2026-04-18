@@ -29,22 +29,27 @@
 use std::sync::Arc;
 
 use aeon_connectors::{
-    BlackholeSink, MemorySource, StdoutSink,
+    BlackholeSink, StreamingMemorySource, StdoutSink,
     kafka::{KafkaSink, KafkaSinkConfig, KafkaSource, KafkaSourceConfig},
 };
 use aeon_engine::{ConnectorRegistry, DynSink, DynSource, SinkFactory, SourceFactory};
 use aeon_types::{
-    AeonError, DeliveryStrategy, Event, PartitionId,
+    AeonError, DeliveryStrategy,
     registry::{SinkConfig, SourceConfig},
 };
-use bytes::Bytes;
 
 // ─── Memory source ─────────────────────────────────────────────────────────
 
-/// Generates `count` synthetic events of `payload_size` bytes each, served in
-/// batches of `batch_size`. All three are pulled from `SourceConfig::config`
-/// with sensible defaults — the supervisor only needs to know the key
-/// (`memory`), the rest is config-driven.
+/// Generates synthetic events of `payload_size` bytes each, served in batches
+/// of `batch_size`. All three are pulled from `SourceConfig::config` with
+/// sensible defaults — the supervisor only needs to know the key (`memory`),
+/// the rest is config-driven.
+///
+/// `count = 0` runs unbounded (sustained-sweep mode for Session A load tests);
+/// any positive `count` bounds the run to exactly that many events. Events are
+/// synthesized lazily in `next_batch`, so a 10 M run does not pre-allocate
+/// 2.5 GiB of `Vec<Event>` up front — that OOM is what blocked the 3-minute
+/// sustained sweep in Session 0 (see `docs/GATE2-ACCEPTANCE-PLAN.md § 11.5`).
 ///
 /// Used for the T0 isolation matrix: drives the pipeline at a deterministic
 /// rate without any external broker.
@@ -56,24 +61,11 @@ impl SourceFactory for MemorySourceFactory {
         let payload_size = parse_usize(cfg.config.get("payload_size"), 256)?;
         let batch_size = parse_usize(cfg.config.get("batch_size"), 1024)?;
 
-        // Single allocation reused via `Bytes::clone` (Arc bump, no copy).
-        let payload = Bytes::from(vec![0u8; payload_size]);
-        let source_name: Arc<str> = Arc::from("memory");
-        let partition = PartitionId::new(0);
-
-        let events: Vec<Event> = (0..count)
-            .map(|i| {
-                Event::new(
-                    uuid::Uuid::nil(),
-                    i as i64,
-                    Arc::clone(&source_name),
-                    partition,
-                    payload.clone(),
-                )
-            })
-            .collect();
-
-        Ok(Box::new(MemorySource::new(events, batch_size)))
+        Ok(Box::new(StreamingMemorySource::new(
+            count,
+            payload_size,
+            batch_size,
+        )))
     }
 }
 
