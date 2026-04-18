@@ -1649,7 +1649,7 @@ async fn pipeline_tail(
     }
 
     let pipelines = state.pipelines.clone();
-    let metrics_map = state.pipeline_metrics.clone();
+    let supervisor = Arc::clone(&state.supervisor);
     ws.on_upgrade(move |mut socket| async move {
         use axum::extract::ws::Message;
         use std::sync::atomic::Ordering;
@@ -1665,7 +1665,7 @@ async fn pipeline_tail(
                 .map(|p| format!("{}", p.state))
                 .unwrap_or_else(|| "unknown".into());
 
-            let metrics_json = if let Some(m) = metrics_map.get(&name) {
+            let metrics_json = if let Some(m) = supervisor.get_metrics(&name).await {
                 serde_json::json!({
                     "pipeline": name,
                     "state": state_str,

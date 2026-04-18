@@ -266,6 +266,14 @@ impl PipelineSupervisor {
             .collect()
     }
 
+    /// Per-pipeline metrics lookup. Returns `None` if `name` is not currently
+    /// running on this node. Used by the `/v1/pipelines/{name}/tail` WebSocket
+    /// tick loop so it picks up a fresh metrics handle after restart.
+    pub async fn get_metrics(&self, name: &str) -> Option<Arc<PipelineMetrics>> {
+        let running = self.running.lock().await;
+        running.get(name).map(|entry| Arc::clone(&entry.metrics))
+    }
+
     /// Test helper — seed a metrics handle under `name` without spinning up a
     /// pipeline task. Lets rest_api tests exercise the `/metrics` handler
     /// without standing up real source/sink plumbing.
