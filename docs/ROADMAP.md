@@ -3109,11 +3109,11 @@ logic. Both are now derived from `raft_timing` — keep-alive =
 
 **Deferred to Session A (DOKS AMS3):**
 
-- **T0 C1/C2** — blocked by absence of a sustained Redpanda producer
-  harness wired for a rate-sweep loop (the `MemorySourceFactory` OOM on
-  `count × payload_size` pre-allocation is now fixed by the
-  `StreamingMemorySource` added post-Session 0). ~15 min of shell-level
-  wrapper work before Session A.
+- **T0 C1/C2** — harness shipped (`scripts/t0-sweep.sh` wraps
+  `aeon-producer` in a rate-sweep loop, emits a TSV per cell). Producer
+  emits a stable `SUMMARY` stdout line so the sweep is parse-safe. The
+  `MemorySourceFactory` OOM on `count × payload_size` pre-allocation is
+  also fixed by the post-Session-0 `StreamingMemorySource`.
 - **Row 4 leader failover** — observed 14.4 s on Rancher Desktop (over
   the < 5 s target). Number includes WSL2 + `kubectl port-forward`
   latency; the QUIC transport fix above is expected to tighten it; native

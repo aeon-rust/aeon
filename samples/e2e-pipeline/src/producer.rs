@@ -98,7 +98,10 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Route human-readable logs to stderr so stdout is reserved for the
+    // machine-parseable SUMMARY line that load-sweep harnesses capture.
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
@@ -229,6 +232,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         elapsed_ms = elapsed.as_millis() as u64,
         rate = format!("{:.0} events/sec", rate),
         "Production complete"
+    );
+
+    // Machine-parseable summary on stdout. One tab-separated line so shell
+    // sweep scripts can `awk` or `cut` per column without matching tracing
+    // output. Columns: label, sent, errors, elapsed_ms, events_per_sec,
+    // configured_rate, topic, payload_size.
+    println!(
+        "SUMMARY\tsent={total_sent}\terrors={total_errors}\telapsed_ms={elapsed_ms}\tevents_per_sec={rate:.0}\tconfigured_rate={configured}\ttopic={topic}\tpayload_size={payload}",
+        elapsed_ms = elapsed.as_millis() as u64,
+        configured = args.rate,
+        topic = args.topic,
+        payload = args.payload_size,
     );
 
     Ok(())

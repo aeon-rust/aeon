@@ -212,6 +212,22 @@ Quick-validation shape — each test is minutes, not hours. Sequence matters.
 Runtime: ~60 min total (12 cells × ~3 min + setup between).
 Output: a 12-row table of `(mode, topology) → observed ev/s, Aeon CPU %, pressure`.
 
+**Producer harness for C1/C2:** `scripts/t0-sweep.sh` wraps
+`aeon-producer` in a rate-sweep loop and emits a TSV row per rate
+(`label, configured_rate, sent, errors, elapsed_ms, events_per_sec,
+topic, payload_size`). Example:
+
+```bash
+scripts/t0-sweep.sh --label c2-ordered-batch \
+    --rates 100000,250000,500000,1000000 \
+    --duration 60 --payload-size 256 \
+    --topic aeon-source --brokers localhost:19092 \
+    --output /tmp/t0-c2-ordered.tsv
+```
+
+The producer's `SUMMARY` stdout line is the parse contract; human logs
+go to stderr so operators can still watch progress.
+
 ### T1 — 3-node throughput (≈ 3×)
 
 **Setup:** 3-node Aeon, Redpanda→Redpanda (C2 topology). Sweep all four
