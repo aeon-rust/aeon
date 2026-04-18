@@ -180,6 +180,10 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/pipelines/{name}/verify", get(verify_pipeline))
         // Cluster status
         .route("/api/v1/cluster/status", get(cluster_status))
+        .route(
+            "/api/v1/cluster/partitions/{partition}/transfer",
+            post(transfer_partition),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -562,6 +566,115 @@ async fn cluster_status(State(state): State<Arc<AppState>>) -> impl IntoResponse
             "mode": "standalone",
             "message": "cluster feature not enabled"
         }))
+    }
+}
+
+// ── Partition transfer endpoint (CL-6) ─────────────────────────────────
+
+/// Body for `POST /api/v1/cluster/partitions/{partition}/transfer`.
+///
+/// Initiates a partition handover to `target_node_id`. The source is read
+/// from the committed partition table; callers don't need to know it.
+#[derive(Deserialize)]
+#[cfg_attr(not(feature = "cluster"), allow(dead_code))]
+struct TransferPartitionBody {
+    target_node_id: u64,
+}
+
+/// Operator-triggered CL-6 partition handover. Leader-only: followers reply
+/// with `409 Conflict` and an `X-Leader-Id` header so the client can retry
+/// against the actual leader. Measures Row 5 cutover latency in the Gate 2
+/// plan (`docs/GATE2-ACCEPTANCE-PLAN.md §11.5`).
+async fn transfer_partition(
+    State(state): State<Arc<AppState>>,
+    Path(partition): Path<u16>,
+    Json(body): Json<TransferPartitionBody>,
+) -> axum::response::Response {
+    #[cfg(feature = "cluster")]
+    {
+        let Some(ref node) = state.cluster_node else {
+            return api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "cluster mode not enabled on this node",
+            )
+            .into_response();
+        };
+
+        let pid = aeon_types::PartitionId::new(partition);
+        let status = match node
+            .propose_partition_transfer(pid, body.target_node_id)
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                return api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+                    .into_response();
+            }
+        };
+
+        use aeon_cluster::TransferStatus;
+        match status {
+            TransferStatus::Accepted { source, target } => (
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({
+                    "status": "accepted",
+                    "partition": partition,
+                    "source": source,
+                    "target": target,
+                })),
+            )
+                .into_response(),
+            TransferStatus::NotLeader { current_leader } => {
+                let mut resp = (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": "not the Raft leader",
+                        "current_leader": current_leader,
+                    })),
+                )
+                    .into_response();
+                if let Some(leader_id) = current_leader {
+                    if let Ok(v) = HeaderValue::from_str(&leader_id.to_string()) {
+                        resp.headers_mut().insert("X-Leader-Id", v);
+                    }
+                }
+                resp
+            }
+            TransferStatus::UnknownPartition => api_error(
+                StatusCode::NOT_FOUND,
+                format!("partition {partition} not found in partition table"),
+            )
+            .into_response(),
+            TransferStatus::AlreadyTransferring { source, target } => (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "partition already has a transfer in flight",
+                    "partition": partition,
+                    "source": source,
+                    "target": target,
+                })),
+            )
+                .into_response(),
+            TransferStatus::NoChange { owner } => (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": "no-change",
+                    "partition": partition,
+                    "owner": owner,
+                })),
+            )
+                .into_response(),
+            TransferStatus::Rejected(msg) => api_error(StatusCode::CONFLICT, msg).into_response(),
+        }
+    }
+    #[cfg(not(feature = "cluster"))]
+    {
+        let _ = (state, partition, body);
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "cluster feature not enabled in this build",
+        )
+        .into_response()
     }
 }
 

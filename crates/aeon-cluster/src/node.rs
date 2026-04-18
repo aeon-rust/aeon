@@ -18,7 +18,9 @@ mod inner {
     use crate::transport::endpoint::QuicEndpoint;
     use crate::transport::network::QuicNetworkFactory;
     use crate::transport::server;
-    use crate::types::{ClusterRequest, ClusterResponse, JoinRequest, NodeAddress, NodeId};
+    use crate::types::{
+        ClusterRequest, ClusterResponse, JoinRequest, NodeAddress, NodeId, TransferStatus,
+    };
 
     /// A stub RaftNetworkFactory that does nothing (for single-node clusters).
     /// Multi-node networking is implemented in Phase 8c.
@@ -936,6 +938,65 @@ mod inner {
             self.raft.current_leader().await
         }
 
+        /// Initiate a partition handover from the current owner to `target`.
+        ///
+        /// Validates on the caller side (must be leader, partition exists, not
+        /// already transferring, target differs from source) and then submits
+        /// `ClusterRequest::BeginTransfer` through Raft. The state-machine
+        /// re-validates on apply so racing callers can't corrupt the table.
+        ///
+        /// Intended for operator-driven handover (REST/CLI) — the Row 5
+        /// Gate 2 cutover test in `docs/GATE2-ACCEPTANCE-PLAN.md §11.5` needs
+        /// a way to measure transfer latency without waiting for rebalance.
+        ///
+        /// Returns [`TransferStatus`] indicating whether the begin-transfer was
+        /// accepted, rejected, or would be a no-op. Only raises `AeonError`
+        /// for plumbing failures (Raft proposal errored, etc).
+        pub async fn propose_partition_transfer(
+            &self,
+            partition: PartitionId,
+            target: NodeId,
+        ) -> Result<TransferStatus, AeonError> {
+            if !self.is_leader().await {
+                return Ok(TransferStatus::NotLeader {
+                    current_leader: self.current_leader().await,
+                });
+            }
+
+            let source = {
+                let state = self.shared_state.read().await;
+                match state.partition_table.get(partition) {
+                    None => return Ok(TransferStatus::UnknownPartition),
+                    Some(crate::types::PartitionOwnership::Transferring { source, target: t }) => {
+                        return Ok(TransferStatus::AlreadyTransferring {
+                            source: *source,
+                            target: *t,
+                        });
+                    }
+                    Some(crate::types::PartitionOwnership::Owned(owner)) => *owner,
+                }
+            };
+
+            if source == target {
+                return Ok(TransferStatus::NoChange { owner: source });
+            }
+
+            match self
+                .propose(ClusterRequest::BeginTransfer {
+                    partition,
+                    source,
+                    target,
+                })
+                .await?
+            {
+                ClusterResponse::Ok => Ok(TransferStatus::Accepted { source, target }),
+                ClusterResponse::Error(msg) => Ok(TransferStatus::Rejected(msg)),
+                ClusterResponse::Registry(_) => Ok(TransferStatus::Rejected(
+                    "unexpected Registry response to BeginTransfer".to_string(),
+                )),
+            }
+        }
+
         /// Propose initial partition assignment via Raft.
         ///
         /// Must be called only on the leader node after election completes.
@@ -1231,6 +1292,82 @@ mod inner {
                 .await
                 .unwrap();
             assert_eq!(resp, ClusterResponse::Ok);
+
+            node.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn propose_partition_transfer_accepts_on_leader() {
+            let config = ClusterConfig::single_node(1, 4);
+            let node = ClusterNode::bootstrap_single(config).await.unwrap();
+
+            // P0 is owned by node 1 after bootstrap — transfer to node 2.
+            let status = node
+                .propose_partition_transfer(PartitionId::new(0), 2)
+                .await
+                .unwrap();
+            assert_eq!(
+                status,
+                TransferStatus::Accepted {
+                    source: 1,
+                    target: 2,
+                }
+            );
+
+            node.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn propose_partition_transfer_noop_when_target_is_owner() {
+            let config = ClusterConfig::single_node(1, 4);
+            let node = ClusterNode::bootstrap_single(config).await.unwrap();
+
+            let status = node
+                .propose_partition_transfer(PartitionId::new(0), 1)
+                .await
+                .unwrap();
+            assert_eq!(status, TransferStatus::NoChange { owner: 1 });
+
+            node.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn propose_partition_transfer_unknown_partition() {
+            let config = ClusterConfig::single_node(1, 4);
+            let node = ClusterNode::bootstrap_single(config).await.unwrap();
+
+            // Partition 99 is out of range — not in the table.
+            let status = node
+                .propose_partition_transfer(PartitionId::new(99), 2)
+                .await
+                .unwrap();
+            assert_eq!(status, TransferStatus::UnknownPartition);
+
+            node.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn propose_partition_transfer_already_transferring() {
+            let config = ClusterConfig::single_node(1, 4);
+            let node = ClusterNode::bootstrap_single(config).await.unwrap();
+
+            // First transfer goes through.
+            node.propose_partition_transfer(PartitionId::new(0), 2)
+                .await
+                .unwrap();
+
+            // Second attempt observes the in-flight transfer.
+            let status = node
+                .propose_partition_transfer(PartitionId::new(0), 3)
+                .await
+                .unwrap();
+            assert_eq!(
+                status,
+                TransferStatus::AlreadyTransferring {
+                    source: 1,
+                    target: 2,
+                }
+            );
 
             node.shutdown().await.unwrap();
         }

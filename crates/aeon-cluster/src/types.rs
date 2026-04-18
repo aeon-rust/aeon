@@ -55,6 +55,29 @@ impl FromStr for NodeAddress {
     }
 }
 
+/// Outcome of a caller-initiated partition transfer attempt.
+///
+/// Returned by [`crate::ClusterNode::propose_partition_transfer`] so REST and
+/// CLI callers can map each business-logic outcome to a distinct HTTP status
+/// or exit code without inspecting free-form error strings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransferStatus {
+    /// `BeginTransfer` was accepted and the partition is now in the
+    /// `Transferring { source, target }` state on the committed Raft log.
+    Accepted { source: NodeId, target: NodeId },
+    /// This node is not the Raft leader. Callers should retry against
+    /// `current_leader` (if present) or discover the leader via cluster status.
+    NotLeader { current_leader: Option<NodeId> },
+    /// Requested partition is not present in the partition table.
+    UnknownPartition,
+    /// The partition already has a transfer in flight.
+    AlreadyTransferring { source: NodeId, target: NodeId },
+    /// Target equals current owner — nothing to do.
+    NoChange { owner: NodeId },
+    /// The state-machine rejected the `BeginTransfer` (e.g. racy apply).
+    Rejected(String),
+}
+
 /// Raft log entry payload — what gets replicated across the cluster.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ClusterRequest {

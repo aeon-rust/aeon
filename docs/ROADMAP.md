@@ -3109,19 +3109,19 @@ logic. Both are now derived from `raft_timing` — keep-alive =
 
 **Deferred to Session A (DOKS AMS3):**
 
-- **T0 C1/C2** — blocked by (a) `MemorySourceFactory`'s
-  pre-allocate-`count × payload_size` which OOMs a 2 GiB pod at
-  10 M × 256 B, and (b) absence of a sustained Redpanda producer harness
-  wired for a rate-sweep loop. Both are ~30 min of engine work before
-  Session A.
+- **T0 C1/C2** — blocked by absence of a sustained Redpanda producer
+  harness wired for a rate-sweep loop (the `MemorySourceFactory` OOM on
+  `count × payload_size` pre-allocation is now fixed by the
+  `StreamingMemorySource` added post-Session 0). ~15 min of shell-level
+  wrapper work before Session A.
 - **Row 4 leader failover** — observed 14.4 s on Rancher Desktop (over
   the < 5 s target). Number includes WSL2 + `kubectl port-forward`
   latency; the QUIC transport fix above is expected to tighten it; native
   Linux on DOKS without port-forward will be the clean re-measurement.
-- **Row 5 two-phase cutover** — needs a REST or CLI trigger for CL-6
-  partition handover (Raft-internal today; `grep /api/v1/cluster` finds
-  only `/status`). ~30 min of engine work, reasonable first hour of
-  Session A.
+- **Row 5 two-phase cutover** — **harness shipped** (`POST
+  /api/v1/cluster/partitions/{id}/transfer` + `aeon cluster
+  transfer-partition`). The < 100 ms cutover *measurement* moves to
+  Session A where a real multi-node cluster is running.
 - **Row T5 partial split-brain** — needs `NET_ADMIN` capability on the
   pod or Chaos Mesh; better exercised on a multi-host real partition in
   Session A than on a loopback single-node.

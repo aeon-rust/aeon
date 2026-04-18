@@ -29,7 +29,7 @@ pub use snapshot::ClusterSnapshot;
 pub use types::{
     ClusterRequest, ClusterResponse, NodeAddress, NodeId, PartitionCutoverRequest,
     PartitionCutoverResponse, PartitionOwnership, PartitionTable, PartitionTransferEnd,
-    PartitionTransferRequest, PohChainTransferRequest, PohChainTransferResponse,
+    PartitionTransferRequest, PohChainTransferRequest, PohChainTransferResponse, TransferStatus,
 };
 
 #[cfg(feature = "cluster")]

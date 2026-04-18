@@ -532,14 +532,20 @@ Session A re-runs this on native Linux nodes:
 
 #### Row 5 — Two-phase partition transfer cutover
 
-*Deferred to Session A.* CL-6 partition handover (commit `807321f`) is
-implemented as a Raft-internal state-machine command; there is no REST
-API to trigger a cutover from a test harness (`grep /api/v1/cluster`
-finds only `/status`). Measuring the < 100 ms cutover target requires
-one of: a dedicated REST endpoint, a CLI subcommand, or submitting a
-synthetic Raft command via an internal test helper. That harness is
-~30 min of engine work and is a reasonable deliverable either before
-Session A or as part of Session A's first hour.
+*Harness shipped; measurement deferred to Session A.* CL-6 partition
+handover (commit `807321f`) is now operator-triggerable via:
+
+- `POST /api/v1/cluster/partitions/{partition}/transfer` with body
+  `{"target_node_id": N}` — leader-only (followers reply `409 Conflict`
+  with an `X-Leader-Id` header for retry).
+- `aeon cluster transfer-partition --partition N --target M` — wraps
+  the REST call and surfaces the leader hint on rejection.
+
+Outcomes are reported as `Accepted` / `NotLeader` / `UnknownPartition` /
+`AlreadyTransferring` / `NoChange` / `Rejected` so scripts can branch
+deterministically. The harness is covered by unit tests in
+`crates/aeon-cluster/src/node.rs`. Measuring the < 100 ms cutover target
+against the real 3-node cluster moves to Session A.
 
 #### Row 6 — PoH chain continuity
 

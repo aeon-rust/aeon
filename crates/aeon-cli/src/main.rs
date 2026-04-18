@@ -148,6 +148,14 @@ enum Commands {
         #[arg(long, default_value = "/app/artifacts")]
         artifact_dir: String,
     },
+    /// Inspect and control the Aeon cluster (Raft status, partition handover)
+    Cluster {
+        /// Aeon REST API address
+        #[arg(long, default_value_t = default_api(), global = true)]
+        api: String,
+        #[command(subcommand)]
+        action: ClusterAction,
+    },
     /// Check environment readiness (DX-2): ports, connectivity, state dir, artifacts
     Doctor {
         /// Aeon REST API address (probes /health)
@@ -303,6 +311,25 @@ enum DevAction {
 }
 
 #[derive(Subcommand)]
+enum ClusterAction {
+    /// Show cluster status: node ID, leader, partition assignments, Raft metrics
+    Status,
+    /// Initiate a partition handover from the current owner to a target node.
+    ///
+    /// Must be issued against the current Raft leader. If you hit a follower,
+    /// the server replies `409 Conflict` with an `X-Leader-Id` header pointing
+    /// to the real leader — rerun against that node.
+    TransferPartition {
+        /// Partition ID to transfer
+        #[arg(long)]
+        partition: u16,
+        /// Target node ID (the partition's new owner)
+        #[arg(long)]
+        target: u64,
+    },
+}
+
+#[derive(Subcommand)]
 enum TlsAction {
     /// Export the CA certificate (for distributing to clients)
     ExportCa {
@@ -453,6 +480,7 @@ fn run(cli: Cli) -> Result<()> {
             cmd_dev(&action)
         }
         Some(Commands::Tls { action }) => cmd_tls(&action),
+        Some(Commands::Cluster { api, action }) => cmd_cluster(&api, &action),
         #[cfg(feature = "rest-api")]
         Some(Commands::Serve { addr, artifact_dir }) => cmd_serve(&addr, &artifact_dir),
         Some(Commands::Doctor {
@@ -1447,6 +1475,51 @@ fn cmd_pipeline(api: &str, action: &PipelineAction) -> Result<()> {
                 .into_json()?;
             println!("{}", serde_json::to_string_pretty(&body)?);
             Ok(())
+        }
+    }
+}
+
+// ── aeon cluster ──────────────────────────────────────────────────────
+
+fn cmd_cluster(api: &str, action: &ClusterAction) -> Result<()> {
+    match action {
+        ClusterAction::Status => {
+            let body: serde_json::Value = ureq::get(&format!("{api}/api/v1/cluster/status"))
+                .call()
+                .context("failed to reach Aeon API")?
+                .into_json()
+                .context("invalid JSON response")?;
+            println!("{}", serde_json::to_string_pretty(&body)?);
+            Ok(())
+        }
+        ClusterAction::TransferPartition { partition, target } => {
+            let url = format!("{api}/api/v1/cluster/partitions/{partition}/transfer");
+            let payload = serde_json::json!({ "target_node_id": target });
+            // ureq raises an Err on non-2xx. Capture the response body on
+            // error so the operator sees the leader hint / rejection reason.
+            match ureq::post(&url).send_json(&payload) {
+                Ok(resp) => {
+                    let body: serde_json::Value = resp
+                        .into_json()
+                        .context("invalid JSON response from transfer-partition")?;
+                    println!("{}", serde_json::to_string_pretty(&body)?);
+                    Ok(())
+                }
+                Err(ureq::Error::Status(code, resp)) => {
+                    let leader_hint = resp
+                        .header("X-Leader-Id")
+                        .map(|s| s.to_string());
+                    let body_text = resp.into_string().unwrap_or_default();
+                    if let Some(leader_id) = leader_hint {
+                        bail!(
+                            "transfer rejected (HTTP {code}); current Raft leader is node {leader_id}\n\
+                             body: {body_text}"
+                        );
+                    }
+                    bail!("transfer rejected (HTTP {code}): {body_text}");
+                }
+                Err(e) => Err(anyhow::Error::new(e).context("failed to reach Aeon API")),
+            }
         }
     }
 }
