@@ -64,6 +64,9 @@ pub struct WireEvent {
     /// Source-system offset for checkpoint resume.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_offset: Option<i64>,
+    /// EO-2: L2 body-store sequence (push/poll sources under durability).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub l2_seq: Option<u64>,
 }
 
 /// Serde-friendly representation of `Output` for wire transport.
@@ -87,6 +90,9 @@ pub struct WireOutput {
     /// Source offset for checkpoint resume.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_offset: Option<i64>,
+    /// EO-2: L2 body-store sequence propagated from the originating Event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub l2_seq: Option<u64>,
 }
 
 // ── Conversions ─────────────────────────────────────────────────────────────
@@ -106,6 +112,7 @@ impl From<&Event> for WireEvent {
             // FT-11: Bytes clone = refcount bump, not data copy.
             payload: event.payload.clone(),
             source_offset: event.source_offset,
+            l2_seq: event.l2_seq,
         }
     }
 }
@@ -129,6 +136,7 @@ impl From<WireEvent> for Event {
             payload: wire.payload,
             source_ts: None, // Not meaningful over the wire
             source_offset: wire.source_offset,
+            l2_seq: wire.l2_seq,
         }
     }
 }
@@ -148,6 +156,7 @@ impl From<&Output> for WireOutput {
             source_event_id: output.source_event_id,
             source_partition: output.source_partition,
             source_offset: output.source_offset,
+            l2_seq: output.l2_seq,
         }
     }
 }
@@ -171,6 +180,7 @@ impl From<WireOutput> for Output {
             source_event_id: wire.source_event_id,
             source_partition: wire.source_partition,
             source_offset: wire.source_offset,
+            l2_seq: wire.l2_seq,
         }
     }
 }

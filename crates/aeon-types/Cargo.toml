@@ -22,10 +22,12 @@ serde_bytes = { workspace = true }
 serde_json = { workspace = true }
 rmp-serde = { workspace = true }
 memchr = { workspace = true }
+sha2 = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+bincode = { workspace = true }
 
 [[bench]]
 name = "uuid_bench"

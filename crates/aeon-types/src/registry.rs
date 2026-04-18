@@ -234,12 +234,12 @@ impl std::fmt::Display for ProcessorRef {
 pub struct PipelineDefinition {
     /// Pipeline name (unique identifier).
     pub name: String,
-    /// Source configuration.
-    pub source: SourceConfig,
+    /// Source configurations. At least one required.
+    pub sources: Vec<SourceConfig>,
     /// Processor reference.
     pub processor: ProcessorRef,
-    /// Sink configuration.
-    pub sink: SinkConfig,
+    /// Sink configurations. At least one required.
+    pub sinks: Vec<SinkConfig>,
     /// Upgrade strategy.
     #[serde(default)]
     pub upgrade_strategy: UpgradeStrategy,
@@ -258,6 +258,12 @@ pub struct PipelineDefinition {
     /// In-progress upgrade state (blue-green or canary). None when stable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upgrade_state: Option<UpgradeInfo>,
+    /// EO-2 durability block — drives engine-side DeliveryConfig (durability
+    /// mode, checkpoint backend, flush cadence, L2 byte cap) when the
+    /// pipeline runtime spawns. Defaults to `None` mode for backward
+    /// compatibility with pre-EO-2 serialized forms.
+    #[serde(default)]
+    pub durability: crate::manifest::DurabilityBlock,
 }
 
 impl PipelineDefinition {
@@ -271,9 +277,9 @@ impl PipelineDefinition {
     ) -> Self {
         Self {
             name: name.into(),
-            source,
+            sources: vec![source],
             processor,
-            sink,
+            sinks: vec![sink],
             upgrade_strategy: UpgradeStrategy::default(),
             state: PipelineState::Created,
             created_at: now,
@@ -281,6 +287,7 @@ impl PipelineDefinition {
             assigned_node: None,
             transport_codec: crate::transport_codec::TransportCodec::default(),
             upgrade_state: None,
+            durability: crate::manifest::DurabilityBlock::default(),
         }
     }
 }

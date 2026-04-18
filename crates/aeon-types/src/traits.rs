@@ -12,6 +12,37 @@ use crate::processor_transport::{ProcessorHealth, ProcessorInfo};
 use std::future::Future;
 use std::pin::Pin;
 
+/// Classification of how a source obtains events from its upstream.
+///
+/// Drives downstream decisions about event-body durability (EO-2):
+/// `Pull` sources have a durable replay position upstream (broker offset,
+/// CDC LSN, file byte offset) so Aeon does not persist event bodies to L2.
+/// `Push` and `Poll` sources have no durable upstream position and require
+/// L2 persistence when `durability != none`.
+///
+/// See `docs/EO-2-DURABILITY-DESIGN.md` §3 for the full source-kind matrix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceKind {
+    /// Aeon polls; upstream has a durable replay position.
+    /// Examples: Kafka, Redis Streams, Postgres/MySQL/Mongo CDC, file.
+    /// Identity: deterministic UUIDv7 from `(source, partition, offset)`.
+    /// L2 write: skipped — broker is buffer of record.
+    Pull,
+
+    /// Upstream pushes events; Aeon cannot pause the wire directly.
+    /// Examples: WebSocket, WebTransport, webhook, MQTT, RabbitMQ push, QUIC.
+    /// Identity: random UUIDv7 with sub-ms monotonic counter.
+    /// L2 write: required when `durability != none`.
+    Push,
+
+    /// Aeon polls but upstream has no durable replay position.
+    /// Examples: HTTP polling of REST endpoints, DNS poll, time-sampled sources.
+    /// Identity: config-driven (cursor / etag / content_hash / compound).
+    /// L2 write: required when `durability != none`.
+    Poll,
+}
+
 /// Event ingestion source. Batch-first: returns `Vec<Event>` per poll.
 ///
 /// Pull sources call the external system inside `next_batch()`.
@@ -23,6 +54,32 @@ pub trait Source: Send + Sync {
     fn next_batch(
         &mut self,
     ) -> impl std::future::Future<Output = Result<Vec<Event>, AeonError>> + Send;
+
+    /// Declare how this source obtains events — drives EO-2 L2 write decisions.
+    ///
+    /// Default: `SourceKind::Pull`. Override in push and poll connectors so the
+    /// pipeline runner enables L2 event-body persistence for them when
+    /// `durability != none`. Pull sources never write L2 regardless.
+    ///
+    /// **Forgetting to override in a push connector is a silent data-loss bug
+    /// under `durability != none`.** Every push/poll connector must override.
+    fn source_kind(&self) -> SourceKind {
+        SourceKind::Pull
+    }
+
+    /// Declare whether this source can supply an upstream-native timestamp
+    /// for every event (Kafka record ts, CDC commit ts, file mtime, …).
+    ///
+    /// EO-2 P2: if the pipeline's `event_time` config is `Broker` but the
+    /// connector returns `false` here, the pipeline **fails at start** —
+    /// no silent fallback to `AeonIngest`. See
+    /// `docs/EO-2-DURABILITY-DESIGN.md` §4.4.
+    ///
+    /// Default: `false`. Connectors that always carry an upstream timestamp
+    /// must override to `true`.
+    fn supports_broker_event_time(&self) -> bool {
+        false
+    }
 
     /// Pause the source — stop producing new events.
     ///
@@ -43,6 +100,20 @@ pub trait Source: Send + Sync {
     /// Default: no-op (matches the default no-op pause).
     fn resume(&mut self) -> impl std::future::Future<Output = ()> + Send {
         async {}
+    }
+
+    /// EO-2 P5: apply a recovery plan derived from the last persisted
+    /// checkpoint at pipeline start. `pull_offsets` carries per-partition
+    /// upstream offsets (for `Seekable`-style pull connectors like Kafka);
+    /// `replay_from_l2_seq` is the min-across-sinks ack cursor to replay
+    /// from for push/poll connectors that know how to iterate the L2 body
+    /// store. Default: no-op — connectors opt in by overriding.
+    fn on_recovery_plan(
+        &mut self,
+        _pull_offsets: &std::collections::HashMap<crate::partition::PartitionId, i64>,
+        _replay_from_l2_seq: u64,
+    ) -> impl std::future::Future<Output = Result<(), AeonError>> + Send {
+        async { Ok(()) }
     }
 }
 
