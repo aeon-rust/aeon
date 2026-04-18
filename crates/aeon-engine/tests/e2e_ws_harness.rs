@@ -109,6 +109,9 @@ pub async fn start_ws_test_server(pipeline_name: &str) -> WsTestServer {
     let state = Arc::new(AppState {
         registry: Arc::new(ProcessorRegistry::new(&dir).unwrap()),
         pipelines: Arc::new(PipelineManager::new()),
+        supervisor: Arc::new(aeon_engine::PipelineSupervisor::new(Arc::new(
+            aeon_engine::ConnectorRegistry::new(),
+        ))),
         delivery_ledgers: dashmap::DashMap::new(),
         pipeline_controls: dashmap::DashMap::new(),
         pipeline_metrics: dashmap::DashMap::new(),

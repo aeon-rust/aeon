@@ -39,7 +39,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"], option
 dashmap = { workspace = true, optional = true }
 notify = { workspace = true, optional = true }
 aeon-wasm = { workspace = true, optional = true }
-aeon-connectors = { workspace = true, optional = true }
+aeon-connectors = { workspace = true, optional = true, features = ["kafka"] }
 uuid = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
 aeon-cluster = { workspace = true, features = ["auto-tls"], optional = true }

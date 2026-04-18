@@ -54,6 +54,7 @@ use crate::delivery_ledger::DeliveryLedger;
 use crate::identity_store::ProcessorIdentityStore;
 use crate::pipeline::PipelineControl;
 use crate::pipeline_manager::PipelineManager;
+use crate::pipeline_supervisor::PipelineSupervisor;
 use crate::registry::ProcessorRegistry;
 
 /// Maximum request body size (10 MB).
@@ -63,6 +64,11 @@ const MAX_REQUEST_BODY_BYTES: usize = 10 * 1024 * 1024;
 pub struct AppState {
     pub registry: Arc<ProcessorRegistry>,
     pub pipelines: Arc<PipelineManager>,
+    /// Bridge from `PipelineManager`'s declarative state to actually-running
+    /// tokio tasks. Handlers for `/start` and `/stop` consult this *after*
+    /// updating the manager (or after the Raft commit in cluster mode) so
+    /// that the process converges on what the manifest declares.
+    pub supervisor: Arc<PipelineSupervisor>,
     /// Per-pipeline delivery ledgers (pipeline_name → ledger).
     /// Populated when pipelines run with delivery tracking enabled.
     pub delivery_ledgers: dashmap::DashMap<String, Arc<DeliveryLedger>>,
@@ -780,6 +786,9 @@ async fn start_pipeline(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
+    // Cluster path: go through Raft. The supervisor side-effect runs in
+    // `ClusterRegistryApplier::apply` after the commit lands on every node,
+    // so there's nothing for this handler to do beyond proposing.
     #[cfg(feature = "cluster")]
     if let Some(node) = state.cluster_node.as_ref() {
         let cmd = aeon_types::RegistryCommand::SetPipelineState {
@@ -796,8 +805,29 @@ async fn start_pipeline(
         };
     }
 
-    match state.pipelines.start(&name, "api").await {
-        Ok(()) => Json(serde_json::json!({"status": "started"})).into_response(),
+    // Standalone path: flip the declarative state, then ask the supervisor
+    // to spin up the real runtime task. Install the returned control /
+    // metrics handles into AppState so the existing upgrade / metrics
+    // endpoints can find them by pipeline name.
+    if let Err(e) = state.pipelines.start(&name, "api").await {
+        return api_error(StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+    let def = match state.pipelines.get(&name).await {
+        Some(d) => d,
+        None => {
+            return api_error(
+                StatusCode::NOT_FOUND,
+                format!("pipeline '{name}' not found after start"),
+            )
+            .into_response();
+        }
+    };
+    match state.supervisor.start(&def).await {
+        Ok((control, metrics)) => {
+            state.pipeline_controls.insert(name.clone(), control);
+            state.pipeline_metrics.insert(name.clone(), metrics);
+            Json(serde_json::json!({"status": "started"})).into_response()
+        }
         Err(e) => api_error(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     }
 }
@@ -822,10 +852,15 @@ async fn stop_pipeline(
         };
     }
 
-    match state.pipelines.stop(&name, "api").await {
-        Ok(()) => Json(serde_json::json!({"status": "stopped"})).into_response(),
-        Err(e) => api_error(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    if let Err(e) = state.pipelines.stop(&name, "api").await {
+        return api_error(StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
+    if let Err(e) = state.supervisor.stop(&name).await {
+        tracing::warn!(pipeline = %name, error = %e, "supervisor stop returned error");
+    }
+    state.pipeline_controls.remove(&name);
+    state.pipeline_metrics.remove(&name);
+    Json(serde_json::json!({"status": "stopped"})).into_response()
 }
 
 #[derive(Deserialize)]
@@ -1680,11 +1715,64 @@ async fn pipeline_tail(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connector_registry::{
+        ConnectorRegistry, DynSink, DynSource, SinkFactory, SourceFactory,
+    };
     use aeon_types::registry::{PipelineDefinition, ProcessorRef, SinkConfig, SourceConfig};
+    use aeon_types::{AeonError, BatchResult, Event, Output, Sink, Source};
     use axum::body::Body;
     use axum::http::Request;
     use std::collections::BTreeMap;
     use tower::ServiceExt;
+
+    /// Stub source that immediately returns empty (the pipeline exits on its
+    /// own). Lets `supervisor.start()` succeed in REST lifecycle tests that
+    /// only care about state transitions, not actual data flow.
+    struct StubSource;
+    impl Source for StubSource {
+        async fn next_batch(&mut self) -> Result<Vec<Event>, AeonError> {
+            Ok(vec![])
+        }
+    }
+    struct StubSourceFactory;
+    impl SourceFactory for StubSourceFactory {
+        fn build(&self, _cfg: &SourceConfig) -> Result<Box<dyn DynSource>, AeonError> {
+            Ok(Box::new(StubSource))
+        }
+    }
+
+    struct StubSink;
+    impl Sink for StubSink {
+        async fn write_batch(
+            &mut self,
+            outputs: Vec<Output>,
+        ) -> Result<BatchResult, AeonError> {
+            Ok(BatchResult::all_delivered(
+                outputs.iter().map(|_| uuid::Uuid::nil()).collect(),
+            ))
+        }
+        async fn flush(&mut self) -> Result<(), AeonError> {
+            Ok(())
+        }
+    }
+    struct StubSinkFactory;
+    impl SinkFactory for StubSinkFactory {
+        fn build(&self, _cfg: &SinkConfig) -> Result<Box<dyn DynSink>, AeonError> {
+            Ok(Box::new(StubSink))
+        }
+    }
+
+    /// Build a `PipelineSupervisor` pre-registered with stub factories for
+    /// the connector names the REST tests declare in their fixtures
+    /// (currently `kafka`). Extend here if tests start referencing other
+    /// source/sink types — the stubs only need to satisfy the lifecycle,
+    /// not the data path.
+    fn test_supervisor() -> Arc<PipelineSupervisor> {
+        let mut reg = ConnectorRegistry::new();
+        reg.register_source("kafka", Arc::new(StubSourceFactory));
+        reg.register_sink("kafka", Arc::new(StubSinkFactory));
+        Arc::new(PipelineSupervisor::new(Arc::new(reg)))
+    }
 
     fn test_state() -> Arc<AppState> {
         let dir = std::env::temp_dir().join(format!(
@@ -1697,6 +1785,7 @@ mod tests {
         Arc::new(AppState {
             registry: Arc::new(ProcessorRegistry::new(&dir).unwrap()),
             pipelines: Arc::new(PipelineManager::new()),
+            supervisor: test_supervisor(),
             delivery_ledgers: dashmap::DashMap::new(),
             pipeline_controls: dashmap::DashMap::new(),
             pipeline_metrics: dashmap::DashMap::new(),
@@ -1737,6 +1826,7 @@ mod tests {
         Arc::new(AppState {
             registry: Arc::new(ProcessorRegistry::new(&dir).unwrap()),
             pipelines: Arc::new(PipelineManager::new()),
+            supervisor: test_supervisor(),
             delivery_ledgers: dashmap::DashMap::new(),
             pipeline_controls: dashmap::DashMap::new(),
             pipeline_metrics: dashmap::DashMap::new(),
@@ -1823,6 +1913,7 @@ mod tests {
         let state = Arc::new(AppState {
             registry: base.registry.clone(),
             pipelines: base.pipelines.clone(),
+            supervisor: base.supervisor.clone(),
             delivery_ledgers: dashmap::DashMap::new(),
             pipeline_controls: dashmap::DashMap::new(),
             pipeline_metrics: dashmap::DashMap::new(),
@@ -2443,8 +2534,8 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
 
         let p = state.pipelines.get("reconf-src-api").await.unwrap();
-        assert_eq!(p.source.topic.as_deref(), Some("new-input"));
-        assert_eq!(p.source.partitions, vec![0, 1, 2]);
+        assert_eq!(p.sources[0].topic.as_deref(), Some("new-input"));
+        assert_eq!(p.sources[0].partitions, vec![0, 1, 2]);
     }
 
     #[tokio::test]
@@ -2467,7 +2558,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
 
         let p = state.pipelines.get("reconf-sink-api").await.unwrap();
-        assert_eq!(p.sink.topic.as_deref(), Some("new-output"));
+        assert_eq!(p.sinks[0].topic.as_deref(), Some("new-output"));
     }
 
     #[tokio::test]

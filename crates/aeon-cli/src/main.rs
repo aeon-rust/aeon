@@ -3,6 +3,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[cfg(feature = "rest-api")]
+mod connectors;
+
 /// Default REST API address for CLI commands.
 /// Overridable via `AEON_API_URL` environment variable (12-Factor Config).
 fn default_api() -> String {
@@ -494,6 +497,16 @@ fn cmd_serve(addr: &str, artifact_dir: &str) -> Result<()> {
         let pipelines = Arc::new(aeon_engine::pipeline_manager::PipelineManager::new());
         let identities = Arc::new(aeon_engine::identity_store::ProcessorIdentityStore::new());
 
+        // Build the ConnectorRegistry and register every default connector
+        // factory this binary ships with (memory / kafka sources and
+        // blackhole / stdout / kafka sinks). The supervisor then drives
+        // running tokio tasks off that registry — both through the REST
+        // start/stop path and through Raft-committed SetPipelineState.
+        let mut connectors = aeon_engine::ConnectorRegistry::new();
+        crate::connectors::register_defaults(&mut connectors);
+        let connectors = Arc::new(connectors);
+        let supervisor = Arc::new(aeon_engine::PipelineSupervisor::new(Arc::clone(&connectors)));
+
         // Cluster initialization — detect K8s environment
         let cluster_enabled = std::env::var("AEON_CLUSTER_ENABLED")
             .map(|v| v.to_lowercase() == "true")
@@ -545,9 +558,10 @@ fn cmd_serve(addr: &str, artifact_dir: &str) -> Result<()> {
                     // pipelines created via REST on one node would replicate but
                     // never take effect on follower replicas.
                     node.install_registry_applier(Arc::new(
-                        aeon_engine::ClusterRegistryApplier::new(
+                        aeon_engine::ClusterRegistryApplier::with_supervisor(
                             Arc::clone(&registry),
                             Arc::clone(&pipelines),
+                            Arc::clone(&supervisor),
                         ),
                     ))
                     .await;
@@ -619,6 +633,7 @@ fn cmd_serve(addr: &str, artifact_dir: &str) -> Result<()> {
         let state = Arc::new(aeon_engine::AppState {
             registry,
             pipelines,
+            supervisor,
             delivery_ledgers: dashmap::DashMap::new(),
             pipeline_controls: dashmap::DashMap::new(),
             pipeline_metrics: dashmap::DashMap::new(),
@@ -1741,7 +1756,7 @@ fn cmd_verify(target: &str, api: &str) -> Result<()> {
 #[derive(serde::Serialize, serde::Deserialize, Default)]
 struct Manifest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pipelines: Vec<serde_json::Value>,
+    pipelines: Vec<aeon_types::manifest::PipelineManifest>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     identities: Vec<ManifestIdentity>,
 }
@@ -1767,6 +1782,16 @@ fn default_pipelines_all() -> String {
 
 fn default_max_instances() -> u32 {
     1
+}
+
+/// Export-only manifest shape. Uses opaque JSON for pipelines since the server
+/// returns `PipelineDefinition`, not `PipelineManifest`.
+#[derive(serde::Serialize)]
+struct ExportManifest {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pipelines: Vec<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    identities: Vec<ManifestIdentity>,
 }
 
 /// Maximum YAML manifest size (1 MB) to prevent resource exhaustion (OWASP A04).
@@ -1803,21 +1828,46 @@ fn cmd_apply(file: &Path, api: &str, dry_run: bool) -> Result<()> {
         .filter_map(|p| p["name"].as_str().map(String::from))
         .collect();
 
-    for pipeline_def in &manifest.pipelines {
-        let name = pipeline_def["name"].as_str().unwrap_or("<unnamed>");
+    for pipeline_manifest in &manifest.pipelines {
+        let name = &pipeline_manifest.name;
+
+        // EO-2 P6: validate manifest shape before sending to the API.
+        aeon_types::manifest::validate_pipeline_shape(pipeline_manifest)
+            .with_context(|| format!("validation failed for pipeline '{name}'"))?;
+
+        for source in &pipeline_manifest.sources {
+            aeon_types::manifest::validate_source_shape(
+                &source.name,
+                source.kind,
+                &source.identity,
+                &source.event_time,
+                // Conservative: assume no broker-ts support at the CLI layer.
+                // The engine will re-validate with the actual connector at start.
+                source.kind == aeon_types::SourceKind::Pull,
+            )
+            .with_context(|| {
+                format!("source '{}' validation failed in pipeline '{name}'", source.name)
+            })?;
+        }
+
+        let pipeline_def = pipeline_manifest.to_pipeline_definition();
         let exists = existing_names.contains(&name.to_string());
 
         if dry_run {
             if exists {
                 println!("[dry-run] pipeline '{name}' — already exists (skip)");
             } else {
-                println!("[dry-run] pipeline '{name}' — would create");
+                println!(
+                    "[dry-run] pipeline '{name}' — would create ({} source(s), {} sink(s))",
+                    pipeline_manifest.sources.len(),
+                    pipeline_manifest.sinks.len(),
+                );
             }
         } else if exists {
             println!("pipeline '{name}' — already exists (skip)");
         } else {
             ureq::post(&format!("{api}/api/v1/pipelines"))
-                .send_json(pipeline_def)
+                .send_json(&pipeline_def)
                 .with_context(|| format!("failed to create pipeline '{name}'"))?;
             println!("pipeline '{name}' — created");
         }
@@ -1948,11 +1998,11 @@ fn cmd_export(file: Option<&Path>, api: &str) -> Result<()> {
         }
     }
 
-    let manifest = Manifest {
+    let export = ExportManifest {
         pipelines: full_pipelines,
         identities,
     };
-    let yaml = serde_yaml::to_string(&manifest).context("failed to serialize manifest")?;
+    let yaml = serde_yaml::to_string(&export).context("failed to serialize manifest")?;
 
     match file {
         Some(path) => {
@@ -1984,7 +2034,7 @@ fn cmd_diff(file: &Path, api: &str) -> Result<()> {
     let manifest_names: Vec<String> = manifest
         .pipelines
         .iter()
-        .filter_map(|p| p["name"].as_str().map(String::from))
+        .map(|p| p.name.clone())
         .collect();
 
     let mut changes = false;
@@ -2712,7 +2762,9 @@ fn check_manifest(path: &Path) -> (CheckResult, Vec<PathBuf>) {
 
     let mut artifacts: Vec<PathBuf> = Vec::new();
     for pipeline in &manifest.pipelines {
-        collect_artifact_paths(pipeline, &mut artifacts);
+        if let Ok(v) = serde_json::to_value(pipeline) {
+            collect_artifact_paths(&v, &mut artifacts);
+        }
     }
 
     let detail = format!(
