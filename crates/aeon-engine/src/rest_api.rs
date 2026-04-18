@@ -412,11 +412,17 @@ async fn metrics_prometheus(State(state): State<Arc<AppState>>) -> impl IntoResp
 
     let mut out = String::with_capacity(4096);
 
+    // Single source of truth: the supervisor knows what's actually running
+    // on this node regardless of whether start() came from the REST handler
+    // or the Raft applier. (Previously this read from AppState.pipeline_metrics,
+    // which was only populated by the REST path — cluster-mode pipelines
+    // started via Raft had no Prometheus samples.)
+    let pipelines = state.supervisor.metrics_snapshot().await;
+
     // Per-pipeline aggregates
     out.push_str("# HELP aeon_pipeline_events_received_total Events received by a pipeline's source\n");
     out.push_str("# TYPE aeon_pipeline_events_received_total counter\n");
-    for entry in state.pipeline_metrics.iter() {
-        let (name, m) = (entry.key(), entry.value());
+    for (name, m) in &pipelines {
         out.push_str(&format!(
             "aeon_pipeline_events_received_total{{pipeline=\"{name}\"}} {}\n",
             m.events_received.load(Ordering::Relaxed)
@@ -425,8 +431,7 @@ async fn metrics_prometheus(State(state): State<Arc<AppState>>) -> impl IntoResp
 
     out.push_str("# HELP aeon_pipeline_events_processed_total Events processed by a pipeline's processor\n");
     out.push_str("# TYPE aeon_pipeline_events_processed_total counter\n");
-    for entry in state.pipeline_metrics.iter() {
-        let (name, m) = (entry.key(), entry.value());
+    for (name, m) in &pipelines {
         out.push_str(&format!(
             "aeon_pipeline_events_processed_total{{pipeline=\"{name}\"}} {}\n",
             m.events_processed.load(Ordering::Relaxed)
@@ -435,8 +440,7 @@ async fn metrics_prometheus(State(state): State<Arc<AppState>>) -> impl IntoResp
 
     out.push_str("# HELP aeon_pipeline_outputs_sent_total Outputs delivered by a pipeline's sink\n");
     out.push_str("# TYPE aeon_pipeline_outputs_sent_total counter\n");
-    for entry in state.pipeline_metrics.iter() {
-        let (name, m) = (entry.key(), entry.value());
+    for (name, m) in &pipelines {
         out.push_str(&format!(
             "aeon_pipeline_outputs_sent_total{{pipeline=\"{name}\"}} {}\n",
             m.outputs_sent.load(Ordering::Relaxed)
@@ -445,8 +449,7 @@ async fn metrics_prometheus(State(state): State<Arc<AppState>>) -> impl IntoResp
 
     out.push_str("# HELP aeon_pipeline_events_failed_total Events permanently failed (retry-exhausted or skip-to-dlq)\n");
     out.push_str("# TYPE aeon_pipeline_events_failed_total counter\n");
-    for entry in state.pipeline_metrics.iter() {
-        let (name, m) = (entry.key(), entry.value());
+    for (name, m) in &pipelines {
         out.push_str(&format!(
             "aeon_pipeline_events_failed_total{{pipeline=\"{name}\"}} {}\n",
             m.events_failed.load(Ordering::Relaxed)
@@ -455,8 +458,7 @@ async fn metrics_prometheus(State(state): State<Arc<AppState>>) -> impl IntoResp
 
     out.push_str("# HELP aeon_pipeline_events_retried_total Individual retry attempts\n");
     out.push_str("# TYPE aeon_pipeline_events_retried_total counter\n");
-    for entry in state.pipeline_metrics.iter() {
-        let (name, m) = (entry.key(), entry.value());
+    for (name, m) in &pipelines {
         out.push_str(&format!(
             "aeon_pipeline_events_retried_total{{pipeline=\"{name}\"}} {}\n",
             m.events_retried.load(Ordering::Relaxed)
@@ -465,8 +467,7 @@ async fn metrics_prometheus(State(state): State<Arc<AppState>>) -> impl IntoResp
 
     out.push_str("# HELP aeon_pipeline_checkpoints_written_total Checkpoint records appended\n");
     out.push_str("# TYPE aeon_pipeline_checkpoints_written_total counter\n");
-    for entry in state.pipeline_metrics.iter() {
-        let (name, m) = (entry.key(), entry.value());
+    for (name, m) in &pipelines {
         out.push_str(&format!(
             "aeon_pipeline_checkpoints_written_total{{pipeline=\"{name}\"}} {}\n",
             m.checkpoints_written.load(Ordering::Relaxed)
@@ -475,8 +476,7 @@ async fn metrics_prometheus(State(state): State<Arc<AppState>>) -> impl IntoResp
 
     out.push_str("# HELP aeon_pipeline_poh_entries_total PoH chain entries appended (per batch)\n");
     out.push_str("# TYPE aeon_pipeline_poh_entries_total counter\n");
-    for entry in state.pipeline_metrics.iter() {
-        let (name, m) = (entry.key(), entry.value());
+    for (name, m) in &pipelines {
         out.push_str(&format!(
             "aeon_pipeline_poh_entries_total{{pipeline=\"{name}\"}} {}\n",
             m.poh_entries.load(Ordering::Relaxed)
@@ -1864,7 +1864,10 @@ mod tests {
         m.events_processed.store(1200, Ordering::Relaxed);
         m.outputs_sent.store(1180, Ordering::Relaxed);
         m.events_failed.store(7, Ordering::Relaxed);
-        state.pipeline_metrics.insert("demo".into(), m);
+        state
+            .supervisor
+            .insert_metrics_for_test("demo", Arc::clone(&m))
+            .await;
 
         let app = api_router(state);
         let resp = app
@@ -1932,7 +1935,10 @@ mod tests {
         // Touch a pipeline metric so the pipeline section is non-empty too.
         let m = Arc::new(crate::pipeline::PipelineMetrics::new());
         m.events_received.store(5, Ordering::Relaxed);
-        state.pipeline_metrics.insert("demo".into(), m);
+        state
+            .supervisor
+            .insert_metrics_for_test("demo", Arc::clone(&m))
+            .await;
 
         let app = api_router(state);
         let resp = app

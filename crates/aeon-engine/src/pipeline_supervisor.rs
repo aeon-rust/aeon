@@ -252,6 +252,37 @@ impl PipelineSupervisor {
         }
         Ok(())
     }
+
+    /// Snapshot of every running pipeline's metrics handle. The Prometheus
+    /// `/metrics` handler iterates this to expose per-pipeline counters for
+    /// pipelines started through either the REST path or the Raft applier —
+    /// the supervisor is the single source of truth for "what's actually
+    /// running on this node", so metrics discovery piggybacks on it.
+    pub async fn metrics_snapshot(&self) -> Vec<(String, Arc<PipelineMetrics>)> {
+        let running = self.running.lock().await;
+        running
+            .iter()
+            .map(|(name, entry)| (name.clone(), Arc::clone(&entry.metrics)))
+            .collect()
+    }
+
+    /// Test helper — seed a metrics handle under `name` without spinning up a
+    /// pipeline task. Lets rest_api tests exercise the `/metrics` handler
+    /// without standing up real source/sink plumbing.
+    #[cfg(test)]
+    pub(crate) async fn insert_metrics_for_test(
+        &self,
+        name: impl Into<String>,
+        metrics: Arc<PipelineMetrics>,
+    ) {
+        let entry = Arc::new(RunningPipeline {
+            handle: Mutex::new(None),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            control: PipelineControl::new(),
+            metrics,
+        });
+        self.running.lock().await.insert(name.into(), entry);
+    }
 }
 
 fn build_processor(
