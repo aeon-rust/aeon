@@ -219,6 +219,21 @@ If you see frequent leadership changes without actual node failures,
 move up to `prod_recommended`. Only use `flaky_network` if your latency
 distribution has multi-second tails.
 
+#### QUIC transport timeouts (derived from `raft_timing`)
+
+The Raft-layer timing above drives two QUIC-level knobs on every
+inter-node connection. Operators don't set these directly — they're
+derived automatically — but knowing the values matters when reading
+QUIC metrics or diagnosing stale connections:
+
+| QUIC knob | Value | Why |
+|-----------|-------|-----|
+| `keep_alive_interval` | `heartbeat_ms` (500 ms default) | Forces PING frames at the Raft heartbeat cadence so a silently-gone peer is noticed at the transport layer, not only via openraft's heartbeat-miss. |
+| `max_idle_timeout` | `2 × election_max_ms` (6 s default, 12 s prod, 24 s flaky) | Closes orphaned connections after a peer crashes. Sized well above the election window so normal traffic never trips it. |
+
+Raising `election_max_ms` automatically widens the idle-timeout, so the
+three presets scale together — there's no separate QUIC knob to forget.
+
 ### Connection retry and backoff — layering
 
 Aeon uses connection-retry with exponential backoff + jitter
