@@ -1,0 +1,51 @@
+# cert-manager bootstrap: self-signed -> CA -> CA ClusterIssuer
+# Apply AFTER `helm install cert-manager jetstack/cert-manager`.
+#
+# Usage:
+#   kubectl apply -f cert-manager-install.yaml
+#   kubectl wait --for=condition=Ready clusterissuer/aeon-internal-ca --timeout=120s
+#
+# After this, the `aeon-internal-ca` ClusterIssuer can sign certs for
+# Aeon inter-node mTLS. The signed root CA lives in the secret
+# `aeon-ca-key-pair` in namespace `cert-manager`.
+
+---
+# Bootstrap self-signed issuer — used only to sign the internal CA below.
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: selfsigned-bootstrap
+spec:
+  selfSigned: {}
+
+---
+# The internal CA certificate itself. Self-signed root for Aeon mTLS.
+# 10-year validity — Gate 2 cluster is ephemeral, we don't care about rotation.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: aeon-ca
+  namespace: cert-manager
+spec:
+  isCA: true
+  commonName: aeon-internal-ca
+  secretName: aeon-ca-key-pair
+  duration: 87600h          # 10 years
+  renewBefore: 8760h        # 1 year — irrelevant for ephemeral cluster
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  issuerRef:
+    name: selfsigned-bootstrap
+    kind: ClusterIssuer
+    group: cert-manager.io
+
+---
+# The working ClusterIssuer Aeon certs actually reference.
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: aeon-internal-ca
+spec:
+  ca:
+    secretName: aeon-ca-key-pair

@@ -44,6 +44,7 @@ COPY crates/aeon-processor-client/Cargo.toml crates/aeon-processor-client/Cargo.
 COPY crates/aeon-cli/Cargo.toml crates/aeon-cli/Cargo.toml
 COPY samples/processors/rust-native/Cargo.toml samples/processors/rust-native/Cargo.toml
 COPY samples/e2e-pipeline/Cargo.toml samples/e2e-pipeline/Cargo.toml
+COPY xtask/Cargo.toml xtask/Cargo.toml
 
 # Create stub lib.rs/main.rs for dependency pre-build (Docker layer caching)
 RUN mkdir -p crates/aeon-types/src && echo "pub fn stub(){}" > crates/aeon-types/src/lib.rs && \
@@ -61,7 +62,8 @@ RUN mkdir -p crates/aeon-types/src && echo "pub fn stub(){}" > crates/aeon-types
     mkdir -p crates/aeon-cli/src && echo "fn main(){}" > crates/aeon-cli/src/main.rs && \
     mkdir -p samples/processors/rust-native/src && echo "pub fn stub(){}" > samples/processors/rust-native/src/lib.rs && \
     mkdir -p samples/e2e-pipeline/src && echo "fn main(){}" > samples/e2e-pipeline/src/pipeline.rs && \
-    echo "fn main(){}" > samples/e2e-pipeline/src/producer.rs
+    echo "fn main(){}" > samples/e2e-pipeline/src/producer.rs && \
+    mkdir -p xtask/src && echo "fn main(){}" > xtask/src/main.rs
 
 # Pre-build dependencies (cached layer — only re-runs when Cargo.toml/lock changes)
 ARG PROFILE=release
@@ -71,6 +73,7 @@ RUN cargo build --profile ${PROFILE} -p aeon-cli --features rest-api 2>/dev/null
 COPY crates/ crates/
 COPY samples/processors/rust-native/ samples/processors/rust-native/
 COPY samples/e2e-pipeline/ samples/e2e-pipeline/
+COPY xtask/ xtask/
 
 # Touch source files to invalidate cache for real build
 RUN find crates/ samples/ -name "*.rs" -exec touch {} +

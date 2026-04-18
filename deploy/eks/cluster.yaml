@@ -1,0 +1,99 @@
+# eksctl cluster config — Session B (AWS EKS ceiling run)
+# Usage: eksctl create cluster -f cluster.yaml
+#
+# Single-AZ pinned to us-east-1a so cross-AZ transfer ($0.01/GB each way)
+# doesn't contaminate throughput numbers.
+
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: aeon-gate2-b
+  region: us-east-1
+  version: "1.31"
+  tags:
+    project: aeon
+    session: gate2-b
+    auto-teardown: weekend
+
+availabilityZones: [us-east-1a, us-east-1b]  # 2 required for control plane; workers all in 1a
+
+vpc:
+  cidr: 10.42.0.0/16
+  nat:
+    gateway: Disable   # no internet egress from workers; cluster is ephemeral
+
+iam:
+  withOIDC: true
+
+managedNodeGroups:
+  # Aeon pool — 8 vCPU, 64 GiB, local NVMe, 18.75 Gbps
+  # CPU pinning enabled here (cpu-manager-policy=static) — the only
+  # thing EKS offers that DOKS cannot.
+  - name: aeon-pool
+    instanceType: i4i.2xlarge
+    availabilityZones: [us-east-1a]
+    desiredCapacity: 3
+    minSize: 3
+    maxSize: 5              # T2-equivalent scale test on EKS (optional)
+    volumeSize: 50          # EBS root only; Redpanda uses local NVMe
+    labels:
+      workload: aeon
+    taints:
+      - key: workload
+        value: aeon
+        effect: NoSchedule
+    # Kubelet config for CPU pinning (Guaranteed QoS pods with integer
+    # CPU requests get exclusive cores).
+    kubeletExtraConfig:
+      cpuManagerPolicy: static
+      kubeReserved:
+        cpu: "250m"
+        memory: "1Gi"
+      systemReserved:
+        cpu: "250m"
+        memory: "1Gi"
+      evictionHard:
+        memory.available: "200Mi"
+    tags:
+      project: aeon
+      pool: aeon
+
+  # Redpanda pool — 12 vCPU, 96 GiB, 7.5 TB NVMe, 25 Gbps
+  - name: redpanda-pool
+    instanceType: i3en.3xlarge
+    availabilityZones: [us-east-1a]
+    desiredCapacity: 3
+    minSize: 3
+    maxSize: 3
+    volumeSize: 50
+    labels:
+      workload: redpanda
+    taints:
+      - key: workload
+        value: redpanda
+        effect: NoSchedule
+    tags:
+      project: aeon
+      pool: redpanda
+
+  # Default pool — loadgen, Prometheus, Chaos Mesh
+  - name: default-pool
+    instanceType: m7i.xlarge
+    availabilityZones: [us-east-1a]
+    desiredCapacity: 1
+    minSize: 1
+    maxSize: 1
+    volumeSize: 30
+    tags:
+      project: aeon
+      pool: default
+
+addons:
+  - name: vpc-cni
+  - name: coredns
+  - name: kube-proxy
+
+cloudWatch:
+  clusterLogging:
+    enableTypes: ["audit", "authenticator"]   # minimal logging; cost-conscious
