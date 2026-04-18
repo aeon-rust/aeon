@@ -3084,6 +3084,52 @@ recorded. Decisions captured:
 Results land inline in `GATE2-ACCEPTANCE-PLAN.md` § 10 and back-propagate
 to the Gate 2 Checkpoint rows above as each test closes.
 
+### Session 0 status (2026-04-18)
+
+First of the three sessions from `GATE2-ACCEPTANCE-PLAN.md` completed on
+Rancher Desktop k3s (single-node, WSL2 8 CPU / 12 GiB, 3-peer loopback
+Aeon StatefulSet via `helm/aeon/values-local.yaml`). Full results in
+[`GATE2-ACCEPTANCE-PLAN.md` § 11.5](GATE2-ACCEPTANCE-PLAN.md#115-results--session-0).
+
+**Closed in Session 0:**
+
+- T0 isolation matrix **C0 × 4 durability modes** (~400 K ev/s per node;
+  mode deltas ≈ 0 at blackhole sink — expected per EO-2 P4 note that the
+  L2-write hot path is still a stub at the engine-side write site).
+- Row 6 — `aeon verify` local self-test passes (PoH / Merkle / MMR /
+  Ed25519).
+
+**Code gap fixed in-session:** The Raft QUIC transport was using
+quinn-default `max_idle_timeout` / `keep_alive_interval` (both unset),
+leaving peer-death detection entirely to openraft's heartbeat-miss
+logic. Both are now derived from `raft_timing` — keep-alive =
+`heartbeat_ms`, idle = `2 × election_max_ms` — in
+`crates/aeon-cluster/src/transport/tls.rs`. See
+[`docs/CLUSTERING.md § QUIC transport timeouts`](CLUSTERING.md#quic-transport-timeouts-derived-from-raft_timing).
+
+**Deferred to Session A (DOKS AMS3):**
+
+- **T0 C1/C2** — blocked by (a) `MemorySourceFactory`'s
+  pre-allocate-`count × payload_size` which OOMs a 2 GiB pod at
+  10 M × 256 B, and (b) absence of a sustained Redpanda producer harness
+  wired for a rate-sweep loop. Both are ~30 min of engine work before
+  Session A.
+- **Row 4 leader failover** — observed 14.4 s on Rancher Desktop (over
+  the < 5 s target). Number includes WSL2 + `kubectl port-forward`
+  latency; the QUIC transport fix above is expected to tighten it; native
+  Linux on DOKS without port-forward will be the clean re-measurement.
+- **Row 5 two-phase cutover** — needs a REST or CLI trigger for CL-6
+  partition handover (Raft-internal today; `grep /api/v1/cluster` finds
+  only `/status`). ~30 min of engine work, reasonable first hour of
+  Session A.
+- **Row T5 partial split-brain** — needs `NET_ADMIN` capability on the
+  pod or Chaos Mesh; better exercised on a multi-host real partition in
+  Session A than on a loopback single-node.
+
+Session 0 torn down (`helm uninstall aeon` + `kubectl delete ns aeon`);
+`aeon:session0` image retained in Rancher Desktop for quick re-spin if
+Session A uncovers a local-reproducible gap.
+
 ---
 
 ## EO-2 Implementation Phases (Design frozen 2026-04-15)

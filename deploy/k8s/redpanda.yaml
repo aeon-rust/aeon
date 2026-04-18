@@ -63,21 +63,24 @@ spec:
       containers:
         - name: redpanda
           image: docker.redpanda.com/redpandadata/redpanda:v24.2.12
-          command:
-            - redpanda
-            - start
-            - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092
-            - --advertise-kafka-addr internal://redpanda:9092,external://localhost:31092
-            - --pandaproxy-addr 0.0.0.0:8082
-            - --advertise-pandaproxy-addr redpanda:8082
-            - --schema-registry-addr 0.0.0.0:8081
-            - --advertise-schema-registry-addr redpanda:8081
-            - --rpc-addr 0.0.0.0:33145
-            - --advertise-rpc-addr redpanda:33145
-            - --mode dev-container
-            - --smp 2
-            - --memory 1G
-            - --default-log-level=warn
+          command: [/usr/bin/rpk, redpanda, start]
+          args:
+            - --kafka-addr
+            - internal://0.0.0.0:9092,external://0.0.0.0:19092
+            - --advertise-kafka-addr
+            - internal://redpanda:9092,external://localhost:31092
+            - --rpc-addr
+            - 0.0.0.0:33145
+            - --advertise-rpc-addr
+            - redpanda:33145
+            - --mode
+            - dev-container
+            - --smp
+            - "2"
+            - --memory
+            - 1G
+            - --default-log-level
+            - warn
           ports:
             - containerPort: 9092
               name: kafka
@@ -131,7 +134,7 @@ spec:
           command: ["bash", "-c"]
           args:
             - |
-              until rpk cluster health --brokers redpanda:9092 2>/dev/null; do
+              until rpk -X admin.hosts=redpanda:9644 cluster health 2>/dev/null | grep -q "Healthy:                          true"; do
                 echo "Waiting for Redpanda..."
                 sleep 3
               done
@@ -141,7 +144,7 @@ spec:
           command: ["bash", "-c"]
           args:
             - |
-              rpk topic create aeon-bench-source -p 16 --brokers redpanda:9092 && \
-              rpk topic create aeon-bench-sink -p 16 --brokers redpanda:9092 && \
-              rpk topic create aeon-dlq -p 4 --brokers redpanda:9092 && \
+              rpk -X brokers=redpanda:9092 topic create aeon-bench-source -p 16 && \
+              rpk -X brokers=redpanda:9092 topic create aeon-bench-sink -p 16 && \
+              rpk -X brokers=redpanda:9092 topic create aeon-dlq -p 4 && \
               echo "Topics created successfully"

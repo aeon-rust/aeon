@@ -430,7 +430,153 @@ Session 0 is "done" when:
 
 ### 11.5 Results — Session 0
 
-*(Empty until Session 0 runs.)*
+**Date:** 2026-04-18
+**Cluster:** Rancher Desktop k3s v1.34.6+k3s1, single-node (WSL2 8 CPU / 12 GiB).
+3-peer Aeon StatefulSet (image `aeon:session0` = commit `4d05b02`, helm
+values `helm/aeon/values-local.yaml`), Redpanda single-broker
+(`--smp 2 --memory 1G`), all three Aeon pods co-located on the one node
+with loopback inter-pod Raft over the headless service.
+
+#### T0 — Isolation matrix (partial)
+
+Scope attempted: C0 × 4 durability modes (4 cells / 12). C1 and C2 not
+run — see "Blockers" below.
+
+| Cell | Events | Elapsed (adj.) | Per-node rate |
+|------|--------|----------------|---------------|
+| C0 · None            | 1,000,000 | 2,441 ms | **409,668 ev/s** |
+| C0 · UnorderedBatch  | 1,000,000 | 2,462 ms | **406,173 ev/s** |
+| C0 · OrderedBatch    | 1,000,000 | 2,430 ms | **411,522 ev/s** |
+| C0 · PerEvent        | 1,000,000 | 2,477 ms | **403,714 ev/s** |
+
+Payload 256 B, batch 1024, identity processor, blackhole sink.
+Per-node — each of the 3 pods runs an independent memory source, so
+aggregate across the cluster is ~1.22 M ev/s at this size.
+
+**Finding — durability mode deltas ≈ 0 at C0.** All four modes land
+within 2% of each other. Two likely explanations, either of which is a
+Session 0 output worth recording:
+
+1. The EO-2 L2-write hot path (`l2_body`, fsync cadence, sink ack
+   sequence tracking) is still a stub at the engine-side write site.
+   `ROADMAP.md` puts the real write path at EO-2 P4 ("body store + ack
+   seq + flush cadence"), and §44 of `crates/aeon-engine/src/l2_body.rs`
+   explicitly flags the full hot-path as deferred to P4.
+2. Even once wired, a blackhole sink does no network I/O and the L2
+   write is asynchronous wrt the sink ack, so mode deltas may only
+   materialize once a real sink is in the topology.
+
+Interpretation per the plan's §4 rules: this *does not* invalidate the
+12-cell matrix — C1/C2 were designed to expose sink-side durability
+cost, which C0 cannot reach by construction. The C0 row stands as
+"engine-internal ceiling, mode-agnostic at 256 B / blackhole".
+
+**Blockers — why C1/C2 were not run in this session:**
+
+- `MemorySourceFactory` pre-allocates `count × payload_size` bytes up
+  front. 10 M × 256 B OOM-killed the 2 GiB-limit pods. 1 M runs
+  complete in ~3 s, so the 3-minute sustained sweep the plan asks for
+  cannot be done against the current memory source without either
+  raising pod memory or making the source looping/unbounded. A looping
+  mode is ~30 min of engine work but was out of scope for Session 0.
+- C1/C2 also need a sustained Redpanda-side producer harness; the
+  `aeon-e2e-pipeline` sample `aeon-producer` binary exists but was not
+  wired into a rate-sweep loop here. That and the looping memory source
+  are the two pieces to add before Session A re-runs the full matrix on
+  isolated hardware.
+
+#### Row 4 — Leader failover
+
+**Observed: 14.4 s elected-new-leader latency. Target: < 5 s.**
+
+Procedure: `kubectl delete pod aeon-1 --force --grace-period=0` while aeon-1
+was leader (node_id=2, term=3). Polled `/api/v1/cluster/status` on aeon-0
+and aeon-2 every ~100 ms; detected new leader when either non-leader's
+`raft.state == "Leader"` or any `leader_id` differed from the killed
+node_id. Result: aeon-2 elected (node_id=3, term=4) at t = 14,361 ms.
+
+One prior attempt against aeon-2 with default `kubectl delete` (30 s
+grace period) timed out at 20 s because the terminating pod kept sending
+Raft heartbeats over QUIC until the container was actually SIGKILLed —
+not a failure mode that represents a real crash. Re-ran with
+`--force --grace-period=0` for a clean SIGKILL; 14.4 s result is from
+that run.
+
+**Why it's 3× the target:**
+
+- Raft timing is at the local-profile defaults
+  (`crates/aeon-cluster/src/config.rs`): heartbeat 500 ms, election
+  window 1500–3000 ms. Expected convergence upper bound ≈ 4 s.
+- The QUIC transport (`crates/aeon-cluster`) does not set a `max_idle_timeout`
+  or `keep_alive_interval` — grep returns zero hits. On peer SIGKILL, the
+  surviving peers rely on Raft's application-level heartbeat-miss detection
+  rather than any transport-level failure signal, which is strictly
+  correct but slower than it needs to be.
+- WSL2 + Windows + `kubectl port-forward` adds latency on every poll
+  (observed ≈ 1 s per poll cycle during the election window, likely from
+  the PF reconnecting when the leader pod it was forwarded to vanished).
+  This inflates the *observed* convergence time above the *actual* Raft
+  convergence.
+
+**Ship or not:** does not block v0.1 acceptance by itself — the cluster
+does converge and partitions remain intact. Flag two follow-ups before
+Session A re-runs this on native Linux nodes:
+
+1. Set `max_idle_timeout` and `keep_alive_interval` on the Raft QUIC
+   transport so peer death is detected at the transport layer, not only
+   via application-level heartbeat miss.
+2. Re-measure on DOKS AMS3 where native Linux + no port-forward removes
+   the WSL2/PF latency floor. If the number stays > 5 s on DOKS, tune
+   `election_min_ms/election_max_ms` down for the local profile (the
+   `wan` profile can keep its wider window).
+
+#### Row 5 — Two-phase partition transfer cutover
+
+*Deferred to Session A.* CL-6 partition handover (commit `807321f`) is
+implemented as a Raft-internal state-machine command; there is no REST
+API to trigger a cutover from a test harness (`grep /api/v1/cluster`
+finds only `/status`). Measuring the < 100 ms cutover target requires
+one of: a dedicated REST endpoint, a CLI subcommand, or submitting a
+synthetic Raft command via an internal test helper. That harness is
+~30 min of engine work and is a reasonable deliverable either before
+Session A or as part of Session A's first hour.
+
+#### Row 6 — PoH chain continuity
+
+**Local self-test passes.** `aeon verify` (run inside aeon-0 pod):
+
+```
+Local module validation:
+  PoH chain:    OK (seq=2, hash=262e949946badafb..)
+  Merkle tree:  OK (root=1f9f2378f6273830..)
+  MMR:          OK (leaves=3, root=16e06e6ffd375049..)
+  Ed25519 sign: OK (pubkey=ffeb71e8b07c934d..)
+```
+
+The subcommand is marked `(placeholder)` in `--help` and today only
+exercises the crypto primitives, not the cluster-wide per-partition PoH
+chain across a transfer. Continuity across a real handover needs to be
+re-checked in Session A once Row 5's cutover harness is in place.
+
+#### Row T5 — Partial split-brain
+
+*Deferred to Session A.* Requires privileged `iptables -A INPUT`
+execution inside an Aeon pod; the `helm/aeon/values-local.yaml` pods
+run with the default unprivileged `securityContext`. Adding
+`capabilities: { add: [ NET_ADMIN ] }` just for this test is feasible
+but the Raft quorum-refuse code path is better exercised on a real
+multi-host split in Session A where a host-level firewall rule (or
+Chaos Mesh `NetworkChaos`) genuinely isolates a node without requiring
+privileged sidecars.
+
+#### Session 0 tear-down status
+
+*Ready for tear-down.* All rows closable in Session 0 are recorded
+above; remaining rows (5, T5, + any re-run of Row 4 on native Linux)
+are explicitly deferred to Session A. Tear-down action: `helm
+uninstall aeon -n aeon && kubectl delete ns aeon`; image
+`aeon:session0` can stay in Rancher Desktop for quick re-load if a
+Session 0 re-run is needed.
 
 ---
 
