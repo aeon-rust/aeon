@@ -4,7 +4,8 @@
 //! `DeliveryStrategy`, `BatchFailurePolicy`, and `DeliverySemantics` live in `aeon-types`
 //! (sinks need them); everything else is engine-internal.
 
-use aeon_types::{BatchFailurePolicy, DeliverySemantics, DeliveryStrategy};
+use aeon_types::{BatchFailurePolicy, DeliverySemantics, DeliveryStrategy, DurabilityMode};
+use std::path::PathBuf;
 use std::time::Duration;
 
 /// Controls when the pipeline flushes pending outputs to the sink.
@@ -69,11 +70,6 @@ pub enum CheckpointBackend {
     /// Best for: when L2/L3 tiers are already active.
     StateStore,
 
-    /// Write checkpoints to a Kafka/Redpanda compacted topic.
-    /// Survives node loss (replicated). ~1-5ms per checkpoint.
-    /// Best for: multi-node clusters.
-    Kafka,
-
     /// No persistence. Checkpoints exist only in memory.
     /// Best for: dev/test, stateless processors where replay is acceptable.
     None,
@@ -104,6 +100,31 @@ impl Default for CheckpointConfig {
     }
 }
 
+/// EO-2 L2 event-body store configuration.
+///
+/// Only consulted when `DeliveryConfig::durability != None` and the pipeline
+/// contains at least one push or poll source. Pull-only pipelines ignore this
+/// block entirely.
+#[derive(Debug, Clone)]
+pub struct L2BodyStoreConfig {
+    /// Root directory under which per-pipeline per-partition segment files
+    /// are written: `{root}/{pipeline}/p{partition:05}/{start_seq:020}.l2b`.
+    /// `None` means use the system temp dir (dev-only default).
+    pub root: Option<PathBuf>,
+
+    /// Rollover threshold in bytes. Default: 256 MiB.
+    pub segment_bytes: u64,
+}
+
+impl Default for L2BodyStoreConfig {
+    fn default() -> Self {
+        Self {
+            root: None,
+            segment_bytes: 256 * 1024 * 1024,
+        }
+    }
+}
+
 /// Complete delivery configuration for a pipeline.
 ///
 /// Controls delivery strategy, failure policy, delivery guarantees, flush timing,
@@ -125,6 +146,13 @@ pub struct DeliveryConfig {
 
     /// Checkpoint persistence backend and retention.
     pub checkpoint: CheckpointConfig,
+
+    /// EO-2: event-body durability level. Default: `None` (backwards-compatible).
+    pub durability: DurabilityMode,
+
+    /// EO-2: L2 event-body store configuration. Only consulted when
+    /// `durability != None` and a push/poll source is present.
+    pub l2_body: L2BodyStoreConfig,
 
     /// Maximum number of retries per event before routing to DLQ.
     /// Only used with `RetryFailed` and `SkipToDlq` policies.
@@ -156,6 +184,8 @@ impl DeliveryConfig {
             },
             max_retries: 0,
             retry_backoff: Duration::ZERO,
+            durability: DurabilityMode::None,
+            l2_body: L2BodyStoreConfig::default(),
         }
     }
 }
@@ -207,7 +237,7 @@ mod tests {
     #[test]
     fn checkpoint_backend_variants() {
         assert_eq!(CheckpointBackend::default(), CheckpointBackend::Wal);
-        assert_ne!(CheckpointBackend::Kafka, CheckpointBackend::None);
+        assert_ne!(CheckpointBackend::StateStore, CheckpointBackend::None);
         assert_ne!(CheckpointBackend::StateStore, CheckpointBackend::Wal);
     }
 
@@ -224,18 +254,20 @@ mod tests {
                 ..Default::default()
             },
             checkpoint: CheckpointConfig {
-                backend: CheckpointBackend::Kafka,
+                backend: CheckpointBackend::StateStore,
                 retention: Duration::from_secs(3600),
                 dir: None,
             },
             max_retries: 5,
             retry_backoff: Duration::from_millis(200),
+            durability: DurabilityMode::None,
+            l2_body: L2BodyStoreConfig::default(),
         };
         assert_eq!(config.strategy, DeliveryStrategy::OrderedBatch);
         assert_eq!(config.semantics, DeliverySemantics::ExactlyOnce);
         assert_eq!(config.failure_policy, BatchFailurePolicy::FailBatch);
         assert!(config.flush.adaptive);
-        assert_eq!(config.checkpoint.backend, CheckpointBackend::Kafka);
+        assert_eq!(config.checkpoint.backend, CheckpointBackend::StateStore);
         assert_eq!(config.max_retries, 5);
     }
 

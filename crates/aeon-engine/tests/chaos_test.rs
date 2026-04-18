@@ -109,6 +109,7 @@ impl Processor for FaultyProcessor {
             source_event_id: Some(event.id),
             source_partition: Some(event.partition),
             source_offset: None,
+            l2_seq: None,
         }])
     }
 

@@ -222,6 +222,7 @@ fn deserialize_outputs(data: &[u8], source_event: &Event) -> Result<Vec<Output>,
             source_event_id: Some(source_event.id),
             source_partition: Some(source_event.partition),
             source_offset: None,
+            l2_seq: source_event.l2_seq,
         });
     }
 

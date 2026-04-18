@@ -530,7 +530,11 @@ impl PipelineManager {
             });
         }
 
-        let old_type = pipeline.source.source_type.clone();
+        let old_type = pipeline
+            .sources
+            .first()
+            .map(|s| s.source_type.clone())
+            .unwrap_or_default();
         if new_source.source_type != old_type {
             return Err(AeonError::Config {
                 message: format!(
@@ -541,7 +545,11 @@ impl PipelineManager {
             });
         }
 
-        pipeline.source = new_source;
+        if let Some(first) = pipeline.sources.first_mut() {
+            *first = new_source;
+        } else {
+            pipeline.sources.push(new_source);
+        }
         pipeline.updated_at = now_millis();
 
         // Drop lock before recording history (needs write lock on history)
@@ -584,7 +592,11 @@ impl PipelineManager {
             });
         }
 
-        let old_type = pipeline.sink.sink_type.clone();
+        let old_type = pipeline
+            .sinks
+            .first()
+            .map(|s| s.sink_type.clone())
+            .unwrap_or_default();
         if new_sink.sink_type != old_type {
             return Err(AeonError::Config {
                 message: format!(
@@ -595,7 +607,11 @@ impl PipelineManager {
             });
         }
 
-        pipeline.sink = new_sink;
+        if let Some(first) = pipeline.sinks.first_mut() {
+            *first = new_sink;
+        } else {
+            pipeline.sinks.push(new_sink);
+        }
         pipeline.updated_at = now_millis();
 
         // Drop lock before recording history (needs write lock on history)
@@ -1157,8 +1173,8 @@ mod tests {
             .unwrap();
 
         let p = mgr.get("reconf-src").await.unwrap();
-        assert_eq!(p.source.topic.as_deref(), Some("new-input-topic"));
-        assert_eq!(p.source.partitions, vec![0, 1, 2, 3]);
+        assert_eq!(p.sources[0].topic.as_deref(), Some("new-input-topic"));
+        assert_eq!(p.sources[0].partitions, vec![0, 1, 2, 3]);
         assert_eq!(p.state, PipelineState::Running);
     }
 
@@ -1214,7 +1230,7 @@ mod tests {
             .unwrap();
 
         let p = mgr.get("reconf-sink").await.unwrap();
-        assert_eq!(p.sink.topic.as_deref(), Some("new-output-topic"));
+        assert_eq!(p.sinks[0].topic.as_deref(), Some("new-output-topic"));
         assert_eq!(p.state, PipelineState::Running);
     }
 

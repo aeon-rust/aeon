@@ -56,6 +56,7 @@ dependencies = [
  "aeon-state",
  "aeon-types",
  "bincode",
+ "bytes",
  "dashmap",
  "openraft",
  "quinn",
@@ -190,6 +191,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "wtransport",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -280,6 +282,7 @@ dependencies = [
 name = "aeon-types"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "bytes",
  "criterion",
  "memchr",
@@ -288,6 +291,7 @@ dependencies = [
  "serde",
  "serde_bytes",
  "serde_json",
+ "sha2 0.10.9",
  "smallvec",
  "thiserror 2.0.18",
  "tokio",
@@ -7984,6 +7988,12 @@ dependencies = [
 [[package]]
 name = "xtask"
 version = "0.0.0"
+
+[[package]]
+name = "xxhash-rust"
+version = "0.8.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fdd20c5420375476fbd4394763288da7eb0cc0b8c11deed431a91562af7335d3"
 
 [[package]]
 name = "yasna"

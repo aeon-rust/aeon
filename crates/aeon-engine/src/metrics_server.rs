@@ -14,12 +14,15 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 pub struct MetricsConfig {
     /// TLS certificate expiry (seconds since epoch). 0 = not configured.
     pub tls_cert_expiry_secs: std::sync::atomic::AtomicI64,
+    /// EO-2 P8: optional registry spliced into `/metrics` output when set.
+    pub eo2_metrics: Option<Arc<crate::eo2_metrics::Eo2Metrics>>,
 }
 
 impl MetricsConfig {
     pub fn new() -> Self {
         Self {
             tls_cert_expiry_secs: std::sync::atomic::AtomicI64::new(0),
+            eo2_metrics: None,
         }
     }
 }
@@ -64,6 +67,10 @@ fn format_prometheus(metrics: &PipelineMetrics, config: &MetricsConfig) -> Strin
              # TYPE aeon_tls_cert_days_remaining gauge\n\
              aeon_tls_cert_days_remaining {days_remaining}\n"
         ));
+    }
+
+    if let Some(eo2) = config.eo2_metrics.as_ref() {
+        out.push_str(&eo2.render_prometheus());
     }
 
     out
