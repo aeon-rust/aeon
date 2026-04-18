@@ -3066,6 +3066,24 @@ What is **not** shipped, grouped by whether the task still earns its slot:
 
 **Direction decision is the user's call. This pause is intentional — do not auto-proceed.**
 
+### Direction decided 2026-04-18 — see [`GATE2-ACCEPTANCE-PLAN.md`](GATE2-ACCEPTANCE-PLAN.md)
+
+Same-day DOKS quick-validation session on a newly provisioned cluster with
+adequate node sizes and local-NVMe storage for Redpanda. Bottleneck
+isolation matrix (Memory/Redpanda × Blackhole/Redpanda, all four
+`DurabilityMode` values) runs before any Gate 2 throughput number is
+recorded. Decisions captured:
+
+- **CL-6c.4** → **defer** (transport primitive CL-6c.1/2/3 ships alone; engine-side integration on incident evidence).
+- **CL-1** Gate 2 throughput rows → **invest** (new DOKS cluster, local NVMe for Redpanda).
+- **CL-5** → **park** on demand signal.
+- **Split-brain drill** → **v0.1 blocker**, ran via Chaos Mesh in same session.
+- **Multi-broker sustained load** → **quick 10-min run** today; multi-day soak is a separate future session.
+- **CPU pinning validation** → **parked for DOKS only**; revisit on AWS EKS post-v0.1 (DOKS kubelet lacks `cpu-manager-policy=static`).
+
+Results land inline in `GATE2-ACCEPTANCE-PLAN.md` § 10 and back-propagate
+to the Gate 2 Checkpoint rows above as each test closes.
+
 ---
 
 ## EO-2 Implementation Phases (Design frozen 2026-04-15)
