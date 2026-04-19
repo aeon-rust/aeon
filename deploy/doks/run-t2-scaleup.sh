@@ -176,7 +176,7 @@ spec:
       nodeSelector: { workload: monitoring }
       containers:
         - name: producer
-          image: registry.digitalocean.com/rust-proxy-registry/aeon:session-a-prep
+          image: registry.digitalocean.com/rust-proxy-registry/aeon:70c68b3
           imagePullPolicy: IfNotPresent
           command: ["aeon-producer"]
           args:
@@ -189,7 +189,7 @@ spec:
             - "--rate"
             - "$RATE"
       imagePullSecrets:
-        - name: rust-proxy-registry
+        - name: registry-rust-proxy-registry
 EOF
   log "producer Job '$PRODUCER_JOB' submitted (rate=$RATE count=$TOTAL)"
   kubectl -n loadgen wait --for=condition=Ready pod \

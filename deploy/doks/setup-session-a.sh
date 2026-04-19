@@ -75,10 +75,36 @@ step 1 "doctl kubeconfig for '$CLUSTER'"
 doctl kubernetes cluster kubeconfig save "$CLUSTER" >/dev/null
 kubectl cluster-info >/dev/null
 
-# ── 2. label default pool ──────────────────────────────────────────────
+# ── 2. label pools ─────────────────────────────────────────────────────
 
-step 2 "label default pool workload=monitoring"
-kubectl label nodes -l doks.digitalocean.com/node-pool=default \
+step 2 "label pools workload={aeon,redpanda,monitoring}"
+# DOKS auto-generates pool names (e.g. pool-psmexo05w) unless explicitly
+# named, so identify pools by droplet size per GATE2-ACCEPTANCE-PLAN.md §3.
+# Allow explicit overrides via env (pool IDs from `doctl k8s cluster
+# node-pool list`).
+pool_id_by_size() {
+  doctl kubernetes cluster node-pool list "$CLUSTER" \
+    --format ID,Size --no-header \
+    | awk -v s="$1" '$2 == s { print $1; exit }'
+}
+
+AEON_POOL_ID="${AEON_POOL_ID:-$(pool_id_by_size g-8vcpu-32gb)}"
+REDPANDA_POOL_ID="${REDPANDA_POOL_ID:-$(pool_id_by_size so1_5-4vcpu-32gb)}"
+MONITORING_POOL_ID="${MONITORING_POOL_ID:-$(pool_id_by_size s-4vcpu-8gb)}"
+
+for var in AEON_POOL_ID REDPANDA_POOL_ID MONITORING_POOL_ID; do
+  if [[ -z "${!var}" ]]; then
+    echo "error: could not auto-discover $var — set it explicitly." >&2
+    exit 1
+  fi
+done
+
+log "pools: aeon=$AEON_POOL_ID  redpanda=$REDPANDA_POOL_ID  monitoring=$MONITORING_POOL_ID"
+kubectl label nodes -l "doks.digitalocean.com/node-pool-id=$AEON_POOL_ID" \
+  workload=aeon --overwrite >/dev/null
+kubectl label nodes -l "doks.digitalocean.com/node-pool-id=$REDPANDA_POOL_ID" \
+  workload=redpanda --overwrite >/dev/null
+kubectl label nodes -l "doks.digitalocean.com/node-pool-id=$MONITORING_POOL_ID" \
   workload=monitoring --overwrite >/dev/null
 
 # ── 3. cert-manager chart ──────────────────────────────────────────────
@@ -131,6 +157,11 @@ log "topics created (aeon-source, aeon-sink, 24 partitions each)"
 step 7 "apply shared/aeon-certificate.yaml"
 # aeon namespace must exist before Certificate can be created in it.
 kubectl create namespace aeon --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+# DOCR pull secret — DOKS integrates the registry but only provisions the
+# secret in the default namespace, so copy it into `aeon`. Idempotent via
+# `apply`. Chart references imagePullSecret name registry-rust-proxy-registry
+# (the doctl-generated name, which prefixes registry-<registry-name>).
+doctl registry kubernetes-manifest --namespace aeon 2>/dev/null | kubectl apply -f - >/dev/null
 kubectl apply -f "$SHARED/aeon-certificate.yaml" >/dev/null
 kubectl -n aeon wait --for=condition=Ready certificate/aeon-tls \
   --timeout=120s >/dev/null

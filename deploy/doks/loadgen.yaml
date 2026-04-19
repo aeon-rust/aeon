@@ -17,12 +17,12 @@ spec:
     workload: monitoring
   containers:
     - name: aeon
-      image: registry.digitalocean.com/rust-proxy-registry/aeon:session-a-prep
+      image: registry.digitalocean.com/rust-proxy-registry/aeon:70c68b3
       imagePullPolicy: Always
       command: ["sleep", "infinity"]
       resources:
         requests: { cpu: "500m", memory: "256Mi" }
         limits:   { cpu: "2", memory: "1Gi" }
   imagePullSecrets:
-    - name: rust-proxy-registry
+    - name: registry-rust-proxy-registry
   restartPolicy: Never
