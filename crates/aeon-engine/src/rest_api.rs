@@ -359,21 +359,45 @@ async fn shutdown_signal(state: Arc<AppState>) {
     tracing::warn!("shutdown signal received — beginning graceful drain");
     state.shutting_down.store(true, Ordering::Relaxed);
 
-    // Let K8s observe /ready=503 and remove us from the service endpoints
-    // before we tear down sources. Without this delay, kube-proxy / iptables
-    // can still route new connections to us for a few seconds after the pod
-    // is marked Terminating.
+    // G14 — relinquish Raft leadership in parallel with endpoint propagation.
+    // If this pod is the leader, disabling heartbeats lets followers
+    // election-timeout and pick a new leader while we're still alive to
+    // answer their RPCs. Running it concurrently with `AEON_PRESTOP_DELAY_SECS`
+    // means the handoff mostly hides inside the window K8s needs to propagate
+    // the /ready=503 flip through kube-proxy.
     let prestop = std::env::var("AEON_PRESTOP_DELAY_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(5);
-    if prestop > 0 {
-        tracing::info!(
-            secs = prestop,
-            "waiting for endpoint propagation before stopping pipelines"
-        );
-        tokio::time::sleep(std::time::Duration::from_secs(prestop)).await;
-    }
+
+    let relinquish = async {
+        #[cfg(feature = "cluster")]
+        {
+            if let Some(node) = &state.cluster_node {
+                let budget = std::time::Duration::from_millis(
+                    std::env::var("AEON_LEADER_RELINQUISH_MS")
+                        .ok()
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .unwrap_or(4_000),
+                );
+                if let Err(e) = node.relinquish_leadership(budget).await {
+                    tracing::warn!(error = %e, "leader relinquish failed — proceeding with shutdown anyway");
+                }
+            }
+        }
+    };
+
+    let prestop_sleep = async {
+        if prestop > 0 {
+            tracing::info!(
+                secs = prestop,
+                "waiting for endpoint propagation before stopping pipelines"
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(prestop)).await;
+        }
+    };
+
+    tokio::join!(relinquish, prestop_sleep);
 
     // Stop every running pipeline. PipelineSupervisor::stop flips the
     // per-pipeline shutdown flag, awaits the task handle, and lets the
@@ -477,6 +501,49 @@ struct ApiError {
 
 fn api_error(status: StatusCode, msg: impl Into<String>) -> impl IntoResponse {
     (status, Json(ApiError { error: msg.into() }))
+}
+
+/// G9 — auto-forward cluster-write requests from a follower to the Raft leader.
+///
+/// Returns `Some(307 Temporary Redirect)` when this pod is not the current
+/// leader and the leader's REST URL can be derived; the caller should
+/// short-circuit the handler and return this response. Returns `None`
+/// when this pod IS the leader (proceed locally), or when auto-forward
+/// is not configured / leader is unknown (fall through to the existing
+/// `NotLeader`-style error path).
+///
+/// Always emits `X-Leader-Node-Id` when a leader is known, so scripted
+/// clients that don't follow 307 can still route themselves without
+/// parsing redirect URLs.
+#[cfg(feature = "cluster")]
+fn maybe_forward_to_leader(
+    state: &Arc<AppState>,
+    uri: &axum::http::Uri,
+) -> Option<axum::response::Response> {
+    let node = state.cluster_node.as_ref()?;
+    let path_and_query = uri
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or_else(|| uri.path());
+    let location = node.leader_rest_url(path_and_query)?;
+
+    let leader_id = node
+        .raft()
+        .metrics()
+        .borrow()
+        .current_leader
+        .unwrap_or_default();
+
+    let mut resp = axum::response::Response::builder()
+        .status(StatusCode::TEMPORARY_REDIRECT)
+        .header(axum::http::header::LOCATION, &location)
+        .header("X-Leader-Node-Id", leader_id.to_string())
+        .body(axum::body::Body::empty())
+        .ok()?;
+    // Don't let a UTF-8 oddity in the host silently drop the redirect.
+    resp.headers_mut()
+        .insert("X-Aeon-Forwarded", HeaderValue::from_static("1"));
+    Some(resp)
 }
 
 #[derive(Serialize)]
@@ -711,6 +778,7 @@ struct TransferPartitionBody {
 async fn transfer_partition(
     State(state): State<Arc<AppState>>,
     Path(partition): Path<u16>,
+    #[cfg_attr(not(feature = "cluster"), allow(unused))] uri: axum::http::Uri,
     Json(body): Json<TransferPartitionBody>,
 ) -> axum::response::Response {
     #[cfg(feature = "cluster")]
@@ -722,6 +790,9 @@ async fn transfer_partition(
             )
             .into_response();
         };
+        if let Some(resp) = maybe_forward_to_leader(&state, &uri) {
+            return resp;
+        }
 
         let pid = aeon_types::PartitionId::new(partition);
         let status = match node
@@ -792,7 +863,7 @@ async fn transfer_partition(
     }
     #[cfg(not(feature = "cluster"))]
     {
-        let _ = (state, partition, body);
+        let _ = (state, partition, body, uri);
         api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "cluster feature not enabled in this build",
@@ -820,15 +891,19 @@ struct DrainBody {
 /// retry against the real leader (mirrors `transfer_partition`).
 async fn cluster_drain(
     State(state): State<Arc<AppState>>,
+    #[cfg_attr(not(feature = "cluster"), allow(unused))] uri: axum::http::Uri,
     Json(body): Json<DrainBody>,
 ) -> axum::response::Response {
     #[cfg(feature = "cluster")]
     {
+        if let Some(resp) = maybe_forward_to_leader(&state, &uri) {
+            return resp;
+        }
         cluster_bulk_transfer(&state, BulkPlan::Drain(body.node_id)).await
     }
     #[cfg(not(feature = "cluster"))]
     {
-        let _ = (state, body);
+        let _ = (state, body, uri);
         api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "cluster feature not enabled in this build",
@@ -840,14 +915,20 @@ async fn cluster_drain(
 /// Operator-triggered rebalance: redistribute partitions evenly across all
 /// live cluster members. Used after T2 (scale-up) to push load onto the
 /// freshly-joined nodes.
-async fn cluster_rebalance(State(state): State<Arc<AppState>>) -> axum::response::Response {
+async fn cluster_rebalance(
+    State(state): State<Arc<AppState>>,
+    #[cfg_attr(not(feature = "cluster"), allow(unused))] uri: axum::http::Uri,
+) -> axum::response::Response {
     #[cfg(feature = "cluster")]
     {
+        if let Some(resp) = maybe_forward_to_leader(&state, &uri) {
+            return resp;
+        }
         cluster_bulk_transfer(&state, BulkPlan::Rebalance).await
     }
     #[cfg(not(feature = "cluster"))]
     {
-        let _ = state;
+        let _ = (state, uri);
         api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "cluster feature not enabled in this build",
@@ -1068,6 +1149,7 @@ struct RegisterProcessorRequest {
 
 async fn register_processor(
     State(state): State<Arc<AppState>>,
+    #[cfg_attr(not(feature = "cluster"), allow(unused))] uri: axum::http::Uri,
     Json(req): Json<RegisterProcessorRequest>,
 ) -> impl IntoResponse {
     let cmd = aeon_types::registry::RegistryCommand::RegisterProcessor {
@@ -1080,6 +1162,9 @@ async fn register_processor(
     // registry observes the new processor version.
     #[cfg(feature = "cluster")]
     if let Some(node) = state.cluster_node.as_ref() {
+        if let Some(resp) = maybe_forward_to_leader(&state, &uri) {
+            return resp;
+        }
         return match node.propose_registry(cmd).await {
             Ok(aeon_types::RegistryResponse::ProcessorRegistered { name, version }) => (
                 StatusCode::CREATED,
@@ -1193,6 +1278,7 @@ struct CreatePipelineRequest {
 
 async fn create_pipeline(
     State(state): State<Arc<AppState>>,
+    #[cfg_attr(not(feature = "cluster"), allow(unused))] uri: axum::http::Uri,
     Json(req): Json<CreatePipelineRequest>,
 ) -> impl IntoResponse {
     if let Err(e) = validate_resource_name(&req.definition.name, "pipeline") {
@@ -1204,6 +1290,9 @@ async fn create_pipeline(
     // registered `ClusterRegistryApplier` after the log entry commits.
     #[cfg(feature = "cluster")]
     if let Some(node) = state.cluster_node.as_ref() {
+        if let Some(resp) = maybe_forward_to_leader(&state, &uri) {
+            return resp;
+        }
         let cmd = aeon_types::RegistryCommand::CreatePipeline {
             definition: Box::new(req.definition),
         };
@@ -1251,12 +1340,16 @@ async fn get_pipeline(
 async fn start_pipeline(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
+    #[cfg_attr(not(feature = "cluster"), allow(unused))] uri: axum::http::Uri,
 ) -> impl IntoResponse {
     // Cluster path: go through Raft. The supervisor side-effect runs in
     // `ClusterRegistryApplier::apply` after the commit lands on every node,
     // so there's nothing for this handler to do beyond proposing.
     #[cfg(feature = "cluster")]
     if let Some(node) = state.cluster_node.as_ref() {
+        if let Some(resp) = maybe_forward_to_leader(&state, &uri) {
+            return resp;
+        }
         let cmd = aeon_types::RegistryCommand::SetPipelineState {
             name: name.clone(),
             state: aeon_types::registry::PipelineState::Running,
@@ -1301,9 +1394,13 @@ async fn start_pipeline(
 async fn stop_pipeline(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
+    #[cfg_attr(not(feature = "cluster"), allow(unused))] uri: axum::http::Uri,
 ) -> impl IntoResponse {
     #[cfg(feature = "cluster")]
     if let Some(node) = state.cluster_node.as_ref() {
+        if let Some(resp) = maybe_forward_to_leader(&state, &uri) {
+            return resp;
+        }
         let cmd = aeon_types::RegistryCommand::SetPipelineState {
             name: name.clone(),
             state: aeon_types::registry::PipelineState::Stopped,
@@ -1433,6 +1530,7 @@ async fn instantiate_processor(
 async fn upgrade_pipeline(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
+    #[cfg_attr(not(feature = "cluster"), allow(unused))] uri: axum::http::Uri,
     Json(req): Json<UpgradeRequest>,
 ) -> impl IntoResponse {
     let proc_ref = aeon_types::registry::ProcessorRef::new(
@@ -1446,6 +1544,9 @@ async fn upgrade_pipeline(
     // own the pipeline's PipelineControl handle can swap the running processor.
     #[cfg(feature = "cluster")]
     if let Some(node) = state.cluster_node.as_ref() {
+        if let Some(resp) = maybe_forward_to_leader(&state, &uri) {
+            return resp;
+        }
         let cmd = aeon_types::RegistryCommand::UpgradePipeline {
             name: name.clone(),
             new_processor: proc_ref.clone(),
@@ -1723,9 +1824,13 @@ async fn reconfigure_sink(
 async fn delete_pipeline(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
+    #[cfg_attr(not(feature = "cluster"), allow(unused))] uri: axum::http::Uri,
 ) -> impl IntoResponse {
     #[cfg(feature = "cluster")]
     if let Some(node) = state.cluster_node.as_ref() {
+        if let Some(resp) = maybe_forward_to_leader(&state, &uri) {
+            return resp;
+        }
         let cmd = aeon_types::RegistryCommand::DeletePipeline { name: name.clone() };
         return match node.propose_registry(cmd).await {
             Ok(aeon_types::RegistryResponse::Error { message }) => {

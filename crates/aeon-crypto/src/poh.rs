@@ -335,6 +335,144 @@ impl PohChainState {
     }
 }
 
+/// Policy for verifying a `PohChainState` received during partition
+/// transfer (CL-6b). Configurable so operators can trade correctness
+/// strictness against transfer throughput.
+///
+/// * `Verify` — default. Structural validation of the incoming state:
+///   partition id matches the expected partition, `current_hash` is
+///   consistent with `sequence` (genesis iff seq==0), and the MMR's
+///   internal leaf/peak accounting is self-consistent. Does **not**
+///   verify hash-chain linkage because the current wire format
+///   (`PohChainState`) is MMR-only and does not carry recent entries.
+///
+/// * `VerifyWithKey` — like `Verify`, plus validates every signed
+///   `PohEntry` carried in the (future, optional) `recent_entries`
+///   field against the supplied `VerifyingKey`. Until the wire format
+///   carries recent entries this degrades to `Verify` plus a
+///   documented TODO-on-import, so callers can opt in today and get
+///   stronger checks for free when the extension lands.
+///
+/// * `TrustExtend` — skip all verification and accept the state as-is
+///   (legacy behaviour of `PohChain::from_state`). Only safe when the
+///   transport is already authenticated (mTLS) and the operator fully
+///   trusts the source node — e.g. internal cluster with signed certs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PohVerifyMode {
+    #[default]
+    Verify,
+    VerifyWithKey,
+    TrustExtend,
+}
+
+impl std::str::FromStr for PohVerifyMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "verify" => Ok(PohVerifyMode::Verify),
+            "verify_with_key" | "verify-with-key" | "verifywithkey" => {
+                Ok(PohVerifyMode::VerifyWithKey)
+            }
+            "trust_extend" | "trust-extend" | "trustextend" => {
+                Ok(PohVerifyMode::TrustExtend)
+            }
+            other => Err(format!(
+                "unknown poh_verify_mode '{other}' (valid: verify, verify_with_key, trust_extend)"
+            )),
+        }
+    }
+}
+
+/// Errors returned by [`PohChain::verify_state`].
+#[derive(Debug, thiserror::Error)]
+pub enum PohVerifyError {
+    #[error(
+        "poh-verify: partition mismatch: expected {expected:?}, state carries {actual:?}"
+    )]
+    PartitionMismatch {
+        expected: PartitionId,
+        actual: PartitionId,
+    },
+    #[error(
+        "poh-verify: sequence/hash inconsistency: seq={sequence} but current_hash {state} genesis"
+    )]
+    SequenceHashInconsistent {
+        sequence: u64,
+        /// "== " or "!= " — just a string slot for the message.
+        state: &'static str,
+    },
+    #[error(
+        "poh-verify: MMR leaf_count {mmr_leaves} exceeds chain sequence {sequence}"
+    )]
+    MmrAheadOfSequence { mmr_leaves: u64, sequence: u64 },
+    #[error(
+        "poh-verify: MMR internal inconsistency: leaf_count={leaf_count} but {peaks} peaks for that count is invalid"
+    )]
+    MmrPeaksInconsistent { leaf_count: u64, peaks: usize },
+}
+
+impl PohChain {
+    /// Structurally verify a `PohChainState` before trusting it on import.
+    ///
+    /// See [`PohVerifyMode`] for the boundaries of what this can and
+    /// cannot catch given the current wire format. Callers in
+    /// `TrustExtend` mode skip this entirely and hand the state
+    /// straight to [`PohChain::from_state`].
+    ///
+    /// `expected_partition` is the partition the caller believes is
+    /// being transferred; we surface a `PartitionMismatch` error rather
+    /// than silently accepting a state for the wrong partition.
+    pub fn verify_state(
+        state: &PohChainState,
+        expected_partition: PartitionId,
+    ) -> Result<(), PohVerifyError> {
+        if state.partition != expected_partition {
+            return Err(PohVerifyError::PartitionMismatch {
+                expected: expected_partition,
+                actual: state.partition,
+            });
+        }
+
+        let genesis = Self::compute_genesis(state.partition);
+        let at_genesis = state.current_hash == genesis;
+        match (state.sequence, at_genesis) {
+            (0, true) | (1.., false) => {} // consistent
+            (0, false) => {
+                return Err(PohVerifyError::SequenceHashInconsistent {
+                    sequence: 0,
+                    state: "!= ",
+                });
+            }
+            (seq, true) => {
+                return Err(PohVerifyError::SequenceHashInconsistent {
+                    sequence: seq,
+                    state: "== ",
+                });
+            }
+        }
+
+        if state.mmr.leaf_count() > state.sequence {
+            return Err(PohVerifyError::MmrAheadOfSequence {
+                mmr_leaves: state.mmr.leaf_count(),
+                sequence: state.sequence,
+            });
+        }
+
+        let peaks = state.mmr.peaks();
+        let expected_peaks = state.mmr.leaf_count().count_ones() as usize;
+        if peaks.len() != expected_peaks {
+            return Err(PohVerifyError::MmrPeaksInconsistent {
+                leaf_count: state.mmr.leaf_count(),
+                peaks: peaks.len(),
+            });
+        }
+
+        Ok(())
+    }
+}
+
 /// Global PoH checkpoint — aggregates per-partition chain heads.
 ///
 /// Replicated via Raft to give the cluster a consistent view of PoH state.
@@ -742,5 +880,76 @@ mod tests {
 
         // MMR has all roots
         assert_eq!(chain.mmr().leaf_count(), 20);
+    }
+
+    // ── verify_state / PohVerifyMode tests ─────────────────────────────
+
+    #[test]
+    fn verify_mode_parses_common_spellings() {
+        use std::str::FromStr;
+        assert_eq!(PohVerifyMode::from_str("verify").unwrap(), PohVerifyMode::Verify);
+        assert_eq!(
+            PohVerifyMode::from_str("Verify_With_Key").unwrap(),
+            PohVerifyMode::VerifyWithKey
+        );
+        assert_eq!(
+            PohVerifyMode::from_str("trust-extend").unwrap(),
+            PohVerifyMode::TrustExtend
+        );
+        assert!(PohVerifyMode::from_str("yolo").is_err());
+    }
+
+    #[test]
+    fn verify_state_accepts_freshly_exported_state() {
+        let mut chain = make_chain(5);
+        for i in 0..4 {
+            chain.append_batch(&[format!("b-{i}").as_bytes()], (i + 1) * 1000, None);
+        }
+        let state = chain.export_state();
+        PohChain::verify_state(&state, PartitionId::new(5)).unwrap();
+    }
+
+    #[test]
+    fn verify_state_accepts_empty_chain() {
+        let chain = make_chain(0);
+        let state = chain.export_state();
+        PohChain::verify_state(&state, PartitionId::new(0)).unwrap();
+    }
+
+    #[test]
+    fn verify_state_rejects_wrong_partition() {
+        let chain = make_chain(9);
+        let state = chain.export_state();
+        let err = PohChain::verify_state(&state, PartitionId::new(10)).unwrap_err();
+        matches!(err, PohVerifyError::PartitionMismatch { .. });
+    }
+
+    #[test]
+    fn verify_state_rejects_nonzero_seq_with_genesis_hash() {
+        let mut state = make_chain(0).export_state();
+        state.sequence = 5; // lied: we claim 5 entries but hash is genesis
+        let err = PohChain::verify_state(&state, PartitionId::new(0)).unwrap_err();
+        matches!(err, PohVerifyError::SequenceHashInconsistent { .. });
+    }
+
+    #[test]
+    fn verify_state_rejects_zero_seq_with_non_genesis_hash() {
+        let mut state = make_chain(0).export_state();
+        state.current_hash = sha512(b"not-genesis");
+        // sequence is still 0 — inconsistent.
+        let err = PohChain::verify_state(&state, PartitionId::new(0)).unwrap_err();
+        matches!(err, PohVerifyError::SequenceHashInconsistent { .. });
+    }
+
+    #[test]
+    fn verify_state_rejects_mmr_ahead_of_sequence() {
+        let mut chain = make_chain(2);
+        for i in 0..3 {
+            chain.append_batch(&[format!("x-{i}").as_bytes()], (i + 1) * 100, None);
+        }
+        let mut state = chain.export_state();
+        state.sequence = 1; // lied downwards
+        let err = PohChain::verify_state(&state, PartitionId::new(2)).unwrap_err();
+        matches!(err, PohVerifyError::MmrAheadOfSequence { .. });
     }
 }

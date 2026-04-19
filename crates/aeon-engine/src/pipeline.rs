@@ -117,6 +117,19 @@ pub struct PipelineConfig {
     /// a hash chain of all processed batches for integrity verification.
     #[cfg(feature = "processor-auth")]
     pub poh: Option<PohConfig>,
+    /// G11.c: shared registry of PoH chain snapshots installed by the
+    /// cluster-side `PohChainInstaller` during a CL-6 partition handover.
+    /// When this pipeline's task starts up (or a partition sub-task starts
+    /// in `run_multi_partition`), `create_poh_state` checks the registry
+    /// keyed on `(pipeline_name, partition_id)` — if the transfer driver
+    /// already installed a snapshot, `create_poh_state` resumes from it
+    /// (preserving the hash chain across node moves) instead of genesising
+    /// a fresh chain. Without this wiring, Gate 2's "PoH chain has no gaps
+    /// across transfers" row can't pass because every ownership flip
+    /// would restart the chain at sequence 0. `None` disables — safe for
+    /// all non-cluster callers.
+    #[cfg(all(feature = "processor-auth", feature = "cluster"))]
+    pub poh_installed_chains: Option<Arc<crate::partition_install::InstalledPohChainRegistry>>,
     /// FT-3: Optional L3 backend for `CheckpointBackend::StateStore`.
     /// When `delivery.checkpoint.backend == StateStore`, the sink task
     /// persists checkpoint records into this store under the `checkpoint/`
@@ -185,6 +198,8 @@ impl Default for PipelineConfig {
             delivery: DeliveryConfig::default(),
             #[cfg(feature = "processor-auth")]
             poh: None,
+            #[cfg(all(feature = "processor-auth", feature = "cluster"))]
+            poh_installed_chains: None,
             l3_checkpoint_store: None,
             pipeline_name: String::new(),
             l2_registry: None,
@@ -253,14 +268,36 @@ impl Default for PipelineMetrics {
 
 /// Create a shared PoH chain from pipeline config.
 /// Returns `None` if PoH is disabled or the feature is not compiled.
+///
+/// G11.c: before genesising a fresh chain, consult
+/// `config.poh_installed_chains` (when the `cluster` feature is enabled).
+/// The cluster-side `PohChainInstaller` drops a per-`(pipeline, partition)`
+/// snapshot there during a partition handover, so resumed partitions pick
+/// up from where the previous owner left off instead of restarting at
+/// sequence 0. The registry entry is consumed (taken) so a subsequent
+/// restart without a fresh install falls back to genesis — callers that
+/// need chain continuity across restarts must re-install first.
 #[cfg(feature = "processor-auth")]
 pub fn create_poh_state(config: &PipelineConfig) -> Option<PohState> {
-    config.poh.as_ref().map(|poh_config| {
-        Arc::new(Mutex::new(aeon_crypto::poh::PohChain::new(
-            poh_config.partition,
-            poh_config.max_recent_entries,
-        )))
-    })
+    let poh_config = config.poh.as_ref()?;
+
+    #[cfg(feature = "cluster")]
+    if let Some(registry) = config.poh_installed_chains.as_ref() {
+        if let Some(chain) = registry.take(&config.pipeline_name, config.partition_id) {
+            tracing::info!(
+                pipeline = %config.pipeline_name,
+                partition = config.partition_id.as_u16(),
+                sequence = chain.sequence(),
+                "G11.c: resuming PoH chain from transfer-driver installed snapshot"
+            );
+            return Some(Arc::new(Mutex::new(chain)));
+        }
+    }
+
+    Some(Arc::new(Mutex::new(aeon_crypto::poh::PohChain::new(
+        poh_config.partition,
+        poh_config.max_recent_entries,
+    ))))
 }
 
 /// TR-2: Transfer host-side state from an outgoing processor into an
@@ -1184,6 +1221,8 @@ where
             delivery: config.pipeline.delivery.clone(),
             #[cfg(feature = "processor-auth")]
             poh: config.pipeline.poh.clone(),
+            #[cfg(all(feature = "processor-auth", feature = "cluster"))]
+            poh_installed_chains: config.pipeline.poh_installed_chains.clone(),
             l3_checkpoint_store: config.pipeline.l3_checkpoint_store.clone(),
             pipeline_name: config.pipeline.pipeline_name.clone(),
             l2_registry: config.pipeline.l2_registry.clone(),
@@ -4422,6 +4461,79 @@ mod tests {
             let chain = binding.lock().await;
             assert_eq!(chain.partition(), PartitionId::new(0));
             assert_eq!(chain.sequence(), 0);
+        }
+
+        /// G11.c — when a PoH chain has been pre-installed by the cluster-
+        /// side `PohChainInstaller` for `(pipeline_name, partition_id)`,
+        /// `create_poh_state` must resume from that snapshot instead of
+        /// genesising a fresh chain. The snapshot is consumed (taken) so a
+        /// second startup without a fresh install falls back to genesis.
+        #[cfg(feature = "cluster")]
+        #[tokio::test]
+        async fn create_poh_state_resumes_installed_chain_g11c() {
+            use crate::partition_install::InstalledPohChainRegistry;
+            use aeon_cluster::types::PohChainTransferRequest;
+            use aeon_crypto::poh::PohVerifyMode;
+
+            // Build a registry and install a chain that has already run
+            // 5 batches through it (simulating what the outgoing owner
+            // shipped to this node during CL-6).
+            let registry = InstalledPohChainRegistry::new();
+            let installer = crate::partition_install::PohChainInstallerImpl::new(
+                registry.clone(),
+                PohVerifyMode::Verify,
+            );
+            let mut src_chain = aeon_crypto::poh::PohChain::new(PartitionId::new(3), 64);
+            for i in 0..5i64 {
+                src_chain.append_batch(
+                    &[format!("evt-{i}").as_bytes()],
+                    (i + 1) * 1000,
+                    None,
+                );
+            }
+            let state_bytes = src_chain.export_state().to_bytes().unwrap();
+            let req = PohChainTransferRequest {
+                pipeline: "pl-resume".to_string(),
+                partition: PartitionId::new(3),
+            };
+            aeon_cluster::partition_driver::PohChainInstaller::install(
+                &installer,
+                &req,
+                state_bytes,
+            )
+            .unwrap();
+
+            // Now construct a PipelineConfig pointed at the same pipeline/
+            // partition and assert `create_poh_state` resumes.
+            let config = PipelineConfig {
+                pipeline_name: "pl-resume".to_string(),
+                partition_id: PartitionId::new(3),
+                poh: Some(PohConfig {
+                    partition: PartitionId::new(3),
+                    max_recent_entries: 64,
+                    signing_key: None,
+                }),
+                poh_installed_chains: Some(Arc::new(registry.clone())),
+                ..PipelineConfig::default()
+            };
+            let state = create_poh_state(&config).expect("poh enabled");
+            let chain = state.lock().await;
+            assert_eq!(chain.partition(), PartitionId::new(3));
+            assert_eq!(
+                chain.sequence(),
+                5,
+                "resumed chain must carry source sequence, not genesis"
+            );
+            drop(chain);
+
+            // Second call must genesis — the take() consumed the snapshot.
+            let state2 = create_poh_state(&config).expect("poh enabled");
+            let chain2 = state2.lock().await;
+            assert_eq!(
+                chain2.sequence(),
+                0,
+                "no fresh install → next create_poh_state must genesis"
+            );
         }
 
         #[tokio::test]

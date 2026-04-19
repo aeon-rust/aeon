@@ -390,6 +390,9 @@ mod tests {
             initial_members: Vec::new(),
             advertise_addr: None,
             raft_timing: crate::config::RaftTiming::default(),
+            poh_verify_mode: "verify".to_string(),
+            rest_api_port: None,
+            rest_scheme: None,
         }
     }
 

@@ -77,6 +77,27 @@ impl RaftTiming {
         }
     }
 
+    /// G14 — fast-failover preset targeting <5 s leader failover on a
+    /// reliable VPC (Gate 2 row).
+    ///
+    /// Tightens heartbeat to 250 ms and election window to 750–2000 ms.
+    /// Combined with `ClusterNode::relinquish_leadership` on graceful
+    /// shutdown, the observed failover on a 3-node, no-load cluster should
+    /// drop from ~10 s (default timings, no pre-stop hook) to ~1–2 s
+    /// (graceful) and ~2–3 s worst-case (ungraceful leader-kill).
+    ///
+    /// Trade-off vs. `default()` / `prod_recommended()`:
+    ///   - 2× heartbeat rate (250 ms vs. 500 ms)
+    ///   - Narrower jitter (1250 ms vs. 4000 ms in prod preset) — slightly
+    ///     higher split-vote probability, but acceptable on reliable VPCs.
+    pub fn fast_failover() -> Self {
+        Self {
+            heartbeat_ms: 250,
+            election_min_ms: 750,
+            election_max_ms: 2000,
+        }
+    }
+
     /// Validate timing constraints: `heartbeat < election_min < election_max`.
     pub fn validate(&self) -> Result<(), AeonError> {
         if self.heartbeat_ms == 0 {
@@ -137,6 +158,30 @@ pub struct ClusterConfig {
     /// Raft consensus timing (FT-5). Controls heartbeat and election intervals.
     #[serde(default)]
     pub raft_timing: RaftTiming,
+    /// G11.a — PoH chain verification policy on partition transfer
+    /// (CL-6b install). One of `"verify"` (default), `"verify_with_key"`,
+    /// or `"trust_extend"`. See `aeon_crypto::poh::PohVerifyMode` for
+    /// semantics. Settable via the `AEON_CLUSTER_POH_VERIFY_MODE` env
+    /// var when constructing `ClusterConfig` from env in `aeon-cli`.
+    #[serde(default = "default_poh_verify_mode")]
+    pub poh_verify_mode: String,
+    /// G9 — port the REST API listens on for *every* pod in this cluster.
+    /// Set by `aeon-cli` from the `--addr` flag (or `AEON_API_ADDR` env).
+    /// When `Some`, followers can 307-redirect cluster-write requests to
+    /// the leader's REST URL derived as `<scheme>://<leader-host>:<port>`.
+    /// `None` disables the auto-forward path — writes to followers keep
+    /// the pre-G9 behaviour of returning an error.
+    #[serde(default)]
+    pub rest_api_port: Option<u16>,
+    /// G9 — URL scheme for the auto-forward `Location` header.
+    /// Typically `"http"` (default when `None`). Set to `"https"` when the
+    /// REST API is fronted by TLS.
+    #[serde(default)]
+    pub rest_scheme: Option<String>,
+}
+
+fn default_poh_verify_mode() -> String {
+    "verify".to_string()
 }
 
 impl ClusterConfig {
@@ -156,6 +201,9 @@ impl ClusterConfig {
             initial_members: Vec::new(),
             advertise_addr: None,
             raft_timing: RaftTiming::default(),
+            poh_verify_mode: default_poh_verify_mode(),
+            rest_api_port: None,
+            rest_scheme: None,
         }
     }
 
@@ -184,6 +232,22 @@ impl ClusterConfig {
         }
 
         self.raft_timing.validate()?;
+
+        // G11.a — validate poh_verify_mode string maps to a known variant
+        // at config-load time, not at first partition-transfer. Keeps the
+        // crypto crate's parsing logic as the single source of truth.
+        match self.poh_verify_mode.trim().to_ascii_lowercase().as_str() {
+            "verify" | "verify_with_key" | "verify-with-key" | "verifywithkey"
+            | "trust_extend" | "trust-extend" | "trustextend" => {}
+            other => {
+                return Err(AeonError::Config {
+                    message: format!(
+                        "cluster.poh_verify_mode '{other}' is not valid \
+                         (expected one of: verify, verify_with_key, trust_extend)"
+                    ),
+                });
+            }
+        }
 
         // Check for duplicate peers
         for (i, a) in self.peers.iter().enumerate() {
@@ -276,6 +340,9 @@ mod tests {
             initial_members: Vec::new(),
             advertise_addr: None,
             raft_timing: RaftTiming::default(),
+            poh_verify_mode: "verify".to_string(),
+            rest_api_port: None,
+            rest_scheme: None,
         };
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("TLS"));
@@ -294,6 +361,9 @@ mod tests {
             initial_members: Vec::new(),
             advertise_addr: None,
             raft_timing: RaftTiming::default(),
+            poh_verify_mode: "verify".to_string(),
+            rest_api_port: None,
+            rest_scheme: None,
         };
         // 1 self + 1 peer = 2 (even) — should succeed (advisory warning only)
         cfg.validate().unwrap();
@@ -316,6 +386,9 @@ mod tests {
                 initial_members: Vec::new(),
                 advertise_addr: None,
                 raft_timing: RaftTiming::default(),
+                poh_verify_mode: "verify".to_string(),
+                rest_api_port: None,
+                rest_scheme: None,
             };
             // 1 + 2=3, 1+4=5, 1+6=7 — all odd
             cfg.validate().unwrap();
@@ -338,6 +411,9 @@ mod tests {
             initial_members: Vec::new(),
             advertise_addr: None,
             raft_timing: RaftTiming::default(),
+            poh_verify_mode: "verify".to_string(),
+            rest_api_port: None,
+            rest_scheme: None,
         };
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("duplicate"));
@@ -357,6 +433,9 @@ mod tests {
             initial_members: Vec::new(),
             advertise_addr: None,
             raft_timing: RaftTiming::default(),
+            poh_verify_mode: "verify".to_string(),
+            rest_api_port: None,
+            rest_scheme: None,
         };
         assert!(!cfg.is_single_node());
         let err = cfg.validate().unwrap_err();
@@ -376,6 +455,9 @@ mod tests {
             initial_members: Vec::new(),
             advertise_addr: None,
             raft_timing: RaftTiming::default(),
+            poh_verify_mode: "verify".to_string(),
+            rest_api_port: None,
+            rest_scheme: None,
         };
         assert!(!cfg.is_single_node());
         // cluster size = 1 (self only), odd-number check passes
@@ -402,6 +484,9 @@ mod tests {
             initial_members: Vec::new(),
             advertise_addr: None,
             raft_timing: RaftTiming::default(),
+            poh_verify_mode: "verify".to_string(),
+            rest_api_port: None,
+            rest_scheme: None,
         };
 
         let bytes = bincode::serialize(&cfg).unwrap();
@@ -449,6 +534,20 @@ mod tests {
     }
 
     #[test]
+    fn raft_timing_fast_failover_preset() {
+        let t = RaftTiming::fast_failover();
+        assert_eq!(t.heartbeat_ms, 250);
+        assert_eq!(t.election_min_ms, 750);
+        assert_eq!(t.election_max_ms, 2000);
+        t.validate().unwrap();
+        // Fast-failover worst-case (2× election_max_ms for a catastrophic
+        // split-vote retry) must still come in under the 5 s Gate 2 target.
+        assert!(t.election_max_ms * 2 <= 5_000);
+        // Must be strictly faster than the default preset's worst case.
+        assert!(t.election_max_ms < RaftTiming::default().election_max_ms);
+    }
+
+    #[test]
     fn raft_timing_rejects_zero_heartbeat() {
         let t = RaftTiming {
             heartbeat_ms: 0,
@@ -491,6 +590,51 @@ mod tests {
             election_max_ms: 6000, // 4s jitter window
         };
         t.validate().unwrap();
+    }
+
+    #[test]
+    fn poh_verify_mode_defaults_to_verify() {
+        let cfg = ClusterConfig::single_node(1, 16);
+        assert_eq!(cfg.poh_verify_mode, "verify");
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn poh_verify_mode_accepts_known_spellings() {
+        for mode in [
+            "verify",
+            "Verify",
+            "verify_with_key",
+            "verify-with-key",
+            "VerifyWithKey",
+            "trust_extend",
+            "trust-extend",
+            "TrustExtend",
+        ] {
+            let mut cfg = ClusterConfig::single_node(1, 16);
+            cfg.poh_verify_mode = mode.to_string();
+            cfg.validate()
+                .unwrap_or_else(|e| panic!("mode '{mode}' should validate, got: {e}"));
+        }
+    }
+
+    #[test]
+    fn poh_verify_mode_rejects_garbage() {
+        let mut cfg = ClusterConfig::single_node(1, 16);
+        cfg.poh_verify_mode = "yolo".to_string();
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("poh_verify_mode"));
+    }
+
+    #[test]
+    fn poh_verify_mode_deserialises_default_from_missing_field() {
+        let json = r#"{
+            "node_id": 1,
+            "bind": "0.0.0.0:4470",
+            "num_partitions": 16
+        }"#;
+        let cfg: ClusterConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.poh_verify_mode, "verify");
     }
 
     #[test]

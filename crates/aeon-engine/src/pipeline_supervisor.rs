@@ -86,6 +86,18 @@ pub struct PipelineSupervisor {
     /// Absent resolver → sources keep their own fallbacks (single-node
     /// tests / benches). See `PartitionOwnershipResolver` for the contract.
     ownership: OnceLock<Arc<dyn PartitionOwnershipResolver>>,
+    /// G11.c: shared `InstalledPohChainRegistry`. The cluster-side
+    /// `PohChainInstallerImpl` (spawned in `aeon-cli` at bootstrap)
+    /// writes per-`(pipeline, partition)` `PohChain` snapshots here on
+    /// every completed CL-6 handover. `start()` stamps this Arc onto
+    /// each pipeline's `PipelineConfig.poh_installed_chains` so
+    /// `create_poh_state` can `take()` the snapshot and resume the
+    /// chain when the post-transfer pipeline task starts. Absent
+    /// registry → pipelines always genesis a fresh chain (the T0 /
+    /// single-node / test path).
+    #[cfg(all(feature = "processor-auth", feature = "cluster"))]
+    poh_installed_chains:
+        OnceLock<Arc<crate::partition_install::InstalledPohChainRegistry>>,
 }
 
 impl PipelineSupervisor {
@@ -95,7 +107,27 @@ impl PipelineSupervisor {
             running: Mutex::new(HashMap::new()),
             gate_registry: Arc::new(WriteGateRegistry::new()),
             ownership: OnceLock::new(),
+            #[cfg(all(feature = "processor-auth", feature = "cluster"))]
+            poh_installed_chains: OnceLock::new(),
         }
+    }
+
+    /// G11.c: install the shared `InstalledPohChainRegistry`. Called once
+    /// in `cmd_serve` after the cluster-side `PartitionTransferDriver`
+    /// is built, so the same registry instance the driver writes to is
+    /// the one `create_poh_state` reads from on pipeline start. Returns
+    /// `Err` if already installed — startup ordering bug, not a runtime
+    /// condition.
+    #[cfg(all(feature = "processor-auth", feature = "cluster"))]
+    pub fn set_poh_installed_chains(
+        &self,
+        registry: Arc<crate::partition_install::InstalledPohChainRegistry>,
+    ) -> Result<(), AeonError> {
+        self.poh_installed_chains.set(registry).map_err(|_| {
+            AeonError::state(
+                "PipelineSupervisor: poh_installed_chains registry already installed",
+            )
+        })
     }
 
     pub fn connectors(&self) -> &ConnectorRegistry {
@@ -201,6 +233,14 @@ impl PipelineSupervisor {
         let mut pipeline_config = pipeline_config_for(def);
         pipeline_config.partition_id = partition_id;
         pipeline_config.write_gate = Some(gate);
+        // G11.c: share the process-wide PoH-chain install registry so
+        // `create_poh_state` can resume a chain a recent partition-transfer
+        // installed on this node instead of genesising fresh.
+        #[cfg(all(feature = "processor-auth", feature = "cluster"))]
+        {
+            pipeline_config.poh_installed_chains =
+                self.poh_installed_chains.get().cloned();
+        }
 
         let metrics = Arc::new(PipelineMetrics::new());
         let control = PipelineControl::new();

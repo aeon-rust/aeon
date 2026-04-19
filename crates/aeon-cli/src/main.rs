@@ -577,7 +577,79 @@ fn cmd_serve(addr: &str, artifact_dir: &str) -> Result<()> {
                         "K8s cluster discovery: initializing Raft node"
                     );
 
-                    let config = k8s.to_cluster_config();
+                    // G10 — scale-up pods (StatefulSet ordinal >= initial
+                    // replicas count) must not re-run `raft.initialize`; they
+                    // seed-join the existing cluster instead. `is_scale_up_pod`
+                    // reads the stale `AEON_CLUSTER_REPLICAS` env that helm
+                    // baked at install time against this pod's ordinal.
+                    let scale_up = k8s.is_scale_up_pod();
+                    let mut config = if scale_up {
+                        tracing::info!(
+                            ordinal = k8s.ordinal,
+                            replicas = k8s.replicas,
+                            "scale-up pod detected — will seed-join existing cluster"
+                        );
+                        k8s.to_join_config()
+                    } else {
+                        k8s.to_cluster_config()
+                    };
+
+                    // G11.a: allow operators to override the PoH chain verification
+                    // mode at install time via env (Helm values set this on the
+                    // StatefulSet). YAML is the source of truth; env is the
+                    // operator override because the k8s path doesn't read YAML.
+                    if let Ok(mode) = std::env::var("AEON_CLUSTER_POH_VERIFY_MODE") {
+                        config.poh_verify_mode = mode;
+                    }
+
+                    // G14: raft_timing env overrides. Helm surfaces
+                    // `cluster.raftTiming.*` as these env vars so operators can
+                    // pick `fast_failover` (<5s target) vs `prod_recommended`
+                    // vs `flaky_network` without rebuilding. Validation runs
+                    // below so an invalid combo fails fast at startup.
+                    if let Some(v) = std::env::var("AEON_RAFT_HEARTBEAT_MS")
+                        .ok()
+                        .and_then(|s| s.parse::<u64>().ok())
+                    {
+                        config.raft_timing.heartbeat_ms = v;
+                    }
+                    if let Some(v) = std::env::var("AEON_RAFT_ELECTION_MIN_MS")
+                        .ok()
+                        .and_then(|s| s.parse::<u64>().ok())
+                    {
+                        config.raft_timing.election_min_ms = v;
+                    }
+                    if let Some(v) = std::env::var("AEON_RAFT_ELECTION_MAX_MS")
+                        .ok()
+                        .and_then(|s| s.parse::<u64>().ok())
+                    {
+                        config.raft_timing.election_max_ms = v;
+                    }
+
+                    // G9: auto-forward REST writes to leader needs to know
+                    // (a) what port peers listen on — all pods share the same
+                    // REST port because the StatefulSet's headless service
+                    // publishes it on every pod FQDN — and (b) the scheme.
+                    // Parse the bind address string (CLI flag or AEON_API_ADDR
+                    // env) once so follower pods can synthesise a 307 Location.
+                    let rest_listen = std::env::var("AEON_API_ADDR")
+                        .unwrap_or_else(|_| addr.to_string());
+                    if let Ok(parsed) = rest_listen.parse::<std::net::SocketAddr>() {
+                        config.rest_api_port = Some(parsed.port());
+                    } else if let Some(port) = rest_listen
+                        .rsplit(':')
+                        .next()
+                        .and_then(|p| p.parse::<u16>().ok())
+                    {
+                        config.rest_api_port = Some(port);
+                    }
+                    if config.rest_scheme.is_none() {
+                        config.rest_scheme = Some("http".to_string());
+                    }
+
+                    config
+                        .validate()
+                        .map_err(|e| anyhow::anyhow!("cluster config: {e}"))?;
 
                     // Select TLS mode based on cluster config (FT-8):
                     //   - config.tls = Some(...)  → production mTLS (file-based)
@@ -596,13 +668,22 @@ fn cmd_serve(addr: &str, artifact_dir: &str) -> Result<()> {
                         .map_err(|e| anyhow::anyhow!("QUIC bind failed: {e}"))?,
                     );
 
-                    // All nodes call bootstrap_multi with the same membership.
-                    // openraft requires every node to initialize with identical
-                    // membership for fresh cluster bootstrap. Raft election then
-                    // determines the actual leader.
-                    let node = aeon_cluster::ClusterNode::bootstrap_multi(config, endpoint)
+                    // G10 — branch on bootstrap vs join. bootstrap_multi()
+                    // runs `raft.initialize(members)`; join() seed-contacts an
+                    // existing leader and lets it `add_learner → change_membership`.
+                    let poh_mode_str = config.poh_verify_mode.clone();
+                    let node = if scale_up {
+                        aeon_cluster::ClusterNode::join(config, Arc::clone(&endpoint))
+                            .await
+                            .map_err(|e| anyhow::anyhow!("Cluster seed-join failed: {e}"))?
+                    } else {
+                        aeon_cluster::ClusterNode::bootstrap_multi(
+                            config,
+                            Arc::clone(&endpoint),
+                        )
                         .await
-                        .map_err(|e| anyhow::anyhow!("Cluster bootstrap failed: {e}"))?;
+                        .map_err(|e| anyhow::anyhow!("Cluster bootstrap failed: {e}"))?
+                    };
 
                     let node = Arc::new(node);
 
@@ -635,6 +716,86 @@ fn cmd_serve(addr: &str, artifact_dir: &str) -> Result<()> {
                         .map_err(|e| {
                             anyhow::anyhow!("install ownership resolver: {e}")
                         })?;
+
+                    // G11.b — spawn the leader-side partition-transfer driver.
+                    // Without this, Raft-committed `Transferring` entries never
+                    // drive the three-step CL-6 handover and T4 / T2 cutovers
+                    // stall with `owner=null` forever. We gate on an explicit
+                    // pipeline name (single-pipeline deployment assumption —
+                    // see partition_driver.rs) — if unset, skip driver setup
+                    // and log. The driver itself is a no-op on nodes that are
+                    // never picked as a transfer target.
+                    if let Ok(pipeline_name) = std::env::var("AEON_PIPELINE_NAME") {
+                        let poh_mode: aeon_crypto::poh::PohVerifyMode = poh_mode_str
+                            .parse()
+                            .map_err(|e| anyhow::anyhow!(
+                                "invalid cluster.poh_verify_mode '{poh_mode_str}': {e}"
+                            ))?;
+
+                        let l2_root = std::env::var("AEON_L2_ROOT").unwrap_or_else(|_| {
+                            format!("{dir}/l2body")
+                        });
+                        let seg_installer = Arc::new(
+                            aeon_engine::L2SegmentInstaller::new(&l2_root, &pipeline_name),
+                        );
+
+                        let poh_registry = aeon_engine::InstalledPohChainRegistry::new();
+                        let poh_installer = Arc::new(
+                            aeon_engine::PohChainInstallerImpl::new(
+                                poh_registry.clone(),
+                                poh_mode,
+                            ),
+                        );
+
+                        // G11.c: the supervisor reads from the same registry
+                        // the installer writes to, so a chain installed during
+                        // CL-6 handover is picked up by `create_poh_state`
+                        // when the post-transfer pipeline task starts on this
+                        // node. Without this, every ownership flip would
+                        // restart the PoH chain at sequence 0 and Gate 2's
+                        // "PoH chain has no gaps across transfers" row can't
+                        // pass.
+                        supervisor
+                            .set_poh_installed_chains(Arc::new(poh_registry.clone()))
+                            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+                        let resolver: Arc<dyn aeon_cluster::NodeResolver> =
+                            Arc::new(aeon_cluster::RaftNodeResolver::new(
+                                node.raft().clone(),
+                            ));
+
+                        let driver = Arc::new(aeon_cluster::PartitionTransferDriver::new(
+                            Arc::clone(&endpoint),
+                            node.raft().clone(),
+                            node.shared_state(),
+                            resolver,
+                            node.config().node_id,
+                            pipeline_name.clone(),
+                            seg_installer,
+                            poh_installer,
+                        ));
+
+                        node.install_transfer_driver(Arc::clone(&driver)).await;
+
+                        let driver_shutdown = node.shutdown_flag();
+                        let driver_for_loop = Arc::clone(&driver);
+                        tokio::spawn(async move {
+                            driver_for_loop.watch_loop(driver_shutdown).await;
+                        });
+
+                        tracing::info!(
+                            pipeline = %pipeline_name,
+                            verify_mode = %poh_mode_str,
+                            l2_root = %l2_root,
+                            "PartitionTransferDriver spawned — transfers will drive automatically"
+                        );
+                    } else {
+                        tracing::warn!(
+                            "AEON_PIPELINE_NAME unset — skipping PartitionTransferDriver. \
+                             Raft-committed partition transfers will not make progress \
+                             on this node. Set AEON_PIPELINE_NAME to enable CL-6 handover."
+                        );
+                    }
 
                     // Spawn background task for leader election + partition assignment.
                     // Retries for up to 120s. Each iteration checks:

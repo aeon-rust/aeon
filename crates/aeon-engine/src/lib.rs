@@ -13,6 +13,8 @@ pub mod cluster_applier;
 pub mod engine_cutover;
 #[cfg(feature = "cluster")]
 pub mod partition_ownership;
+#[cfg(all(feature = "cluster", feature = "processor-auth"))]
+pub mod partition_install;
 pub mod batch_tuner;
 pub mod batch_wire;
 pub mod checkpoint;
@@ -107,6 +109,11 @@ pub use engine_cutover::{CutoverWatermarkReader, EngineCutoverCoordinator};
 
 #[cfg(feature = "cluster")]
 pub use partition_ownership::ClusterPartitionOwnership;
+
+#[cfg(all(feature = "cluster", feature = "processor-auth"))]
+pub use partition_install::{
+    InstalledPohChainRegistry, L2SegmentInstaller, PohChainInstallerImpl,
+};
 
 #[cfg(feature = "rest-api")]
 pub use rest_api::{AppState, api_router, serve};

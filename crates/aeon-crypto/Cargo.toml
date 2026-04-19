@@ -20,6 +20,7 @@ auto-tls = ["rcgen", "hostname"]  # Enable auto-generated self-signed certificat
 aeon-types = { workspace = true }
 serde = { workspace = true }
 bincode = { workspace = true }
+thiserror = { workspace = true }
 
 # Cryptographic primitives
 sha2 = "0.10"
