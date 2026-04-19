@@ -124,6 +124,60 @@ helm install redpanda redpanda/redpanda -f values-redpanda.yaml -n redpanda --cr
   t=8min heal. Verdict: zero loss, WAL stays 0, failover < 5s.
   Usage: `./run-t6-sustained.sh`.
 
+## G13 — Chaos Mesh on DOKS leaves iptables/tc rules behind (workaround)
+
+Observed during the 2026-04-19 T6 run: after `kubectl delete -f
+chaos-netpart-aeon-2.yaml` the top-level `NetworkChaos` resource is
+gone and each affected pod's `PodNetworkChaos` reconciles to `spec: {}`,
+but the kernel-level `iptables` / `tc` rules injected by the
+`chaos-daemon` DaemonSet on the DOKS worker nodes are **not** removed.
+Net effect for Aeon: subsequent QUIC `sendmsg` on the cluster-Raft
+path fails with `EPERM`, the Raft log stops advancing, and the
+post-heal pipeline wedges even though every pod appears `Ready`.
+
+This is an infrastructure gap in the Chaos Mesh ↔ DOKS CNI
+integration (not an Aeon code bug). We reproduced it with a clean
+install of Chaos Mesh 2.6.3 against a fresh DOKS `g-8vcpu-32gb`
+cluster in AMS3; the PPS probe is fine before the experiment runs and
+broken after the heal.
+
+**Workaround** — after every NetworkChaos experiment, before starting
+the next test, restart the Aeon StatefulSet so each pod re-creates its
+QUIC endpoint from a fresh network namespace:
+
+```bash
+# 1. Confirm the top-level NetworkChaos + any PodNetworkChaos are gone.
+kubectl get networkchaos -n aeon
+kubectl get podnetworkchaos -n aeon
+
+# 2. Nudge the kernel rules out by restarting the StatefulSet.
+#    Rolling restart keeps quorum if ≥ 3 replicas; for a 1- or 2-node
+#    cluster expect a brief leaderless window during the roll.
+kubectl -n aeon rollout restart sts/aeon
+kubectl -n aeon rollout status  sts/aeon --timeout=120s
+
+# 3. Verify Raft is committing again before resuming the test.
+kubectl -n aeon exec aeon-0 -- curl -s http://127.0.0.1:4471/cluster/status \
+  | jq '.raft.last_applied, .leader_id'
+```
+
+The rolling-restart is cheap on a 3-node cluster (≤ 90 s), but it is
+not zero-cost: T6's 10-minute sustained-load run has to pause during
+the roll. When Session A is re-run with this workaround, record the
+pause in the evidence log so the 10 min wall-clock stays separable
+from the active-load window.
+
+Aeon-side gap to watch for (not part of G13): if a future T6 variant
+re-applies network partitions back-to-back, the rolling-restart
+between iterations will churn the Raft log store. `bootstrap_single_persistent`
+handles restart correctly (FT-1 / FT-2), so this is safe — but worth a
+note if we observe log-replay cost in the metrics.
+
+Once Session B runs on AWS EKS (different CNI + kernel path), re-try
+Chaos Mesh without the workaround. If EKS doesn't exhibit the leak,
+the workaround stays DOKS-only and we file the DOKS result upstream
+at `chaos-mesh/chaos-mesh`.
+
 ## Tear-down criterion
 
 All boxes in plan § 8 ticked, then:

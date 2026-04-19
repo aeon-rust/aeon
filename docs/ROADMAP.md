@@ -376,15 +376,19 @@ for streaming connectors, tokio-rustls for TCP-based connectors, etc.).
 
 **Before crossing Gate 2, all of the following must be true:**
 
-- [ ] 3-node cluster scales throughput ~3x vs single-node
-- [ ] 1→3→5 scale-up works with zero event loss
-- [ ] 5→3→1 scale-down works with zero event loss
-- [ ] Leader failover recovers in <5s
-- [ ] Two-phase partition transfer cutover <100ms
-- [ ] PoH chain has no gaps across transfers
-- [ ] Merkle proofs verify correctly
-- [ ] mTLS between all cluster nodes
-- [ ] Crypto does not regress throughput beyond acceptable margin
+- [x] 3-node cluster scales throughput ~3x vs single-node — 2026-04-18 T1: 6.96 M agg / 2.32 M per-node on Memory→Blackhole (Session A, DOKS AMS3)
+- [ ] 1→3→5 scale-up works with zero event loss — 2026-04-19 re-run closed **3-node steady state** (100 K events drained, 0 WAL). 3→5 scale-up code path unblocked 2026-04-19 via **G10** (`is_scale_up_pod` → `ClusterNode::join` branch in aeon-cli); awaiting DOKS re-run to re-verify end-to-end.
+- [ ] 5→3→1 scale-down works with zero event loss — unblocked 2026-04-19 (G10 ships the bidirectional seed-join / remove-node path); awaiting DOKS re-run.
+- [ ] Leader failover recovers in <5s — 2026-04-19 T6 measured **10 s** on 3-node no-load cluster; code path unblocked 2026-04-19 via **G14** (`ClusterNode::relinquish_leadership` runs in parallel with the `preStopDelay` sleep during SIGTERM, + `RaftTiming::fast_failover` preset 250/750/2000 ms wired through `AEON_RAFT_*` env / helm `cluster.raftTiming`). Awaiting DOKS re-run to re-measure.
+- [ ] Two-phase partition transfer cutover <100ms — 2026-04-19 T4: API accepts the Raft proposal, but **all 17 transfers stuck `status=transferring, owner=null`** → **G11** (leader-side cutover driver is present in code but inert at runtime; no handover ever fires)
+- [ ] PoH chain has no gaps across transfers — gated on G11 (can't verify until transfers complete)
+- [ ] Merkle proofs verify correctly — not exercised this session
+- [x] mTLS between all cluster nodes — auto-TLS accepted by all 3 pods, QUIC transport green on baseline; see T5 below
+- [ ] Crypto does not regress throughput beyond acceptable margin — deferred to Session B (AWS EKS with NVMe)
+
+Re-run split-brain drill **T5 passed correctness bar** 2026-04-19 (majority commits, minority refused, Raft `last_applied=44` converged across all 3 nodes post-heal; per-partition ownership identical). Sustained-chaos **T6 partial** — orchestration + rebalance endpoint verified, but the chaos-heal itself surfaced **G13** (Chaos Mesh leaves orphan iptables/tc rules on DOKS → QUIC `sendmsg` EPERM → cluster wedges post-heal; infra issue, not an Aeon code gap).
+
+**Gate 2 blocker queue (Aeon code):** ~~G10~~ (✅ 2026-04-19) > ~~G11~~ (all sub-items ✅ 2026-04-19) > ~~G14~~ (✅ 2026-04-19 — code; DOKS re-measure pending) > ~~G9~~ (✅ 2026-04-19 — 307 auto-forward to leader shipped) > ~~G8~~ (✅ 2026-04-19 — `ClusterNode::wait_for_leader` + self-election wait in `propose`). **Infra:** ~~G13~~ (✅ 2026-04-19 — `deploy/doks/README.md` workaround section). See `docs/GATE2-ACCEPTANCE-PLAN.md` § 10.8 for evidence; `deploy/doks/session-a-evidence.md` for full logs.
 
 **Only after Gate 2 is passed, proceed to ecosystem expansion.**
 
@@ -3250,12 +3254,92 @@ DOKS re-spin validates the full bundle in one cluster lifecycle.
 | P2.2d | T2/T3 run scripts (`run-t2-scaleup.sh` covers 1→3→5 path; `run-t3-scaledown.sh` covers 5→3→1) using new `aeon cluster drain` | ✅ landed 2026-04-19 — `deploy/doks/run-t2-scaleup.sh` sequences pipeline-create → producer Job → 1→3 → wait for 3 voters + all partitions Owned → `resize-aeon-pool.sh` 3→5 → 3→5 scale → wait for drain → verdict (producer count vs `aeon_pipeline_outputs_acked_total` sum, WAL fallback counter must stay 0). `run-t3-scaledown.sh` mirrors with the key twist for the missing preStop hook: each step POSTs `/api/v1/cluster/drain {node_id}` first so the leader evacuates partitions, waits for Owned, then `kubectl scale`. Pool shrinks 5→3 at the end. New pipeline manifests `t2-ordered.json` / `t3-ordered.json` (partitions=[], ownership-resolved). Both scripts `bash -n` clean. |
 | P2.2e | T5/T6 run scripts using Chaos Mesh (pragmatic targets: one-pod kill, 30 % packet loss between aeon-1 ↔ aeon-2, DOKS node cordon+drain) | ✅ landed 2026-04-19 — shared `deploy/doks/chaos-netpart-aeon-2.yaml` (NetworkChaos, direction=both, isolates aeon-2 from aeon-0/aeon-1). `run-t5-split-brain.sh`: apply → 2-min write loop against all 3 REST endpoints (tallies majority-commit vs minority-reject) → heal → wait for Raft `last_applied` to converge → cross-member per-partition ownership diff. Pass requires majority-ok > 0, minority-rejected > 0, converged, no mismatch. `run-t6-sustained.sh`: 10-min OrderedBatch run at `RATE` (default 500k/s) with four timer-triggered events (t=2 leader-pod kill → failover-ms capture; t=4 `POST /cluster/rebalance`; t=6 apply NetworkChaos; t=8 heal), verdict: zero loss, WAL == 0, failover < 5s. Both `bash -n` clean. |
 
-**Phase 3 — Re-run Session A on fresh DOKS**
+**Phase 3 — Re-run Session A on fresh DOKS** ✅ executed 2026-04-19, torn down same day
 
-Full T0 → T6 sweep on a freshly-spun DOKS cluster (AMS3, same
-`values-aeon.yaml` + `helm/aeon` chart). Pre-flight: all Phase 1 + Phase
-2 items merged, P1.1i deployed for live debugging. Single cluster
-lifecycle; tear down at end.
+Full T0 → T6 sweep attempted on a freshly-spun DOKS cluster
+(`98d58935-b2c9-4b8e-8c8c-3c75f6660c89`, AMS3, 3× g-8vcpu-32gb aeon
+pool + redpanda + monitoring). Pre-flight confirmed: all Phase-1 code
+gaps (G1–G5) closed by the bundle; `aeon:session-a-prep` image deployed
+via `rust-proxy-registry`; Chaos Mesh 2.6.3 installed into `chaos` ns.
+
+**Closed in re-run:**
+
+- **T5 Split-brain drill — correctness bar met.** NetworkChaos isolates
+  aeon-2; majority pair (leader on aeon-1 throughout) committed 10/10
+  writes; minority aeon-2 rejected 10/10; after heal, all 3 members
+  converged on Raft `term=44, last_applied=44` within 2 s, per-partition
+  ownership map identical across members. Pass-checker jq path bug
+  (`.raft.last_applied_log_id.index` → `.raft.last_applied`) fixed in
+  `deploy/doks/run-t5-split-brain.sh` during the run.
+- **T2 partial — 3-node steady-state verified.** End-to-end
+  Kafka→Aeon→Kafka pipeline drained 100 037 produced events down to
+  97 182 broker-acked before the manual stop, `aeon_checkpoint_fallback_wal_total = 0`
+  throughout (no durability degradation path engaged).
+- **T6 partial — script orchestration + chaos sequencing + leader-aware
+  routing all verified.** Pipeline create + start + rebalance events
+  route through `pick_leader_host`, landing on the current leader (G9
+  workaround). Rebalance endpoint returned `{"planned":0,"status":"noop"}`
+  in 2.2 s on the healthy 3-node baseline.
+
+**New gaps surfaced (Aeon code):**
+
+| ID | Gap | Surfaces in | Severity |
+|---|---|---|---|
+| **G8** | Pipeline create on a freshly-bootstrapped single-node Raft cluster returns `Raft proposal failed: has to forward request to: None, None` (self-election hasn't completed when REST accepts traffic). Worked around by starting at 3 replicas. | T2 scale-up path | Medium — startup race, not a design issue |
+| **G9** | REST API write paths (pipeline create / start / rebalance) do not auto-forward to the Raft leader; a request hitting a follower returns 500 with a `Some(NodeId)` hint and expects the client to retry. CLI already routes via `leader_id`; the T-run bash scripts had to be patched to parity. | T2 + T6 | Medium — test-harness friction today, operator friction tomorrow |
+| **G10** | StatefulSet scale-up beyond `cluster.replicas` fails — new pods read the frozen `AEON_CLUSTER_REPLICAS=3` env, call `raft.initialize({1,2,3})` excluding themselves, crash-loop with `node 4 has to be a member`. Discovery needs a "seed-join when `pod_ordinal >= replicas`" branch. | **Blocker T2 3→5 / T3** | **High — blocks every horizontal scale-out** |
+| **G11** | Partition-transfer endpoint accepts the request, Raft replicates the `Transferring` transition, but the leader-side cutover driver never executes the handover. All 17 T4 transfers stuck at `status=transferring, owner=null`. CL-6 / P1.1c driver is present in source but inert at runtime — needs a re-visit of the watch-loop spawn-point. No abort endpoint to clear the stuck state. | **Blocker T4 + all rebalance-driven moves** | **High — Gate 2 cutover row depends on this** |
+
+**Infra observations (not Aeon code):**
+
+- **G13** — Chaos Mesh on DOKS leaves orphan iptables/tc rules after
+  `kubectl delete networkchaos ...`; `PodNetworkChaos` reconciles to
+  `spec: {}` but the chaos-daemon doesn't clear the rules. Manifests as
+  `quinn_udp sendmsg error: code: 1 PermissionDenied` on all aeon pods
+  → Raft vote-timeout loop. Workaround for future T6 on DOKS:
+  `kubectl -n aeon rollout restart sts/aeon` after every heal.
+- **G14** — Leader-kill failover measured **10 s** on a 3-node,
+  no-load cluster (target < 5 s). openraft vote-timeout loop visible
+  (`Vote N->M timeout after 1.5s` repeated). Needs a pre-stop hook
+  that relinquishes leadership before pod shutdown + `raft_timing`
+  tuning (heartbeat/election windows).
+
+**DOKS cluster torn down** 2026-04-19 via `doctl kubernetes cluster delete 98d58935-b2c9-4b8e-8c8c-3c75f6660c89 --dangerous --force`. Registry tags retained (`rust-proxy-registry/aeon`, 7 tags) for future re-runs / Session B image pre-bake.
+
+Full evidence: [`deploy/doks/session-a-evidence.md`](../deploy/doks/session-a-evidence.md).
+
+**Session A re-run — to-do list (2026-04-19 → next re-spin)**
+
+One-branch strategy again (per user preference). All items below land before another DOKS cluster is created.
+
+| ID | Item | Why first | Notes |
+|----|------|-----------|-------|
+| **G11** | Wire the leader-side partition cutover driver so `PartitionOwnership::Transferring` → `CompleteTransfer` actually fires. Split: **G11.a** ✅ shipped 2026-04-19 — production `L2SegmentInstaller` + `PohChainInstallerImpl` with configurable `PohVerifyMode::{Verify, VerifyWithKey, TrustExtend}` (default `Verify`; wired via `cluster.poh_verify_mode` YAML + `AEON_CLUSTER_POH_VERIFY_MODE` env). **G11.b** ✅ shipped 2026-04-19 — spawn `PartitionTransferDriver::watch_loop` in `aeon-cli` K8s bootstrap (gated on `AEON_PIPELINE_NAME`); `ClusterNode::propose_partition_transfer` now calls `driver.notify()` on accept so the watcher wakes immediately. **G11.c** ✅ shipped 2026-04-19 — `PipelineSupervisor::set_poh_installed_chains(Arc<InstalledPohChainRegistry>)` writes the same registry Arc the transfer driver writes to into a `OnceLock`; `start()` stamps it onto every pipeline's `PipelineConfig.poh_installed_chains` before spawning; `create_poh_state` consults the registry keyed on `(pipeline_name, partition_id)` and `take()`s the installed snapshot, wrapping the returned `PohChain` in `Arc<Mutex<>>` so the resumed chain carries the source-side sequence instead of restarting at 0. Falls back to genesis when the registry entry is absent (non-cluster / first-start). Pinned by `create_poh_state_resumes_installed_chain_g11c` — 5-batch source chain resumes at `sequence=5`, second call genesises because `take()` consumed the snapshot. Plumbed through `run_multi_partition` per-partition config clone so multi-partition pipelines get per-partition resume for free. | Unblocks T4 + T2 3→5 partition moves + the entire Gate 2 cutover checkbox | P1.1c watch_loop + installers traits exist; audit showed no production installer impls and driver is only spawned in tests. Crypto stack (SHA-512 PoH/Merkle/MMR + Ed25519 root sig) audited 2026-04-19 — coherent; `PohChainState` wire format is MMR-only so `Verify` mode covers structural MMR; `VerifyWithKey` is honest about being a future extension that requires carrying recent entries in state. |
+| **G10** | Dynamic seed-join on STS scale-up: when `pod_ordinal >= replicas`, switch discovery from `raft.initialize` to `add_learner → change_membership` against an existing leader. ✅ shipped 2026-04-19 — `K8sDiscovery::is_scale_up_pod` / `to_join_config` populate `seed_nodes` with the initial cohort FQDNs and leave `initial_members` empty; `aeon-cli` branches to `ClusterNode::join` (seed-contacts leader, sends `JoinRequest`, leader handles `add_learner → change_membership`) instead of `bootstrap_multi` (runs `raft.initialize`). Covered by 13 discovery unit tests + 166 cluster lib tests green. | Unblocks T2 3→5 + T3 5→3→1 + horizontal HPA in general | Touches `crates/aeon-cluster/src/discovery.rs` + `crates/aeon-cli/src/main.rs` bootstrap branch |
+| **G14** | Leader pre-stop hook + `raft_timing` tuning to hit <5 s failover. ✅ shipped 2026-04-19 — `ClusterNode::relinquish_leadership(timeout)` disables heartbeats and waits for `metrics.current_leader` to flip away from self; wired into `rest_api::shutdown_signal` in parallel with the `AEON_PRESTOP_DELAY_SECS` sleep (runs inside the K8s endpoint-propagation window). `RaftTiming::fast_failover` preset (250 / 750 / 2000 ms) added with a test that pins worst-case 2× election_max_ms ≤ 5 s. Operator knobs: `AEON_RAFT_HEARTBEAT_MS`, `AEON_RAFT_ELECTION_MIN_MS`, `AEON_RAFT_ELECTION_MAX_MS`, `AEON_LEADER_RELINQUISH_MS`; helm `cluster.raftTiming.{heartbeatMs,electionMinMs,electionMaxMs}` + `gracefulShutdown.leaderRelinquishMs`. Live <5 s measurement waits for the next DOKS re-run. | Gate 2 row explicitly targets <5 s | Cheap once G11+G10 land; verify on DOKS re-run |
+| **G9** | Auto-forward (or 307-redirect) cluster-mutation writes to the Raft leader from any REST endpoint. ✅ shipped 2026-04-19 — `rest_api::maybe_forward_to_leader(state, uri)` helper returns `307 Temporary Redirect` with `Location: {scheme}://{leader_host}:{rest_port}{path+query}` plus `X-Leader-Node-Id` and `X-Aeon-Forwarded: 1` headers when the receiving pod is not the current Raft leader. Wired at the top of every cluster-mutation handler (`transfer_partition`, `cluster_drain`, `cluster_rebalance`, `register_processor`, `create_pipeline`, `start_pipeline`, `stop_pipeline`, `upgrade_pipeline`, `delete_pipeline`). Leader host comes from `membership.get_node(leader_id)` on the Raft metrics; REST port is the new `ClusterConfig::rest_api_port` (populated in `aeon-cli` from `AEON_API_ADDR` / CLI bind flag) and defaults to `http` scheme. Scripted clients that don't follow redirects can still read `X-Leader-Node-Id` to reroute. | Operator UX + harness simplification | Engine side — add leader-proxy or return a consistent 307 with `X-Leader-*` headers |
+| **G8** | Accept pipeline-create during single-node self-election (block until leader elected, don't 500). ✅ shipped 2026-04-19 — `ClusterNode::wait_for_leader(timeout)` (openraft `raft.wait(…).metrics(`current_leader.is_some()`)`) exposes a public helper; `ClusterNode::propose` consults it before `client_write` when `metrics.current_leader.is_none()`, bounded by `leader_wait_budget()` = `clamp(3 × election_max_ms, 2 s, 10 s)`. This smooths the freshly-bootstrapped single-node race where `raft.initialize()` has returned but self-election is still in-flight, eliminating the transient `Raft proposal failed: has to forward request to: None, None`. Pinned by `wait_for_leader_returns_self_on_single_node_g8`. On a truly leaderless multi-node quorum the wait times out cleanly with `no Raft leader elected within Nms` instead of hanging. | Makes `START_REPLICAS=1` scripts work without sleep-hack | Smaller, do together with G9 |
+| **G13** | Document the Chaos-Mesh-on-DOKS `rollout restart` workaround in `deploy/doks/README.md`; re-try on AWS EKS (different CNI). ✅ shipped 2026-04-19 — new "G13 — Chaos Mesh on DOKS leaves iptables/tc rules behind (workaround)" section in `deploy/doks/README.md` documents the failure mode (top-level NetworkChaos deleted + PodNetworkChaos reconciled to `spec:{}` but kernel iptables/tc rules persist → QUIC `sendmsg` EPERM → Raft stuck), the operator workaround (`kubectl -n aeon rollout restart sts/aeon` + verify `last_applied` advancing again via `/cluster/status`), how to record the rollout pause in the T6 evidence log so active-load wall-clock stays separable, and the EKS re-try plan (different CNI + kernel path — if the leak is DOKS-specific, file upstream at chaos-mesh/chaos-mesh). | T5/T6 resilience runs | Infra — no code change in Aeon |
+
+**Phase 3 follow-on pipeline:** Phase 4 (Session B / EKS — items P4.i–P4.iv) stays queued as defined. A second DOKS re-spin is **optional** — if the G10/G11/G14 bundle lands cleanly on Rancher Desktop loopback first, we can skip the interim DOKS trip and go straight to Session B (AWS EKS) for the throughput ceiling.
+
+**Phase 3.5 — Rancher Desktop validation rehearsal (pre-Session-B)**
+
+All six Gate 2 Aeon code gaps (G8, G9, G10, G11, G14) + G13 infra workaround shipped 2026-04-19 but haven't been exercised together end-to-end on a real k8s. Before re-spending on DOKS or spinning up EKS, rehearse the full matrix locally on Rancher Desktop k3s against a freshly-built image. RD numbers are **correctness floor only** (WSL2 8 CPU / 12 GiB caps throughput well below DOKS/EKS); the goal is to catch integration regressions, exercise a push-based source for the first time, and explicitly verify the crypto chain under all three `PohVerifyMode` values.
+
+| ID | Item | Status |
+|----|------|--------|
+| V1 | Build fresh `aeon` image from current master; `helm install helm/aeon -f values-local.yaml` 3-node STS on RD; sanity-check `/cluster/status`, `/metrics`, `aeon cluster status --watch` | ⏳ pending (#79) |
+| V2 | Re-run T0–T6 scripts against the RD kubecontext with scaled-down replica counts where needed — exercises G1/G3/G4/G8/G9/G10/G11/G14 together | ⏳ pending (#80) |
+| V3 | Processor validation — both native Rust and Wasm guests through per-event + batch paths; confirm L2/L3/WAL tiers engage per `DurabilityMode`; `outputs_acked_total == input` at steady state | ⏳ pending (#81) |
+| V4 | Push-source — short design note + HTTP ingest source reusing the axum stack; validate E2E on RD with a curl/loadgen client. Complements the existing pull-based Kafka/Redpanda source. | ⏳ pending (#82) |
+| V5 | Crypto chain E2E — walk a transferred partition under each `PohVerifyMode::{Verify, VerifyWithKey, TrustExtend}` and assert MMR + Merkle + Ed25519 root-sig round-trips, resumed `PohChain.sequence()` matches sender | ⏳ pending (#83) |
+| V6 | Consolidated `docs/GATE2-PRE-SESSION-B-VALIDATION.md` report + Session-B readiness checklist; back-propagate any new gaps to the Gate 2 blocker queue | ⏳ pending (#84) |
+
+**Post-V6 flow:**
+
+1. (optional) one more DOKS re-spin to close the remaining "live measurement" rows left open at Phase 3 (G14 <5 s failover, T2/T4 on real NVMe, T6 active-load wall-clock with the G13 rollout-restart workaround in the evidence log);
+2. **Phase 4 (Session B / AWS EKS)** — throughput ceiling + anything DOKS under-serves because of the 2 Gbps / non-NVMe SKU constraint noted in `reference_doks_droplet_availability`.
 
 **Phase 4 — Session B (AWS EKS) calibration, deliverables only (no cluster spend yet)**
 
