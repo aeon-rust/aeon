@@ -619,6 +619,66 @@ rehearsal* for the V1–V6 detail and task IDs #79–#84. Output of V6 is
 checklist, which back-propagates any new gaps into § 10.8.1 before EKS
 spin-up.
 
+### 10.9 Session A post-bundle re-run (2026-04-19) — cluster `c3867cc5`
+
+Fresh DOKS cluster `c3867cc5-e2e7-4d5f-94cd-7d82ca8c4303` (AMS3,
+3 × `g-8vcpu-32gb` aeon-pool + 3 × `so1_5-4vcpu-32gb` redpanda-pool +
+1 × `s-4vcpu-8gb` monitoring pool). Image
+`registry.digitalocean.com/rust-proxy-registry/aeon:70c68b3` (commit
+70c68b3, 2026-04-19 — G1–G14 + G13 workaround, RD-smoked). Setup
+automation gaps surfaced + fixed in-run:
+
+- `deploy/doks/setup-session-a.sh` step 2 auto-generated DOKS pool names
+  (e.g. `pool-psmexo05w`) no longer matched the hardcoded `default`
+  filter → new pool-discovery helper labels `workload={aeon,redpanda,
+  monitoring}` by droplet size with `{AEON,REDPANDA,MONITORING}_POOL_ID`
+  env overrides.
+- DOKS integrates DOCR via a `registry-<name>` secret provisioned only
+  in the `default` namespace → step 7 now also runs
+  `doctl registry kubernetes-manifest --namespace aeon | kubectl apply`;
+  `deploy/doks/values-aeon.yaml` + `deploy/doks/loadgen.yaml` renamed
+  `imagePullSecrets` to the doctl-generated name
+  `registry-rust-proxy-registry`. `loadgen.yaml` image retagged to
+  `70c68b3`.
+
+| Test | Verdict | Notes |
+|---|---|---|
+| Cluster bring-up | ✅ | 3-node STS Ready in <25 s after pull-secret fix; Raft term 1, leader id=3, membership `{1,2,3}`, 24 partitions evenly owned (8/8/8). |
+| **T0.C0 None** · Memory→`__identity`→Blackhole | ✅ | 200 M/node × 3 = **600 M events, zero loss** (`events_failed_total=0`, `events_retried_total=0` on every pod). Monitor poll interval 30 s bounded the measurement at `t ≤ 64 s` (aggregate eps ≥ **9.4 M**); first sample at `t = 17 s` showed 458 M already processed ⇒ **steady-state aggregate ≈ 27 M eps (~9 M eps/node)**. Per-pod `events_received=events_processed=outputs_sent=200 M` exact on all 3 nodes. |
+| **T1 — 3-node Memory→Blackhole** | ✅ | 100 M/node × 3 = **300 M events, zero loss** on every pod. Tighter 10 s poll interval resolved steady-state rate: **aggregate 6.5 M eps (~2.2 M eps/node)** at 41 s sample; the 78 s upper bound reflects settling + poll overhead, not sustained rate. Matches the 2026-04-18 run's 2.2 M eps/node / 45.4 s wall within measurement noise. |
+| T0.C1 / T0.C2 | ⏭ | Not re-run — 2026-04-18 Kafka-bound numbers already on record in § 10.1; re-measurement adds no new correctness signal for Gate 2. |
+| **T2 — Scale-up 3→5** (G10 live verification) | ⛔ blocked by G15 on this run (fix shipped same day) | Pool resize 3→5 clean (67 s). STS scale 3→5 triggered G10 scale-up path correctly — `aeon-3` / `aeon-4` logs show `scale-up pod detected — will seed-join existing cluster`, then `attempting to join cluster via seed node` against all three seeds (aeon-0, aeon-1, aeon-2) in order. **All three seeds — including aeon-2 (`node_id=3`), the current Raft leader — rejected the join with `not the leader; current leader is Some(3)`.** Both new pods `CrashLoopBackOff` after exhausting seeds; STS rollout stalled at 3/5. Scaled back to 3, resized pool 5→3, producer Job deleted. G15 code fix shipped 2026-04-19 — T2 re-measurement folds into next DOKS re-spin. |
+| T3 / T4 / T5 / T6 | ⏭ | Not attempted — G15 pre-empted T2 on this run, and T3 depends on reaching 5 nodes first. T4/T5/T6 correctness verdicts from 2026-04-18 stand. Re-measurement folds into next DOKS re-spin (post-G15). |
+
+#### 10.9.1 Code gap surfaced — G15 (shipped 2026-04-19)
+
+| ID | Gap | Severity | Resolution |
+|---|---|---|---|
+| **G15** | Cluster scale-up join handler rejected join requests even when the receiving seed **was** the current Raft leader. `aeon-cluster::transport::server::handle_add_node` compared `raft.current_leader().await` vs `raft.metrics().borrow().id`; on multi-node clusters the check evaluated false on the true leader (all three seeds — including the pod whose `/api/v1/cluster/status` reports `node_id=3` and `leader_id=3` — returned `"not the leader; current leader is Some(3)"`). Root cause: the watch-channel `metrics.id` diverges from `ClusterConfig::node_id` in the join-handler code path, while REST `/api/v1/cluster/status` uses the configured id (coherent with pod logs). **Impact while open:** G10 scale-up couldn't complete end-to-end on a multi-node cluster; 1-node → 3-node bootstrap worked because initial voters are seeded via `initial_members`. | **High — blocked T2/T3 Gate 2 rows** | ✅ **Shipped 2026-04-19.** `server::serve()` now takes `self_id: NodeId` sourced from `ClusterConfig::node_id`; `handle_add_node` / `handle_remove_node` use the configured id for the leader-self check. `tracing::warn!` diagnostic kept on the reject path to flag any future divergence between `metrics.id` and `config.node_id`. Regression test `g15_join_targets_actual_leader_of_three_node_cluster` in `crates/aeon-cluster/tests/multi_node.rs` bootstraps a 3-node cluster via `initial_members`, finds the elected leader, and asserts a QUIC `JoinRequest` for node 4 succeeds + 4-voter membership. All 11 `multi_node` + 2 `partition_transfer_e2e` + 82 lib unit tests pass. |
+
+No other code gaps surfaced; the setup-automation regressions (pool
+name + DOCR secret name) were fixed in-tree during the session.
+
+#### 10.9.2 Session verdicts — Session A re-run (2026-04-19)
+
+- **Data plane (T0, T1):** ✅ green — 900 M events processed across
+  two cells, zero loss on every pod. Steady-state aggregate **~6.5 M
+  eps** (Kafka-free path); per-node ceiling matches the 2026-04-18 run.
+  Aeon as bottleneck: still comfortably under CPU — 3×g-8vcpu-32gb pods
+  sustained both runs without back-pressure.
+- **Cluster mutation path (T2):** ⛔ blocked by G15 on this run; **G15
+  code fix shipped 2026-04-19** (configured-id threaded through
+  `server::serve()`; regression test green). T2 + T3 re-measurement on
+  real k8s folds into the next DOKS re-spin. All Aeon Gate 2 code
+  blockers (G8–G11, G13, G14, G15) now closed — remaining work is
+  cluster re-measurement, not code.
+
+#### 10.9.3 Tear-down — c3867cc5
+
+`doctl kubernetes cluster delete c3867cc5-e2e7-4d5f-94cd-7d82ca8c4303
+--dangerous --force` — user is running this manually post-session.
+DOCR registry (`rust-proxy-registry`) retained.
+
 ---
 
 ## 11. Session 0 — Local Rancher Desktop (do this first, $0)

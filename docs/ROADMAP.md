@@ -376,19 +376,19 @@ for streaming connectors, tokio-rustls for TCP-based connectors, etc.).
 
 **Before crossing Gate 2, all of the following must be true:**
 
-- [x] 3-node cluster scales throughput ~3x vs single-node — 2026-04-18 T1: 6.96 M agg / 2.32 M per-node on Memory→Blackhole (Session A, DOKS AMS3)
-- [ ] 1→3→5 scale-up works with zero event loss — 2026-04-19 re-run closed **3-node steady state** (100 K events drained, 0 WAL). 3→5 scale-up code path unblocked 2026-04-19 via **G10** (`is_scale_up_pod` → `ClusterNode::join` branch in aeon-cli); awaiting DOKS re-run to re-verify end-to-end.
-- [ ] 5→3→1 scale-down works with zero event loss — unblocked 2026-04-19 (G10 ships the bidirectional seed-join / remove-node path); awaiting DOKS re-run.
-- [ ] Leader failover recovers in <5s — 2026-04-19 T6 measured **10 s** on 3-node no-load cluster; code path unblocked 2026-04-19 via **G14** (`ClusterNode::relinquish_leadership` runs in parallel with the `preStopDelay` sleep during SIGTERM, + `RaftTiming::fast_failover` preset 250/750/2000 ms wired through `AEON_RAFT_*` env / helm `cluster.raftTiming`). Awaiting DOKS re-run to re-measure.
-- [ ] Two-phase partition transfer cutover <100ms — 2026-04-19 T4: API accepts the Raft proposal, but **all 17 transfers stuck `status=transferring, owner=null`** → **G11** (leader-side cutover driver is present in code but inert at runtime; no handover ever fires)
-- [ ] PoH chain has no gaps across transfers — gated on G11 (can't verify until transfers complete)
-- [ ] Merkle proofs verify correctly — not exercised this session
+- [x] 3-node cluster scales throughput ~3x vs single-node — 2026-04-18 T1: 6.96 M agg / 2.32 M per-node on Memory→Blackhole (Session A, DOKS AMS3); **re-confirmed 2026-04-19** on fresh cluster `c3867cc5` — T1 6.5 M agg / 2.2 M per-node, zero loss on 300 M events, matches the 2026-04-18 floor within measurement noise. T0.C0 on the same cluster: **600 M events, zero loss, ~27 M agg eps steady-state** (~9 M eps/node) — confirming the ~3× scaling shape on the Kafka-free path.
+- [ ] 1→3→5 scale-up works with zero event loss — 2026-04-19 post-bundle re-run (`c3867cc5`): pool 3→5 clean (67 s); STS 3→5 hit **G15 gap** — scale-up pods `aeon-3/aeon-4` entered `seed-join` flow correctly (G10 client-side wiring verified), but **every seed — including the current Raft leader — rejected the join with `"not the leader; current leader is Some(3)"`**. G15 code fix **shipped 2026-04-19** (`crates/aeon-cluster/src/transport/server.rs` — `serve()` takes `self_id: NodeId` sourced from `ClusterConfig::node_id`; `handle_add_node` / `handle_remove_node` use the configured id for the leader-self check instead of `raft.metrics().borrow().id`; new regression test `g15_join_targets_actual_leader_of_three_node_cluster` in `tests/multi_node.rs` passes + 10 existing multi-node tests stay green). **T2 re-measurement on real k8s deferred to next DOKS re-spin.**
+- [ ] 5→3→1 scale-down works with zero event loss — `aeon cluster drain` + REST paths are green on the 3-node baseline; full 5→3→1 roundtrip gated on next DOKS re-spin (needs to reach 5 first via the now-shipped G15 path).
+- [ ] Leader failover recovers in <5s — 2026-04-19 (first pass) T6 measured **10 s** on 3-node no-load cluster; code path unblocked 2026-04-19 via **G14** (`ClusterNode::relinquish_leadership` runs in parallel with the `preStopDelay` sleep during SIGTERM, + `RaftTiming::fast_failover` preset 250/750/2000 ms wired through `AEON_RAFT_*` env / helm `cluster.raftTiming`). Post-bundle re-run didn't reach T6 (blocked at T2 by G15 at the time; G15 now shipped). Re-measurement folded into the next DOKS re-spin.
+- [ ] Two-phase partition transfer cutover <100ms — T4 not re-attempted 2026-04-19 post-bundle; code path closed via **G11** (a/b/c shipped). Re-measurement folded into the next DOKS re-spin alongside T2/T3/T6.
+- [ ] PoH chain has no gaps across transfers — gated on T4 re-measurement.
+- [ ] Merkle proofs verify correctly — not exercised this session; scheduled for Phase 3.5 V5.
 - [x] mTLS between all cluster nodes — auto-TLS accepted by all 3 pods, QUIC transport green on baseline; see T5 below
 - [ ] Crypto does not regress throughput beyond acceptable margin — deferred to Session B (AWS EKS with NVMe)
 
 Re-run split-brain drill **T5 passed correctness bar** 2026-04-19 (majority commits, minority refused, Raft `last_applied=44` converged across all 3 nodes post-heal; per-partition ownership identical). Sustained-chaos **T6 partial** — orchestration + rebalance endpoint verified, but the chaos-heal itself surfaced **G13** (Chaos Mesh leaves orphan iptables/tc rules on DOKS → QUIC `sendmsg` EPERM → cluster wedges post-heal; infra issue, not an Aeon code gap).
 
-**Gate 2 blocker queue (Aeon code):** ~~G10~~ (✅ 2026-04-19) > ~~G11~~ (all sub-items ✅ 2026-04-19) > ~~G14~~ (✅ 2026-04-19 — code; DOKS re-measure pending) > ~~G9~~ (✅ 2026-04-19 — 307 auto-forward to leader shipped) > ~~G8~~ (✅ 2026-04-19 — `ClusterNode::wait_for_leader` + self-election wait in `propose`). **Infra:** ~~G13~~ (✅ 2026-04-19 — `deploy/doks/README.md` workaround section). See `docs/GATE2-ACCEPTANCE-PLAN.md` § 10.8 for evidence; `deploy/doks/session-a-evidence.md` for full logs.
+**Gate 2 blocker queue (Aeon code):** ~~G15~~ (✅ 2026-04-19 — configured-id threaded through `server::serve()`; regression test shipped) > ~~G10~~ (✅ 2026-04-19 — client-side seed-join flow verified in re-run) > ~~G11~~ (all sub-items ✅ 2026-04-19) > ~~G14~~ (✅ 2026-04-19 — code; DOKS re-measure pending) > ~~G9~~ (✅ 2026-04-19 — 307 auto-forward to leader shipped) > ~~G8~~ (✅ 2026-04-19 — `ClusterNode::wait_for_leader` + self-election wait in `propose`). **Infra:** ~~G13~~ (✅ 2026-04-19 — `deploy/doks/README.md` workaround section). **All Aeon code blockers closed; remaining Gate 2 work is re-measurement on real k8s.** See `docs/GATE2-ACCEPTANCE-PLAN.md` § 10.8 (pre-bundle) + § 10.9 (post-bundle re-run) for evidence; `deploy/doks/session-a-evidence.md` for full logs.
 
 **Only after Gate 2 is passed, proceed to ecosystem expansion.**
 
@@ -3321,7 +3321,7 @@ One-branch strategy again (per user preference). All items below land before ano
 | **G8** | Accept pipeline-create during single-node self-election (block until leader elected, don't 500). ✅ shipped 2026-04-19 — `ClusterNode::wait_for_leader(timeout)` (openraft `raft.wait(…).metrics(`current_leader.is_some()`)`) exposes a public helper; `ClusterNode::propose` consults it before `client_write` when `metrics.current_leader.is_none()`, bounded by `leader_wait_budget()` = `clamp(3 × election_max_ms, 2 s, 10 s)`. This smooths the freshly-bootstrapped single-node race where `raft.initialize()` has returned but self-election is still in-flight, eliminating the transient `Raft proposal failed: has to forward request to: None, None`. Pinned by `wait_for_leader_returns_self_on_single_node_g8`. On a truly leaderless multi-node quorum the wait times out cleanly with `no Raft leader elected within Nms` instead of hanging. | Makes `START_REPLICAS=1` scripts work without sleep-hack | Smaller, do together with G9 |
 | **G13** | Document the Chaos-Mesh-on-DOKS `rollout restart` workaround in `deploy/doks/README.md`; re-try on AWS EKS (different CNI). ✅ shipped 2026-04-19 — new "G13 — Chaos Mesh on DOKS leaves iptables/tc rules behind (workaround)" section in `deploy/doks/README.md` documents the failure mode (top-level NetworkChaos deleted + PodNetworkChaos reconciled to `spec:{}` but kernel iptables/tc rules persist → QUIC `sendmsg` EPERM → Raft stuck), the operator workaround (`kubectl -n aeon rollout restart sts/aeon` + verify `last_applied` advancing again via `/cluster/status`), how to record the rollout pause in the T6 evidence log so active-load wall-clock stays separable, and the EKS re-try plan (different CNI + kernel path — if the leak is DOKS-specific, file upstream at chaos-mesh/chaos-mesh). | T5/T6 resilience runs | Infra — no code change in Aeon |
 
-**Phase 3 follow-on pipeline:** Phase 4 (Session B / EKS — items P4.i–P4.iv) stays queued as defined. A second DOKS re-spin is **optional** — if the G10/G11/G14 bundle lands cleanly on Rancher Desktop loopback first, we can skip the interim DOKS trip and go straight to Session B (AWS EKS) for the throughput ceiling.
+**Phase 3 follow-on pipeline:** Phase 4 (Session B / EKS — items P4.i–P4.iv) stays queued as defined. An interim DOKS re-spin was **run ad-hoc 2026-04-19** against cluster `c3867cc5` to validate the G8–G14 bundle end-to-end — T0.C0 + T1 green, T2 surfaced **G15** (shipped same day). See "Phase 3b" below for the post-bundle re-run evidence. **Next DOKS re-spin is gated on Phase 3.5 V2–V6 completion on Rancher Desktop** (integration-regression floor), then re-measures T2/T3/T4 + G14 <5 s failover + T6 sustained in a single cluster lifecycle.
 
 **Phase 3.5 — Rancher Desktop validation rehearsal (pre-Session-B)**
 
@@ -3344,6 +3344,50 @@ All six Gate 2 Aeon code gaps (G8, G9, G10, G11, G14) + G13 infra workaround shi
 
 1. **DOKS re-spin** is now non-optional because T5/T6 chaos realism can't be closed on RD. The re-spin also closes the remaining live-measurement rows left open at Phase 3 (G14 <5 s failover, T2/T4 on real NVMe, T6 active-load wall-clock with the G13 rollout-restart workaround in the evidence log).
 2. **Phase 4 (Session B / AWS EKS)** — throughput ceiling + anything DOKS under-serves because of the 2 Gbps / non-NVMe SKU constraint noted in `reference_doks_droplet_availability`.
+
+**Phase 3b — Post-bundle DOKS re-run on fresh cluster `c3867cc5` (2026-04-19)**
+
+Ad-hoc DOKS re-spin run 2026-04-19 on fresh cluster
+`c3867cc5-e2e7-4d5f-94cd-7d82ca8c4303` (AMS3, 3 × `g-8vcpu-32gb`
+aeon-pool + 3 × `so1_5-4vcpu-32gb` redpanda-pool + 1 × `s-4vcpu-8gb`
+monitoring). Image `registry.digitalocean.com/rust-proxy-registry/aeon:70c68b3`
+(commit 70c68b3 — G1–G14 bundle + G13 workaround). Ran T0.C0 + T1 + T2
+to exercise the shipped bundle end-to-end on a real multi-node cluster,
+skipping T3–T6 once T2 blocked.
+
+**Setup-automation gaps surfaced + fixed in-run** (no new tasks — all fixed in-tree during session):
+
+- DOKS auto-generated pool names (e.g. `pool-95gb35xh1`, `pool-psmexo05w`)
+  no longer match the hard-coded `default` filter in
+  `deploy/doks/setup-session-a.sh` → added `pool_id_by_size()` helper
+  that resolves `aeon-pool`/`redpanda-pool`/`monitoring-pool` by droplet
+  size, with `{AEON,REDPANDA,MONITORING}_POOL_ID` env overrides.
+- DOKS DOCR integration provisions the pull secret only in the `default`
+  namespace → `setup-session-a.sh` now also runs `doctl registry kubernetes-manifest --namespace aeon | kubectl apply`
+  after the `aeon` namespace is created. Secret naming aligned:
+  `deploy/doks/values-aeon.yaml`, `deploy/doks/loadgen.yaml`, and
+  `deploy/doks/run-t2-scaleup.sh` all reference
+  `registry-rust-proxy-registry` (the doctl-generated name).
+
+**Results table:**
+
+| Row | Verdict | Evidence |
+|-----|---------|----------|
+| Cluster bring-up | ✅ | 3-node STS Ready in <25 s post-secret-fix; Raft term 1, leader id=3, membership `{1,2,3}`, 24 partitions evenly owned (8/8/8). |
+| **T0.C0 None** (Memory→`__identity`→Blackhole) | ✅ | 200 M/pod × 3 = **600 M events, zero loss** (`events_failed_total=0`, `events_retried_total=0` on every pod). Monitor poll bounded measurement at `t ≤ 64 s` → aggregate ≥ 9.4 M eps lower-bound; first sample at 17 s showed 458 M already processed ⇒ **steady-state ~27 M agg eps (~9 M eps/pod)**. |
+| **T1** (3-node Memory→Blackhole) | ✅ | 100 M/pod × 3 = **300 M events, zero loss**. 10 s poll resolved steady-state: **6.5 M agg eps (2.2 M eps/pod)** at 41 s sample. Matches 2026-04-18 T1 baseline (6.96 M/2.32 M) within measurement noise — **3-node scaling shape reproducible.** |
+| **T2** (3→5 STS scale + G10 live verification) | ⛔ **blocked by new G15** | Pool resize 3→5 clean (67 s). STS 3→5 scale fired the G10 client path correctly — `aeon-3/aeon-4` logs show `scale-up pod detected — will seed-join existing cluster`, rotating through all three seeds. **Every seed — including `aeon-2` (`node_id=3`, current Raft leader) — rejected the join with `"not the leader; current leader is Some(3)"`.** New pods CrashLoopBackOff; STS stalled 3/5. Scaled back to 3, pool 5→3, cluster stable for document + tear-down. |
+| T3 / T4 / T5 / T6 | ⏭ skipped | T3 depends on reaching 5; T4/T5/T6 correctness verdicts from 2026-04-18 stand. Re-measurement folded into the next re-spin (post-G15). |
+
+**Code gap surfaced — G15 (Aeon code) — shipped 2026-04-19:**
+
+| ID | Gap | Severity | Resolution |
+|---|---|---|---|
+| **G15** | Cluster scale-up join handler rejected join requests even when the receiving seed **was** the current Raft leader. `aeon-cluster::transport::server::handle_add_node` compared `raft.current_leader().await` vs `raft.metrics().borrow().id`; on a multi-node cluster, all three seeds — including the pod whose `/api/v1/cluster/status` reports `node_id=3` and `leader_id=3` — returned `"not the leader; current leader is Some(3)"`. Root cause: the metrics watch-channel `id` diverges from `ClusterConfig::node_id` in the join-handler code path, while REST `/api/v1/cluster/status` uses the configured id (coherent with pod logs). | **High — blocked T2/T3 Gate 2 rows** | ✅ **Shipped 2026-04-19.** `server::serve()` now takes `self_id: NodeId` sourced from `ClusterConfig::node_id`; `handle_add_node` / `handle_remove_node` use the configured id for the leader-self check, with a `tracing::warn!` on the reject path if `metrics.id` ever diverges in future (kept as diagnostic). New regression test `g15_join_targets_actual_leader_of_three_node_cluster` in `crates/aeon-cluster/tests/multi_node.rs` bootstraps a 3-node cluster via `initial_members`, finds the elected leader, and asserts a QUIC `JoinRequest` for node 4 succeeds + 4-voter membership. All 11 `multi_node` tests + 2 `partition_transfer_e2e` tests + 82 lib unit tests green. |
+
+**DOKS cluster tear-down:** user runs `doctl kubernetes cluster delete c3867cc5-e2e7-4d5f-94cd-7d82ca8c4303 --dangerous --force` manually post-session. DOCR registry (`rust-proxy-registry`) retained.
+
+**Next re-spin enters with:** all Aeon Gate 2 code blockers closed (G8–G11, G13, G14, G15 all shipped). Remaining gate = Phase 3.5 V2–V6 closed on Rancher Desktop, then one DOKS re-spin to re-measure T2/T3/T4 + G14 <5 s failover + T6 sustained in a single cluster lifecycle. See [`GATE2-ACCEPTANCE-PLAN.md § 10.9`](GATE2-ACCEPTANCE-PLAN.md) for the full run trace.
 
 **Phase 4 — Session B (AWS EKS) calibration, deliverables only (no cluster spend yet)**
 

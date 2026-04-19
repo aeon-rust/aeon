@@ -12,16 +12,23 @@
 > (Pillar 3). Note that local Rancher Desktop K3s is single-node; multi-node testing
 > requires DOKS/EKS/GKE or a real multi-node K3s cluster.
 >
-> **Known limitation (2026-04-18, Session A — gap G2):** the CL-6 partition
-> transfer transport (BulkSync / Cutover / Throttle RPCs) is shipped, but the
-> leader-side driver that observes `PartitionOwnership::Transferring` and runs
-> the two-phase protocol is **not yet wired**. Calling
-> `POST /api/v1/cluster/partitions/{id}/transfer` (or `aeon cluster
-> transfer-partition`) commits the state transition through Raft but the actual
-> ownership flip never happens — the partition stays in `transferring` state.
-> This blocks zero-loss scale-up, scale-down, drain, and explicit handover.
-> Tracked in `docs/ROADMAP.md` "Session A status (2026-04-18)" → fix bundle
-> item 1; targeted for the next DOKS re-spin.
+> **Gate 2 code-path status (2026-04-19):** all Aeon code blockers for
+> horizontal scale-up/down are closed. G11.a/b/c shipped the transfer
+> driver + installer hooks. G15 shipped the fix for the
+> `handle_add_node` leader-self-equality check — `server::serve()` now
+> takes `self_id: NodeId` sourced from `ClusterConfig::node_id`
+> (authoritative for REST), so the leader-self check in
+> `handle_add_node` / `handle_remove_node` no longer relies on the
+> watch-channel `raft.metrics().borrow().id`, which can diverge from the
+> configured id. A `tracing::warn!` stays on the reject path as a
+> diagnostic if future divergence occurs. Regression test
+> `g15_join_targets_actual_leader_of_three_node_cluster` in
+> `crates/aeon-cluster/tests/multi_node.rs` asserts the QUIC join RPC
+> succeeds against the actual leader of a 3-node cluster bootstrapped
+> via `initial_members`. End-to-end T2/T3 verification on DOKS
+> (3→5→3→1 STS events with live T1 load + zero event loss) folds into
+> the next DOKS re-spin; see `docs/ROADMAP.md` "Phase 3b" +
+> `docs/GATE2-ACCEPTANCE-PLAN.md § 10.9` for the post-bundle evidence.
 
 ---
 
