@@ -7,7 +7,7 @@
 
 image:
   repository: registry.digitalocean.com/rust-proxy-registry/aeon
-  tag: session-a-prep   # 2026-04-18 build (sha 36d44fd336c1) — SIGTERM/graceful-shutdown fix
+  tag: session-a-rerun  # 2026-04-19 build — G1-G5 fixes (commit 7bf6241), Session A re-run
   pullPolicy: Always    # force re-pull so we track any new push from laptop
 
 imagePullSecrets:

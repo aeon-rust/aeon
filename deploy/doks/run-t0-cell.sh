@@ -66,9 +66,16 @@ while true; do
     sleep 3
 done
 
+# On timeout: stamp t_end now and report the observed aggregate so the
+# derived eps reflects what actually happened, not the unmet target.
+if [ -z "${t_end:-}" ]; then
+    t_end=$(date +%s%3N)
+    expect_total=$sum
+fi
+
 duration_ms=$((t_end - t_start))
 duration_s=$(awk "BEGIN { printf \"%.2f\", $duration_ms / 1000 }")
 aggregate_eps=$(awk "BEGIN { printf \"%.0f\", $expect_total / ($duration_ms / 1000) }")
-per_node_eps=$(awk "BEGIN { printf \"%.0f\", $expect_per_node / ($duration_ms / 1000) }")
+per_node_eps=$(awk "BEGIN { printf \"%.0f\", ($expect_total / 3) / ($duration_ms / 1000) }")
 
 printf "%s\t%s\t%d\t%s\t%s\n" "$CELL_NAME" "$duration_s" "$expect_total" "$aggregate_eps" "$per_node_eps"

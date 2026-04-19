@@ -107,13 +107,40 @@ pick_leader_host() {
   echo "$LEADER_SINGLE"
 }
 
+# Find the actual Raft leader pod (workaround for G9 — REST API returns
+# 500 + leader-hint instead of 307 forwarding writes). Reads the
+# `leader_id` from any reachable pod's cluster-status, then maps it back
+# to its `aeon-N` pod. Returns the pod's host:port string.
+pick_writable_leader() {
+  local probe_host
+  probe_host=$(pick_leader_host)
+  local lid
+  lid=$(curl_api "http://${probe_host}/api/v1/cluster/status" 2>/dev/null \
+        | jq -r '.leader_id // empty' 2>/dev/null)
+  if [[ -z "$lid" || "$lid" == "null" ]]; then
+    echo "$probe_host"  # no leader yet — best-effort
+    return 0
+  fi
+  # Aeon node IDs are 1-indexed; pod ordinals are 0-indexed (aeon-0 = node 1)
+  local ord=$(( lid - 1 ))
+  echo "aeon-${ord}.aeon-headless.${NS}.svc.cluster.local:4471"
+}
+
 wait_for_members() {
+  # Cluster status exposes Raft membership as a Rust Debug string, e.g.
+  #   "membership":"Membership { configs: [{1, 2, 3}], nodes: {...} }"
+  # We extract the LAST {…} set inside `configs: [...]` (newest joint cfg),
+  # then count the comma-separated voter ids inside it.
   local want="$1"; local deadline=$(( $(date +%s) + 300 ))
   while [[ $(date +%s) -lt $deadline ]]; do
     local host; host=$(pick_leader_host)
-    local members
-    members=$(curl_api "http://${host}/api/v1/cluster/status" 2>/dev/null \
-      | jq -r '.members | length' 2>/dev/null || echo 0)
+    local membership members
+    membership=$(curl_api "http://${host}/api/v1/cluster/status" 2>/dev/null \
+      | jq -r '.raft.membership // ""' 2>/dev/null || echo '')
+    members=$(echo "$membership" \
+      | grep -oE 'configs: \[[^]]*\]' \
+      | grep -oE '\{[0-9, ]+\}' | tail -1 \
+      | tr -cd '0-9,' | tr ',' '\n' | grep -c '[0-9]' || echo 0)
     if [[ "$members" == "$want" ]]; then
       log "cluster has $want members"
       return 0
@@ -133,7 +160,7 @@ wait_for_all_partitions_owned() {
     local total transferring
     total=$(echo "$status" | jq -r '.partitions | length')
     transferring=$(echo "$status" | jq -r \
-      '[.partitions | to_entries[] | select(.value.state != "owned")] | length')
+      '[.partitions | to_entries[] | select(.value.status != "owned")] | length')
     if [[ "$total" -gt 0 && "$transferring" == 0 ]]; then
       log "all $total partitions owned"
       return 0
@@ -255,7 +282,7 @@ drain_and_scale_down() {
   for (( ord=current-1; ord>=target; ord-- )); do
     local node_id=$(( ord + 1 ))
     log "draining node_id=$node_id (pod aeon-$ord) before scale"
-    local host; host=$(pick_leader_host)
+    local host; host=$(pick_writable_leader)
     local resp
     resp=$(curl_api -X POST -H "Content-Type:application/json" \
       -d "{\"node_id\":$node_id}" \
@@ -283,10 +310,12 @@ if [[ "$CUR" != "5" ]]; then
 fi
 
 log "creating pipeline '$PIPELINE'"
+LEADER_HOST=$(pick_writable_leader)
+log "  routing writes to leader: $LEADER_HOST"
 curl_api -X POST -H "Content-Type:application/json" \
   --data-binary "$(cat "$JSON_FILE")" \
-  "http://${LEADER_SINGLE}/api/v1/pipelines" | tail -1
-curl_api -X POST "http://${LEADER_SINGLE}/api/v1/pipelines/${PIPELINE}/start" | tail -1
+  "http://${LEADER_HOST}/api/v1/pipelines" | tail -1
+curl_api -X POST "http://${LEADER_HOST}/api/v1/pipelines/${PIPELINE}/start" | tail -1
 row pipeline started
 
 start_producer_job

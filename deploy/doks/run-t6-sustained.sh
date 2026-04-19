@@ -71,7 +71,7 @@ leader_pod() {
   for n in 0 1 2; do
     local id
     id=$(curl_api "http://$(host_for "$n")/api/v1/cluster/status" 2>/dev/null \
-      | jq -r '.leader // .raft.current_leader // empty' 2>/dev/null)
+      | jq -r '.leader_id // empty' 2>/dev/null)
     if [[ -n "$id" && "$id" != "null" ]]; then
       echo "aeon-$(( id - 1 ))"
       return 0
@@ -84,12 +84,20 @@ pod_has_leader() {
   for n in 0 1 2; do
     local id
     id=$(curl_api -m 3 "http://$(host_for "$n")/api/v1/cluster/status" 2>/dev/null \
-      | jq -r '.leader // .raft.current_leader // 0' 2>/dev/null || echo 0)
+      | jq -r '.leader_id // 0' 2>/dev/null || echo 0)
     if [[ "$id" != "0" && "$id" != "null" ]]; then
       return 0
     fi
   done
   return 1
+}
+
+# Resolve current leader host:port. Falls back to aeon-0 if leader is
+# unknown (e.g. mid-election). Used to route cluster-mutation writes
+# so we don't trip G9 (REST API doesn't auto-forward to leader).
+pick_leader_host() {
+  local pod; pod=$(leader_pod 2>/dev/null || echo "aeon-0")
+  echo "${pod}.aeon-headless.${NS}.svc.cluster.local:4471"
 }
 
 wait_for_leader() {
@@ -218,7 +226,7 @@ event_kill_leader() {
 event_rebalance() {
   log "event: POST /cluster/rebalance"
   row chaos rebalance_start
-  local host; host=$(host_for 0)
+  local host; host=$(pick_leader_host)
   local t0; t0=$(date +%s%3N)
   local resp
   resp=$(curl_api -X POST "http://${host}/api/v1/cluster/rebalance" 2>/dev/null || echo '{}')
@@ -258,10 +266,12 @@ row setup begin "rate=$RATE duration=${DURATION_S}s"
 # patching in-flight (configmap-based create with renamed payload).
 log "creating pipeline '$PIPELINE'"
 PATCHED=$(jq --arg n "$PIPELINE" '.name=$n' "$JSON_FILE")
+LEADER_HOST=$(pick_leader_host)
+log "  leader host: $LEADER_HOST"
 curl_api -X POST -H "Content-Type:application/json" \
   -d "$PATCHED" \
-  "http://$(host_for 0)/api/v1/pipelines" | tail -1
-curl_api -X POST "http://$(host_for 0)/api/v1/pipelines/${PIPELINE}/start" | tail -1
+  "http://${LEADER_HOST}/api/v1/pipelines" | tail -1
+curl_api -X POST "http://${LEADER_HOST}/api/v1/pipelines/${PIPELINE}/start" | tail -1
 row pipeline started
 
 start_producer_job

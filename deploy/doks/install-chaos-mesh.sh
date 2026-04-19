@@ -48,12 +48,25 @@ helm repo update chaos-mesh >/dev/null
 # ── install / upgrade ────────────────────────────────────────────────
 
 log "installing chaos-mesh $CHART_VERSION into namespace '$NAMESPACE'"
-helm upgrade --install chaos-mesh chaos-mesh/chaos-mesh \
+# MSYS_NO_PATHCONV=1: stop Git Bash on Windows from mangling the
+# Linux-side socketPath into 'C:/Program Files/Git/run/containerd/...'.
+# Tolerations: chaos-daemon must run on every node it might inject into
+# (DOKS pools are tainted workload=aeon|redpanda:NoSchedule), otherwise
+# the DaemonSet only schedules on the untainted monitoring node.
+MSYS_NO_PATHCONV=1 helm upgrade --install chaos-mesh chaos-mesh/chaos-mesh \
   --version "$CHART_VERSION" \
   --namespace "$NAMESPACE" \
   --create-namespace \
   --set chaosDaemon.runtime=containerd \
   --set chaosDaemon.socketPath=/run/containerd/containerd.sock \
+  --set "chaosDaemon.tolerations[0].key=workload" \
+  --set "chaosDaemon.tolerations[0].operator=Equal" \
+  --set "chaosDaemon.tolerations[0].value=aeon" \
+  --set "chaosDaemon.tolerations[0].effect=NoSchedule" \
+  --set "chaosDaemon.tolerations[1].key=workload" \
+  --set "chaosDaemon.tolerations[1].operator=Equal" \
+  --set "chaosDaemon.tolerations[1].value=redpanda" \
+  --set "chaosDaemon.tolerations[1].effect=NoSchedule" \
   --set dashboard.securityMode=false \
   --wait \
   --timeout "${READY_TIMEOUT}s" >/dev/null

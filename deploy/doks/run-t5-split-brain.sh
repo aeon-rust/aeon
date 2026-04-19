@@ -157,7 +157,7 @@ while (( $(date +%s) < deadline )); do
   vals=()
   for n in 0 1 2; do
     v=$(curl_api -m 5 "http://$(host_for "$n")/api/v1/cluster/status" 2>/dev/null \
-      | jq -r '.raft.last_applied_log_id.index // .last_applied // 0' 2>/dev/null || echo 0)
+      | jq -r '.raft.last_applied // 0' 2>/dev/null || echo 0)
     vals+=("$v")
   done
   if [[ "${vals[0]}" == "${vals[1]}" && "${vals[1]}" == "${vals[2]}" && "${vals[0]}" != "0" ]]; then

@@ -82,6 +82,15 @@ retaint_if_needed() {
   log "applying taint '$TAINT' to all '$POOL' nodes (--overwrite)"
   kubectl taint nodes -l "doks.digitalocean.com/node-pool=$POOL" \
     "$TAINT" --overwrite >/dev/null
+  # Also reapply the matching workload label — DOKS doesn't carry it
+  # forward to fresh nodes added by scale-up. Without the label the
+  # nodeSelector on the Aeon StatefulSet rejects the new nodes even
+  # though the toleration matches the taint. Derived from the taint:
+  # `workload=aeon:NoSchedule` → label `workload=aeon`.
+  local label_kv="${TAINT%:*}"  # strip ":NoSchedule"
+  log "applying label '$label_kv' to all '$POOL' nodes (--overwrite)"
+  kubectl label nodes -l "doks.digitalocean.com/node-pool=$POOL" \
+    "$label_kv" --overwrite >/dev/null
 }
 
 # ── resolve cluster + pool IDs ────────────────────────────────────────

@@ -110,12 +110,21 @@ curl_api() { kubectl -n $NS exec -q deploy/probe -- curl -sS -m 10 "$@"; }
 # ── wait for cluster to converge on expected member + ownership state ───
 
 wait_for_members() {
+  # The cluster status exposes Raft membership as a Rust Debug string, e.g.
+  #   "membership":"Membership { configs: [{1, 2, 3}], nodes: {...} }"
+  # We extract the LAST {…} set inside `configs: [...]` (newest joint cfg),
+  # then count the comma-separated voter ids inside it.
   local want="$1"; local deadline=$(( $(date +%s) + 300 ))
   while [[ $(date +%s) -lt $deadline ]]; do
     local host; host=$(pick_leader_host)
-    local members
-    members=$(curl_api "http://${host}/api/v1/cluster/status" 2>/dev/null \
-      | jq -r '.members | length' 2>/dev/null || echo 0)
+    local membership members
+    membership=$(curl_api "http://${host}/api/v1/cluster/status" 2>/dev/null \
+      | jq -r '.raft.membership // ""' 2>/dev/null || echo '')
+    # Pull the last brace-set inside configs:[...] and count voters.
+    members=$(echo "$membership" \
+      | grep -oE 'configs: \[[^]]*\]' \
+      | grep -oE '\{[0-9, ]+\}' | tail -1 \
+      | tr -cd '0-9,' | tr ',' '\n' | grep -c '[0-9]' || echo 0)
     if [[ "$members" == "$want" ]]; then
       log "cluster has $want members"
       return 0
@@ -137,7 +146,7 @@ wait_for_all_partitions_owned() {
     local total transferring
     total=$(echo "$status" | jq -r '.partitions | length')
     transferring=$(echo "$status" | jq -r \
-      '[.partitions | to_entries[] | select(.value.state != "owned")] | length')
+      '[.partitions | to_entries[] | select(.value.status != "owned")] | length')
     if [[ "$total" -gt 0 && "$transferring" == 0 ]]; then
       log "all $total partitions owned"
       return 0
@@ -260,9 +269,24 @@ scale_aeon() {
 }
 
 # ── sequence ────────────────────────────────────────────────────────────
+#
+# START_REPLICAS env (default 1) lets you skip the 1→3 phase and start
+# the test from an existing N-node cluster. Used after the 2026-04-19
+# G8 finding (single-node Raft bootstrap fails on first proposal); the
+# 1→3 phase was implicitly proven on 2026-04-19 11:09 UTC before the
+# parser bug aborted the run, so re-validating only 3→5 is acceptable.
+
+START_REPLICAS="${START_REPLICAS:-1}"
 
 ensure_probe
-row setup begin "cluster=$CLUSTER rate=$RATE total=$TOTAL"
+row setup begin "cluster=$CLUSTER rate=$RATE total=$TOTAL start_replicas=$START_REPLICAS"
+
+# step 0 — make sure the cluster has actually settled before we touch the
+# REST API. Skip when START_REPLICAS=1 (we own the bootstrap then).
+if [[ "$START_REPLICAS" -ge 3 ]]; then
+  wait_for_members "$START_REPLICAS"
+  wait_for_all_partitions_owned
+fi
 
 # step 1 — pipeline
 log "creating pipeline '$PIPELINE'"
@@ -276,15 +300,17 @@ row pipeline started
 start_producer_job
 row producer started
 
-# step 3 — producer warmup on 1-node
+# step 3 — warmup at start replicas
 sleep 30
-row phase1 1_node_stable
+row phase1 "${START_REPLICAS}_node_stable"
 
-# step 4 — scale 1 → 3
-scale_aeon 3
-wait_for_members 3
-wait_for_all_partitions_owned
-row phase2 3_node_stable
+# step 4 — scale (skipped if we already started at >=3)
+if [[ "$START_REPLICAS" -lt 3 ]]; then
+  scale_aeon 3
+  wait_for_members 3
+  wait_for_all_partitions_owned
+  row phase2 3_node_stable
+fi
 
 # step 5 — resize pool 3 → 5
 log "resizing node-pool '$POOL' → 5"
