@@ -3325,20 +3325,24 @@ One-branch strategy again (per user preference). All items below land before ano
 
 **Phase 3.5 — Rancher Desktop validation rehearsal (pre-Session-B)**
 
-All six Gate 2 Aeon code gaps (G8, G9, G10, G11, G14) + G13 infra workaround shipped 2026-04-19 but haven't been exercised together end-to-end on a real k8s. Before re-spending on DOKS or spinning up EKS, rehearse the full matrix locally on Rancher Desktop k3s against a freshly-built image. RD numbers are **correctness floor only** (WSL2 8 CPU / 12 GiB caps throughput well below DOKS/EKS); the goal is to catch integration regressions, exercise a push-based source for the first time, and explicitly verify the crypto chain under all three `PohVerifyMode` values.
+All six Gate 2 Aeon code gaps (G8, G9, G10, G11, G14) + G13 infra workaround shipped 2026-04-19 but haven't been exercised together end-to-end on a real k8s. Before re-spending on DOKS or spinning up EKS, rehearse the full matrix locally on Rancher Desktop against a freshly-built image. RD numbers are **correctness floor only** (WSL2 8 CPU / 12 GiB caps throughput well below DOKS/EKS); the goal is to catch integration regressions, exercise a push-based source for the first time, and explicitly verify the crypto chain under all three `PohVerifyMode` values.
 
-| ID | Item | Status |
-|----|------|--------|
-| V1 | Build fresh `aeon` image from current master; `helm install helm/aeon -f values-local.yaml` 3-node STS on RD; sanity-check `/cluster/status`, `/metrics`, `aeon cluster status --watch` | ⏳ pending (#79) |
-| V2 | Re-run T0–T6 scripts against the RD kubecontext with scaled-down replica counts where needed — exercises G1/G3/G4/G8/G9/G10/G11/G14 together | ⏳ pending (#80) |
-| V3 | Processor validation — both native Rust and Wasm guests through per-event + batch paths; confirm L2/L3/WAL tiers engage per `DurabilityMode`; `outputs_acked_total == input` at steady state | ⏳ pending (#81) |
-| V4 | Push-source — short design note + HTTP ingest source reusing the axum stack; validate E2E on RD with a curl/loadgen client. Complements the existing pull-based Kafka/Redpanda source. | ⏳ pending (#82) |
-| V5 | Crypto chain E2E — walk a transferred partition under each `PohVerifyMode::{Verify, VerifyWithKey, TrustExtend}` and assert MMR + Merkle + Ed25519 root-sig round-trips, resumed `PohChain.sequence()` matches sender | ⏳ pending (#83) |
-| V6 | Consolidated `docs/GATE2-PRE-SESSION-B-VALIDATION.md` report + Session-B readiness checklist; back-propagate any new gaps to the Gate 2 blocker queue | ⏳ pending (#84) |
+> ⚠️ **Rancher Desktop constraint.** RD is a **single-node k3s** (not multi-node k8s). A 3-replica Aeon StatefulSet co-locates all three pods on the same node via loopback — fine for validating the code paths that don't require real inter-node networking (G8 self-election, G9 307 forward, G10 seed-join to an existing leader, G11 partition transfer driver, G14 relinquish + raft_timing handoff, PoH chain resume), but **not** a faithful substitute for scenarios that require real multi-node chaos or node-pool mutation. Mark those rows explicitly and defer to a cloud re-spin.
+>
+> Any test or script that risks wedging the k3s node (chart mis-install that won't `helm uninstall` cleanly, CRDs with finalizers, kernel-level chaos tools that mutate iptables/tc) may force a Rancher Desktop reset. When in doubt, prefer `helm uninstall` + `kubectl delete ns aeon` over in-place upgrades, and drop the whole namespace rather than reconciling bad state.
+
+| ID | Item | RD-suitable? | Status |
+|----|------|--------------|--------|
+| V1 | Build fresh `aeon` image from current master; `helm install helm/aeon -f values-local.yaml` 3-replica loopback STS on RD; sanity-check `/cluster/status`, `/metrics`, `aeon cluster status --watch` | ✅ yes | ⏳ pending (#79) |
+| V2 | T0–T6 matrix — **partial on RD**: T0 baseline, T2 3→5 STS-scale (exercises G10 seed-join code path; no node-pool resize on RD), T3 5→3→1 drain (G5 + G14 relinquish), T4 manual cutover (G11.a/b/c + PoH resume). **T5 split-brain (NetworkChaos between pods) and T6 multi-node chaos** are **not** faithful on single-node RD and get deferred to the cloud re-spin. | ✅ T0/T2-code/T3/T4 • ❌ T5/T6 chaos realism | ⏳ pending (#80) |
+| V3 | Processor validation — both native Rust and Wasm guests through per-event + batch paths; confirm L2/L3/WAL tiers engage per `DurabilityMode`; `outputs_acked_total == input` at steady state | ✅ yes | ⏳ pending (#81) |
+| V4 | Push-source — short design note + HTTP ingest source reusing the axum stack; validate E2E on RD with a curl/loadgen client. Complements the existing pull-based Kafka/Redpanda source. | ✅ yes | ⏳ pending (#82) |
+| V5 | Crypto chain E2E — walk a transferred partition under each `PohVerifyMode::{Verify, VerifyWithKey, TrustExtend}` and assert MMR + Merkle + Ed25519 root-sig round-trips, resumed `PohChain.sequence()` matches sender. All traffic is loopback but the crypto path is identical. | ✅ yes | ⏳ pending (#83) |
+| V6 | Consolidated `docs/GATE2-PRE-SESSION-B-VALIDATION.md` report + Session-B readiness checklist; back-propagate any new gaps to the Gate 2 blocker queue. Explicitly records the T5/T6-on-RD gap so the DOKS re-spin checklist carries it forward. | ✅ yes | ⏳ pending (#84) |
 
 **Post-V6 flow:**
 
-1. (optional) one more DOKS re-spin to close the remaining "live measurement" rows left open at Phase 3 (G14 <5 s failover, T2/T4 on real NVMe, T6 active-load wall-clock with the G13 rollout-restart workaround in the evidence log);
+1. **DOKS re-spin** is now non-optional because T5/T6 chaos realism can't be closed on RD. The re-spin also closes the remaining live-measurement rows left open at Phase 3 (G14 <5 s failover, T2/T4 on real NVMe, T6 active-load wall-clock with the G13 rollout-restart workaround in the evidence log).
 2. **Phase 4 (Session B / AWS EKS)** — throughput ceiling + anything DOKS under-serves because of the 2 Gbps / non-NVMe SKU constraint noted in `reference_doks_droplet_availability`.
 
 **Phase 4 — Session B (AWS EKS) calibration, deliverables only (no cluster spend yet)**

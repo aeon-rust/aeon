@@ -595,13 +595,25 @@ Session B EKS image pre-bake.
 The Gate 2 code bundle (G8, G9, G10, G11, G14 + G13 infra docs) all
 shipped 2026-04-19 but hasn't yet been exercised together end-to-end on
 a real k8s. Before re-spending on a DOKS re-spin or opening Session B
-on AWS EKS, the full matrix is rehearsed on Rancher Desktop k3s against
-a freshly-built image. RD numbers are a **correctness floor only**
+on AWS EKS, the full matrix is rehearsed on Rancher Desktop against a
+freshly-built image. RD numbers are a **correctness floor only**
 (WSL2 8 CPU / 12 GiB caps throughput well below DOKS/EKS); the goal is
 to catch integration regressions, exercise a push-based source (HTTP
 ingest) alongside the pull-based Kafka source for the first time, and
 explicitly verify the crypto chain under all three `PohVerifyMode`
-values. See `docs/ROADMAP.md` § *Phase 3.5 — Rancher Desktop validation
+values.
+
+**Rancher Desktop is single-node k3s**, not multi-node k8s. A 3-replica
+Aeon StatefulSet co-locates all three pods on the same node over
+loopback — sufficient to validate G8 / G9 / G10 / G11 / G14 / PoH-resume
+code paths, but **not** a faithful substitute for T5 split-brain or T6
+multi-node chaos. Those rows stay open and are closed on the DOKS
+re-spin that follows V6. Any destructive test that could wedge the k3s
+node may force a full Rancher Desktop reset — prefer `helm uninstall` +
+`kubectl delete ns aeon` over in-place reconciliation; skip
+kernel-level chaos tools on RD.
+
+See `docs/ROADMAP.md` § *Phase 3.5 — Rancher Desktop validation
 rehearsal* for the V1–V6 detail and task IDs #79–#84. Output of V6 is
 `docs/GATE2-PRE-SESSION-B-VALIDATION.md` + a Session-B readiness
 checklist, which back-propagates any new gaps into § 10.8.1 before EKS
