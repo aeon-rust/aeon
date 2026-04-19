@@ -948,4 +948,56 @@ the verdict from Session A carries over. Do not re-spend the budget.
 
 ### 12.6 Results — Session B
 
-*(Empty until Session B runs. Detailed plan written when session is imminent.)*
+*Template. Rows filled in during the session; pre-session values remain
+`TBD`. Mirrors the § 10.9 Session A re-run shape so the two sessions
+read the same way in the Gate 2 bundle.*
+
+EKS cluster `TBD` (us-east-1a, `i4i.2xlarge × 3` aeon-pool +
+`i3en.3xlarge × 3` redpanda-pool + `m7i.xlarge × 1` default-pool,
+`cpu-manager-policy=static` on aeon-pool). Image
+`TBD.dkr.ecr.us-east-1.amazonaws.com/aeon:TBD` (commit `TBD`). Entry
+preconditions per § 12.1 must all be green before `eksctl create
+cluster -f deploy/eks/cluster.yaml` runs; spot-vs-on-demand decision
+from `deploy/eks/check-spot-pricing.sh` recorded here before
+provisioning.
+
+| Test | Verdict | Notes |
+|---|---|---|
+| Pre-flight — spot pricing decision | TBD | Record `check-spot-pricing.sh` verdict (on-demand vs spot per instance type), final 6-hr cost estimate, and whether window fits $50 hard cap. |
+| Cluster bring-up | TBD | STS Ready time, Raft term + leader id, partition ownership fan-out (expect `{1,2,3}` voters, 24 partitions 8/8/8). |
+| **T1 at ceiling — 4 durability modes** (§ 12.4.1) | TBD | Redpanda→Aeon→Redpanda on NVMe + 18.75–25 Gbps. Rate-sweep per durability mode (None / Ordered / PerEvent / Measure) until Aeon CPU hits **50 %** (Gate 1 headroom rule), not until infra saturates first. Record steady-state aggregate eps and per-node eps at the 50 % CPU point; cite `aeon_pipeline_events_processed_total` + `container_cpu_usage_seconds_total` samples. |
+| **CPU pinning delta** (§ 12.4.2) | TBD | Re-run T1 with Aeon pods in Guaranteed QoS (integer CPU requests = 7, one core per pod reserved for kubelet/system per `kubeletExtraConfig`). Record unpinned baseline vs pinned throughput + p99 latency delta. Only test that strictly cannot run on DOKS. |
+| **T6 sustained at ceiling** (§ 12.4.3) | TBD | 30-min run at 80 % of the pinned T1 ceiling. Record zero-loss invariant (`events_failed_total = 0`, `events_retried_total = 0`), drift (if any) between start and end eps, and CPU headroom margin held. |
+
+#### 12.6.1 Code gaps surfaced — Session B
+
+*(Template — fill during session.)*
+
+| ID | Gap | Severity | Resolution |
+|---|---|---|---|
+| TBD | *(Describe gap if any surfaces. Otherwise delete this subsection and state "No code gaps surfaced.")* | TBD | TBD |
+
+#### 12.6.2 Session verdicts — Session B
+
+*(Fill during session. Template below.)*
+
+- **Ceiling claim (T1, 4 durability modes):** `TBD` — steady-state
+  aggregate `TBD M eps`, per-node `TBD M eps` at the 50 % CPU point.
+  This is the number Aeon cites as its verified ceiling post-Session B.
+- **CPU pinning delta:** `TBD %` throughput gain, `TBD µs` p99 latency
+  delta vs unpinned. Decision: pin by default / pin optional / no
+  meaningful delta.
+- **Sustainability (T6 at 80 % of ceiling):** `TBD` — zero loss over
+  30 min, drift `TBD`, CPU margin held at `TBD %`.
+- **Gate 2 ceiling row:** `TBD` — either closed with the number above
+  or deferred with reason.
+
+#### 12.6.3 Tear-down — Session B
+
+*(Fill during session.)*
+
+Target: `eksctl delete cluster -f deploy/eks/cluster.yaml` completes
+within 15 min of the last T6 sample. Record actual wall-clock cost
+(AWS Cost Explorer, us-east-1, session tag `gate2-b`) against the
+**$50** hard cap from § 12.3. ECR registry retained for subsequent
+re-runs; VPC + IAM role + OIDC provider torn down with the cluster.

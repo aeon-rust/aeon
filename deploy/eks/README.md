@@ -63,6 +63,10 @@ buffer ~60 min → **~6 hours wall-clock**.
 ## Sequence
 
 ```bash
+# 0. Spot-vs-on-demand pre-check (read-only, no charges)
+#    Records decision + 6-hr cost estimate vs the $50 hard cap.
+./check-spot-pricing.sh
+
 # 1. Create cluster (~20 min)
 eksctl create cluster -f cluster.yaml
 
@@ -86,6 +90,9 @@ eksctl delete cluster -f cluster.yaml
 
 ## Files
 
+- `check-spot-pricing.sh` — read-only pre-check wrapping
+  `aws ec2 describe-spot-price-history`. Emits SPOT / ON-DEMAND
+  decision per pool + 6-hr cost vs $50 cap. Run before `eksctl create`.
 - `cluster.yaml` — eksctl cluster config, single-AZ, 3 node groups,
   kubelet pinning enabled on `aeon-pool`
 - `values-aeon.yaml` — Aeon values sized for `i4i.2xlarge`
