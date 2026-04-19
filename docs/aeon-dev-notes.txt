@@ -40119,5 +40119,242 @@ claude's response:
 
 ✻ Churned for 1m 38s · 1 shell still running
 
-=========
+※ recap: Gate 2 / Session B prep: P4.ii spot-pricing pre-check and P4.iv §12.6 results template shipped and committed (bad8489), with ROADMAP synced. Next
+  action is V2, the pull-source T0..T6 matrix on Rancher Desktop.
 
+  46 tasks (39 done, 7 open)
+  □ P4.iii — Pre-bake Aeon image to ECR
+  □ P5 (post-Phase-3) — Dynamic source re-assign on partition transfer
+  □ V2 — Pull-source T0..T6 matrix on Rancher Desktop
+  □ V3 — Processor validation (native + Wasm)
+  □ V4 — Push-source design note + HTTP ingest source
+  □ V5 — Crypto chain E2E verification (PoH / Merkle / MMR / Ed25519)
+  □ V6 — Consolidated RD validation report + pre-Session-B readiness checklist
+  √ P1.1a — Engine per-partition write-freeze API
+  √ P1.1b — Engine CutoverCoordinator implementation
+  √ P1.1c — Leader-side partition transfer driver (G2)
+   … +36 completed
+=========
+ how much is the real effort left, for session b? Then, if we wanted to compare with Apache flink and make it better, what else is needed to be added to
+  to do list?
+  =========
+  claude's response:
+  
+   Session B — real effort remaining
+
+  Prereqs before clicking eksctl create (from §12.1 + outstanding pending tasks):
+
+  ┌───────────────────────────────────────────────────────────────────────────────────────────┬─────────────────────────────┬─────────────────────┐
+  │                                           Item                                            │         Est. effort         │       Status        │
+  ├───────────────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────┼─────────────────────┤
+  │ V2 — RD T0..T6 matrix (#80)                                                               │ ~1 day                      │ pending             │
+  ├───────────────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────┼─────────────────────┤
+  │ V3 — native + Wasm processor validation (#81)                                             │ ~½ day                      │ pending             │
+  ├───────────────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────┼─────────────────────┤
+  │ V4 — push-source design + HTTP ingest source (#82)                                        │ ~2 days (new code)          │ pending             │
+  ├───────────────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────┼─────────────────────┤
+  │ V5 — crypto chain E2E under all PohVerifyMode (#83)                                       │ ~½ day                      │ pending             │
+  ├───────────────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────┼─────────────────────┤
+  │ V6 — consolidated RD report (#84)                                                         │ ~½ day                      │ pending             │
+  ├───────────────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────┼─────────────────────┤
+  │ DOKS re-spin — close T2/T3/T4 + G14 <5 s + T6 sustained post-G15                          │ ~1 day session + ½ day prep │ implicit (after V6) │
+  ├───────────────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────┼─────────────────────┤
+  │ P4.iii — ECR pre-bake (#64)                                                               │ ~2 hr                       │ pending             │
+  ├───────────────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────┼─────────────────────┤
+  │ values-redpanda.yaml + EKS shared/ manifests (cert-manager, topic-create, loadgen, chaos) │ ~½ day                      │ TBD per README      │
+  ├───────────────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────┼─────────────────────┤
+  │ AWS account + IAM + ECR bootstrap                                                         │ ~1–2 hr                     │ not started         │
+  ├───────────────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────┼─────────────────────┤
+  │ Session B itself                                                                          │ ~6 hr wall-clock, ~$40      │ weekend slot        │
+  └───────────────────────────────────────────────────────────────────────────────────────────┴─────────────────────────────┴─────────────────────┘
+
+  Bottom line: ~6–7 focused working days before Session B + a weekend for the session. V4 (HTTP push source) is the only item requiring new code; everything
+   else is ops/validation.
+
+  ---
+  Flink-competitive backlog — what to add
+
+  The POSITIONING.md §6 gaps, broken into actionable tasks. I'll add them to the task list if you confirm, but here's the proposed set ordered by leverage:
+
+  Tier 1 — Feature parity unblockers (things Flink has that Aeon literally cannot do):
+  1. F1 — Windowing primitives: tumbling + sliding + session windows with event-time/processing-time modes. 3–6 months. Biggest single gap.
+  2. F2 — Watermarks + event-time: late-data handling, allowed lateness, side-output for late events. Pairs with F1.
+  3. F3 — State TTL + automatic cleanup: TtlConfig equivalent on StateOps. ~2 weeks.
+  4. F4 — Savepoints (versioned, named checkpoints): restore-from-point beyond crash recovery. ~1 month.
+
+  Tier 2 — Adoption blockers (things that determine who evaluates Aeon):
+  5. F5 — Streaming SQL (subset): DDL + SELECT + windowed aggregations via sqlparser + DataFusion reuse. 6–12 months; MVP 2 months.
+  6. F6 — Connector 20-pack: JDBC, Elasticsearch, S3/Parquet, Pulsar, Kinesis, ClickHouse, Postgres CDC (Debezium), Redis, NATS, MQTT, WebSocket, HTTP/SSE
+  push. 2–3 months incremental.
+  7. F7 — Async I/O enrichment operator: Flink's AsyncDataStream equivalent for external-lookup hot-path. ~2 weeks.
+
+  Tier 3 — Win-the-wedge (lean into crypto chain):
+  8. F8 — aeon verify CLI: offline proof verification of PoH/Merkle/MMR chain from export. ~1 week.
+  9. F9 — Proof bundle export format: portable, signed, versioned. Sibling of F8. ~1 week.
+  10. F10 — Head-to-head benchmark harness: same workload, same hardware, Aeon vs Flink vs Arroyo, published results. ~2 weeks.
+
+  Tier 4 — Credibility:
+  11. F11 — Documentation funnel: "write your first processor in 15 min" tutorial + cookbook. ~1 week.
+  12. F12 — First production case study: land one regulated-industry pilot (finance/healthcare/web3). Unbounded.
+
+  Recommendation: F10 (benchmark harness) + F8/F9 (crypto verify tooling) are the cheapest moves that upgrade the pitch from "targets" to "proof." F1/F2
+  (windowing + watermarks) is the single biggest Flink-parity lift — without it, the positioning doc's "Flink still wins anything needing windowing" stays
+  true.
+
+  Want me to create tasks for any of these?
+
+✻ Cooked for 49s · 1 shell still running
+
+  46 tasks (39 done, 7 open)
+  □ P4.iii — Pre-bake Aeon image to ECR
+  □ P5 (post-Phase-3) — Dynamic source re-assign on partition transfer
+  □ V2 — Pull-source T0..T6 matrix on Rancher Desktop
+  □ V3 — Processor validation (native + Wasm)
+  □ V4 — Push-source design note + HTTP ingest source
+  □ V5 — Crypto chain E2E verification (PoH / Merkle / MMR / Ed25519)
+  □ V6 — Consolidated RD validation report + pre-Session-B readiness checklist
+  √ P1.1a — Engine per-partition write-freeze API
+  √ P1.1b — Engine CutoverCoordinator implementation
+  √ P1.1c — Leader-side partition transfer driver (G2)
+   … +36 completed
+
+==========
+
+ what does F1 and F2 tasks mean?
+ =========
+ claude's response:
+ 
+  F1 — Windowing primitives
+
+  Today Processor::process(event) → Vec<Output> runs per-event, stateless. Windowing groups events into bounded collections so you can aggregate across them
+   — "count per minute," "avg in last 5 min," "session per user."
+
+  Three window types:
+
+  ┌──────────┬───────────────────────────────┬───────────────────────────────────────────────────────────────────────┐
+  │   Type   │           Behavior            │                                Example                                │
+  ├──────────┼───────────────────────────────┼───────────────────────────────────────────────────────────────────────┤
+  │ Tumbling │ Non-overlapping fixed buckets │ Count events per 1-min bucket: 00:00–00:59, 01:00–01:59, …            │
+  ├──────────┼───────────────────────────────┼───────────────────────────────────────────────────────────────────────┤
+  │ Sliding  │ Overlapping fixed buckets     │ Count last 5 min, recomputed every 1 min → 5 open windows at any time │
+  ├──────────┼───────────────────────────────┼───────────────────────────────────────────────────────────────────────┤
+  │ Session  │ Gap-driven, per key           │ Group user clicks; close when 30 min idle since last click            │
+  └──────────┴───────────────────────────────┴───────────────────────────────────────────────────────────────────────┘
+
+  Each needs: a window assigner (which window(s) an event belongs to), window state (keyed by window_id + partition_key, backed by Aeon's L1/L2/L3 store), a
+   trigger (when to emit — watermark-based, count-based, time-based), and a window function (the reduce/aggregate).
+
+  F2 — Watermarks + event-time
+
+  Events carry two timestamps:
+  - Event-time — when the event actually happened (Event.timestamp, already populated).
+  - Processing-time — when Aeon sees it.
+
+  They diverge when events arrive late (slow network, replay, out-of-order Kafka partitions). Without a mechanism to say "no more events for the 00:00
+  minute will arrive," you can't safely close a tumbling window.
+
+  Watermark = a monotonic promise that flows through the DAG: "no event with timestamp < T will arrive after this." Generated at the source (from broker
+  timestamps or periodic extractor), propagated through processors, used by windows to trigger emission.
+
+  Two knobs that go with it:
+  - Allowed lateness — grace period where late events still update an already-emitted window result.
+  - Side output for late events — a second stream for events past the grace period, so nothing is silently dropped.
+
+  ---
+  Concrete why this matters for Aeon: without F1+F2, any user whose workload is "aggregate by time" (99% of observability, finance surveillance, IoT
+  telemetry) has to either pre-aggregate upstream or bolt on their own state machine in a Wasm processor. Flink's entire
+  DataStream.keyBy().window(...).reduce(...) ergonomic is exactly this, and it's why POSITIONING.md §3.1 says "Flink still wins anything requiring rich
+  windowing."
+
+  Implementation shape in Aeon terms: a new Windowed<P: Processor> wrapper that sits between the source and the user's processor, owns the window state in
+  aeon-state, consumes watermarks from the source task, and emits to the processor only when a window triggers.
+
+=======
+ we have Orderedbatch and UnOrderedbatch. We have UUIDv7 assigned for upstream with push source method scenario and not for pull source method, to save
+  some storage and we thought to track the source offset in latter scenario. we are tracking delivery acknowledgement too. Since UUIDv7 is time and
+  randomness-based with sequencing capability, may be, if we track event datetime when processor receives it? thinking...
+
+========
+claude's response:
+
+ Good instinct — there's real overlap, but also a conflation worth unpacking.
+
+  What Aeon already has that helps
+
+  ┌──────────────────────────┬──────────────────────────────────────────────────────────────────┬───────────────────────────────────────────────────────┐
+  │        Primitive         │                        What it gives you                         │                    What it doesn't                    │
+  ├──────────────────────────┼──────────────────────────────────────────────────────────────────┼───────────────────────────────────────────────────────┤
+  │ Event.timestamp (nanos)  │ Already the event-time if upstream populated it correctly (Kafka │ —                                                     │
+  │                          │  broker ts, sensor clock, etc.)                                  │                                                       │
+  ├──────────────────────────┼──────────────────────────────────────────────────────────────────┼───────────────────────────────────────────────────────┤
+  │ UUIDv7 per-core pool     │ Monotonic ingest-time per generator; cheap "current time at      │ Not event-time — it's when Aeon stamped the id        │
+  │                          │ source" signal                                                   │                                                       │
+  ├──────────────────────────┼──────────────────────────────────────────────────────────────────┼───────────────────────────────────────────────────────┤
+  │ Source offset (pull)     │ Monotonic position per partition                                 │ No time info at all                                   │
+  ├──────────────────────────┼──────────────────────────────────────────────────────────────────┼───────────────────────────────────────────────────────┤
+  │ per_sink_ack_seq         │ Delivery watermark for GC / recovery                             │ Orthogonal to windowing — "did the sink persist?" ≠   │
+  │                          │                                                                  │ "can I close the window?"                             │
+  ├──────────────────────────┼──────────────────────────────────────────────────────────────────┼───────────────────────────────────────────────────────┤
+  │ OrderedBatch /           │ Delivery semantics                                               │ Not about when to emit an aggregation                 │
+  │ UnorderedBatch           │                                                                  │                                                       │
+  └──────────────────────────┴──────────────────────────────────────────────────────────────────┴───────────────────────────────────────────────────────┘
+
+  The gap: what "watermark" actually needs
+
+  A watermark is a monotonic promise that flows through the DAG separate from the data plane saying: "no event with timestamp < T will arrive after this."
+  That's three things Aeon doesn't have yet:
+
+  1. A generation strategy — someone has to emit Watermark(T). Four common approaches: (a) broker-provided, (b) periodic ascending (assume monotonic
+  timestamp), (c) bounded out-of-orderness (assume events are at most N ms late — most used in practice), (d) punctuated. UUIDv7 timestamp → gives you (b)
+  or (c) cheaply as a processing-time watermark, not event-time.
+  2. Propagation channel — events don't carry watermarks; watermarks are a sibling signal flowing through SPSC rings, processor boundaries, and the cluster
+  transfer path.
+  3. Fan-in min — at a multi-partition or multi-source join, you take min(watermarks) because the slowest source dictates safety.
+
+  Where your instinct pays off
+
+  Your reuse instinct is valid for two concrete shortcuts:
+
+  - Processing-time windowing: UUIDv7's embedded timestamp + per-core monotonicity gives you a watermark for free if the user is okay with processing-time
+  semantics (good enough for ~50% of workloads — ops dashboards, rate limiting, simple bucket counts).
+  - Per-partition event-time watermark from pull sources: (source_ts, offset) + configurable max-out-of-orderness → emit Watermark(max(source_ts) − N) every
+   K events or M ms. That's the Flink-style BoundedOutOfOrderness strategy and it slots naturally beside the existing source_ts plumbing.
+
+  Minimum new work, given what's there
+
+  1. Watermark signal type (sibling of Event, carries partition_id + timestamp + source_kind).
+  2. Source-side strategy trait: WatermarkStrategy with on_event(&Event) → Option<Watermark> + periodic tick.
+  3. Propagation through SPSC rings (either interleaved enum RingMsg { Event, Watermark } or a side channel).
+  4. Fan-in merger that takes min across upstream partitions.
+  5. A trigger hook in the (future) windowing layer.
+
+  The GC tracker (per_sink_ack_seq, L2 store) is a close structural analogue — same "minimum across inputs, monotonic, propagated out of band" shape. You
+  could literally model watermarks as another AckSeqTracker-shaped thing. That's probably the cleanest reuse.
+
+  So the net: F2 shrinks from "whole new subsystem" to "new signal type + propagation + a strategy trait." Maybe 3–4 weeks instead of 3 months, because the
+  per-partition tracking pattern and the min-across-inputs reducer are already in the codebase. F1 windowing doesn't shrink the same way — that's genuinely
+  new state + trigger machinery.
+
+✻ Worked for 52s · 1 shell still running
+======
+ thanks for the info, please document these details, as we have done earlier. we will think about this later, after our current priorities.
+
+=======
+claude's response:
+
+ I'll create a design-sketch doc mirroring how EO-2 and POSITIONING were captured, then link it from POSITIONING §6.
+
+ Committed as f7426f4.
+
+  What's in docs/WINDOWING-WATERMARKS-DESIGN.md: 9 sections — scope (F1+F2 ship together), current primitives table (what Aeon already has), the real
+  watermark gap, reuse shortcuts (UUIDv7 → processing-time free; (source_ts, offset) → bounded-OOO event-time; AckSeqTracker as structural analogue),
+  minimum new work itemized in 6 steps, revised effort estimate (F2 ~3–4 wks, F1 ~6–10 wks, combined ~3 months), open trade-offs, explicit not-doing list,
+  and the revisit preconditions (Gate 2 done + Session B ceiling + v0.1 + real user ask).
+
+  POSITIONING §6 — windowing row now points at the design doc with the tighter estimate; "see also" footer links it.
+
+  Not touched: task list, ROADMAP (per "think about this later"), docs/aeon-dev-notes.txt.
+
+✻ Brewed for 2m 9s · 1 shell still running
+
+========
