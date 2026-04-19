@@ -41,6 +41,8 @@ use aeon_types::{AeonError, PartitionId};
 
 use crate::l2_transfer::SegmentWriter;
 
+type WritersMap = HashMap<(String, u16), SegmentWriter>;
+
 // ── L2 segment installer ──────────────────────────────────────────────
 
 /// Production [`SegmentInstaller`] — routes received segments to the
@@ -59,7 +61,7 @@ pub struct L2SegmentInstaller {
     pipeline: String,
     /// `(pipeline, partition_id) → in-flight SegmentWriter`. An entry is
     /// inserted on `begin` and removed on `finish` (success or abort).
-    writers: Mutex<HashMap<(String, u16), SegmentWriter>>,
+    writers: Mutex<WritersMap>,
 }
 
 impl L2SegmentInstaller {
@@ -79,7 +81,7 @@ impl L2SegmentInstaller {
             .join(format!("p{:05}", partition.as_u16()))
     }
 
-    fn lock_writers(&self) -> Result<std::sync::MutexGuard<'_, HashMap<(String, u16), SegmentWriter>>, AeonError> {
+    fn lock_writers(&self) -> Result<std::sync::MutexGuard<'_, WritersMap>, AeonError> {
         self.writers
             .lock()
             .map_err(|e| AeonError::state(format!("l2-installer: writers lock poisoned: {e}")))

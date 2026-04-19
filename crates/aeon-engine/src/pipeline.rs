@@ -1129,7 +1129,7 @@ fn build_sink_task_ctx(config: &PipelineConfig, core: Option<usize>) -> SinkTask
                 config
                     .eo2_shared_ack_tracker
                     .clone()
-                    .unwrap_or_else(crate::eo2::AckSeqTracker::new),
+                    .unwrap_or_default(),
             )
         } else {
             None

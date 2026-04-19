@@ -132,10 +132,7 @@ impl FallbackCheckpointStore {
             Err(_) => return Ok(false),
         };
 
-        let wal_records = match wal.read_last() {
-            Ok(opt) => opt,
-            Err(e) => return Err(e),
-        };
+        let wal_records = wal.read_last()?;
         // Fast exit if WAL has nothing beyond primary.
         if let (Some(wr), Some(pid)) = (&wal_records, primary_last_id) {
             if wr.checkpoint_id <= pid {

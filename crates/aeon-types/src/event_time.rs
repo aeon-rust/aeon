@@ -3,12 +3,12 @@
 //! Three modes, explicit per connector, no silent fallbacks. See
 //! `docs/EO-2-DURABILITY-DESIGN.md` §4.4.
 //!
-//! - `Broker`      — timestamp supplied by upstream (Kafka ts, CDC ts, …).
-//!                    Zero cost. Requires `Source::supports_broker_event_time()`
-//!                    to return `true`; pipeline fails at start otherwise.
-//! - `AeonIngest`  — `Instant::now()` at batch ingestion (~20 ns). Loses
-//!                    cross-replay determinism — pull-source UUIDv7
-//!                    derivation will therefore be non-deterministic.
+//! - `Broker` — timestamp supplied by upstream (Kafka ts, CDC ts, …).
+//!   Zero cost. Requires `Source::supports_broker_event_time()`
+//!   to return `true`; pipeline fails at start otherwise.
+//! - `AeonIngest` — `Instant::now()` at batch ingestion (~20 ns). Loses
+//!   cross-replay determinism — pull-source UUIDv7
+//!   derivation will therefore be non-deterministic.
 //! - `Header(name)` — parse from a metadata header the upstream sets. ~50 ns.
 
 use serde::{Deserialize, Serialize};

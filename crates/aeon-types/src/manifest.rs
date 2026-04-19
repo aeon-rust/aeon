@@ -146,9 +146,10 @@ pub struct SourceManifest {
 /// `Native`   — pull connector uses broker-provided offset (Kafka, CDC).
 /// `Random`   — push connector uses random UUIDv7 + sub-ms counter.
 /// `Compound` — poll connector uses cursor + content-hash window.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum IdentityConfig {
+    #[default]
     Native,
     Random,
     Compound {
@@ -157,12 +158,6 @@ pub enum IdentityConfig {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         content_hash: Option<ContentHashConfig>,
     },
-}
-
-impl Default for IdentityConfig {
-    fn default() -> Self {
-        Self::Native
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

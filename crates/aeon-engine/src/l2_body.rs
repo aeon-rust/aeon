@@ -41,7 +41,7 @@
 //!
 //! This module provides the segment primitive + multi-segment partition store
 //! + GC cursor + tests. Wiring into the pipeline runner (push/poll ingest
-//! path, sink ack sequence tracking, fsync cadence) lands in P4.
+//!   path, sink ack sequence tracking, fsync cadence) lands in P4.
 
 use aeon_types::{AeonError, Event, TransportCodec};
 use std::fs::{File, OpenOptions};
