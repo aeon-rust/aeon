@@ -1,0 +1,73 @@
+# kube-prometheus-stack — Session A (DOKS AMS3)
+# Target node: s-4vcpu-8gb monitoring pool (1 node, workload=monitoring label,
+# no taint). Chart: prometheus-community/kube-prometheus-stack.
+#
+# Scope: scrape aeon pods at /metrics on :4471 and redpanda brokers. Grafana
+# is kept minimal (no dashboards bundled — load them later if needed).
+#
+# Install:
+#   helm install monitoring prometheus-community/kube-prometheus-stack \
+#     -f deploy/doks/values-prometheus.yaml \
+#     -n monitoring --create-namespace
+
+# Pin every component to the monitoring pool so Prometheus scraping
+# never steals CPU from aeon or redpanda test pools.
+_monitoringNodeSelector: &monitoringNodeSelector
+  workload: monitoring
+
+prometheus:
+  prometheusSpec:
+    nodeSelector: *monitoringNodeSelector
+    retention: 7d
+    resources:
+      requests: { cpu: "500m", memory: "2Gi" }
+      limits:   { cpu: "1500m", memory: "3Gi" }
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: do-block-storage
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 20Gi
+    # Broad label-selector policy so ServiceMonitors we create in aeon/
+    # redpanda namespaces are discovered without needing a release-label
+    # match on every object.
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+
+prometheusOperator:
+  nodeSelector: *monitoringNodeSelector
+  resources:
+    requests: { cpu: "100m", memory: "128Mi" }
+    limits:   { cpu: "500m", memory: "256Mi" }
+
+alertmanager:
+  alertmanagerSpec:
+    nodeSelector: *monitoringNodeSelector
+    resources:
+      requests: { cpu: "50m", memory: "64Mi" }
+      limits:   { cpu: "200m", memory: "128Mi" }
+
+grafana:
+  nodeSelector: *monitoringNodeSelector
+  adminPassword: aeon-session-a
+  persistence:
+    enabled: true
+    storageClassName: do-block-storage
+    size: 5Gi
+  resources:
+    requests: { cpu: "100m", memory: "128Mi" }
+    limits:   { cpu: "500m", memory: "512Mi" }
+
+kube-state-metrics:
+  nodeSelector: *monitoringNodeSelector
+
+# node-exporter runs on every node as a DaemonSet — that's the point.
+# Leave it unpinned.
+
+# Scrape configs — ServiceMonitor objects are created in step 2; this
+# keeps the stack minimal.
+defaultRules:
+  create: false   # reduce noise for a test cluster

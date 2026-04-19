@@ -1,0 +1,32 @@
+{
+  "name": "t0-c0-measure",
+  "sources": [
+    {
+      "type": "memory",
+      "topic": null,
+      "partitions": [],
+      "config": {
+        "count": "200000000",
+        "payload_size": "256",
+        "batch_size": "1024"
+      }
+    }
+  ],
+  "processor": {
+    "name": "__identity",
+    "version": "0.0.0"
+  },
+  "sinks": [
+    {
+      "type": "blackhole",
+      "topic": null,
+      "config": {}
+    }
+  ],
+  "state": "created",
+  "created_at": 0,
+  "updated_at": 0,
+  "durability": {
+    "mode": "none"
+  }
+}

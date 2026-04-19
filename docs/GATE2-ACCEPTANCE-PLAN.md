@@ -390,7 +390,168 @@ session and the reason this plan exists as a standalone same-day plan.
 > Fill this section as each test closes. Format per test:
 > **TN — (title)** · **Date** · **Status:** ✅ / ❌ / partial · **Numbers:** … · **Notes:** …
 
-*(Empty until the session runs.)*
+### 10.0 Pre-flight PPS probe — AMS3 aeon-pool · 2026-04-18
+
+**Cluster:** DOKS `70821a02-9a2a-4ee6-9a74-38f5dea070e7` (AMS3), aeon-pool
+nodes `pool-f5vm1izlt-9q983` / `-9q988` (g-8vcpu-32gb, Regular SSD, DO
+standard networking — Premium Intel / NVMe / 10 Gbps not available in AMS3
+as of this date, see memory `reference_doks_droplet_availability.md`).
+
+Ran §3.6 UDP 64-byte packet probe in two modes — pod-to-pod over the CNI
+overlay, and host-network droplet-to-droplet — plus a 1400-byte MTU-sized
+sanity check. Artifacts: `deploy/doks/pps-probe-{a-to-b,b-to-a,hostnet,hostnet-1400}.json`.
+
+| Scenario | PPS | Throughput | Loss |
+|---|---:|---:|---:|
+| Pod→pod CNI, 64 B UDP, A→B | **158,202** | 0.08 Gbit/s | 0.04% |
+| Pod→pod CNI, 64 B UDP, B→A | 156,915 | 0.08 Gbit/s | 0.03% |
+| hostNetwork raw, 64 B UDP | **174,908** | 0.09 Gbit/s | 0.10% |
+| hostNetwork, 1400 B UDP | 199,795 | **2.24 Gbit/s** | 13.24% |
+
+**Against §3.6 pass criteria** (≥500 K PPS = no cap · 200–400 K = cap higher
+than historical · ≤207 K = historical cap active): **historical cap is
+active on DO standard tier in AMS3.**
+
+**Interpretation — proceed anyway:**
+
+1. **Bandwidth is not the bottleneck.** 2.24 Gbit/s on 1400 B packets
+   proves the droplets can push real byte throughput; only the
+   per-packet rate is capped.
+2. **CNI overhead is ~10%** (157 K pod→pod vs 175 K raw) — not the
+   dominant cost; the DO droplet-level PPS cap is.
+3. **Aeon's hot path is batched Kafka** (`rdkafka` coalesces 100–1000
+   events per TCP segment). At 256 B/event, 157 K packets/s maps to
+   multiple M events/s — PPS cap does not bind the measured path.
+4. **Where the cap *will* show up:** T3 WebTransport single-event
+   fanout, T5 cluster QUIC bursts of tiny control frames, any tiny-packet
+   partition-handover traffic. Those measurements need to be
+   interpreted with this ceiling in mind and/or deferred to Session B on
+   premium-tier (AWS/GCP) nodes.
+5. **Session B remains the throughput-ceiling session** per the existing
+   plan — this result reinforces that, not contradicts it.
+
+**Decision:** proceed with Session A. Session A's goals (cluster
+correctness, election, drain, split-brain, checkpoint recovery, T0
+shape-of-delta matrix) are not PPS-bound. Annotate any PPS-sensitive
+row below with "DO AMS3 standard-tier ceiling — see §10.0".
+
+### 10.1 T0 — Isolation matrix · 2026-04-18
+
+Full evidence + raw metric samples in
+[`deploy/doks/session-a-evidence.md`](../deploy/doks/session-a-evidence.md) §2.
+Image: `registry.digitalocean.com/rust-proxy-registry/aeon:session-a-prep`
+(sha `36d44fd336c1`).
+
+**T0.C0 — Memory → `__identity` → Blackhole** · Status: ✅ all 4 modes
+
+| Durability | Count/node | Aggregate | Wall (s) | Per-node eps | ns/event |
+|---|---:|---:|---:|---:|---:|
+| None | 200 M | 600 M | 44.4 | 4.50 M | 222 |
+| UnorderedBatch | 50 M | 150 M | ~22 | 2.27 M | 441 |
+| OrderedBatch | 50 M | 150 M | ~22 | 2.27 M | 441 |
+| PerEvent | 20 M | 60 M | 23.0 | 0.87 M | 1152 |
+
+**T0.C1 — Redpanda `aeon-source` → `__identity` → Blackhole** · Status:
+✅ all 4 modes (with G1 workaround — explicit 24-partition list per pipeline JSON)
+
+| Durability | Aggregate | Wall (s) | Per-node eps |
+|---|---:|---:|---:|
+| None | 90 M | 172.55 | 173,860 |
+| UnorderedBatch | 90 M | 174.79 | 171,636 |
+| OrderedBatch | 90 M | 178.98 | 167,616 |
+| PerEvent | 90 M | 186.11 | 161,198 |
+
+Kafka fetch is binding; mode spread None→PerEvent is 7.8 %.
+
+**T0.C2 — Redpanda `aeon-source` → `__identity` → Redpanda `aeon-sink`** ·
+Status: 🟡 3 of 4 modes (PerEvent skipped per G3)
+
+| Durability | Per-node eps | Notes |
+|---|---:|---|
+| None | 52 K (steady) | partial — Kafka write saturated, run timed out at 293 s |
+| UnorderedBatch | 169 K | **HWM only 78.1 M / 90 M aggregate — ~13 % drop is fire-and-forget by design (G4)** |
+| OrderedBatch | 38 K | acks=all bound; 7× slower than Unordered (expected) |
+| PerEvent | _deferred_ | G3 (per-pod txn-id) + DOKS no-NVMe ceiling — moves to Session B |
+
+### 10.2 T1 — 3-node throughput · 2026-04-18 · Status: ✅
+
+Memory source × 100 M / node, `__identity`, Blackhole sink, durability
+None.
+
+```
+t1-3node  45.37s  300,000,000  6,612,153 agg eps  2,204,051 per-node eps
+```
+
+Steady-state (subtract 5 s startup): 5.93 M agg eps / 1.98 M per-node.
+Linear scale on the no-I/O engine path — no inter-node coordination
+penalty observed.
+
+### 10.3 T4 — Cutover duration · 2026-04-18 · Status: ❌ FAIL
+
+Test ran via `deploy/doks/run-t4-cutover.sh` against random partitions:
+POST `/api/v1/cluster/partitions/{p}/transfer`, then poll
+`/api/v1/cluster/status` for ownership flip.
+
+| Metric | Observed |
+|---|---|
+| P50 REST `accepted` (POST→202) | ~2,300 ms |
+| Cutover < 100 ms target | **0 / 12 attempts** |
+| Cutover < 5,000 ms (broader window) | **0 / 12 attempts** |
+| Final ownership flipped | **0 / 12** — all stayed at source |
+
+Post-run `/cluster/status` showed 12 partitions stuck in `transferring`
+with `source` and `target` populated — Raft-replicated proposal, but
+the actual handover never executed.
+
+**Root cause (G2):** leader proposes `ClusterRequest::BeginTransfer`
+which sets `PartitionOwnership::Transferring{source,target}`, but
+there is no background `tokio::spawn` driver on the leader that
+consumes that state and runs the two-phase BulkSync→Cutover→Complete.
+CL-6 transport (`crates/aeon-cluster/src/transport/cutover.rs`,
+commit `807321f`) ships but is unwired. Single reference to
+`Transferring` in `node.rs` is a guard check inside
+`propose_partition_transfer`.
+
+### 10.4 T2 / T3 / T5 / T6 — deferred · 2026-04-18
+
+| Test | Status | Reason |
+|---|---|---|
+| T2 (Scale-up 1→3→5) | ⏸ deferred | Blocked by G2 (no functional partition handover) + DOKS pool needs expansion to 5× g-8vcpu-32gb |
+| T3 (Scale-down 5→3→1) | ⏸ deferred | Same blockers as T2 |
+| T5 (Split-brain drill) | ⏸ deferred | Chaos Mesh not installed in this session |
+| T6 (10-min sustained with chaos) | ⏸ deferred | Depends on T5 prerequisites |
+
+### 10.5 Code gaps surfaced — Session A
+
+| ID | Gap | Severity | Status |
+|---|---|---|---|
+| **G1** | `KafkaSourceFactory` defaults `partitions` to `[0]` (silent under-read) | Medium | Workaround applied; fix queued for next bundle |
+| **G2** | No leader-side driver consumes `PartitionOwnership::Transferring` | **Blocker T2/T3/T4** | Must-fix before next DOKS re-spin |
+| **G3** | Shared `transactional_id` across pods causes Kafka producer fencing | Medium | Skipped C2.PerEvent; queued for next bundle |
+| **G4** | `aeon_pipeline_outputs_sent_total` counts queued, not acked | Low | Add `_acked_total` companion metric |
+| **G5** | `aeon cluster drain` / `rebalance` CLIs missing | Low | Land with G2 |
+
+Full file/line refs and recommended fix order are in
+[`docs/ROADMAP.md` "Session A status (2026-04-18)"](ROADMAP.md#session-a-status-2026-04-18).
+
+### 10.6 Session A — verdicts
+
+- **Aeon-as-bottleneck (Gate 2 floor):** Engine path sustains 4.5 M
+  ev/s/node @ 222 ns/event with zero loss. Once Kafka enters the path,
+  throughput is broker-bound (170 K read-only, 38 K read+write
+  ordered). **Aeon is not the bottleneck on any I/O-bearing scenario.**
+- **Cluster correctness:** Raft membership stable across leader changes
+  (term 1 → 4 observed). Pipeline + partition table replication works
+  across all 3 nodes. **Partition handover does NOT work** — protocol
+  driver missing at the leader. This is the one Gate 2 must-fix
+  surfaced by Session A.
+
+### 10.7 Tear-down — Session A
+
+DOKS cluster `70821a02-9a2a-4ee6-9a74-38f5dea070e7` left running for
+user discretion (re-runs of T4 once G2 lands will be cheaper than
+rebuild). Full tear-down: `doctl kubernetes cluster delete
+70821a02-9a2a-4ee6-9a74-38f5dea070e7`.
 
 ---
 

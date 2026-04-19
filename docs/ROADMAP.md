@@ -3042,10 +3042,15 @@ What is **not** shipped, grouped by whether the task still earns its slot:
 
 | ID | Item | Open question for reassessment |
 |----|------|-------------------------------|
-| **CL-1** | Gate 2 multi-node acceptance — 9-item checklist, partially exercised on 3-node DOKS | Split-brain, multi-broker sustained load, and CPU-pinning items are infra-bound on current DOKS node pool. Do we invest in bigger nodes / Chaos Mesh, or mark Gate 2 "best-effort validated" and ship v0.1? |
-| **CL-5** | Raft-aware K8s auto-scaling (`cluster.auto_join: true`, `autoscaling.mode: raft-aware`) — depends on CL-6 for safe scale-down | Is HPA-driven elasticity actually wanted, or is explicit node-count control the expected operator pattern? No user has asked for this yet. |
-| **CL-6c.4** | Engine-side write-freeze + buffer-and-replay — crosses `aeon-cluster` ↔ `aeon-engine`, needs partition write-gate API | Transport-level drain+freeze (CL-6c.1/2/3) is shipped. Open: is the bulk-sync→freeze delta window actually observable as an incident in practice, or does existing `tracker.state == Cutover` + coordinator drain cover the case? Consider: defer until a real DOKS handover exposes the gap. |
-| Split-brain recovery drill | Network-partition test via Chaos Mesh or manual iptables | Is this a v0.1 blocker or a post-release hardening task? |
+| **CL-1** | Gate 2 multi-node acceptance — 9-item checklist | **Session A (2026-04-18) closed T0/T1 (Aeon-as-bottleneck floor verified); T2/T3/T4 surfaced G2 (no leader-side transfer driver — ownership flips never execute). T5/T6 deferred to next DOKS re-spin with Chaos Mesh.** See "Session A status" block below for full closed/deferred breakdown. |
+| **CL-5** | Raft-aware K8s auto-scaling (`cluster.auto_join: true`, `autoscaling.mode: raft-aware`) — depends on CL-6 for safe scale-down | **Parked** until G2 lands (it is a strict prerequisite). Still no user signal. |
+| **CL-6c.4** | Engine-side write-freeze + buffer-and-replay — crosses `aeon-cluster` ↔ `aeon-engine`, needs partition write-gate API | **Session A confirms the gap is real**: Raft commit of `Transferring` happens but no driver runs the protocol, so the write-freeze handoff is the missing piece. Land with G2 in the next bundle; do not split further. |
+| **G1 — Kafka source partition defaulting** | `KafkaSourceFactory` defaults to `[0]` when partitions list is empty; should consult cluster ownership table | Surfaced in Session A T0.C1 (silent under-read). Workaround: explicit 24-partition lists in JSON. Fix file: `crates/aeon-cli/src/connectors.rs:116-120`. |
+| **G2 — leader-side transfer driver** | No `tokio::spawn` consumes `PartitionOwnership::Transferring` to drive BulkSync→Cutover→Complete | **Session A blocker for T2/T3/T4.** CL-6 transport (`transport/cutover.rs`) shipped via `807321f` but unwired. Land with CL-6c.4. |
+| **G3 — per-pod transactional_id** | Shared `transactional_id` across pods causes Kafka producer fencing | Blocks T0.C2.PerEvent and EO-2 Kafka T2 on multi-pod. Fix: `${HOSTNAME}` substitution in `crates/aeon-cli/src/connectors.rs:164-166`. |
+| **G4 — outputs-acked metric** | `aeon_pipeline_outputs_sent_total` counts queued, not broker-acked (~13 % overcount on Unordered) | Add `aeon_pipeline_outputs_acked_total` companion; do not rename existing metric (back-compat). |
+| **G5 — `aeon cluster drain` / `rebalance` CLIs** | Manual `transfer-partition` loop required in T4 | Land with G2 to make T2/T3 one-command. |
+| Split-brain recovery drill | Network-partition test via Chaos Mesh or manual iptables | **v0.1 blocker** per 2026-04-18 decision; install Chaos Mesh in next DOKS re-spin alongside G2 fixes. |
 | Multi-broker Redpanda sustained load | Current DOKS node pool is CPU-saturated at rest (system DaemonSets eat ~2/2 vCPU) | Requires larger nodes or dedicated cluster. Cost vs signal tradeoff. |
 
 ### Pillar 4 — Transport Resilience follow-up
@@ -3129,6 +3134,144 @@ logic. Both are now derived from `raft_timing` — keep-alive =
 Session 0 torn down (`helm uninstall aeon` + `kubectl delete ns aeon`);
 `aeon:session0` image retained in Rancher Desktop for quick re-spin if
 Session A uncovers a local-reproducible gap.
+
+### Session A status (2026-04-18)
+
+Second of the three sessions from `GATE2-ACCEPTANCE-PLAN.md` completed on
+DOKS AMS3 (`70821a02-9a2a-4ee6-9a74-38f5dea070e7`, 3× g-8vcpu-32gb aeon
+pool, 3× so1_5-4vcpu-32gb redpanda pool, 1× s-4vcpu-8gb monitoring,
+Redpanda 26.1.2 / kube-prometheus-stack / `helm/aeon` 3-pod StatefulSet
+with QUIC auto_tls). Full evidence in
+[`deploy/doks/session-a-evidence.md`](../deploy/doks/session-a-evidence.md).
+Headlines also folded into [`GATE2-ACCEPTANCE-PLAN.md` § 10](GATE2-ACCEPTANCE-PLAN.md#10-results--session-a).
+
+**Closed in Session A:**
+
+- **T0.C0 Memory→__identity→Blackhole**, all 4 `DurabilityMode` modes —
+  None: 4.5 M ev/s/node @ 222 ns/event · UnorderedBatch / OrderedBatch:
+  2.27 M ev/s/node @ 441 ns · PerEvent: 0.87 M ev/s/node @ 1152 ns.
+  Engine path is NOT the bottleneck on any I/O-bearing scenario.
+- **T0.C1 Redpanda→__identity→Blackhole**, all 4 modes — converged in a
+  172–186 s window for 90 M aggregate (~170 K ev/s/node), Kafka-fetch
+  bound, durability mode overhead measurable but overshadowed by fetch.
+- **T0.C2 Redpanda→__identity→Redpanda**, 3 of 4 modes — Unordered:
+  506 K agg eps (broker drop ~13 % vs metric, see G4); Ordered: 113 K
+  agg eps (acks=all bound, expected). PerEvent skipped (G3 + DOKS
+  no-NVMe ceiling — moves to Session B).
+- **T1 3-node throughput** — 6.6 M aggregate eps on Memory→Blackhole,
+  linear scale per node (no inter-node coordination penalty observed
+  on the no-I/O engine path).
+- **PPS probe** — DO standard-tier cap ~175 K pps documented; does not
+  bind batched Kafka path. (Already captured in `GATE2-ACCEPTANCE-PLAN.md`
+  § 10.0.)
+
+**Code gaps surfaced (must-fix bundle for Session A re-run):**
+
+| ID | Gap | File / line | Severity |
+|---|---|---|---|
+| **G1** | `KafkaSourceFactory` defaults `partitions` to `[0]` when empty list passed — should be cluster-ownership aware (read whatever this node currently owns from `PartitionTable`). | `crates/aeon-cli/src/connectors.rs:116-120` | Medium — silent under-read |
+| **G2** | **No leader-side driver consumes `PartitionOwnership::Transferring`.** Raft proposal commits the state transition but no `tokio::spawn` orchestrates BulkSync→Cutover→Complete. CL-6 transport (`transport/cutover.rs`) shipped but unwired. | `crates/aeon-cluster/src/node.rs` (missing driver task); transport in `transport/cutover.rs` | **Blocker for T2 / T3 / T4** |
+| **G3** | Shared `transactional_id` across pods causes Kafka producer fencing — cannot run T0.C2.PerEvent EO-2 on multi-pod cluster without per-pod `${HOSTNAME}` substitution. | `crates/aeon-cli/src/connectors.rs:164-166` | Medium — limits T2 EO-2 verification |
+| **G4** | `aeon_pipeline_outputs_sent_total` is queue-count, not ack-count. C2.Unordered metric reported 90 M but broker HWM was 78.1 M (~13 % overcount). | metric emission in pipeline supervisor / sink loop | Low — observability accuracy |
+| **G5** | `aeon cluster drain` and `aeon cluster rebalance` CLIs missing — forced manual `transfer-partition` loop in T4. | `crates/aeon-cli/src/main.rs` cluster subcommands | Low — operator UX (defer with G2) |
+
+**Deferred to Session A re-run / Session B:**
+
+- **T2 (Scale-up 1→3→5)** and **T3 (Scale-down 5→3→1)** — both require
+  G2 fix (functional partition handover) before they can pass; T2 also
+  needs DOKS pool expansion to 5× g-8vcpu-32gb.
+- **T4 (Cutover < 100 ms)** — re-runs as soon as G2 lands; transport
+  primitives already exist, only the leader-side orchestrator is
+  missing.
+- **T5 (Split-brain drill)** — needs Chaos Mesh install. Not on the
+  correctness-floor critical path (Raft already enforces quorum), but
+  required for the "v0.1 blocker" flag set on 2026-04-18.
+- **T6 (10-min sustained with chaos)** — depends on T5 prerequisites.
+- **T0.C2.PerEvent** — depends on G3 fix; full per-event acks=all
+  ceiling measurement still moves to Session B (AWS EKS with NVMe).
+
+**Recommended fix bundle before next DOKS re-spin** (to validate
+multiple gaps in one cluster lifecycle, per
+`feedback_doks_stay_on_task.md`):
+
+1. **G2 — leader-side transfer driver** in `aeon-cluster`. Single largest
+   unblocker; converts CL-1 from "harness-shipped" to "data-path
+   verified". Must include the engine-side write-freeze hand-off if
+   that is the cleanest place to land **CL-6c.4** alongside (the
+   shipped transport already covers .1/.2/.3).
+2. **G1 — cluster-ownership-aware Kafka source partition defaulting.**
+   Removes the workaround currently hard-coded in every C1/C2 pipeline
+   JSON; required for honest auto-rebalance after a handover.
+3. **G3 — per-pod `transactional_id` substitution** in
+   `KafkaSinkFactory`. Cheap; unlocks honest T0.C2.PerEvent and the EO-2
+   Kafka T2 path on multi-pod clusters.
+4. **G5 — `aeon cluster drain` / `aeon cluster rebalance` CLIs.**
+   Lands naturally with G2; makes T2/T3 one-command.
+5. **G4 — `aeon_pipeline_outputs_acked_total` companion metric.**
+   Smallest item; do alongside the others to avoid another deploy.
+6. **CL-5 still parked.** Auto-scaling is downstream of (1)–(2);
+   revisit only if a user signal arrives.
+7. **Chaos Mesh install** can be scripted against the new cluster as
+   part of the same re-spin so T5/T6 close in the same session as the
+   re-run T2/T3/T4.
+
+DOKS cluster `70821a02-9a2a-4ee6-9a74-38f5dea070e7` will be torn down
+before the bundle lands; re-spin a fresh cluster against the same
+`deploy/doks/values-aeon.yaml` and `helm/aeon` chart once items 1–5
+are merged.
+
+### Session A re-run — to-do list (locked 2026-04-18)
+
+Working tree reset to `master`; all five phases below land on a single
+feature branch (one-branch strategy, per user preference) so the next
+DOKS re-spin validates the full bundle in one cluster lifecycle.
+
+**Phase 1 — Code gap fixes (all land before re-spin)**
+
+| ID  | Item | Files | Status |
+|-----|------|-------|--------|
+| P1.1a | Engine per-partition write-freeze API (`WriteGate` + `WriteGateRegistry`, async drain semantics, RAII `DrainGuard`) | `crates/aeon-engine/src/write_gate.rs` (+ lib.rs re-exports, pipeline.rs source-loop hook, pipeline_supervisor.rs registry field, `MultiPartitionConfig.gate_registry`) | ✅ landed (12 unit tests in `write_gate::tests`; engine lib suite 408/408 green) |
+| P1.1b | Engine `CutoverCoordinator` impl (async) backed by `WriteGateRegistry` (`EngineCutoverCoordinator` behind `cluster` feature); pluggable `CutoverWatermarkReader` for final source offset / PoH seq (sentinels `-1 / 0` when absent); `CutoverCoordinator::drain_and_freeze` flipped to `Pin<Box<dyn Future>>` for dyn-compat | `crates/aeon-engine/src/engine_cutover.rs` + `crates/aeon-cluster/src/transport/cutover.rs` (async trait + all 3 in-file test impls) + `crates/aeon-cluster/tests/cutover.rs` stub coordinator | ✅ landed (5 engine_cutover unit tests; cluster lib 140/140 green; CL-6c integration test `full_handover_walks_bulksync_poh_and_cutover_over_real_quic` green) |
+| P1.1c | Leader-side partition transfer driver (G2) — target-node orchestrator consumes `PartitionOwnership::Transferring`, walks CL-6a (BulkSync) → CL-6b (PoH chain) → CL-6c (Cutover) → Raft `CompleteTransfer` / `AbortTransfer`; pluggable `SegmentInstaller` / `PohChainInstaller` / `NodeResolver` traits for dependency injection; `watch_loop` polls `SharedClusterState` for transfers targeting this node, dedups via per-partition tracker map | `crates/aeon-cluster/src/partition_driver.rs` (new module + lib.rs re-exports) | ✅ landed (3 unit tests over real QUIC loopback: happy-path commit, bulk-failure abort, concurrent-rejection dedup; cluster lib 144/144 green) |
+| P1.1d | G1: cluster-ownership-aware Kafka source partition defaulting — new async `PartitionOwnershipResolver` trait in `aeon-engine`; `PipelineSupervisor` gains a `OnceLock` resolver installed post-bootstrap; empty `partitions` lists in source manifests now filled from the Raft `PartitionTable` before the factory builds. `KafkaSourceFactory` keeps `[0]` as a loud fallback for pre-cluster / single-node paths (now with `tracing::warn!`). | `crates/aeon-engine/src/connector_registry.rs` (+ trait), `crates/aeon-engine/src/pipeline_supervisor.rs` (resolver field + fill logic), `crates/aeon-engine/src/partition_ownership.rs` (new `ClusterPartitionOwnership` impl), `crates/aeon-cli/src/main.rs` (wire post-`bootstrap_multi`), `crates/aeon-cli/src/connectors.rs` | ✅ landed (3 resolver unit tests + 5 supervisor tests covering: fill from resolver, explicit-partitions-not-overridden, no-resolver passthrough, None-passthrough, install-once semantics; engine lib 422/422 green; cluster lib 143/143 green) |
+| P1.1e | G3: per-pod `transactional_id` template substitution — `KafkaSinkFactory` runs the configured `transactional_id` through `substitute_env_placeholders`, which resolves `${HOSTNAME}` and `${POD_NAME}` from the process env (fail-loud on unset / unknown / unterminated). Unblocks T0.C2.PerEvent + EO-2 Kafka T2 on multi-pod ReplicaSets by giving every pod a unique producer id from a single manifest. | `crates/aeon-cli/src/connectors.rs` (factory + helper) | ✅ landed (7 unit tests: fast-path, HOSTNAME, POD_NAME, multi-placeholder, unset-var error, unknown-placeholder error, unterminated-template error; aeon-cli test suite 12/12 green) |
+| P1.1f | G4: `aeon_pipeline_outputs_acked_total` companion metric via generic `Sink` trait ack-callback (`on_ack_callback(Arc<dyn Fn(usize) + Send + Sync>)`, defaulted to no-op). Wire Kafka first; other 7 sinks adopt after validation. | `crates/aeon-types/src/traits.rs` (`SinkAckCallback` type alias + defaulted method) + re-export, `crates/aeon-engine/src/pipeline.rs` (`outputs_acked: AtomicU64` + `PipelineMetrics::ack_callback()`), `crates/aeon-engine/src/connector_registry.rs` (`DynSink::on_ack_callback_dyn` + `BoxedSinkAdapter` forward), `crates/aeon-engine/src/pipeline_supervisor.rs` (install in `start()` before spawn), `crates/aeon-engine/src/metrics_server.rs` + `health.rs` + `rest_api.rs` (Prometheus + JSON exposure), `crates/aeon-connectors/src/kafka/sink.rs` (store callback, fire from PerEvent/OrderedBatch produce arms + UnorderedBatch flush) | ✅ landed (4 KafkaSink unit tests, 2 BoxedSinkAdapter dyn-forward tests, 1 metrics callback test, +1 acked field assertion in metrics-server + REST exposition tests; aeon-types lib 165/165, aeon-engine lib 416/416, aeon-connectors lib 19/19; trait change is non-breaking — every other Sink picks up the no-op default) |
+| P1.1g | G5: `aeon cluster drain` + `aeon cluster rebalance` CLIs (operator UX for T2/T3). Pure planning helpers `plan_drain` / `plan_rebalance` in `aeon-cluster` (round-robin in ascending NodeId, skip `Transferring`, drain excludes target from destination set, rebalance uses `ceil(total/M)` per-node cap and skips non-live owners). Two new leader-only REST routes `POST /api/v1/cluster/drain` + `POST /api/v1/cluster/rebalance` — shared `cluster_bulk_transfer` backbone replies 202 on full success, 207 Multi-Status on partial, 409 `X-Leader-Id` on follower; per-partition result codes: accepted / no-change / already-transferring / unknown-partition / rejected / lost-leadership. CLI `ClusterAction::Drain { node }` + `Rebalance` reuse a shared `post_cluster_mutation` helper that pretty-prints the leader-hint on 409. | `crates/aeon-cluster/src/rebalance.rs` (new), `crates/aeon-cluster/src/lib.rs` (re-exports), `crates/aeon-engine/src/rest_api.rs` (routes + handlers + `BulkPlan` + `DrainBody`), `crates/aeon-cli/src/main.rs` (subcommands + shared POST helper) | ✅ landed (13 planning unit tests cover drain/rebalance edge cases without a live cluster: empty table, single-node, already-balanced, scale-up redistribution, in-flight skipping, non-live-owner skipping, id-ordered output; aeon-engine lib 425/425 green; aeon-cli + aeon-engine build clean with `cluster` + `rest-api`) |
+| P1.1h | Integration test: 3-node loopback partition transfer driver E2E (BulkSync → Cutover → Complete, with write-freeze + post-cutover ownership flip). Real 3-node Raft cluster over QUIC loopback; node 2 hosts the CL-6 providers (`FixedBulkProvider` / `FixedPohProvider` / `RecordingCutoverCoordinator`); node 3 runs a `PartitionTransferDriver` backed by a real `RaftNodeResolver`. Leader seeds `AssignPartition(P0 → 2)`, waits for Raft propagation, then proposes `BeginTransfer(P0, 2 → 3)`. Both `drive_one` and `watch_loop` paths are covered. Write-freeze asserted via exactly-one `drain_and_freeze` call on the source coordinator. `propose_on_leader` retry helper absorbs transient `ForwardToLeader { leader_id: None }` races so the two tests run in parallel without flakes. | `crates/aeon-cluster/tests/partition_transfer_e2e.rs` (new) | ✅ landed (2 E2E tests covering direct-drive + watcher-drive paths, both assert all three replicas observe `Owned(3)` after CompleteTransfer + all installer hooks fired with expected bytes + cutover coordinator called exactly once; cluster suite 180/180 green (157 lib + 1 cutover + 10 multi_node + 2 E2E + 2 poh_transfer + 1 raft_log_persistence + 7 single_node); 5/5 consecutive stability runs of the E2E binary) |
+| P1.1i | `aeon cluster status --watch` operator UX command (live partition ownership + Raft term/index, helpful for next Session A debugging). Extends `ClusterAction::Status` with `--watch` + `--interval <f64>` (default 2.0s). Without `--watch`: prints existing pretty-JSON (script-friendly). With `--watch`: clears the screen (`\x1b[2J\x1b[H`), prints a compact human view — node id, leader id, Raft state/term/last_applied/last_log, and a numerically-sorted partition table showing `owned   node N` or `transfer  S → T` per partition — every `interval` seconds until Ctrl-C. Transient HTTP failures render as an `error: …` banner instead of exiting the loop so flaky leader elections don't kick the operator out. Numeric partition-id sort handles the P2/P10 lexicographic trap. | `crates/aeon-cli/src/main.rs` (`cmd_cluster_status` + `render_cluster_status` + `chrono_like_hms`) | ✅ landed (5 unit tests cover: cluster-mode row/header shape, partition-id numeric sort (`P2` before `P10`), transfer-row formatting (`S → T`), standalone-mode fallback text, missing-leader `<none>` rendering, `HH:MM:SSZ` timestamp shape; aeon-cli 16/16 green (5 new unit + 11 existing integration); `cargo clippy -p aeon-cli --no-deps` clean) |
+
+**Phase 2 — Harness prep (mostly shell/YAML; no Phase-1 code dependency except .2c)**
+
+| ID  | Item | Status |
+|-----|------|--------|
+| P2.2a | DOKS `aeon-pool` 3→5 expansion script via `doctl k8s cluster node-pool update --count`. Idempotent — exits 0 if already at target, and still re-applies the `workload=aeon:NoSchedule` taint so an idempotent re-run also fixes drift. Post-resize wait loop polls `kubectl get nodes -l doks.digitalocean.com/node-pool=aeon-pool` for Ready=True count == target, with configurable `READY_TIMEOUT` (default 600s). Re-applies the pool taint with `--overwrite` on every invocation because DOKS HA-enabled pools don't persist taints through scale-up events reliably. Validates target ∈ [1, 20], non-numeric / zero args rejected with exit 2. Env overrides: `POOL` (default `aeon-pool`), `TAINT` (empty string = skip retaint), `READY_TIMEOUT`. Supports both scale-up (3 → 5 for T2) and scale-down (5 → 3 after T3) paths. | `deploy/doks/resize-aeon-pool.sh` (new) + README pointer | ✅ landed (bash -n clean; usage/validation smoke-tested: missing-args / non-numeric / zero / out-of-range all exit 2; requires live DOKS cluster for end-to-end validation during P3 Session A re-run) |
+| P2.2b | Chaos Mesh install/uninstall scripts for T5/T6 (PodChaos + NetworkChaos targets documented) | ✅ landed 2026-04-19 — `deploy/doks/install-chaos-mesh.sh` pins Chaos Mesh 2.6.3 into `chaos` ns with `chaosDaemon.runtime=containerd` (DOKS), `helm upgrade --install` for idempotency, waits for all pods Ready + verifies `networkchaos.chaos-mesh.org` CRD. `uninstall-chaos-mesh.sh` drops live experiments first (avoids finalizer-blocked ns delete), then helm uninstall, then CRDs (opt-out via `KEEP_CRDS=1`), then namespace. Both pass `bash -n`. README entry added. |
+| P2.2c | Strip G1 workaround (hard-coded `partitions: [0/1/2]`) from Session A pipeline JSONs once P1.1d lands | ✅ landed 2026-04-19 — all 8 Kafka-source cell JSONs (`t0-c1-{none,ordered,unordered,perevent}.json`, `t0-c2-*.json`) now carry `"partitions":[]`. At pipeline-create time `pipeline_supervisor.rs:166-183` asks the `OwnershipResolver` for this node's slice and injects it — same intent as the old 24-element workaround but derived from cluster truth, and it tracks rebalances instead of going stale. Memory-source JSONs were already `[]`, unchanged. |
+| P2.2d | T2/T3 run scripts (`run-t2-scaleup.sh` covers 1→3→5 path; `run-t3-scaledown.sh` covers 5→3→1) using new `aeon cluster drain` | ✅ landed 2026-04-19 — `deploy/doks/run-t2-scaleup.sh` sequences pipeline-create → producer Job → 1→3 → wait for 3 voters + all partitions Owned → `resize-aeon-pool.sh` 3→5 → 3→5 scale → wait for drain → verdict (producer count vs `aeon_pipeline_outputs_acked_total` sum, WAL fallback counter must stay 0). `run-t3-scaledown.sh` mirrors with the key twist for the missing preStop hook: each step POSTs `/api/v1/cluster/drain {node_id}` first so the leader evacuates partitions, waits for Owned, then `kubectl scale`. Pool shrinks 5→3 at the end. New pipeline manifests `t2-ordered.json` / `t3-ordered.json` (partitions=[], ownership-resolved). Both scripts `bash -n` clean. |
+| P2.2e | T5/T6 run scripts using Chaos Mesh (pragmatic targets: one-pod kill, 30 % packet loss between aeon-1 ↔ aeon-2, DOKS node cordon+drain) | ✅ landed 2026-04-19 — shared `deploy/doks/chaos-netpart-aeon-2.yaml` (NetworkChaos, direction=both, isolates aeon-2 from aeon-0/aeon-1). `run-t5-split-brain.sh`: apply → 2-min write loop against all 3 REST endpoints (tallies majority-commit vs minority-reject) → heal → wait for Raft `last_applied` to converge → cross-member per-partition ownership diff. Pass requires majority-ok > 0, minority-rejected > 0, converged, no mismatch. `run-t6-sustained.sh`: 10-min OrderedBatch run at `RATE` (default 500k/s) with four timer-triggered events (t=2 leader-pod kill → failover-ms capture; t=4 `POST /cluster/rebalance`; t=6 apply NetworkChaos; t=8 heal), verdict: zero loss, WAL == 0, failover < 5s. Both `bash -n` clean. |
+
+**Phase 3 — Re-run Session A on fresh DOKS**
+
+Full T0 → T6 sweep on a freshly-spun DOKS cluster (AMS3, same
+`values-aeon.yaml` + `helm/aeon` chart). Pre-flight: all Phase 1 + Phase
+2 items merged, P1.1i deployed for live debugging. Single cluster
+lifecycle; tear down at end.
+
+**Phase 4 — Session B (AWS EKS) calibration, deliverables only (no cluster spend yet)**
+
+| ID  | Item | Region / notes | Status |
+|-----|------|----------------|--------|
+| P4.i | EKS Terraform/eksctl manifest (x86_64 node groups: `i4i.4xlarge` Redpanda with local NVMe, `c7gn.4xlarge` → rewrite to `c7i.4xlarge` for x86_64 parity, monitoring `m6i.2xlarge`) | `us-east-1` | ⏳ pending |
+| P4.ii | EKS spot pricing pre-check script (`aws ec2 describe-spot-price-history` snapshot + decision matrix for switching to on-demand) | — | ⏳ pending |
+| P4.iii | Pre-bake Aeon image to ECR (`us-east-1`) from the same feature-branch SHA used on DOKS | Blocks on P4.i | ⏳ pending |
+| P4.iv | Stub Session B results template in `GATE2-ACCEPTANCE-PLAN.md` §10 (mirrors §10 Session A shape; fill in on Session B day) | — | ⏳ pending |
+
+**Phase 5 — Post Phase-3 follow-ups (not blocking Session A re-run)**
+
+| ID  | Item | Status |
+|-----|------|--------|
+| P5.a | Dynamic source re-assign on partition transfer (connector-side hot re-subscription once G2 proves the contract) | ⏳ pending (blocked by Phase 3 evidence) |
+| P5.b | Per-sink dynamic checkpointing on transfer — revisit after Phase 3; may already be covered by existing `per_sink_ack_seq` plumbing | ⏳ pending |
 
 ---
 
