@@ -376,15 +376,19 @@ for streaming connectors, tokio-rustls for TCP-based connectors, etc.).
 
 **Before crossing Gate 2, all of the following must be true:**
 
-- [ ] 3-node cluster scales throughput ~3x vs single-node
-- [ ] 1→3→5 scale-up works with zero event loss
-- [ ] 5→3→1 scale-down works with zero event loss
-- [ ] Leader failover recovers in <5s
-- [ ] Two-phase partition transfer cutover <100ms
-- [ ] PoH chain has no gaps across transfers
-- [ ] Merkle proofs verify correctly
-- [ ] mTLS between all cluster nodes
-- [ ] Crypto does not regress throughput beyond acceptable margin
+- [x] 3-node cluster scales throughput ~3x vs single-node — 2026-04-18 T1: 6.96 M agg / 2.32 M per-node on Memory→Blackhole (Session A, DOKS AMS3); **re-confirmed 2026-04-19** on fresh cluster `c3867cc5` — T1 6.5 M agg / 2.2 M per-node, zero loss on 300 M events, matches the 2026-04-18 floor within measurement noise. T0.C0 on the same cluster: **600 M events, zero loss, ~27 M agg eps steady-state** (~9 M eps/node) — confirming the ~3× scaling shape on the Kafka-free path.
+- [ ] 1→3→5 scale-up works with zero event loss — 2026-04-19 post-bundle re-run (`c3867cc5`): pool 3→5 clean (67 s); STS 3→5 hit **G15 gap** — scale-up pods `aeon-3/aeon-4` entered `seed-join` flow correctly (G10 client-side wiring verified), but **every seed — including the current Raft leader — rejected the join with `"not the leader; current leader is Some(3)"`**. G15 code fix **shipped 2026-04-19** (`crates/aeon-cluster/src/transport/server.rs` — `serve()` takes `self_id: NodeId` sourced from `ClusterConfig::node_id`; `handle_add_node` / `handle_remove_node` use the configured id for the leader-self check instead of `raft.metrics().borrow().id`; new regression test `g15_join_targets_actual_leader_of_three_node_cluster` in `tests/multi_node.rs` passes + 10 existing multi-node tests stay green). **T2 re-measurement on real k8s deferred to next DOKS re-spin.**
+- [ ] 5→3→1 scale-down works with zero event loss — `aeon cluster drain` + REST paths are green on the 3-node baseline; full 5→3→1 roundtrip gated on next DOKS re-spin (needs to reach 5 first via the now-shipped G15 path).
+- [ ] Leader failover recovers in <5s — 2026-04-19 (first pass) T6 measured **10 s** on 3-node no-load cluster; code path unblocked 2026-04-19 via **G14** (`ClusterNode::relinquish_leadership` runs in parallel with the `preStopDelay` sleep during SIGTERM, + `RaftTiming::fast_failover` preset 250/750/2000 ms wired through `AEON_RAFT_*` env / helm `cluster.raftTiming`). Post-bundle re-run didn't reach T6 (blocked at T2 by G15 at the time; G15 now shipped). Re-measurement folded into the next DOKS re-spin.
+- [ ] Two-phase partition transfer cutover <100ms — T4 not re-attempted 2026-04-19 post-bundle; code path closed via **G11** (a/b/c shipped). Re-measurement folded into the next DOKS re-spin alongside T2/T3/T6.
+- [ ] PoH chain has no gaps across transfers — gated on T4 re-measurement.
+- [ ] Merkle proofs verify correctly — not exercised this session; scheduled for Phase 3.5 V5.
+- [x] mTLS between all cluster nodes — auto-TLS accepted by all 3 pods, QUIC transport green on baseline; see T5 below
+- [ ] Crypto does not regress throughput beyond acceptable margin — deferred to Session B (AWS EKS with NVMe)
+
+Re-run split-brain drill **T5 passed correctness bar** 2026-04-19 (majority commits, minority refused, Raft `last_applied=44` converged across all 3 nodes post-heal; per-partition ownership identical). Sustained-chaos **T6 partial** — orchestration + rebalance endpoint verified, but the chaos-heal itself surfaced **G13** (Chaos Mesh leaves orphan iptables/tc rules on DOKS → QUIC `sendmsg` EPERM → cluster wedges post-heal; infra issue, not an Aeon code gap).
+
+**Gate 2 blocker queue (Aeon code):** ~~G15~~ (✅ 2026-04-19 — configured-id threaded through `server::serve()`; regression test shipped) > ~~G10~~ (✅ 2026-04-19 — client-side seed-join flow verified in re-run) > ~~G11~~ (all sub-items ✅ 2026-04-19) > ~~G14~~ (✅ 2026-04-19 — code; DOKS re-measure pending) > ~~G9~~ (✅ 2026-04-19 — 307 auto-forward to leader shipped) > ~~G8~~ (✅ 2026-04-19 — `ClusterNode::wait_for_leader` + self-election wait in `propose`). **Infra:** ~~G13~~ (✅ 2026-04-19 — `deploy/doks/README.md` workaround section). **All Aeon code blockers closed; remaining Gate 2 work is re-measurement on real k8s.** See `docs/GATE2-ACCEPTANCE-PLAN.md` § 10.8 (pre-bundle) + § 10.9 (post-bundle re-run) for evidence; `deploy/doks/session-a-evidence.md` for full logs.
 
 **Only after Gate 2 is passed, proceed to ecosystem expansion.**
 
@@ -962,7 +966,10 @@ placeholders). Test counts updated to reflect current state.
    - ✅ Leader election: N2 elected ~1 s after startup, partition table populated
    - ✅ Failover: killed leader pod (aeon-1, N2) at T0 → new leader N1 (aeon-0) committed at T0+5 s → cluster stable, 3/3 Ready, 0 restarts
    - ✅ **Pipeline CRUD Raft replication landed (2026-04-12)**: new `RegistryApplier` trait in `aeon-types`, `ClusterRequest::Registry(payload)` / `ClusterResponse::Registry` variants, shared applier slot on `StateMachineStore`, `ClusterNode::install_registry_applier` + `propose_registry`, `ClusterRegistryApplier` in `aeon-engine` fans commands to `ProcessorRegistry` + `PipelineManager`. `cmd_serve` hoists registry / pipelines into Arcs and installs the applier before spawning partition-assignment background task. REST handlers `create_pipeline`, `delete_pipeline`, `upgrade_pipeline`, `start_pipeline`, `stop_pipeline`, `register_processor` all branch through Raft when `cluster_node` is present; `upgrade_pipeline` still performs the per-node drain-swap after replication. Two integration tests exercise both the replicated-apply path and the silent no-applier path. JSON (not bincode) for the payload since `RegistryCommand` is internally-tagged.
-   - ⬜ PoH chain transfer real-network testing (CL-6b)
+   - ✅ PoH chain transfer real-network testing (CL-6b, shipped 2026-04-16) — see Pillar 3 row
+   - ✅ Partition cutover handshake (CL-6c, shipped 2026-04-16) — see Pillar 3 row
+   - ✅ Partition transfer bandwidth throttle (CL-6d.1, shipped 2026-04-16) — see Pillar 3 row
+   - ✅ Partition transfer progress Prometheus metric (CL-6d.2, shipped 2026-04-16) — see Pillar 3 row
    - ⬜ Split-brain recovery (network partition test — needs Chaos Mesh or manual iptables)
    - ⬜ Multi-broker Redpanda sustained load
    - ⬜ CPU pinning with `cpu-manager-policy=static` — current node pool lacks the feature-gate
@@ -3021,11 +3028,382 @@ developer experience, and deferred work into 7 pillars with clear dependency cha
 |--------|-------|----------|-----------|
 | 1. Persistence & Durability + Security | 12 | **Complete** | All shipped 2026-04-12: FT-1/2 (persistent Raft log + snapshots via L3), FT-3 (L3 checkpoint), FT-4 (pre-vote mitigated), FT-5 (election timeouts), FT-6 (health ping/pong), FT-7 (L3 generics), FT-8 (mTLS), FT-9 (L3Store in aeon-types), FT-10 (unwrap audit — 10 crates locked), FT-11 (zero-copy via `bytes::Bytes`), FT-12 (refcount perf). |
 | 2. Zero-Downtime Deployment | 7 | **Complete** | ZD-1/2/3 (bug fixes) + ZD-4 (drain/swap) + ZD-5 (blue-green) + ZD-6 (canary) + ZD-7/8 (same-type source/sink reconfig) all shipped 2026-04-11/12. ZD-9 (cross-type swap via separate pipeline) deferred. |
-| 3. Cluster Operations | 9 | Medium | Gate 2 acceptance, partition reassignment, PoH transfer, cluster metrics (CL-4), CL-6a/b/c/d (partition transfer data movement), raft-aware auto-scaling (CL-5, depends on CL-6) |
+| 3. Cluster Operations | 9 | Medium | Gate 2 acceptance, partition reassignment, PoH transfer, cluster metrics (CL-4), CL-6a/b/c/d (partition transfer data movement), raft-aware auto-scaling (CL-5, depends on CL-6). **CL-6a.1 primitive landed 2026-04-16** (`aeon_engine::l2_transfer`): `SegmentManifest` + `SegmentEntry` (start_seq, size_bytes, crc32), chunked `SegmentReader` (1 MiB default, ragged-tail-safe, `is_last` flag), `SegmentWriter` (lazy file creation, offset-addressed writes, CRC validate on `is_last`, rejects overflow/replay/unknown-segment chunks, `finish()` asserts every manifest entry validated). 12 unit tests covering empty/nonexistent dir, sorted listing, non-l2b skip, ragged chunks, L2BodyStore roundtrip, CRC mismatch, missing-segment finish, overflow, replay-finalize, bytes-received accounting. **CL-6a.2 QUIC wire protocol landed 2026-04-16**: wire types (`SegmentManifest`/`SegmentEntry`/`SegmentChunk`/`DEFAULT_CHUNK_BYTES`) hoisted into `aeon_types::l2_transfer` so `aeon-cluster` + `aeon-engine` share the exact serde layout (no dep cycle); `MessageType` variants `PartitionTransferRequest = 17`, `PartitionTransferManifestFrame = 18`, `PartitionTransferChunkFrame = 19`, `PartitionTransferEndFrame = 20`; request/end structs in `aeon_cluster::types`; streaming client (`request_partition_transfer`) + server (`serve_partition_transfer_stream`) in `aeon_cluster::transport::partition_transfer` — closure-based callbacks keep the transport engine-agnostic; `PartitionTransferProvider` trait lets the caller plug in an `L2BodyStore`-backed source. Errors mid-stream surface as a failure end-frame with the error text. 3 QUIC roundtrip tests over dev certs: happy-path multi-segment transfer preserves manifest + chunk order exactly, failing provider surfaces as client-side error, empty manifest completes cleanly. 7 tests total added today (4 types + 3 cluster); cluster lib 111 tests, types lib 165 tests, engine lib 388 tests all green. **CL-6a.3 TransferTracker integration landed 2026-04-16**: `serve()` extended with `transfer_provider: Option<Arc<dyn PartitionTransferProvider>>` — `None` at tests/benches sends a failure end-frame so stale clients get a clear error; `handle_stream()` peeks the first frame and routes `MessageType::PartitionTransferRequest` to a new `serve_partition_transfer_with_request` entrypoint (the frame is already consumed, so the core server logic is split so both the full-stream path and the pre-parsed-request path share the same provider → manifest → chunks → end write loop). `drive_partition_transfer(tracker, source, target, connection, req, writer)` is the caller-facing orchestrator: `Idle → BulkSync(source,target)` on entry, per-chunk byte accounting fed into `tracker.update_progress(bytes_so_far, total_bytes_from_manifest)` (uses `SegmentManifest::total_bytes()`), `BulkSync → Cutover` on a success end-frame, `→ Aborted { reverted_to: source, reason }` on any transport, provider, or writer error (the final `Cutover → Complete` transition is left to the caller because it must be gated by the Raft ownership-flip commit). Updated 6 `serve()` callers in `node.rs`/tests/benches to pass `None`. 2 new integration tests covering happy-path tracker walk (Idle → BulkSync → Cutover with matching `written_bytes == manifest.total_bytes()`) and provider-failure abort path (tracker lands in `Aborted { reverted_to: source }`). Cluster lib now 113 tests, types 165, engine 388 — all green, zero clippy warnings on the new code. **CL-6a overall complete — unblocks EO-2 P12.** **CL-6b PoH chain transfer landed 2026-04-16** in three increments: **CL-6b.1 wire protocol** — added `MessageType::PohChainTransferRequest = 21` / `PohChainTransferResponse = 22` (single round-trip since `PohChainState` is small — current_hash + sequence + MMR, well under 16 KiB — so no chunking needed); `PohChainTransferRequest` + `PohChainTransferResponse` structs in `aeon_cluster::types` with `state_bytes: Vec<u8>` as opaque wire payload (client encodes/decodes via `aeon_crypto::poh::PohChainState::{to_bytes,from_bytes}`, transport stays crypto-agnostic — mirrors the L2 split from CL-6a); new module `aeon_cluster::transport::poh_transfer` with `PohChainProvider` trait, `request_poh_chain_transfer` client, `serve_poh_chain_transfer_stream`/`_with_request` server entrypoints; 3 unit tests (happy-path payload preservation, provider failure → Cluster error with embedded message, empty payload roundtrip). **CL-6b.2 dispatch integration** — `serve()` signature extended to `serve(ep, raft, shutdown, transfer_provider, poh_provider)`; new `MessageType::PohChainTransferRequest` branch in `handle_stream()` routes to `handle_poh_chain_transfer` (same None-provider-sends-failure-response pattern as CL-6a.3); `drive_poh_chain_transfer(conn, req, on_state)` orchestrator returns raw bytes to the callback so callers own the `PohChainState::from_bytes` step; 6 `serve()` callers in `node.rs` / `tests/multi_node.rs` / `benches/cluster_bench.rs` updated to pass `None, None`; 1 new unit test (drive_transfer hands bytes to callback). **CL-6b.3 real-network integration test** landed in `crates/aeon-cluster/tests/poh_transfer.rs` (2 tests): `poh_chain_transfers_over_real_quic_and_preserves_head` builds a source `PohChain` with 5 real batches (Merkle-tree-computed roots, deterministic payloads + timestamps), stands up a real QUIC server + `LivePohProvider`, drives the transfer from a client endpoint, verifies the restored chain matches byte-for-byte on `current_hash` / `sequence` / `mmr_root` *and* that a post-transfer `append_batch(same_payload, same_ts)` on both source-clone and target yields identical next-entry hash + merkle_root + sequence (continuity); `poh_transfer_of_fresh_chain_yields_genesis_state` covers the zero-append edge (genesis hash + seq=0 survive the transfer). `aeon-crypto` added to `aeon-cluster` `[dev-dependencies]` for the integration test. Cluster lib now 117 tests, cluster integration tests +2 (119 total), types 165, engine 388 — all green, zero clippy warnings on new code. **CL-6b complete.** **CL-6c partition cutover handshake landed 2026-04-16** in three increments: **CL-6c.1 wire primitive** — added `MessageType::PartitionCutoverRequest = 23` / `PartitionCutoverResponse = 24` (single round-trip — cutover is a short control-plane handshake, no streaming needed); `PartitionCutoverRequest` + `PartitionCutoverResponse` structs in `aeon_cluster::types` with `final_source_offset: i64` (`-1` = no offset, e.g. non-Kafka first cutover) + `final_poh_sequence: u64` as watermarks the target must reach before resuming writes; new module `aeon_cluster::transport::cutover` with `CutoverCoordinator` trait (`fn drain_and_freeze(&self, req) -> Result<CutoverOffsets, AeonError>`), `CutoverOffsets { final_source_offset, final_poh_sequence }` value type, `request_partition_cutover` client (surfaces `success=false` as `AeonError::Cluster`), `serve_partition_cutover_stream` + `_with_request` server entrypoints (same split pattern as CL-6a.3 / CL-6b.2 so the dispatcher can peek the first frame then hand off); 3 unit tests (happy-path roundtrip + coordinator invocation count, coordinator failure → Cluster error with embedded message, request fields propagate to coordinator). Engine-side write-freeze + buffer-and-replay behaviour is deferred to CL-6c.4 — this increment is pure transport primitive, kept crypto-agnostic and engine-agnostic. **CL-6c.2 orchestrator + dispatch integration** — `serve()` signature extended to `serve(ep, raft, shutdown, transfer_provider, poh_provider, cutover_coordinator)` with `None` in tests/benches (7 `serve()` callers updated across `node.rs` / `tests/multi_node.rs` / `benches/cluster_bench.rs`); new `MessageType::PartitionCutoverRequest` branch in `handle_stream()` routes to `handle_partition_cutover` (same None-coordinator-sends-failure-response pattern); `drive_partition_cutover(tracker, conn, req)` orchestrator enforces `tracker.state == Cutover` precondition (rejects with `AeonError::State` before hitting the wire so a mis-sequenced caller doesn't waste an RPC), invokes the handshake, keeps tracker in `Cutover` on success (caller drives the final `Cutover → Complete` transition after the Raft ownership-flip commit), moves tracker to `Aborted { reverted_to: source }` on any transport or coordinator failure; 3 new unit tests (success keeps tracker in Cutover with correct offsets, failure moves tracker to Aborted, Idle tracker rejected before any wire traffic — verified via zero coordinator-call count). **CL-6c.3 real-network integration test** — `crates/aeon-cluster/tests/cutover.rs` (1 test): `full_handover_walks_bulksync_poh_and_cutover_over_real_quic` builds a real source `PohChain` with 3 batches, stands up a single QUIC server with all three services wired (`StubTransferProvider` for L2 segments, `LivePohProvider` for real PoH state, `StubCutoverCoordinator` that captures the request + counts calls), drives the full target-side sequence on a single connection (bulk sync → PoH transfer → cutover handshake), verifies tracker transitions Idle→BulkSync→Cutover→Complete, L2 byte totals match manifest, restored PoH chain matches source byte-for-byte, cutover offsets + coordinator.calls == 1 + captured request carries the correct pipeline/partition. Cluster lib now 123 tests (+6 for CL-6c wire+drive), cluster integration tests +1 (20 total), types 165, engine 388 — all green, zero clippy warnings on new code. **CL-6c complete.** **CL-6d.1 transfer bandwidth throttle landed 2026-04-16**: new `aeon_cluster::transport::throttle::TransferThrottle` token-bucket limiter (signed-budget design, 1 s burst cap, lock-then-sleep-outside-lock so the mutex isn't held across the await point, `unlimited()` no-op constructor for the default-config case); `PartitionTransferProvider` trait gained an opt-in `throttle(&self) -> Option<&TransferThrottle>` default-None accessor so the engine plugs in a throttle sized to a fraction (30% per roadmap) of observed link capacity without growing the `serve()` arg list; `serve_partition_transfer_with_request` calls `throttle.acquire(chunk_bytes).await` before each `write_frame` so a bulk-sync can't saturate the QUIC connection it shares with live pipeline traffic. 5 throttle unit tests (unlimited no-op, within-burst no-sleep, beyond-budget-sleeps-for-debt, sustained-rate-respects-limit, burst-cap-limits-idle-accumulation — all using `tokio::test(start_paused = true)` for deterministic time) + 1 new partition_transfer integration test (`provider_throttle_is_respected_during_transfer`: 2×1 MiB chunks at 1 MiB/s over real QUIC — first drains burst, second waits ~1 s for refill, proves the serve loop actually awaits `provider.throttle()`). `tokio` dev-dependency gained the `test-util` feature. Cluster lib now 129 tests (+6 for CL-6d.1), types 165, engine 388 — all green, zero clippy warnings on new code. **CL-6d.2 partition transfer progress metric landed 2026-04-16**: new `aeon_cluster::transport::transfer_metrics` module with `PartitionTransferMetrics` (DashMap-backed registry keyed by `(pipeline, partition, TransferRole::{Source,Target})`, atomic `transferred + total` gauges) and deterministic Prometheus-text renderer — emits `aeon_partition_transfer_bytes_transferred{pipeline, partition, role}` + `aeon_partition_transfer_bytes_total{pipeline, partition, role}` with the same metric shape on both ends of a transfer so operators can watch source + target independently or diff them for asymmetries. `PartitionTransferProvider` gained opt-in `metrics(&self) -> Option<&PartitionTransferMetrics>` (default None); `serve_partition_transfer_with_request` emits `role=source` (`record_total` once from manifest, `add_transferred(chunk.data.len())` after each successful `write_frame`, `clear` on stream end); `drive_partition_transfer` grew an `Option<&PartitionTransferMetrics>` arg and emits `role=target` (`record_total` on manifest, `add_transferred` *before* invoking the writer callback so the gauge semantics are "bytes received" not "bytes durably persisted", `clear` on success or abort). 5 new unit tests on the primitive (add_transferred accumulates, source/target tracked separately, clear drops entries, Prometheus render is deterministic and well-formed, empty registry renders only headers) + 1 new real-QUIC integration test (`both_sides_emit_to_shared_metrics_registry`: wraps the stub provider's chunk iterator to snapshot source metrics at each yield, snapshots target metrics from inside the writer callback, asserts the exact cumulative sequences `src=[0, chunk0, total]` and `tgt=[chunk0, total]`, confirms both entries are cleared after a successful transfer). Also flipped the 2 pre-existing `drive_partition_transfer` callers (unit tests + `tests/cutover.rs`) to pass `None` for metrics. Cluster lib now 135 tests (+6 for CL-6d.2), types 165, engine 388 — all green, zero clippy warnings on new code. **CL-6d complete.** Remaining: CL-6c.4 engine-side write-freeze + buffer-and-replay (moves into `aeon-engine`). |
 | 4. Transport Resilience | 3 | **Mostly complete** | TR-1 (in-flight batch replay on T3/T4 disconnect) + TR-2 (Wasm state transfer on hot-swap) shipped 2026-04-12. TR-3 (connection backoff with jitter): shipped for MQTT source+sink, MongoDB CDC, and `QuicEndpoint::connect_with_backoff()` (bootstrap/join path only — openraft RPC path stays fail-fast; see "Retry layering" below). Remaining TR-3 connectors need reconnect loops introduced first. |
-| 5. Exactly-Once Delivery | 12 phases | Active (design frozen 2026-04-15) | EO-1 (Kafka IdempotentSink ✅) + EO-3 (Nats/Redis IdempotentSink ✅) stay. **EO-2 redesigned** as Aeon-native event durability: L2 mmap event-body spine, L3 checkpoint store with WAL fallback, three source kinds (Pull/Push/Poll), per-sink EOS tiers (T1–T6), per-pipeline durability modes reusing `DeliveryStrategy`. Multi-source + multi-sink first-class. `CheckpointBackend::Kafka` deprecated. Full design: [`docs/EO-2-DURABILITY-DESIGN.md`](EO-2-DURABILITY-DESIGN.md). Implementation tracked in 12 phases (P1–P12) below. Supersedes the sink-participating framing in FAULT-TOLERANCE-ANALYSIS.md EO-2. |
+| 5. Exactly-Once Delivery | 12 phases | **Complete** (EO-2 P1–P12 all shipped by 2026-04-16) | EO-1 (Kafka IdempotentSink ✅) + EO-3 (Nats/Redis IdempotentSink ✅) stay. **EO-2 redesigned** as Aeon-native event durability: L2 mmap event-body spine, L3 checkpoint store with WAL fallback, three source kinds (Pull/Push/Poll), per-sink EOS tiers (T1–T6), per-pipeline durability modes reusing `DeliveryStrategy`. Multi-source + multi-sink first-class. `CheckpointBackend::Kafka` deprecated. Full design: [`docs/EO-2-DURABILITY-DESIGN.md`](EO-2-DURABILITY-DESIGN.md). P1–P11 landed over 2026-04-13 → 2026-04-15 (schema/config, UUIDv7 derivation, L2 body store, pipeline runner wiring, L3→WAL fallback, multi-source/sink topology + validation, backpressure hierarchy, observability, integration tests, benchmarks, docs). **P12 closed 2026-04-16 via Pillar 3 CL-6a** — CL-6a shipped L2-aware from the start (see Pillar 3 row), so EO-2's durability spine and cluster partition transfer share the same segment layout end-to-end. Supersedes the sink-participating framing in FAULT-TOLERANCE-ANALYSIS.md EO-2. |
 | 6. Developer Experience & Adoption-Readiness | 5 | Medium | DX-1 (CLI tests), DX-2 (aeon doctor), DX-3 (hot-reload), DX-4 (error polish), DX-5 (cargo xtask) |
 | 7. Blocked / Demand-Driven | 6 | Blocked | T3 WT SDKs (5 languages blocked on library maturity), T5 isolation tier. T1/T2 inherently language-limited (see FT analysis §10) |
+
+---
+
+## Pause Point (2026-04-16) — Pending Tasks Up for Reassessment
+
+Committed this snapshot to stop-and-think before picking the next direction. Pillars 1/2/4/5/6 are complete. Pillar 3 has all transport primitives shipped (CL-6a bulk sync, CL-6b PoH transfer, CL-6c cutover handshake, CL-6d throttle + metrics). Pillar 7 is blocked by design (library-ecosystem maturity in other languages).
+
+What is **not** shipped, grouped by whether the task still earns its slot:
+
+### Pillar 3 — Cluster Operations remnants
+
+| ID | Item | Open question for reassessment |
+|----|------|-------------------------------|
+| **CL-1** | Gate 2 multi-node acceptance — 9-item checklist | **Session A (2026-04-18) closed T0/T1 (Aeon-as-bottleneck floor verified); T2/T3/T4 surfaced G2 (no leader-side transfer driver — ownership flips never execute). T5/T6 deferred to next DOKS re-spin with Chaos Mesh.** See "Session A status" block below for full closed/deferred breakdown. |
+| **CL-5** | Raft-aware K8s auto-scaling (`cluster.auto_join: true`, `autoscaling.mode: raft-aware`) — depends on CL-6 for safe scale-down | **Parked** until G2 lands (it is a strict prerequisite). Still no user signal. |
+| **CL-6c.4** | Engine-side write-freeze + buffer-and-replay — crosses `aeon-cluster` ↔ `aeon-engine`, needs partition write-gate API | **Session A confirms the gap is real**: Raft commit of `Transferring` happens but no driver runs the protocol, so the write-freeze handoff is the missing piece. Land with G2 in the next bundle; do not split further. |
+| **G1 — Kafka source partition defaulting** | `KafkaSourceFactory` defaults to `[0]` when partitions list is empty; should consult cluster ownership table | Surfaced in Session A T0.C1 (silent under-read). Workaround: explicit 24-partition lists in JSON. Fix file: `crates/aeon-cli/src/connectors.rs:116-120`. |
+| **G2 — leader-side transfer driver** | No `tokio::spawn` consumes `PartitionOwnership::Transferring` to drive BulkSync→Cutover→Complete | **Session A blocker for T2/T3/T4.** CL-6 transport (`transport/cutover.rs`) shipped via `807321f` but unwired. Land with CL-6c.4. |
+| **G3 — per-pod transactional_id** | Shared `transactional_id` across pods causes Kafka producer fencing | Blocks T0.C2.PerEvent and EO-2 Kafka T2 on multi-pod. Fix: `${HOSTNAME}` substitution in `crates/aeon-cli/src/connectors.rs:164-166`. |
+| **G4 — outputs-acked metric** | `aeon_pipeline_outputs_sent_total` counts queued, not broker-acked (~13 % overcount on Unordered) | Add `aeon_pipeline_outputs_acked_total` companion; do not rename existing metric (back-compat). |
+| **G5 — `aeon cluster drain` / `rebalance` CLIs** | Manual `transfer-partition` loop required in T4 | Land with G2 to make T2/T3 one-command. |
+| Split-brain recovery drill | Network-partition test via Chaos Mesh or manual iptables | **v0.1 blocker** per 2026-04-18 decision; install Chaos Mesh in next DOKS re-spin alongside G2 fixes. |
+| Multi-broker Redpanda sustained load | Current DOKS node pool is CPU-saturated at rest (system DaemonSets eat ~2/2 vCPU) | Requires larger nodes or dedicated cluster. Cost vs signal tradeoff. |
+
+### Pillar 4 — Transport Resilience follow-up
+
+| ID | Item | Open question for reassessment |
+|----|------|-------------------------------|
+| **TR-3** | WebTransport T3 SDK reconnect layer | Downstream of Pillar 7 SDK-maturity blockers. Not actionable until target-language WT libraries stabilise. |
+
+### Anti-goals — do not pick up without new signal
+
+- **CL-6c.4 incremental splits** — prior session broke CL-6c.4 into .4.1/.4.2/.4.3 speculatively; reassess the *whole* item before splitting further.
+- **Pillar 7 BL-1..6** — explicitly blocked; revisiting is wasted effort until an ecosystem signal (library release, user ask) arrives.
+
+### What `docs/aeon-dev-notes.txt` still references as "pending" but is actually done
+
+- CL-6a/b/c/d all shipped 2026-04-16. Earlier notes that treated CL-6 as the next big block are now historical.
+- EO-2 P1–P12 all closed 2026-04-15/16 (P12 closed via CL-6a's L2-aware design).
+
+**Direction decision is the user's call. This pause is intentional — do not auto-proceed.**
+
+### Direction decided 2026-04-18 — see [`GATE2-ACCEPTANCE-PLAN.md`](GATE2-ACCEPTANCE-PLAN.md)
+
+Same-day DOKS quick-validation session on a newly provisioned cluster with
+adequate node sizes and local-NVMe storage for Redpanda. Bottleneck
+isolation matrix (Memory/Redpanda × Blackhole/Redpanda, all four
+`DurabilityMode` values) runs before any Gate 2 throughput number is
+recorded. Decisions captured:
+
+- **CL-6c.4** → **defer** (transport primitive CL-6c.1/2/3 ships alone; engine-side integration on incident evidence).
+- **CL-1** Gate 2 throughput rows → **invest** (new DOKS cluster, local NVMe for Redpanda).
+- **CL-5** → **park** on demand signal.
+- **Split-brain drill** → **v0.1 blocker**, ran via Chaos Mesh in same session.
+- **Multi-broker sustained load** → **quick 10-min run** today; multi-day soak is a separate future session.
+- **CPU pinning validation** → **parked for DOKS only**; revisit on AWS EKS post-v0.1 (DOKS kubelet lacks `cpu-manager-policy=static`).
+
+Results land inline in `GATE2-ACCEPTANCE-PLAN.md` § 10 and back-propagate
+to the Gate 2 Checkpoint rows above as each test closes.
+
+### Session 0 status (2026-04-18)
+
+First of the three sessions from `GATE2-ACCEPTANCE-PLAN.md` completed on
+Rancher Desktop k3s (single-node, WSL2 8 CPU / 12 GiB, 3-peer loopback
+Aeon StatefulSet via `helm/aeon/values-local.yaml`). Full results in
+[`GATE2-ACCEPTANCE-PLAN.md` § 11.5](GATE2-ACCEPTANCE-PLAN.md#115-results--session-0).
+
+**Closed in Session 0:**
+
+- T0 isolation matrix **C0 × 4 durability modes** (~400 K ev/s per node;
+  mode deltas ≈ 0 at blackhole sink — expected per EO-2 P4 note that the
+  L2-write hot path is still a stub at the engine-side write site).
+- Row 6 — `aeon verify` local self-test passes (PoH / Merkle / MMR /
+  Ed25519).
+
+**Code gap fixed in-session:** The Raft QUIC transport was using
+quinn-default `max_idle_timeout` / `keep_alive_interval` (both unset),
+leaving peer-death detection entirely to openraft's heartbeat-miss
+logic. Both are now derived from `raft_timing` — keep-alive =
+`heartbeat_ms`, idle = `2 × election_max_ms` — in
+`crates/aeon-cluster/src/transport/tls.rs`. See
+[`docs/CLUSTERING.md § QUIC transport timeouts`](CLUSTERING.md#quic-transport-timeouts-derived-from-raft_timing).
+
+**Deferred to Session A (DOKS AMS3):**
+
+- **T0 C1/C2** — harness shipped (`scripts/t0-sweep.sh` wraps
+  `aeon-producer` in a rate-sweep loop, emits a TSV per cell). Producer
+  emits a stable `SUMMARY` stdout line so the sweep is parse-safe. The
+  `MemorySourceFactory` OOM on `count × payload_size` pre-allocation is
+  also fixed by the post-Session-0 `StreamingMemorySource`.
+- **Row 4 leader failover** — observed 14.4 s on Rancher Desktop (over
+  the < 5 s target). Number includes WSL2 + `kubectl port-forward`
+  latency; the QUIC transport fix above is expected to tighten it; native
+  Linux on DOKS without port-forward will be the clean re-measurement.
+- **Row 5 two-phase cutover** — **harness shipped** (`POST
+  /api/v1/cluster/partitions/{id}/transfer` + `aeon cluster
+  transfer-partition`). The < 100 ms cutover *measurement* moves to
+  Session A where a real multi-node cluster is running.
+- **Row T5 partial split-brain** — needs `NET_ADMIN` capability on the
+  pod or Chaos Mesh; better exercised on a multi-host real partition in
+  Session A than on a loopback single-node.
+
+Session 0 torn down (`helm uninstall aeon` + `kubectl delete ns aeon`);
+`aeon:session0` image retained in Rancher Desktop for quick re-spin if
+Session A uncovers a local-reproducible gap.
+
+### Session A status (2026-04-18)
+
+Second of the three sessions from `GATE2-ACCEPTANCE-PLAN.md` completed on
+DOKS AMS3 (`70821a02-9a2a-4ee6-9a74-38f5dea070e7`, 3× g-8vcpu-32gb aeon
+pool, 3× so1_5-4vcpu-32gb redpanda pool, 1× s-4vcpu-8gb monitoring,
+Redpanda 26.1.2 / kube-prometheus-stack / `helm/aeon` 3-pod StatefulSet
+with QUIC auto_tls). Full evidence in
+[`deploy/doks/session-a-evidence.md`](../deploy/doks/session-a-evidence.md).
+Headlines also folded into [`GATE2-ACCEPTANCE-PLAN.md` § 10](GATE2-ACCEPTANCE-PLAN.md#10-results--session-a).
+
+**Closed in Session A:**
+
+- **T0.C0 Memory→__identity→Blackhole**, all 4 `DurabilityMode` modes —
+  None: 4.5 M ev/s/node @ 222 ns/event · UnorderedBatch / OrderedBatch:
+  2.27 M ev/s/node @ 441 ns · PerEvent: 0.87 M ev/s/node @ 1152 ns.
+  Engine path is NOT the bottleneck on any I/O-bearing scenario.
+- **T0.C1 Redpanda→__identity→Blackhole**, all 4 modes — converged in a
+  172–186 s window for 90 M aggregate (~170 K ev/s/node), Kafka-fetch
+  bound, durability mode overhead measurable but overshadowed by fetch.
+- **T0.C2 Redpanda→__identity→Redpanda**, 3 of 4 modes — Unordered:
+  506 K agg eps (broker drop ~13 % vs metric, see G4); Ordered: 113 K
+  agg eps (acks=all bound, expected). PerEvent skipped (G3 + DOKS
+  no-NVMe ceiling — moves to Session B).
+- **T1 3-node throughput** — 6.6 M aggregate eps on Memory→Blackhole,
+  linear scale per node (no inter-node coordination penalty observed
+  on the no-I/O engine path).
+- **PPS probe** — DO standard-tier cap ~175 K pps documented; does not
+  bind batched Kafka path. (Already captured in `GATE2-ACCEPTANCE-PLAN.md`
+  § 10.0.)
+
+**Code gaps surfaced (must-fix bundle for Session A re-run):**
+
+| ID | Gap | File / line | Severity |
+|---|---|---|---|
+| **G1** | `KafkaSourceFactory` defaults `partitions` to `[0]` when empty list passed — should be cluster-ownership aware (read whatever this node currently owns from `PartitionTable`). | `crates/aeon-cli/src/connectors.rs:116-120` | Medium — silent under-read |
+| **G2** | **No leader-side driver consumes `PartitionOwnership::Transferring`.** Raft proposal commits the state transition but no `tokio::spawn` orchestrates BulkSync→Cutover→Complete. CL-6 transport (`transport/cutover.rs`) shipped but unwired. | `crates/aeon-cluster/src/node.rs` (missing driver task); transport in `transport/cutover.rs` | **Blocker for T2 / T3 / T4** |
+| **G3** | Shared `transactional_id` across pods causes Kafka producer fencing — cannot run T0.C2.PerEvent EO-2 on multi-pod cluster without per-pod `${HOSTNAME}` substitution. | `crates/aeon-cli/src/connectors.rs:164-166` | Medium — limits T2 EO-2 verification |
+| **G4** | `aeon_pipeline_outputs_sent_total` is queue-count, not ack-count. C2.Unordered metric reported 90 M but broker HWM was 78.1 M (~13 % overcount). | metric emission in pipeline supervisor / sink loop | Low — observability accuracy |
+| **G5** | `aeon cluster drain` and `aeon cluster rebalance` CLIs missing — forced manual `transfer-partition` loop in T4. | `crates/aeon-cli/src/main.rs` cluster subcommands | Low — operator UX (defer with G2) |
+
+**Deferred to Session A re-run / Session B:**
+
+- **T2 (Scale-up 1→3→5)** and **T3 (Scale-down 5→3→1)** — both require
+  G2 fix (functional partition handover) before they can pass; T2 also
+  needs DOKS pool expansion to 5× g-8vcpu-32gb.
+- **T4 (Cutover < 100 ms)** — re-runs as soon as G2 lands; transport
+  primitives already exist, only the leader-side orchestrator is
+  missing.
+- **T5 (Split-brain drill)** — needs Chaos Mesh install. Not on the
+  correctness-floor critical path (Raft already enforces quorum), but
+  required for the "v0.1 blocker" flag set on 2026-04-18.
+- **T6 (10-min sustained with chaos)** — depends on T5 prerequisites.
+- **T0.C2.PerEvent** — depends on G3 fix; full per-event acks=all
+  ceiling measurement still moves to Session B (AWS EKS with NVMe).
+
+**Recommended fix bundle before next DOKS re-spin** (to validate
+multiple gaps in one cluster lifecycle, per
+`feedback_doks_stay_on_task.md`):
+
+1. **G2 — leader-side transfer driver** in `aeon-cluster`. Single largest
+   unblocker; converts CL-1 from "harness-shipped" to "data-path
+   verified". Must include the engine-side write-freeze hand-off if
+   that is the cleanest place to land **CL-6c.4** alongside (the
+   shipped transport already covers .1/.2/.3).
+2. **G1 — cluster-ownership-aware Kafka source partition defaulting.**
+   Removes the workaround currently hard-coded in every C1/C2 pipeline
+   JSON; required for honest auto-rebalance after a handover.
+3. **G3 — per-pod `transactional_id` substitution** in
+   `KafkaSinkFactory`. Cheap; unlocks honest T0.C2.PerEvent and the EO-2
+   Kafka T2 path on multi-pod clusters.
+4. **G5 — `aeon cluster drain` / `aeon cluster rebalance` CLIs.**
+   Lands naturally with G2; makes T2/T3 one-command.
+5. **G4 — `aeon_pipeline_outputs_acked_total` companion metric.**
+   Smallest item; do alongside the others to avoid another deploy.
+6. **CL-5 still parked.** Auto-scaling is downstream of (1)–(2);
+   revisit only if a user signal arrives.
+7. **Chaos Mesh install** can be scripted against the new cluster as
+   part of the same re-spin so T5/T6 close in the same session as the
+   re-run T2/T3/T4.
+
+DOKS cluster `70821a02-9a2a-4ee6-9a74-38f5dea070e7` will be torn down
+before the bundle lands; re-spin a fresh cluster against the same
+`deploy/doks/values-aeon.yaml` and `helm/aeon` chart once items 1–5
+are merged.
+
+### Session A re-run — to-do list (locked 2026-04-18)
+
+Working tree reset to `master`; all five phases below land on a single
+feature branch (one-branch strategy, per user preference) so the next
+DOKS re-spin validates the full bundle in one cluster lifecycle.
+
+**Phase 1 — Code gap fixes (all land before re-spin)**
+
+| ID  | Item | Files | Status |
+|-----|------|-------|--------|
+| P1.1a | Engine per-partition write-freeze API (`WriteGate` + `WriteGateRegistry`, async drain semantics, RAII `DrainGuard`) | `crates/aeon-engine/src/write_gate.rs` (+ lib.rs re-exports, pipeline.rs source-loop hook, pipeline_supervisor.rs registry field, `MultiPartitionConfig.gate_registry`) | ✅ landed (12 unit tests in `write_gate::tests`; engine lib suite 408/408 green) |
+| P1.1b | Engine `CutoverCoordinator` impl (async) backed by `WriteGateRegistry` (`EngineCutoverCoordinator` behind `cluster` feature); pluggable `CutoverWatermarkReader` for final source offset / PoH seq (sentinels `-1 / 0` when absent); `CutoverCoordinator::drain_and_freeze` flipped to `Pin<Box<dyn Future>>` for dyn-compat | `crates/aeon-engine/src/engine_cutover.rs` + `crates/aeon-cluster/src/transport/cutover.rs` (async trait + all 3 in-file test impls) + `crates/aeon-cluster/tests/cutover.rs` stub coordinator | ✅ landed (5 engine_cutover unit tests; cluster lib 140/140 green; CL-6c integration test `full_handover_walks_bulksync_poh_and_cutover_over_real_quic` green) |
+| P1.1c | Leader-side partition transfer driver (G2) — target-node orchestrator consumes `PartitionOwnership::Transferring`, walks CL-6a (BulkSync) → CL-6b (PoH chain) → CL-6c (Cutover) → Raft `CompleteTransfer` / `AbortTransfer`; pluggable `SegmentInstaller` / `PohChainInstaller` / `NodeResolver` traits for dependency injection; `watch_loop` polls `SharedClusterState` for transfers targeting this node, dedups via per-partition tracker map | `crates/aeon-cluster/src/partition_driver.rs` (new module + lib.rs re-exports) | ✅ landed (3 unit tests over real QUIC loopback: happy-path commit, bulk-failure abort, concurrent-rejection dedup; cluster lib 144/144 green) |
+| P1.1d | G1: cluster-ownership-aware Kafka source partition defaulting — new async `PartitionOwnershipResolver` trait in `aeon-engine`; `PipelineSupervisor` gains a `OnceLock` resolver installed post-bootstrap; empty `partitions` lists in source manifests now filled from the Raft `PartitionTable` before the factory builds. `KafkaSourceFactory` keeps `[0]` as a loud fallback for pre-cluster / single-node paths (now with `tracing::warn!`). | `crates/aeon-engine/src/connector_registry.rs` (+ trait), `crates/aeon-engine/src/pipeline_supervisor.rs` (resolver field + fill logic), `crates/aeon-engine/src/partition_ownership.rs` (new `ClusterPartitionOwnership` impl), `crates/aeon-cli/src/main.rs` (wire post-`bootstrap_multi`), `crates/aeon-cli/src/connectors.rs` | ✅ landed (3 resolver unit tests + 5 supervisor tests covering: fill from resolver, explicit-partitions-not-overridden, no-resolver passthrough, None-passthrough, install-once semantics; engine lib 422/422 green; cluster lib 143/143 green) |
+| P1.1e | G3: per-pod `transactional_id` template substitution — `KafkaSinkFactory` runs the configured `transactional_id` through `substitute_env_placeholders`, which resolves `${HOSTNAME}` and `${POD_NAME}` from the process env (fail-loud on unset / unknown / unterminated). Unblocks T0.C2.PerEvent + EO-2 Kafka T2 on multi-pod ReplicaSets by giving every pod a unique producer id from a single manifest. | `crates/aeon-cli/src/connectors.rs` (factory + helper) | ✅ landed (7 unit tests: fast-path, HOSTNAME, POD_NAME, multi-placeholder, unset-var error, unknown-placeholder error, unterminated-template error; aeon-cli test suite 12/12 green) |
+| P1.1f | G4: `aeon_pipeline_outputs_acked_total` companion metric via generic `Sink` trait ack-callback (`on_ack_callback(Arc<dyn Fn(usize) + Send + Sync>)`, defaulted to no-op). Wire Kafka first; other 7 sinks adopt after validation. | `crates/aeon-types/src/traits.rs` (`SinkAckCallback` type alias + defaulted method) + re-export, `crates/aeon-engine/src/pipeline.rs` (`outputs_acked: AtomicU64` + `PipelineMetrics::ack_callback()`), `crates/aeon-engine/src/connector_registry.rs` (`DynSink::on_ack_callback_dyn` + `BoxedSinkAdapter` forward), `crates/aeon-engine/src/pipeline_supervisor.rs` (install in `start()` before spawn), `crates/aeon-engine/src/metrics_server.rs` + `health.rs` + `rest_api.rs` (Prometheus + JSON exposure), `crates/aeon-connectors/src/kafka/sink.rs` (store callback, fire from PerEvent/OrderedBatch produce arms + UnorderedBatch flush) | ✅ landed (4 KafkaSink unit tests, 2 BoxedSinkAdapter dyn-forward tests, 1 metrics callback test, +1 acked field assertion in metrics-server + REST exposition tests; aeon-types lib 165/165, aeon-engine lib 416/416, aeon-connectors lib 19/19; trait change is non-breaking — every other Sink picks up the no-op default) |
+| P1.1g | G5: `aeon cluster drain` + `aeon cluster rebalance` CLIs (operator UX for T2/T3). Pure planning helpers `plan_drain` / `plan_rebalance` in `aeon-cluster` (round-robin in ascending NodeId, skip `Transferring`, drain excludes target from destination set, rebalance uses `ceil(total/M)` per-node cap and skips non-live owners). Two new leader-only REST routes `POST /api/v1/cluster/drain` + `POST /api/v1/cluster/rebalance` — shared `cluster_bulk_transfer` backbone replies 202 on full success, 207 Multi-Status on partial, 409 `X-Leader-Id` on follower; per-partition result codes: accepted / no-change / already-transferring / unknown-partition / rejected / lost-leadership. CLI `ClusterAction::Drain { node }` + `Rebalance` reuse a shared `post_cluster_mutation` helper that pretty-prints the leader-hint on 409. | `crates/aeon-cluster/src/rebalance.rs` (new), `crates/aeon-cluster/src/lib.rs` (re-exports), `crates/aeon-engine/src/rest_api.rs` (routes + handlers + `BulkPlan` + `DrainBody`), `crates/aeon-cli/src/main.rs` (subcommands + shared POST helper) | ✅ landed (13 planning unit tests cover drain/rebalance edge cases without a live cluster: empty table, single-node, already-balanced, scale-up redistribution, in-flight skipping, non-live-owner skipping, id-ordered output; aeon-engine lib 425/425 green; aeon-cli + aeon-engine build clean with `cluster` + `rest-api`) |
+| P1.1h | Integration test: 3-node loopback partition transfer driver E2E (BulkSync → Cutover → Complete, with write-freeze + post-cutover ownership flip). Real 3-node Raft cluster over QUIC loopback; node 2 hosts the CL-6 providers (`FixedBulkProvider` / `FixedPohProvider` / `RecordingCutoverCoordinator`); node 3 runs a `PartitionTransferDriver` backed by a real `RaftNodeResolver`. Leader seeds `AssignPartition(P0 → 2)`, waits for Raft propagation, then proposes `BeginTransfer(P0, 2 → 3)`. Both `drive_one` and `watch_loop` paths are covered. Write-freeze asserted via exactly-one `drain_and_freeze` call on the source coordinator. `propose_on_leader` retry helper absorbs transient `ForwardToLeader { leader_id: None }` races so the two tests run in parallel without flakes. | `crates/aeon-cluster/tests/partition_transfer_e2e.rs` (new) | ✅ landed (2 E2E tests covering direct-drive + watcher-drive paths, both assert all three replicas observe `Owned(3)` after CompleteTransfer + all installer hooks fired with expected bytes + cutover coordinator called exactly once; cluster suite 180/180 green (157 lib + 1 cutover + 10 multi_node + 2 E2E + 2 poh_transfer + 1 raft_log_persistence + 7 single_node); 5/5 consecutive stability runs of the E2E binary) |
+| P1.1i | `aeon cluster status --watch` operator UX command (live partition ownership + Raft term/index, helpful for next Session A debugging). Extends `ClusterAction::Status` with `--watch` + `--interval <f64>` (default 2.0s). Without `--watch`: prints existing pretty-JSON (script-friendly). With `--watch`: clears the screen (`\x1b[2J\x1b[H`), prints a compact human view — node id, leader id, Raft state/term/last_applied/last_log, and a numerically-sorted partition table showing `owned   node N` or `transfer  S → T` per partition — every `interval` seconds until Ctrl-C. Transient HTTP failures render as an `error: …` banner instead of exiting the loop so flaky leader elections don't kick the operator out. Numeric partition-id sort handles the P2/P10 lexicographic trap. | `crates/aeon-cli/src/main.rs` (`cmd_cluster_status` + `render_cluster_status` + `chrono_like_hms`) | ✅ landed (5 unit tests cover: cluster-mode row/header shape, partition-id numeric sort (`P2` before `P10`), transfer-row formatting (`S → T`), standalone-mode fallback text, missing-leader `<none>` rendering, `HH:MM:SSZ` timestamp shape; aeon-cli 16/16 green (5 new unit + 11 existing integration); `cargo clippy -p aeon-cli --no-deps` clean) |
+
+**Phase 2 — Harness prep (mostly shell/YAML; no Phase-1 code dependency except .2c)**
+
+| ID  | Item | Status |
+|-----|------|--------|
+| P2.2a | DOKS `aeon-pool` 3→5 expansion script via `doctl k8s cluster node-pool update --count`. Idempotent — exits 0 if already at target, and still re-applies the `workload=aeon:NoSchedule` taint so an idempotent re-run also fixes drift. Post-resize wait loop polls `kubectl get nodes -l doks.digitalocean.com/node-pool=aeon-pool` for Ready=True count == target, with configurable `READY_TIMEOUT` (default 600s). Re-applies the pool taint with `--overwrite` on every invocation because DOKS HA-enabled pools don't persist taints through scale-up events reliably. Validates target ∈ [1, 20], non-numeric / zero args rejected with exit 2. Env overrides: `POOL` (default `aeon-pool`), `TAINT` (empty string = skip retaint), `READY_TIMEOUT`. Supports both scale-up (3 → 5 for T2) and scale-down (5 → 3 after T3) paths. | `deploy/doks/resize-aeon-pool.sh` (new) + README pointer | ✅ landed (bash -n clean; usage/validation smoke-tested: missing-args / non-numeric / zero / out-of-range all exit 2; requires live DOKS cluster for end-to-end validation during P3 Session A re-run) |
+| P2.2b | Chaos Mesh install/uninstall scripts for T5/T6 (PodChaos + NetworkChaos targets documented) | ✅ landed 2026-04-19 — `deploy/doks/install-chaos-mesh.sh` pins Chaos Mesh 2.6.3 into `chaos` ns with `chaosDaemon.runtime=containerd` (DOKS), `helm upgrade --install` for idempotency, waits for all pods Ready + verifies `networkchaos.chaos-mesh.org` CRD. `uninstall-chaos-mesh.sh` drops live experiments first (avoids finalizer-blocked ns delete), then helm uninstall, then CRDs (opt-out via `KEEP_CRDS=1`), then namespace. Both pass `bash -n`. README entry added. |
+| P2.2c | Strip G1 workaround (hard-coded `partitions: [0/1/2]`) from Session A pipeline JSONs once P1.1d lands | ✅ landed 2026-04-19 — all 8 Kafka-source cell JSONs (`t0-c1-{none,ordered,unordered,perevent}.json`, `t0-c2-*.json`) now carry `"partitions":[]`. At pipeline-create time `pipeline_supervisor.rs:166-183` asks the `OwnershipResolver` for this node's slice and injects it — same intent as the old 24-element workaround but derived from cluster truth, and it tracks rebalances instead of going stale. Memory-source JSONs were already `[]`, unchanged. |
+| P2.2d | T2/T3 run scripts (`run-t2-scaleup.sh` covers 1→3→5 path; `run-t3-scaledown.sh` covers 5→3→1) using new `aeon cluster drain` | ✅ landed 2026-04-19 — `deploy/doks/run-t2-scaleup.sh` sequences pipeline-create → producer Job → 1→3 → wait for 3 voters + all partitions Owned → `resize-aeon-pool.sh` 3→5 → 3→5 scale → wait for drain → verdict (producer count vs `aeon_pipeline_outputs_acked_total` sum, WAL fallback counter must stay 0). `run-t3-scaledown.sh` mirrors with the key twist for the missing preStop hook: each step POSTs `/api/v1/cluster/drain {node_id}` first so the leader evacuates partitions, waits for Owned, then `kubectl scale`. Pool shrinks 5→3 at the end. New pipeline manifests `t2-ordered.json` / `t3-ordered.json` (partitions=[], ownership-resolved). Both scripts `bash -n` clean. |
+| P2.2e | T5/T6 run scripts using Chaos Mesh (pragmatic targets: one-pod kill, 30 % packet loss between aeon-1 ↔ aeon-2, DOKS node cordon+drain) | ✅ landed 2026-04-19 — shared `deploy/doks/chaos-netpart-aeon-2.yaml` (NetworkChaos, direction=both, isolates aeon-2 from aeon-0/aeon-1). `run-t5-split-brain.sh`: apply → 2-min write loop against all 3 REST endpoints (tallies majority-commit vs minority-reject) → heal → wait for Raft `last_applied` to converge → cross-member per-partition ownership diff. Pass requires majority-ok > 0, minority-rejected > 0, converged, no mismatch. `run-t6-sustained.sh`: 10-min OrderedBatch run at `RATE` (default 500k/s) with four timer-triggered events (t=2 leader-pod kill → failover-ms capture; t=4 `POST /cluster/rebalance`; t=6 apply NetworkChaos; t=8 heal), verdict: zero loss, WAL == 0, failover < 5s. Both `bash -n` clean. |
+
+**Phase 3 — Re-run Session A on fresh DOKS** ✅ executed 2026-04-19, torn down same day
+
+Full T0 → T6 sweep attempted on a freshly-spun DOKS cluster
+(`98d58935-b2c9-4b8e-8c8c-3c75f6660c89`, AMS3, 3× g-8vcpu-32gb aeon
+pool + redpanda + monitoring). Pre-flight confirmed: all Phase-1 code
+gaps (G1–G5) closed by the bundle; `aeon:session-a-prep` image deployed
+via `rust-proxy-registry`; Chaos Mesh 2.6.3 installed into `chaos` ns.
+
+**Closed in re-run:**
+
+- **T5 Split-brain drill — correctness bar met.** NetworkChaos isolates
+  aeon-2; majority pair (leader on aeon-1 throughout) committed 10/10
+  writes; minority aeon-2 rejected 10/10; after heal, all 3 members
+  converged on Raft `term=44, last_applied=44` within 2 s, per-partition
+  ownership map identical across members. Pass-checker jq path bug
+  (`.raft.last_applied_log_id.index` → `.raft.last_applied`) fixed in
+  `deploy/doks/run-t5-split-brain.sh` during the run.
+- **T2 partial — 3-node steady-state verified.** End-to-end
+  Kafka→Aeon→Kafka pipeline drained 100 037 produced events down to
+  97 182 broker-acked before the manual stop, `aeon_checkpoint_fallback_wal_total = 0`
+  throughout (no durability degradation path engaged).
+- **T6 partial — script orchestration + chaos sequencing + leader-aware
+  routing all verified.** Pipeline create + start + rebalance events
+  route through `pick_leader_host`, landing on the current leader (G9
+  workaround). Rebalance endpoint returned `{"planned":0,"status":"noop"}`
+  in 2.2 s on the healthy 3-node baseline.
+
+**New gaps surfaced (Aeon code):**
+
+| ID | Gap | Surfaces in | Severity |
+|---|---|---|---|
+| **G8** | Pipeline create on a freshly-bootstrapped single-node Raft cluster returns `Raft proposal failed: has to forward request to: None, None` (self-election hasn't completed when REST accepts traffic). Worked around by starting at 3 replicas. | T2 scale-up path | Medium — startup race, not a design issue |
+| **G9** | REST API write paths (pipeline create / start / rebalance) do not auto-forward to the Raft leader; a request hitting a follower returns 500 with a `Some(NodeId)` hint and expects the client to retry. CLI already routes via `leader_id`; the T-run bash scripts had to be patched to parity. | T2 + T6 | Medium — test-harness friction today, operator friction tomorrow |
+| **G10** | StatefulSet scale-up beyond `cluster.replicas` fails — new pods read the frozen `AEON_CLUSTER_REPLICAS=3` env, call `raft.initialize({1,2,3})` excluding themselves, crash-loop with `node 4 has to be a member`. Discovery needs a "seed-join when `pod_ordinal >= replicas`" branch. | **Blocker T2 3→5 / T3** | **High — blocks every horizontal scale-out** |
+| **G11** | Partition-transfer endpoint accepts the request, Raft replicates the `Transferring` transition, but the leader-side cutover driver never executes the handover. All 17 T4 transfers stuck at `status=transferring, owner=null`. CL-6 / P1.1c driver is present in source but inert at runtime — needs a re-visit of the watch-loop spawn-point. No abort endpoint to clear the stuck state. | **Blocker T4 + all rebalance-driven moves** | **High — Gate 2 cutover row depends on this** |
+
+**Infra observations (not Aeon code):**
+
+- **G13** — Chaos Mesh on DOKS leaves orphan iptables/tc rules after
+  `kubectl delete networkchaos ...`; `PodNetworkChaos` reconciles to
+  `spec: {}` but the chaos-daemon doesn't clear the rules. Manifests as
+  `quinn_udp sendmsg error: code: 1 PermissionDenied` on all aeon pods
+  → Raft vote-timeout loop. Workaround for future T6 on DOKS:
+  `kubectl -n aeon rollout restart sts/aeon` after every heal.
+- **G14** — Leader-kill failover measured **10 s** on a 3-node,
+  no-load cluster (target < 5 s). openraft vote-timeout loop visible
+  (`Vote N->M timeout after 1.5s` repeated). Needs a pre-stop hook
+  that relinquishes leadership before pod shutdown + `raft_timing`
+  tuning (heartbeat/election windows).
+
+**DOKS cluster torn down** 2026-04-19 via `doctl kubernetes cluster delete 98d58935-b2c9-4b8e-8c8c-3c75f6660c89 --dangerous --force`. Registry tags retained (`rust-proxy-registry/aeon`, 7 tags) for future re-runs / Session B image pre-bake.
+
+Full evidence: [`deploy/doks/session-a-evidence.md`](../deploy/doks/session-a-evidence.md).
+
+**Session A re-run — to-do list (2026-04-19 → next re-spin)**
+
+One-branch strategy again (per user preference). All items below land before another DOKS cluster is created.
+
+| ID | Item | Why first | Notes |
+|----|------|-----------|-------|
+| **G11** | Wire the leader-side partition cutover driver so `PartitionOwnership::Transferring` → `CompleteTransfer` actually fires. Split: **G11.a** ✅ shipped 2026-04-19 — production `L2SegmentInstaller` + `PohChainInstallerImpl` with configurable `PohVerifyMode::{Verify, VerifyWithKey, TrustExtend}` (default `Verify`; wired via `cluster.poh_verify_mode` YAML + `AEON_CLUSTER_POH_VERIFY_MODE` env). **G11.b** ✅ shipped 2026-04-19 — spawn `PartitionTransferDriver::watch_loop` in `aeon-cli` K8s bootstrap (gated on `AEON_PIPELINE_NAME`); `ClusterNode::propose_partition_transfer` now calls `driver.notify()` on accept so the watcher wakes immediately. **G11.c** ✅ shipped 2026-04-19 — `PipelineSupervisor::set_poh_installed_chains(Arc<InstalledPohChainRegistry>)` writes the same registry Arc the transfer driver writes to into a `OnceLock`; `start()` stamps it onto every pipeline's `PipelineConfig.poh_installed_chains` before spawning; `create_poh_state` consults the registry keyed on `(pipeline_name, partition_id)` and `take()`s the installed snapshot, wrapping the returned `PohChain` in `Arc<Mutex<>>` so the resumed chain carries the source-side sequence instead of restarting at 0. Falls back to genesis when the registry entry is absent (non-cluster / first-start). Pinned by `create_poh_state_resumes_installed_chain_g11c` — 5-batch source chain resumes at `sequence=5`, second call genesises because `take()` consumed the snapshot. Plumbed through `run_multi_partition` per-partition config clone so multi-partition pipelines get per-partition resume for free. | Unblocks T4 + T2 3→5 partition moves + the entire Gate 2 cutover checkbox | P1.1c watch_loop + installers traits exist; audit showed no production installer impls and driver is only spawned in tests. Crypto stack (SHA-512 PoH/Merkle/MMR + Ed25519 root sig) audited 2026-04-19 — coherent; `PohChainState` wire format is MMR-only so `Verify` mode covers structural MMR; `VerifyWithKey` is honest about being a future extension that requires carrying recent entries in state. |
+| **G10** | Dynamic seed-join on STS scale-up: when `pod_ordinal >= replicas`, switch discovery from `raft.initialize` to `add_learner → change_membership` against an existing leader. ✅ shipped 2026-04-19 — `K8sDiscovery::is_scale_up_pod` / `to_join_config` populate `seed_nodes` with the initial cohort FQDNs and leave `initial_members` empty; `aeon-cli` branches to `ClusterNode::join` (seed-contacts leader, sends `JoinRequest`, leader handles `add_learner → change_membership`) instead of `bootstrap_multi` (runs `raft.initialize`). Covered by 13 discovery unit tests + 166 cluster lib tests green. | Unblocks T2 3→5 + T3 5→3→1 + horizontal HPA in general | Touches `crates/aeon-cluster/src/discovery.rs` + `crates/aeon-cli/src/main.rs` bootstrap branch |
+| **G14** | Leader pre-stop hook + `raft_timing` tuning to hit <5 s failover. ✅ shipped 2026-04-19 — `ClusterNode::relinquish_leadership(timeout)` disables heartbeats and waits for `metrics.current_leader` to flip away from self; wired into `rest_api::shutdown_signal` in parallel with the `AEON_PRESTOP_DELAY_SECS` sleep (runs inside the K8s endpoint-propagation window). `RaftTiming::fast_failover` preset (250 / 750 / 2000 ms) added with a test that pins worst-case 2× election_max_ms ≤ 5 s. Operator knobs: `AEON_RAFT_HEARTBEAT_MS`, `AEON_RAFT_ELECTION_MIN_MS`, `AEON_RAFT_ELECTION_MAX_MS`, `AEON_LEADER_RELINQUISH_MS`; helm `cluster.raftTiming.{heartbeatMs,electionMinMs,electionMaxMs}` + `gracefulShutdown.leaderRelinquishMs`. Live <5 s measurement waits for the next DOKS re-run. | Gate 2 row explicitly targets <5 s | Cheap once G11+G10 land; verify on DOKS re-run |
+| **G9** | Auto-forward (or 307-redirect) cluster-mutation writes to the Raft leader from any REST endpoint. ✅ shipped 2026-04-19 — `rest_api::maybe_forward_to_leader(state, uri)` helper returns `307 Temporary Redirect` with `Location: {scheme}://{leader_host}:{rest_port}{path+query}` plus `X-Leader-Node-Id` and `X-Aeon-Forwarded: 1` headers when the receiving pod is not the current Raft leader. Wired at the top of every cluster-mutation handler (`transfer_partition`, `cluster_drain`, `cluster_rebalance`, `register_processor`, `create_pipeline`, `start_pipeline`, `stop_pipeline`, `upgrade_pipeline`, `delete_pipeline`). Leader host comes from `membership.get_node(leader_id)` on the Raft metrics; REST port is the new `ClusterConfig::rest_api_port` (populated in `aeon-cli` from `AEON_API_ADDR` / CLI bind flag) and defaults to `http` scheme. Scripted clients that don't follow redirects can still read `X-Leader-Node-Id` to reroute. | Operator UX + harness simplification | Engine side — add leader-proxy or return a consistent 307 with `X-Leader-*` headers |
+| **G8** | Accept pipeline-create during single-node self-election (block until leader elected, don't 500). ✅ shipped 2026-04-19 — `ClusterNode::wait_for_leader(timeout)` (openraft `raft.wait(…).metrics(`current_leader.is_some()`)`) exposes a public helper; `ClusterNode::propose` consults it before `client_write` when `metrics.current_leader.is_none()`, bounded by `leader_wait_budget()` = `clamp(3 × election_max_ms, 2 s, 10 s)`. This smooths the freshly-bootstrapped single-node race where `raft.initialize()` has returned but self-election is still in-flight, eliminating the transient `Raft proposal failed: has to forward request to: None, None`. Pinned by `wait_for_leader_returns_self_on_single_node_g8`. On a truly leaderless multi-node quorum the wait times out cleanly with `no Raft leader elected within Nms` instead of hanging. | Makes `START_REPLICAS=1` scripts work without sleep-hack | Smaller, do together with G9 |
+| **G13** | Document the Chaos-Mesh-on-DOKS `rollout restart` workaround in `deploy/doks/README.md`; re-try on AWS EKS (different CNI). ✅ shipped 2026-04-19 — new "G13 — Chaos Mesh on DOKS leaves iptables/tc rules behind (workaround)" section in `deploy/doks/README.md` documents the failure mode (top-level NetworkChaos deleted + PodNetworkChaos reconciled to `spec:{}` but kernel iptables/tc rules persist → QUIC `sendmsg` EPERM → Raft stuck), the operator workaround (`kubectl -n aeon rollout restart sts/aeon` + verify `last_applied` advancing again via `/cluster/status`), how to record the rollout pause in the T6 evidence log so active-load wall-clock stays separable, and the EKS re-try plan (different CNI + kernel path — if the leak is DOKS-specific, file upstream at chaos-mesh/chaos-mesh). | T5/T6 resilience runs | Infra — no code change in Aeon |
+
+**Phase 3 follow-on pipeline:** Phase 4 (Session B / EKS) pre-session scaffolding is **partially shipped 2026-04-19** — P4.i eksctl manifest, P4.ii spot-pricing pre-check, and P4.iv results template all landed (no cluster spend yet). P4.iii ECR pre-bake remains pending and unblocks only when Session B is actually scheduled. An interim DOKS re-spin was **run ad-hoc 2026-04-19** against cluster `c3867cc5` to validate the G8–G14 bundle end-to-end — T0.C0 + T1 green, T2 surfaced **G15** (shipped same day). See "Phase 3b" below for the post-bundle re-run evidence. **Next DOKS re-spin is gated on Phase 3.5 V2–V6 completion on Rancher Desktop** (integration-regression floor), then re-measures T2/T3/T4 + G14 <5 s failover + T6 sustained in a single cluster lifecycle.
+
+**Phase 3.5 — Rancher Desktop validation rehearsal (pre-Session-B)**
+
+All six Gate 2 Aeon code gaps (G8, G9, G10, G11, G14) + G13 infra workaround shipped 2026-04-19 but haven't been exercised together end-to-end on a real k8s. Before re-spending on DOKS or spinning up EKS, rehearse the full matrix locally on Rancher Desktop against a freshly-built image. RD numbers are **correctness floor only** (WSL2 8 CPU / 12 GiB caps throughput well below DOKS/EKS); the goal is to catch integration regressions, exercise a push-based source for the first time, and explicitly verify the crypto chain under all three `PohVerifyMode` values.
+
+> ⚠️ **Rancher Desktop constraint.** RD is a **single-node k3s** (not multi-node k8s). A 3-replica Aeon StatefulSet co-locates all three pods on the same node via loopback — fine for validating the code paths that don't require real inter-node networking (G8 self-election, G9 307 forward, G10 seed-join to an existing leader, G11 partition transfer driver, G14 relinquish + raft_timing handoff, PoH chain resume), but **not** a faithful substitute for scenarios that require real multi-node chaos or node-pool mutation. Mark those rows explicitly and defer to a cloud re-spin.
+>
+> Any test or script that risks wedging the k3s node (chart mis-install that won't `helm uninstall` cleanly, CRDs with finalizers, kernel-level chaos tools that mutate iptables/tc) may force a Rancher Desktop reset. When in doubt, prefer `helm uninstall` + `kubectl delete ns aeon` over in-place upgrades, and drop the whole namespace rather than reconciling bad state.
+
+| ID | Item | RD-suitable? | Status |
+|----|------|--------------|--------|
+| V1 | Build fresh `aeon` image from current master; `helm install helm/aeon -f values-local.yaml` 3-replica loopback STS on RD; sanity-check `/cluster/status`, `/metrics`, `aeon cluster status --watch` | ✅ yes | ⏳ pending (#79) |
+| V2 | T0–T6 matrix — **partial on RD**: T0 baseline, T2 3→5 STS-scale (exercises G10 seed-join code path; no node-pool resize on RD), T3 5→3→1 drain (G5 + G14 relinquish), T4 manual cutover (G11.a/b/c + PoH resume). **T5 split-brain (NetworkChaos between pods) and T6 multi-node chaos** are **not** faithful on single-node RD and get deferred to the cloud re-spin. | ✅ T0/T2-code/T3/T4 • ❌ T5/T6 chaos realism | ⏳ pending (#80) |
+| V3 | Processor validation — both native Rust and Wasm guests through per-event + batch paths; confirm L2/L3/WAL tiers engage per `DurabilityMode`; `outputs_acked_total == input` at steady state | ✅ yes | ⏳ pending (#81) |
+| V4 | Push-source — short design note + HTTP ingest source reusing the axum stack; validate E2E on RD with a curl/loadgen client. Complements the existing pull-based Kafka/Redpanda source. | ✅ yes | ⏳ pending (#82) |
+| V5 | Crypto chain E2E — walk a transferred partition under each `PohVerifyMode::{Verify, VerifyWithKey, TrustExtend}` and assert MMR + Merkle + Ed25519 root-sig round-trips, resumed `PohChain.sequence()` matches sender. All traffic is loopback but the crypto path is identical. | ✅ yes | ⏳ pending (#83) |
+| V6 | Consolidated `docs/GATE2-PRE-SESSION-B-VALIDATION.md` report + Session-B readiness checklist; back-propagate any new gaps to the Gate 2 blocker queue. Explicitly records the T5/T6-on-RD gap so the DOKS re-spin checklist carries it forward. | ✅ yes | ⏳ pending (#84) |
+
+**Post-V6 flow:**
+
+1. **DOKS re-spin** is now non-optional because T5/T6 chaos realism can't be closed on RD. The re-spin also closes the remaining live-measurement rows left open at Phase 3 (G14 <5 s failover, T2/T4 on real NVMe, T6 active-load wall-clock with the G13 rollout-restart workaround in the evidence log).
+2. **Phase 4 (Session B / AWS EKS)** — throughput ceiling + anything DOKS under-serves because of the 2 Gbps / non-NVMe SKU constraint noted in `reference_doks_droplet_availability`.
+
+**Phase 3b — Post-bundle DOKS re-run on fresh cluster `c3867cc5` (2026-04-19)**
+
+Ad-hoc DOKS re-spin run 2026-04-19 on fresh cluster
+`c3867cc5-e2e7-4d5f-94cd-7d82ca8c4303` (AMS3, 3 × `g-8vcpu-32gb`
+aeon-pool + 3 × `so1_5-4vcpu-32gb` redpanda-pool + 1 × `s-4vcpu-8gb`
+monitoring). Image `registry.digitalocean.com/rust-proxy-registry/aeon:70c68b3`
+(commit 70c68b3 — G1–G14 bundle + G13 workaround). Ran T0.C0 + T1 + T2
+to exercise the shipped bundle end-to-end on a real multi-node cluster,
+skipping T3–T6 once T2 blocked.
+
+**Setup-automation gaps surfaced + fixed in-run** (no new tasks — all fixed in-tree during session):
+
+- DOKS auto-generated pool names (e.g. `pool-95gb35xh1`, `pool-psmexo05w`)
+  no longer match the hard-coded `default` filter in
+  `deploy/doks/setup-session-a.sh` → added `pool_id_by_size()` helper
+  that resolves `aeon-pool`/`redpanda-pool`/`monitoring-pool` by droplet
+  size, with `{AEON,REDPANDA,MONITORING}_POOL_ID` env overrides.
+- DOKS DOCR integration provisions the pull secret only in the `default`
+  namespace → `setup-session-a.sh` now also runs `doctl registry kubernetes-manifest --namespace aeon | kubectl apply`
+  after the `aeon` namespace is created. Secret naming aligned:
+  `deploy/doks/values-aeon.yaml`, `deploy/doks/loadgen.yaml`, and
+  `deploy/doks/run-t2-scaleup.sh` all reference
+  `registry-rust-proxy-registry` (the doctl-generated name).
+
+**Results table:**
+
+| Row | Verdict | Evidence |
+|-----|---------|----------|
+| Cluster bring-up | ✅ | 3-node STS Ready in <25 s post-secret-fix; Raft term 1, leader id=3, membership `{1,2,3}`, 24 partitions evenly owned (8/8/8). |
+| **T0.C0 None** (Memory→`__identity`→Blackhole) | ✅ | 200 M/pod × 3 = **600 M events, zero loss** (`events_failed_total=0`, `events_retried_total=0` on every pod). Monitor poll bounded measurement at `t ≤ 64 s` → aggregate ≥ 9.4 M eps lower-bound; first sample at 17 s showed 458 M already processed ⇒ **steady-state ~27 M agg eps (~9 M eps/pod)**. |
+| **T1** (3-node Memory→Blackhole) | ✅ | 100 M/pod × 3 = **300 M events, zero loss**. 10 s poll resolved steady-state: **6.5 M agg eps (2.2 M eps/pod)** at 41 s sample. Matches 2026-04-18 T1 baseline (6.96 M/2.32 M) within measurement noise — **3-node scaling shape reproducible.** |
+| **T2** (3→5 STS scale + G10 live verification) | ⛔ **blocked by new G15** | Pool resize 3→5 clean (67 s). STS 3→5 scale fired the G10 client path correctly — `aeon-3/aeon-4` logs show `scale-up pod detected — will seed-join existing cluster`, rotating through all three seeds. **Every seed — including `aeon-2` (`node_id=3`, current Raft leader) — rejected the join with `"not the leader; current leader is Some(3)"`.** New pods CrashLoopBackOff; STS stalled 3/5. Scaled back to 3, pool 5→3, cluster stable for document + tear-down. |
+| T3 / T4 / T5 / T6 | ⏭ skipped | T3 depends on reaching 5; T4/T5/T6 correctness verdicts from 2026-04-18 stand. Re-measurement folded into the next re-spin (post-G15). |
+
+**Code gap surfaced — G15 (Aeon code) — shipped 2026-04-19:**
+
+| ID | Gap | Severity | Resolution |
+|---|---|---|---|
+| **G15** | Cluster scale-up join handler rejected join requests even when the receiving seed **was** the current Raft leader. `aeon-cluster::transport::server::handle_add_node` compared `raft.current_leader().await` vs `raft.metrics().borrow().id`; on a multi-node cluster, all three seeds — including the pod whose `/api/v1/cluster/status` reports `node_id=3` and `leader_id=3` — returned `"not the leader; current leader is Some(3)"`. Root cause: the metrics watch-channel `id` diverges from `ClusterConfig::node_id` in the join-handler code path, while REST `/api/v1/cluster/status` uses the configured id (coherent with pod logs). | **High — blocked T2/T3 Gate 2 rows** | ✅ **Shipped 2026-04-19.** `server::serve()` now takes `self_id: NodeId` sourced from `ClusterConfig::node_id`; `handle_add_node` / `handle_remove_node` use the configured id for the leader-self check, with a `tracing::warn!` on the reject path if `metrics.id` ever diverges in future (kept as diagnostic). New regression test `g15_join_targets_actual_leader_of_three_node_cluster` in `crates/aeon-cluster/tests/multi_node.rs` bootstraps a 3-node cluster via `initial_members`, finds the elected leader, and asserts a QUIC `JoinRequest` for node 4 succeeds + 4-voter membership. All 11 `multi_node` tests + 2 `partition_transfer_e2e` tests + 82 lib unit tests green. |
+
+**DOKS cluster tear-down:** user runs `doctl kubernetes cluster delete c3867cc5-e2e7-4d5f-94cd-7d82ca8c4303 --dangerous --force` manually post-session. DOCR registry (`rust-proxy-registry`) retained.
+
+**Next re-spin enters with:** all Aeon Gate 2 code blockers closed (G8–G11, G13, G14, G15 all shipped). Remaining gate = Phase 3.5 V2–V6 closed on Rancher Desktop, then one DOKS re-spin to re-measure T2/T3/T4 + G14 <5 s failover + T6 sustained in a single cluster lifecycle. See [`GATE2-ACCEPTANCE-PLAN.md § 10.9`](GATE2-ACCEPTANCE-PLAN.md) for the full run trace.
+
+**Phase 4 — Session B (AWS EKS) calibration, deliverables only (no cluster spend yet)**
+
+| ID  | Item | Region / notes | Status |
+|-----|------|----------------|--------|
+| P4.i | EKS eksctl manifest — `deploy/eks/cluster.yaml` single-AZ `us-east-1a`, `i4i.2xlarge × 3` aeon-pool (CPU-pinning `cpu-manager-policy=static`), `i3en.3xlarge × 3` redpanda-pool, `m7i.xlarge × 1` default-pool; `deploy/eks/README.md` sequenced bring-up + tear-down | `us-east-1` | ✅ shipped (pre-session scaffolding only; no `eksctl create` yet) |
+| P4.ii | EKS spot-vs-on-demand pre-check — `deploy/eks/check-spot-pricing.sh`. Wraps `aws ec2 describe-spot-price-history` for all three pool types, computes avg/max/ratio vs embedded on-demand baselines, decides SPOT iff avg ≤ `THRESHOLD` × on-demand AND max ≤ 0.95 × on-demand. Prints 6-hr cost rollup vs the `$50` hard cap (§12.3), exits non-zero on cap breach. Overrides: `AWS_REGION` / `AZ` / `THRESHOLD` / `HARD_CAP` / `SESSION_HOURS`. | — | ✅ shipped 2026-04-19 |
+| P4.iii | Pre-bake Aeon image to ECR (`us-east-1`) from the same feature-branch SHA used on DOKS | Blocks on P4.i | ⏳ pending |
+| P4.iv | Session B results template in `GATE2-ACCEPTANCE-PLAN.md` §12.6 — 5-row table (pre-flight pricing · cluster bring-up · T1 4-mode ceiling · CPU-pinning delta · T6 sustained) + §12.6.1 code gaps + §12.6.2 verdicts + §12.6.3 tear-down; mirrors the §10.9 Session A shape so the two sessions read the same in the Gate 2 bundle. All TBD until Session B runs. | — | ✅ shipped 2026-04-19 |
+
+**Phase 5 — Post Phase-3 follow-ups (not blocking Session A re-run)**
+
+| ID  | Item | Status |
+|-----|------|--------|
+| P5.a | Dynamic source re-assign on partition transfer (connector-side hot re-subscription once G2 proves the contract) | ⏳ pending (blocked by Phase 3 evidence) |
+| P5.b | Per-sink dynamic checkpointing on transfer — revisit after Phase 3; may already be covered by existing `per_sink_ack_seq` plumbing | ⏳ pending |
 
 ---
 
@@ -3044,13 +3422,13 @@ developer experience, and deferred work into 7 pillars with clear dependency cha
 | **P3** | L2 event-body store — per-pipeline per-partition segmented append-only log (`aeon_engine::l2_body`), rollover at `segment_bytes` (256 MiB default), append/iter/gc API, GC cursor = `min(per_sink_ack_seq)`, format magic `AEON-L2B` + version u16, per-record CRC32 with truncation-safe reader. Large-event dedicated segments & mmap read path deferred to P4 wiring. | P1 | ✅ |
 | **P4** | Pipeline runner wiring — `L2WritingSource<S>` adapter (auto-skip pull + `DurabilityMode::None`), `PipelineL2Registry`, `AckSeqTracker` with min-across-sinks cursor, `SinkTaskCtx.per_sink_ack_seq` stamped on checkpoint writes. Source-side wrap via `MaybeL2Wrapped<S>` lands in `run_buffered`, `run_buffered_transport`, and `run_multi_partition` (managed pipeline keeps unwrapped source since downcast-based hot-swap needs the concrete `S` type). L2 seq propagates end-to-end: `L2WritingSource::next_batch` stamps `event.l2_seq`, `WireEvent`/`WireOutput` carry it across AWPP, `Output::with_event_identity` copies it, sink task builds `(event_id → l2_seq)` pre-move then calls `AckSeqTracker::record_ack(sink, max_seq)` on `batch_result.delivered`, `eo2_gc_sweep` calls `L2BodyStore::gc_up_to(min_across_sinks)` per registered partition on every flush + final shutdown. Verified by 5 `eo2_wiring` tests including `push_source_drives_l2_gc_after_successful_delivery`. | P2, P3 | ✅ |
 | **P5** | L3 → WAL automatic fallback + crash-recovery planning. `FallbackCheckpointStore` wraps the L3 primary (engaged by `build_sink_task_ctx` when `CheckpointBackend::StateStore` × `durability != None`) with a `fallback.wal` sidecar; `aeon_checkpoint_fallback_wal` transition counter fires on first degradation. `RecoveryPlan::from_last` → `RecoveryAction::{SeekPartitions, ReplayL2From(min_ack)}` typed plan. **Wired into pipeline start**: `load_recovery_plan` + `dispatch_recovery_plan` call `Source::on_recovery_plan(&pull_offsets, replay_from_l2_seq)` (default no-op, connector-opt-in) before the source task spawns in `run_buffered` and `run_buffered_transport`. **Periodic recovery**: `CheckpointPersist::try_recover_primary` trait method (default `Ok(true)`, override on `FallbackCheckpointStore`) fires every 16 flushes from the sink task — drains the WAL sidecar back into L3 when the primary heals. Verified by `recovery_plan_dispatches_to_source_on_pipeline_start` seeded with a persisted `per_sink_ack_seq` record. | P1 | ✅ |
-| **P6** | Multi-source + multi-sink manifest shape (arrays); validation that `eos_tier` declaration matches connector capability at pipeline start (fail-fast mismatch). **Primitives landed** (`aeon_types::manifest`): typed `PipelineManifest` with `sources`/`sinks` lists, `DurabilityBlock`, `IdentityConfig`, `SinkTierDecl` ↔ `SinkEosTier`; fail-fast validators `validate_sink_tier` (declared vs connector-actual), `validate_source_shape` (broker-ts support + kind/identity pairing invariants), `validate_pipeline_shape` (non-empty sources/sinks, unique names, partitions > 0). **CLI loader swap landed**: `Manifest.pipelines` now `Vec<PipelineManifest>` (was `Vec<serde_json::Value>`); `cmd_apply` calls `validate_pipeline_shape` + per-source `validate_source_shape` before sending to API; `PipelineManifest::to_pipeline_definition()` bridge converts all sources/sinks (was first-only); `ExportManifest` separates the export path; `cmd_diff` uses typed `.name`; 3 bridge tests. **Registry schema upgraded**: `PipelineDefinition.source` → `.sources: Vec<SourceConfig>`, `.sink` → `.sinks: Vec<SinkConfig>`; `::new()` wraps single args into `vec![]` for backward compat; `pipeline_manager.rs` reconfigure methods index `sources[0]`/`sinks[0]`; all REST API and pipeline_manager test assertions updated. **Remaining**: pipeline runtime topology refactor (current `PipelineConfig<S,P,K>` is single-source/single-sink via generics — needs multi-source fan-in + multi-sink fan-out wiring using existing `dag.rs` runners); per-sink EO-2 `AckSeqTracker` extension. | P1 | 🟡 |
+| **P6** | Multi-source + multi-sink manifest shape (arrays); validation that `eos_tier` declaration matches connector capability at pipeline start (fail-fast mismatch). **Primitives landed** (`aeon_types::manifest`): typed `PipelineManifest` with `sources`/`sinks` lists, `DurabilityBlock`, `IdentityConfig`, `SinkTierDecl` ↔ `SinkEosTier`; fail-fast validators `validate_sink_tier` (declared vs connector-actual), `validate_source_shape` (broker-ts support + kind/identity pairing invariants), `validate_pipeline_shape` (non-empty sources/sinks, unique names, partitions > 0). **CLI loader swap landed**: `Manifest.pipelines` now `Vec<PipelineManifest>` (was `Vec<serde_json::Value>`); `cmd_apply` calls `validate_pipeline_shape` + per-source `validate_source_shape` before sending to API; `PipelineManifest::to_pipeline_definition()` bridge converts all sources/sinks (was first-only); `ExportManifest` separates the export path; `cmd_diff` uses typed `.name`; 3 bridge tests. **Registry schema upgraded**: `PipelineDefinition.source` → `.sources: Vec<SourceConfig>`, `.sink` → `.sinks: Vec<SinkConfig>`; `::new()` wraps single args into `vec![]` for backward compat; `pipeline_manager.rs` reconfigure methods index `sources[0]`/`sinks[0]`; all REST API and pipeline_manager test assertions updated. **Topology dispatch landed** (`dag.rs`): `Topology` enum (Linear/FanIn/FanOut/FanInFanOut) with `detect(source_count, sink_count)`, `run_topology()` dispatch selects DAG runner automatically, `run_fan_in_fan_out()` composed runner (round-robin sources → clone to all sinks); exported from `lib.rs`; 9 tests (4 detect + 4 topology paths + error case). **Per-sink AckSeqTracker sharing landed** (`pipeline.rs`): optional `PipelineConfig.eo2_shared_ack_tracker` — when set, `build_sink_task_ctx` uses the shared handle instead of a fresh per-task tracker, so every sink task in a multi-sink topology contributes to the same `min_across_sinks()` frontier used by L2 GC; 2 tests verifying cross-sink visibility (fast-sink ack visible via slow-sink's tracker handle; GC frontier pinned to lagging sink) and isolation when not shared. | P1 | ✅ |
 | **P7** | Backpressure hierarchy (partition soft target → pipeline cap → node global cap); escalation per source kind (push: PushBuffer Phase 3 protocol-level flow control; pull: stop polling; poll: increase interval / skip). **Primitives landed** (`aeon_engine::eo2_backpressure`): `CapacityLimits` (node/pipeline/derived-partition-target), shared `NodeCapacity`, per-pipeline `PipelineCapacity` with per-partition byte accounting, `PressureLevel {Partition, Pipeline, Node}`, `BackpressureDecision::{None, PushReject, PullPause, PollSkip}` via `for_kind(SourceKind, level)`; 95 % pressure threshold; node level wins over pipeline wins over partition. Renamed from Budget→Capacity for DDD clarity across developer/DevOps/user audiences. **Wired into pipeline runtime**: `PipelineConfig.eo2_capacity` threaded through `build_sink_task_ctx` into `SinkTaskCtx`; `L2WritingSource.with_capacity()` calls `adjust(+bytes)` after each L2 append; `eo2_gc_sweep` calls `adjust(-reclaimed)` after `gc_up_to`; source task checks `PipelineCapacity::decide()` before each `next_batch`, sleeps 1ms in a yield loop when engaged, clears all pressure gauges on exit; for blocking strategies (PerEvent/OrderedBatch), GC runs after every batch delivery when capacity tracking is active to prevent source↔sink deadlock; pressure metric flipped via `Eo2Metrics::set_l2_pressure` on engage/disengage. Verified by `capacity_gate_pauses_source_and_gc_releases` (multi_thread, tiny cap, 30 events end-to-end). **Remaining**: connector-level Phase 3 remedy enactment (push 503, pull pause, poll skip) — currently all remedies are source-task-level sleep gates. | P3, P4 | ✅ |
 | **P8** | Observability — `aeon_l2_bytes`, `aeon_l2_segments`, `aeon_l2_gc_lag_seq`, `aeon_l2_pressure{level}`, `aeon_sink_ack_seq`, `aeon_checkpoint_fallback_wal`, `aeon_uuid_identity_collisions`. **Primitives landed** (`aeon_engine::eo2_metrics::Eo2Metrics`): all seven metrics with pipeline/partition and pipeline/sink labels, pressure pre-populated to zero so dashboards see series immediately, Prometheus text-format rendering with deterministic BTreeMap iteration, proper HELP/TYPE headers. **Wired into pipeline runtime**: optional `PipelineConfig.eo2_metrics` threaded through `build_sink_task_ctx` into `SinkTaskCtx`; sink task calls `set_sink_ack_seq` on every `AckSeqTracker::record_ack` advance; `eo2_gc_sweep` publishes `set_l2_bytes` / `set_l2_segments` / `set_l2_gc_lag_seq` per partition on every sweep; `FallbackCheckpointStore::with_metrics` + `engage_fallback` bumps `aeon_checkpoint_fallback_wal_total` on first L3 → WAL transition; `MetricsConfig.eo2_metrics` splices `render_prometheus()` into `metrics_server::format_prometheus`. **Remaining**: pull-source UUIDv7 collision detection (counter inc). Pressure gauge wiring landed via P7, pull-source UUIDv7 collision detection (counter inc). Verified by `fallback_transition_bumps_metrics_counter` + `eo2_metrics_published_on_ack_and_gc`. | P3, P4, P5 | ✅ |
-| **P9** | Integration tests — crash-recovery (kill during batch, verify no loss + no duplicates), slow-sink backpressure (multi-sink with one stalled), multi-source interleaving (pull + push + poll into one processor), L3-to-WAL failover. **Landed** (`tests/eo2_integration.rs`, 6 tests): crash-recovery full-delivery + L2 replay verification, crash mid-batch with L2 gap-fill, L3→WAL failover + recovery, slow-sink under capacity pressure, L2 GC segment reclamation after full delivery, multi-sink recovery plan derivation. **Remaining** (blocked on P6): multi-sink with one stalled, multi-source interleaving (pull + push + poll). | P4, P5 | 🟡 |
-| **P10** | Benchmarks — per-event overhead with each durability mode, L2 write throughput at 20M ev/s target, fsync amortisation at various checkpoint cadences, content-hash dedup cost per poll source; gate on performance regression. **Landed** (`benches/eo2_durability_bench.rs`, 4 benchmark groups): durability mode overhead (`None` 2.5M ev/s vs `OrderedBatch` 124K ev/s — L2 disk I/O dominated), L2 raw append throughput at 64/256/1K/4K payload sizes, checkpoint cadence fsync amortisation (1ms/10ms/100ms/500ms flush intervals), capacity tracking overhead (with vs without `PipelineCapacity`). **Remaining**: content-hash dedup cost per poll source (blocked: `ContentHashConfig` has no runtime implementation yet). | P4 | 🟡 |
+| **P9** | Integration tests — crash-recovery (kill during batch, verify no loss + no duplicates), slow-sink backpressure (multi-sink with one stalled), multi-source interleaving (pull + push + poll into one processor), L3-to-WAL failover. **Landed** (`tests/eo2_integration.rs`, 8 tests): crash-recovery full-delivery + L2 replay verification, crash mid-batch with L2 gap-fill, L3→WAL failover + recovery, slow-sink under capacity pressure, L2 GC segment reclamation after full delivery, multi-sink recovery plan derivation, **multi-sink with stalled-laggard** (two concurrent pipelines sharing `AckSeqTracker` + L2 registry; one fast, one 8ms-delayed; verifies both sinks deliver all events and `min_across_sinks` equals the lesser of the final watermarks), **multi-source Pull+Push+Poll fan-in** (three sources of distinct kinds through `run_fan_in`; verifies full delivery, per-source order preservation, and kind-erased enum dispatch of `source_kind()`). | P4, P5 | ✅ |
+| **P10** | Benchmarks — per-event overhead with each durability mode, L2 write throughput at 20M ev/s target, fsync amortisation at various checkpoint cadences, content-hash dedup cost per poll source; gate on performance regression. **Landed** (`benches/eo2_durability_bench.rs`, 5 benchmark groups): durability mode overhead (`None` 2.5M ev/s vs `OrderedBatch` 124K ev/s — L2 disk I/O dominated), L2 raw append throughput at 64/256/1K/4K payload sizes, checkpoint cadence fsync amortisation (1ms/10ms/100ms/500ms flush intervals), capacity tracking overhead (with vs without `PipelineCapacity`), content-hash dedup cost (`first_seen` 128→343 ns/event, `repeat_lookup` 61→227 ns/event across 64 B→4 KiB payloads — within order of magnitude of design target). **ContentHashDedup primitive landed** (`eo2_content_hash.rs`): `xxhash3_64` via `xxhash-rust` with `xxh3` feature, TTL-windowed `Mutex<HashMap>` seen-set, `check_and_mark(&[u8]) -> bool`, amortised sweep (only retains when ≥ `window / 8` elapsed — crucial for hot-path cost, 24× first-seen speedup over the naïve per-call `retain()`); string-form algorithm parsing accepts `xxhash3_64` / `xxh3_64` / `xxh3-64` aliases; 8 unit tests covering new/repeat/expiry/sweep/config paths. L2-backing the seen-set across restarts is an explicit future optimisation, not required for the primitive to be correct or fast. | P4 | ✅ |
 | **P11** | Docs — `PIPELINE-DESIGN-GUIDE.md` (when multi-sink in one pipeline vs separate pipelines), update `CONNECTORS.md` with source_kind matrix, migration guide for existing pipelines (default `durability: none` for backwards compat). **Landed**: `docs/PIPELINE-DESIGN-GUIDE.md` — source-kind decision table, durability mode matrix, `event_time` rules, multi-source ordering, multi-sink vs separate-pipeline rubric, `eos_tier` reference table, capacity planning, partition-count guidance. `docs/CONNECTORS.md` — overview updated from two-kind (Pull/Push) to three-kind taxonomy (Pull/Push/Poll), connector matrix table gains `Source Kind` column, new §7 "EO-2 Durability — Migration Note" with `durability: none` default, backpressure remedy table per source kind, and SourceKind default documentation. | — | ✅ |
-| **P12** | CL-6a coordination — partition transfer (Pillar 3 CL-6a) must stream L2 segments to target node; either EO-2 lands before CL-6a or CL-6a is L2-aware from the start | Pillar 3 CL-6a | ⬜ |
+| **P12** | CL-6a coordination — partition transfer (Pillar 3 CL-6a) must stream L2 segments to target node; either EO-2 lands before CL-6a or CL-6a is L2-aware from the start. **Landed 2026-04-16 via CL-6a.1/2/3**: CL-6a shipped L2-aware from the start — `SegmentManifest`/`SegmentReader`/`SegmentWriter` operate over the exact L2 body layout (`{root}/{pipeline}/p{partition:05}/{start_seq:020}.l2b`, magic `AEON-L2B`, per-record CRC32); QUIC wire protocol carries `SegmentManifest` + chunked `SegmentChunk`s over `MessageType::PartitionTransfer{Request,ManifestFrame,ChunkFrame,EndFrame}`; `drive_partition_transfer` orchestrator reports real byte progress into `TransferTracker` (Idle → BulkSync → Cutover on success, → Aborted on failure). EO-2's L2 body spine + L3 checkpoint boundary map directly onto CL-6a's segment-granular transfer; cutover only needs the caller to additionally flip source_anchor ownership via Raft. | Pillar 3 CL-6a | ✅ |
 
 **Recommended landing order**: P1 → P2 → P3 → P5 → P4 → P6 → P7 → P8 → P9 → P10 → P11 → P12.
 Each phase independently testable; no phase lands without its tests.

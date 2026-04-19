@@ -1,10 +1,38 @@
 //! TLS configuration for QUIC endpoints using rustls.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use aeon_types::AeonError;
 
-use crate::config::{ClusterConfig, TlsConfig};
+use crate::config::{ClusterConfig, RaftTiming, TlsConfig};
+
+/// Build a shared `quinn::TransportConfig` sized from the cluster's Raft
+/// timing. Sets two knobs that quinn leaves disabled by default:
+///
+/// - `keep_alive_interval = heartbeat_ms`: forces PING frames at the same
+///   cadence as Raft heartbeats so a peer that silently disappears is
+///   detected at the transport layer, not only via application-level
+///   heartbeat-miss in openraft.
+/// - `max_idle_timeout = 2 × election_max_ms`: hard upper bound on
+///   orphaned connections after a peer crashes. Sized well above the
+///   Raft election window so normal traffic never trips it, but low
+///   enough that a genuinely dead peer's connection is reaped within one
+///   election cycle's worth of slack.
+///
+/// Session 0 (2026-04-18) surfaced that the Raft QUIC transport was
+/// using all-quinn-defaults with no idle-timeout and no keep-alive,
+/// leaving peer-death detection entirely to openraft's heartbeat-miss
+/// logic. See `docs/GATE2-ACCEPTANCE-PLAN.md § 11.5` Row 4.
+fn build_transport_config(raft_timing: &RaftTiming) -> Arc<quinn::TransportConfig> {
+    let mut tc = quinn::TransportConfig::default();
+    tc.keep_alive_interval(Some(Duration::from_millis(raft_timing.heartbeat_ms)));
+    let idle_ms = raft_timing.election_max_ms.saturating_mul(2);
+    if let Ok(idle) = quinn::IdleTimeout::try_from(Duration::from_millis(idle_ms)) {
+        tc.max_idle_timeout(Some(idle));
+    }
+    Arc::new(tc)
+}
 
 /// Build a rustls ServerConfig for QUIC from TLS file paths.
 pub fn build_server_config(tls: &TlsConfig) -> Result<rustls::ServerConfig, AeonError> {
@@ -149,6 +177,8 @@ fn quic_client_config(rustls_config: rustls::ClientConfig) -> Result<quinn::Clie
 pub fn quic_configs_for_cluster(
     config: &ClusterConfig,
 ) -> Result<(quinn::ServerConfig, quinn::ClientConfig), AeonError> {
+    let transport = build_transport_config(&config.raft_timing);
+
     if let Some(tls) = &config.tls {
         let server_rustls = build_server_config(tls)?;
         let client_rustls = build_client_config(tls)?;
@@ -157,7 +187,11 @@ pub fn quic_configs_for_cluster(
             ca = ?tls.ca,
             "cluster TLS: production mTLS enabled (file-based certs, peer verification active)"
         );
-        return Ok((quic_server_config(server_rustls)?, quic_client_config(client_rustls)?));
+        let mut server_cfg = quic_server_config(server_rustls)?;
+        let mut client_cfg = quic_client_config(client_rustls)?;
+        server_cfg.transport_config(transport.clone());
+        client_cfg.transport_config(transport);
+        return Ok((server_cfg, client_cfg));
     }
 
     if config.auto_tls {
@@ -169,7 +203,9 @@ pub fn quic_configs_for_cluster(
                  peer verifier. This is INSECURE and intended for development/testing only. \
                  For production, set cluster.tls.{{cert,key,ca}} to file paths."
             );
-            let (server_cfg, client_cfg) = dev_quic_configs_insecure();
+            let (mut server_cfg, mut client_cfg) = dev_quic_configs_insecure();
+            server_cfg.transport_config(transport.clone());
+            client_cfg.transport_config(transport);
             return Ok((server_cfg, client_cfg));
         }
         #[cfg(not(feature = "auto-tls"))]
@@ -354,6 +390,9 @@ mod tests {
             initial_members: Vec::new(),
             advertise_addr: None,
             raft_timing: crate::config::RaftTiming::default(),
+            poh_verify_mode: "verify".to_string(),
+            rest_api_port: None,
+            rest_scheme: None,
         }
     }
 
@@ -424,6 +463,50 @@ mod tests {
         assert!(result.is_ok(), "production mTLS path failed: {result:?}");
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn transport_config_built_for_all_raft_profiles() {
+        // Smoke: build_transport_config must not panic or overflow for any of
+        // the three shipped RaftTiming presets (default / prod / flaky).
+        // flaky_network has election_max_ms = 12000 → idle = 24s, well inside
+        // quinn's IdleTimeout range; default is 6s; prod is 12s.
+        for timing in [
+            RaftTiming::default(),
+            RaftTiming::prod_recommended(),
+            RaftTiming::flaky_network(),
+        ] {
+            let tc = build_transport_config(&timing);
+            // The Debug output of quinn::TransportConfig includes
+            // `max_idle_timeout: Some(...)` and `keep_alive_interval: Some(...)`
+            // — assert both were flipped from the quinn default of None.
+            let dbg = format!("{tc:?}");
+            assert!(
+                dbg.contains("max_idle_timeout: Some"),
+                "max_idle_timeout not set for {timing:?}: {dbg}"
+            );
+            assert!(
+                dbg.contains("keep_alive_interval: Some"),
+                "keep_alive_interval not set for {timing:?}: {dbg}"
+            );
+        }
+    }
+
+    #[cfg(feature = "auto-tls")]
+    #[test]
+    fn auto_tls_path_applies_transport_config() {
+        // Round-trip: auto_tls=true + custom RaftTiming → configs are built
+        // and the transport tweaks are applied to *both* server and client.
+        // We can't inspect quinn::{Server,Client}Config.transport_config
+        // directly (no public getter), so this test only asserts the call
+        // succeeds; build_transport_config is covered above.
+        let cfg = ClusterConfig {
+            auto_tls: true,
+            raft_timing: RaftTiming::prod_recommended(),
+            ..base_cfg()
+        };
+        let result = quic_configs_for_cluster(&cfg);
+        assert!(result.is_ok(), "auto-tls path failed: {result:?}");
     }
 
     #[test]

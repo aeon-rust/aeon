@@ -9,29 +9,40 @@
 pub mod affinity;
 #[cfg(feature = "cluster")]
 pub mod cluster_applier;
+#[cfg(feature = "cluster")]
+pub mod engine_cutover;
+#[cfg(feature = "cluster")]
+pub mod partition_ownership;
+#[cfg(all(feature = "cluster", feature = "processor-auth"))]
+pub mod partition_install;
 pub mod batch_tuner;
 pub mod batch_wire;
 pub mod checkpoint;
 pub mod circuit_breaker;
+pub mod connector_registry;
 pub mod dag;
 pub mod delivery;
 pub mod delivery_ledger;
 pub mod dlq;
 pub mod eo2;
 pub mod eo2_backpressure;
+pub mod eo2_content_hash;
 pub mod eo2_metrics;
 pub mod eo2_recovery;
 pub mod health;
 pub mod identity_store;
 pub mod l2_body;
+pub mod l2_transfer;
 pub mod metrics_server;
 pub mod pipeline;
 pub mod pipeline_manager;
+pub mod pipeline_supervisor;
 pub mod processor;
 pub mod registry;
 pub mod retry;
 pub mod shutdown;
 pub mod transport;
+pub mod write_gate;
 
 #[cfg(feature = "native-loader")]
 pub mod native_loader;
@@ -58,7 +69,11 @@ pub use checkpoint::{
     WalCheckpointStore,
 };
 pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitState};
-pub use dag::{DagGraph, NodeKind, run_chain, run_fan_in, run_fan_out, run_routed};
+pub use connector_registry::{
+    BoxedSinkAdapter, BoxedSourceAdapter, ConnectorRegistry, DynSink, DynSource,
+    PartitionOwnershipResolver, SinkFactory, SourceFactory,
+};
+pub use dag::{DagGraph, NodeKind, Topology, run_chain, run_fan_in, run_fan_out, run_routed, run_topology};
 pub use delivery::{CheckpointBackend, CheckpointConfig, DeliveryConfig, FlushStrategy};
 pub use delivery_ledger::{DeliveryLedger, DeliveryState, FailedEntry, LedgerEntry};
 pub use dlq::{DeadLetterQueue, DlqConfig, DlqRecord};
@@ -72,11 +87,13 @@ pub use pipeline::{
 #[cfg(feature = "processor-auth")]
 pub use pipeline::{PohConfig, PohState, create_poh_state};
 pub use pipeline_manager::PipelineManager;
+pub use pipeline_supervisor::{IDENTITY_PROCESSOR, PipelineSupervisor};
 pub use processor::PassthroughProcessor;
 pub use registry::ProcessorRegistry;
 pub use retry::{RetryConfig, RetryOutcome, backoff_delay, retry_async, retry_sync};
 pub use shutdown::{ShutdownConfig, ShutdownCoordinator};
 pub use transport::InProcessTransport;
+pub use write_gate::{DrainError, DrainGuard, GateState, WriteGate, WriteGateRegistry};
 pub use transport::{
     AwppSession, BatchInflight, ControlChannel, HandshakeConfig, PipelineResolver, SessionState,
 };
@@ -86,6 +103,17 @@ pub use native_loader::NativeProcessor;
 
 #[cfg(feature = "cluster")]
 pub use cluster_applier::ClusterRegistryApplier;
+
+#[cfg(feature = "cluster")]
+pub use engine_cutover::{CutoverWatermarkReader, EngineCutoverCoordinator};
+
+#[cfg(feature = "cluster")]
+pub use partition_ownership::ClusterPartitionOwnership;
+
+#[cfg(all(feature = "cluster", feature = "processor-auth"))]
+pub use partition_install::{
+    InstalledPohChainRegistry, L2SegmentInstaller, PohChainInstallerImpl,
+};
 
 #[cfg(feature = "rest-api")]
 pub use rest_api::{AppState, api_router, serve};

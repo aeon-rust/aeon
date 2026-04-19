@@ -26,6 +26,7 @@ spec:
       {{- end }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      terminationGracePeriodSeconds: {{ .Values.gracefulShutdown.terminationGracePeriodSeconds }}
       containers:
         - name: aeon
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
@@ -60,6 +61,55 @@ spec:
               value: {{ .Values.cluster.partitions | quote }}
             - name: AEON_CLUSTER_QUIC_PORT
               value: {{ .Values.ports.quic | quote }}
+            {{- if .Values.cluster.pohVerifyMode }}
+            - name: AEON_CLUSTER_POH_VERIFY_MODE
+              value: {{ .Values.cluster.pohVerifyMode | quote }}
+            {{- end }}
+            {{- if .Values.cluster.pipelineName }}
+            # G11.b — selects the single pipeline that the partition-transfer
+            # driver installs segments + PoH chains for on this node. Unset
+            # skips driver spawn (transfers won't progress).
+            - name: AEON_PIPELINE_NAME
+              value: {{ .Values.cluster.pipelineName | quote }}
+            {{- end }}
+            {{- if .Values.cluster.l2Root }}
+            - name: AEON_L2_ROOT
+              value: {{ .Values.cluster.l2Root | quote }}
+            {{- end }}
+            {{- if .Values.cluster.raftTiming.heartbeatMs }}
+            - name: AEON_RAFT_HEARTBEAT_MS
+              value: {{ .Values.cluster.raftTiming.heartbeatMs | quote }}
+            {{- end }}
+            {{- if .Values.cluster.raftTiming.electionMinMs }}
+            - name: AEON_RAFT_ELECTION_MIN_MS
+              value: {{ .Values.cluster.raftTiming.electionMinMs | quote }}
+            {{- end }}
+            {{- if .Values.cluster.raftTiming.electionMaxMs }}
+            - name: AEON_RAFT_ELECTION_MAX_MS
+              value: {{ .Values.cluster.raftTiming.electionMaxMs | quote }}
+            {{- end }}
+            # G14 — how long the SIGTERM handler waits for Raft leadership to
+            # flip to a follower before proceeding with the drain. Runs in
+            # parallel with the `AEON_PRESTOP_DELAY_SECS` endpoint-propagation
+            # sleep, so the hand-off mostly hides inside that window.
+            # Target: fast_failover preset → 4 s covers 2× election_max_ms.
+            - name: AEON_LEADER_RELINQUISH_MS
+              value: {{ .Values.gracefulShutdown.leaderRelinquishMs | default 4000 | quote }}
+            # Controls the pre-drain pause in aeon's SIGINT/SIGTERM handler.
+            # Keep this in sync with gracefulShutdown.preStopDelaySeconds so
+            # the handler waits for endpoint propagation before stopping
+            # sources. The StatefulSet's preStop hook gives kubelet the same
+            # window before it forwards SIGTERM to the container process.
+            - name: AEON_PRESTOP_DELAY_SECS
+              value: {{ .Values.gracefulShutdown.preStopDelaySeconds | quote }}
+          lifecycle:
+            preStop:
+              exec:
+                # Small delay so kube-proxy / service endpoints observe the
+                # pod as Terminating before the container receives SIGTERM.
+                # Aeon's in-process signal handler performs its own drain —
+                # this hook only bridges the iptables update window.
+                command: ["/bin/sh", "-c", "sleep {{ .Values.gracefulShutdown.preStopDelaySeconds }}"]
           ports:
             - name: quic
               containerPort: {{ .Values.ports.quic }}

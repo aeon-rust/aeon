@@ -82,7 +82,7 @@ pub mod mongodb_cdc;
 // ─── Re-exports ────────────────────────────────────────────────────────
 
 #[cfg(feature = "memory")]
-pub use memory::{MemorySink, MemorySource};
+pub use memory::{MemorySink, MemorySource, StreamingMemorySource};
 
 #[cfg(feature = "blackhole")]
 pub use blackhole::BlackholeSink;

@@ -1,0 +1,54 @@
+# Aeon mTLS Certificate — signed by the internal CA ClusterIssuer.
+# Produces Secret `aeon-tls` in namespace `aeon` with tls.crt, tls.key,
+# ca.crt — consumed by helm values `cluster.tls.secretName: aeon-tls`.
+#
+# Prerequisite: `aeon` namespace exists, `aeon-internal-ca` ClusterIssuer
+# is Ready (see cert-manager-install.yaml).
+#
+# DNS names cover the 3-replica StatefulSet + Service + headless Service
+# for release name `aeon` in namespace `aeon`. If release name or
+# namespace changes, regenerate SANs accordingly.
+
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: aeon-tls
+  namespace: aeon
+spec:
+  secretName: aeon-tls
+  duration: 8760h         # 1 year — ephemeral cluster, no rotation planned
+  renewBefore: 720h       # 30 days
+  subject:
+    organizations: [aeon-gate2]
+  commonName: aeon.aeon.svc.cluster.local
+  dnsNames:
+    # Pod-specific (StatefulSet ordinal pods via headless service)
+    - aeon-0.aeon-headless.aeon.svc.cluster.local
+    - aeon-1.aeon-headless.aeon.svc.cluster.local
+    - aeon-2.aeon-headless.aeon.svc.cluster.local
+    # T2 scale-up adds ordinals 3 and 4
+    - aeon-3.aeon-headless.aeon.svc.cluster.local
+    - aeon-4.aeon-headless.aeon.svc.cluster.local
+    # Services
+    - aeon.aeon.svc.cluster.local
+    - aeon-headless.aeon.svc.cluster.local
+    - aeon.aeon.svc
+    - aeon
+    # Local
+    - localhost
+  ipAddresses:
+    - 127.0.0.1
+    - ::1
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  usages:
+    - server auth
+    - client auth      # Aeon pods both serve AND dial TLS to each other
+    - digital signature
+    - key encipherment
+  issuerRef:
+    name: aeon-internal-ca
+    kind: ClusterIssuer
+    group: cert-manager.io

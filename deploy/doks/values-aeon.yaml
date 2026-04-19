@@ -1,0 +1,84 @@
+# Aeon values — Session A (DOKS AMS3)
+# Target node: g-8vcpu-32gb (8 dedicated vCPU, 32 GiB RAM, 100 GiB Regular SSD, 2 Gbps)
+# Usage: helm install aeon ../../helm/aeon -f values-aeon.yaml -n aeon --create-namespace
+#
+# Supersedes helm/aeon/values-doks.yaml (which was sized for 2vCPU/8GiB
+# nodes from the deleted US-region cluster).
+
+image:
+  repository: registry.digitalocean.com/rust-proxy-registry/aeon
+  tag: "70c68b3"        # 2026-04-19 build — G1-G14 + G13 workaround, RD-smoked (commit 70c68b3)
+  pullPolicy: Always    # force re-pull so we track any new push from laptop
+
+imagePullSecrets:
+  - name: registry-rust-proxy-registry
+
+config:
+  logLevel: info
+  apiAddr: "0.0.0.0:4471"
+  brokers: "redpanda.redpanda.svc.cluster.local:9092"
+  artifactDir: /app/artifacts
+
+# Cluster mode — 3 Raft peers, 24 partitions (divisible by 3 brokers and
+# multiples of 8 partitions/core on Redpanda)
+cluster:
+  enabled: true
+  replicas: 3
+  partitions: 24
+  tls:
+    # Session A: auto_tls (self-signed) on the QUIC cluster link — the K8s
+    # discovery path defaults auto_tls=true when no secret is mounted, which
+    # keeps Session A scoped to cluster correctness (not cert-manager setup).
+    # Revisit with file-based mTLS for Session B / production.
+    enabled: false
+
+# Resource sizing — g-8vcpu-32gb dedicated; leave 1 vCPU / 4 GiB for
+# kubelet + DaemonSets + system. Requests = limits for Guaranteed QoS
+# (so pods are eligible for future CPU pinning on EKS).
+resources:
+  requests:
+    cpu: "6"
+    memory: 24Gi
+  limits:
+    cpu: "6"
+    memory: 24Gi
+
+# PVC for L3 checkpoint store + artifacts.
+persistence:
+  enabled: true
+  storageClass: do-block-storage   # DOKS default; ~5K IOPS, Regular SSD
+  size: 50Gi
+
+# Keep Aeon pods off the Redpanda and default pools.
+# DOKS auto-generates pool names (e.g. pool-v45pvrnks), so we apply our
+# own semantic label `workload=aeon` at the pool level via doctl.
+nodeSelector:
+  workload: aeon
+
+tolerations:
+  - key: workload
+    operator: Equal
+    value: aeon
+    effect: NoSchedule
+
+# Spread Aeon pods across distinct nodes so T2/T3 scale-events actually
+# exercise cross-node Raft paths, not co-located shortcuts.
+affinity:
+  podAntiAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector:
+          matchExpressions:
+            - key: app.kubernetes.io/name
+              operator: In
+              values: [aeon]
+        topologyKey: kubernetes.io/hostname
+
+# Sized for Gate 2 test — HPA disabled; scale events are manual (T2/T3).
+autoscaling:
+  enabled: false
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false   # Aeon writes to artifactDir
+  capabilities:
+    drop: [ALL]

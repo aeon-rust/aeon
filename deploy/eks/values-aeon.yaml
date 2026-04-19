@@ -1,0 +1,74 @@
+# Aeon values — Session B (AWS EKS, us-east-1a)
+# Target node: i4i.2xlarge (8 vCPU, 64 GiB, 1.875 TB NVMe, 18.75 Gbps)
+# Usage: helm install aeon ../../helm/aeon -f values-aeon.yaml -n aeon --create-namespace
+#
+# Two modes: unpinned (default) and pinned. Pinned mode sets integer
+# CPU requests/limits and the Guaranteed QoS annotation so the static
+# CPU manager policy (enabled in cluster.yaml) pins pods to exclusive
+# cores. Toggle by running the T1 test twice.
+
+image:
+  repository: aeonrust/aeon
+  tag: "0.1.0"
+  pullPolicy: IfNotPresent
+
+config:
+  logLevel: info
+  apiAddr: "0.0.0.0:4471"
+  brokers: "redpanda.redpanda.svc.cluster.local:9092"
+  artifactDir: /app/artifacts
+
+cluster:
+  enabled: true
+  replicas: 3
+  partitions: 24
+  tls:
+    enabled: true
+    secretName: aeon-tls   # provisioned by cert-manager
+
+# Resources — integer CPU for Guaranteed QoS = eligible for CPU pinning
+# under cpu-manager-policy=static. Leave 1 vCPU for kubelet / DaemonSets
+# on the 8-vCPU node.
+resources:
+  requests:
+    cpu: "6"
+    memory: 48Gi
+  limits:
+    cpu: "6"
+    memory: 48Gi
+
+# Persistence — use local NVMe instance store via hostPath for L2 body
+# store; EBS gp3 for L3 checkpoints (small, low-IOPS, durability not
+# critical for test).
+persistence:
+  enabled: true
+  storageClass: gp3
+  size: 50Gi
+
+nodeSelector:
+  workload: aeon
+
+tolerations:
+  - key: workload
+    operator: Equal
+    value: aeon
+    effect: NoSchedule
+
+affinity:
+  podAntiAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector:
+          matchExpressions:
+            - key: app.kubernetes.io/name
+              operator: In
+              values: [aeon]
+        topologyKey: kubernetes.io/hostname
+
+autoscaling:
+  enabled: false
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false
+  capabilities:
+    drop: [ALL]

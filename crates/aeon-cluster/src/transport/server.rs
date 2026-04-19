@@ -6,16 +6,48 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use openraft::Raft;
 
 use crate::raft_config::AeonRaftConfig;
+use crate::transport::cutover::{CutoverCoordinator, serve_partition_cutover_with_request};
 use crate::transport::endpoint::QuicEndpoint;
 use crate::transport::framing::{self, MessageType};
 use crate::transport::health;
-use crate::types::{JoinRequest, JoinResponse, NodeId, RemoveNodeRequest, RemoveNodeResponse};
+use crate::transport::partition_transfer::{
+    PartitionTransferProvider, serve_partition_transfer_with_request,
+};
+use crate::transport::poh_transfer::{
+    PohChainProvider, serve_poh_chain_transfer_with_request,
+};
+use crate::types::{
+    JoinRequest, JoinResponse, NodeId, PartitionCutoverRequest, PartitionCutoverResponse,
+    PartitionTransferEnd, PartitionTransferRequest, PohChainTransferRequest,
+    PohChainTransferResponse, RemoveNodeRequest, RemoveNodeResponse,
+};
 
 /// Run the QUIC server accept loop, dispatching incoming RPCs to the Raft node.
+///
+/// `self_id` is the authoritative node id for this process — the value that
+/// was passed to `Raft::new()` via `ClusterConfig::node_id`, and the same
+/// value that `GET /api/v1/cluster/status` reports. Using this explicitly
+/// (rather than re-reading `raft.metrics().borrow().id`) closes G15: the
+/// watch-channel id can diverge from the configured node id during openraft
+/// initialization / metric-update races, which made `handle_add_node` reject
+/// valid joins on the actual Raft leader.
+///
+/// `transfer_provider` is plugged in by the engine to service
+/// `PartitionTransferRequest` streams (CL-6a). `poh_provider` services
+/// `PohChainTransferRequest` streams (CL-6b). `cutover_coordinator`
+/// services `PartitionCutoverRequest` streams (CL-6c) — the hook that
+/// drains and freezes a partition on the source node when the target
+/// initiates handover. Pass `None` in contexts that don't own a live L2
+/// body store / PoH chain / partition-write path (tests, raft-only
+/// benches) — the relevant requests will receive a failure response.
 pub async fn serve(
     endpoint: Arc<QuicEndpoint>,
     raft: Raft<AeonRaftConfig>,
+    self_id: NodeId,
     shutdown: Arc<AtomicBool>,
+    transfer_provider: Option<Arc<dyn PartitionTransferProvider>>,
+    poh_provider: Option<Arc<dyn PohChainProvider>>,
+    cutover_coordinator: Option<Arc<dyn CutoverCoordinator>>,
 ) {
     while !shutdown.load(Ordering::Relaxed) {
         let incoming = tokio::select! {
@@ -29,6 +61,9 @@ pub async fn serve(
         };
 
         let raft = raft.clone();
+        let transfer_provider = transfer_provider.clone();
+        let poh_provider = poh_provider.clone();
+        let cutover_coordinator = cutover_coordinator.clone();
         tokio::spawn(async move {
             let connection = match incoming.await {
                 Ok(c) => c,
@@ -38,7 +73,6 @@ pub async fn serve(
                 }
             };
 
-            let self_id: NodeId = raft.metrics().borrow().id;
             loop {
                 let stream = match connection.accept_bi().await {
                     Ok(s) => s,
@@ -50,7 +84,17 @@ pub async fn serve(
                 };
 
                 let raft = raft.clone();
-                tokio::spawn(handle_stream(raft, self_id, stream));
+                let transfer_provider = transfer_provider.clone();
+                let poh_provider = poh_provider.clone();
+                let cutover_coordinator = cutover_coordinator.clone();
+                tokio::spawn(handle_stream(
+                    raft,
+                    self_id,
+                    transfer_provider,
+                    poh_provider,
+                    cutover_coordinator,
+                    stream,
+                ));
             }
         });
     }
@@ -60,8 +104,14 @@ pub async fn serve(
 async fn handle_stream(
     raft: Raft<AeonRaftConfig>,
     self_id: NodeId,
+    transfer_provider: Option<Arc<dyn PartitionTransferProvider>>,
+    poh_provider: Option<Arc<dyn PohChainProvider>>,
+    cutover_coordinator: Option<Arc<dyn CutoverCoordinator>>,
     (mut send, mut recv): (quinn::SendStream, quinn::RecvStream),
 ) {
+    // Peek the first frame's type so partition-transfer streams (which
+    // start with a request frame + continue reading from the same recv)
+    // can re-use the open stream without a second read_frame call.
     let (msg_type, payload) = match framing::read_frame(&mut recv).await {
         Ok(f) => f,
         Err(e) => {
@@ -75,9 +125,22 @@ async fn handle_stream(
         MessageType::Vote => handle_vote(&raft, &payload, &mut send).await,
         MessageType::InstallSnapshot => handle_install_snapshot(&raft, &payload, &mut send).await,
         MessageType::FullSnapshot => handle_full_snapshot(&raft, &payload, &mut send).await,
-        MessageType::AddNodeRequest => handle_add_node(&raft, &payload, &mut send).await,
-        MessageType::RemoveNodeRequest => handle_remove_node(&raft, &payload, &mut send).await,
+        MessageType::AddNodeRequest => {
+            handle_add_node(&raft, self_id, &payload, &mut send).await
+        }
+        MessageType::RemoveNodeRequest => {
+            handle_remove_node(&raft, self_id, &payload, &mut send).await
+        }
         MessageType::HealthPing => health::handle_health_ping(self_id, &payload, &mut send).await,
+        MessageType::PartitionTransferRequest => {
+            handle_partition_transfer(transfer_provider.as_deref(), payload, send).await
+        }
+        MessageType::PohChainTransferRequest => {
+            handle_poh_chain_transfer(poh_provider.as_deref(), payload, send).await
+        }
+        MessageType::PartitionCutoverRequest => {
+            handle_partition_cutover(cutover_coordinator.as_deref(), payload, send).await
+        }
         _ => {
             tracing::warn!("unexpected message type: {:?}", msg_type);
             Ok(())
@@ -87,6 +150,125 @@ async fn handle_stream(
     if let Err(e) = result {
         tracing::debug!("RPC handler error: {e}");
     }
+}
+
+/// Dispatch a `PartitionTransferRequest`.
+///
+/// The request frame was already consumed by `handle_stream`; deserialize
+/// it and hand off to `serve_partition_transfer_with_request`. If no
+/// provider is wired (raft-only contexts like tests/benches), reply with
+/// a failure end frame so the client surfaces a meaningful error.
+async fn handle_partition_transfer(
+    provider: Option<&dyn PartitionTransferProvider>,
+    request_payload: Vec<u8>,
+    mut send: quinn::SendStream,
+) -> Result<(), aeon_types::AeonError> {
+    let provider = match provider {
+        Some(p) => p,
+        None => {
+            let end = PartitionTransferEnd {
+                success: false,
+                message: "node has no partition-transfer provider configured".to_string(),
+            };
+            let b =
+                bincode::serialize(&end).map_err(|e| aeon_types::AeonError::Serialization {
+                    message: format!("serialize PartitionTransferEnd: {e}"),
+                    source: None,
+                })?;
+            framing::write_frame(&mut send, MessageType::PartitionTransferEndFrame, &b).await?;
+            let _ = send.finish();
+            return Ok(());
+        }
+    };
+
+    let req: PartitionTransferRequest = bincode::deserialize(&request_payload).map_err(|e| {
+        aeon_types::AeonError::Serialization {
+            message: format!("deserialize PartitionTransferRequest: {e}"),
+            source: None,
+        }
+    })?;
+    serve_partition_transfer_with_request(provider, send, &req).await
+}
+
+/// Dispatch a `PohChainTransferRequest`.
+///
+/// Same shape as `handle_partition_transfer`: the request frame was
+/// already consumed by `handle_stream`; deserialize it and hand off to
+/// `serve_poh_chain_transfer_with_request`. If no provider is wired,
+/// reply with `success = false` so the client surfaces a meaningful
+/// error instead of hanging on a half-closed stream.
+async fn handle_poh_chain_transfer(
+    provider: Option<&dyn PohChainProvider>,
+    request_payload: Vec<u8>,
+    mut send: quinn::SendStream,
+) -> Result<(), aeon_types::AeonError> {
+    let provider = match provider {
+        Some(p) => p,
+        None => {
+            let resp = PohChainTransferResponse {
+                success: false,
+                state_bytes: Vec::new(),
+                message: "node has no poh-chain provider configured".to_string(),
+            };
+            let b =
+                bincode::serialize(&resp).map_err(|e| aeon_types::AeonError::Serialization {
+                    message: format!("serialize PohChainTransferResponse: {e}"),
+                    source: None,
+                })?;
+            framing::write_frame(&mut send, MessageType::PohChainTransferResponse, &b).await?;
+            let _ = send.finish();
+            return Ok(());
+        }
+    };
+
+    let req: PohChainTransferRequest = bincode::deserialize(&request_payload).map_err(|e| {
+        aeon_types::AeonError::Serialization {
+            message: format!("deserialize PohChainTransferRequest: {e}"),
+            source: None,
+        }
+    })?;
+    serve_poh_chain_transfer_with_request(provider, send, &req).await
+}
+
+/// Dispatch a `PartitionCutoverRequest`.
+///
+/// Same shape as the partition/PoH transfer handlers: the request frame
+/// was already consumed by `handle_stream`; deserialize it and hand off
+/// to `serve_partition_cutover_with_request`. If no coordinator is
+/// wired, reply with `success = false` so the client surfaces a
+/// meaningful error.
+async fn handle_partition_cutover(
+    coordinator: Option<&dyn CutoverCoordinator>,
+    request_payload: Vec<u8>,
+    mut send: quinn::SendStream,
+) -> Result<(), aeon_types::AeonError> {
+    let coordinator = match coordinator {
+        Some(c) => c,
+        None => {
+            let resp = PartitionCutoverResponse {
+                success: false,
+                final_source_offset: -1,
+                final_poh_sequence: 0,
+                message: "node has no cutover coordinator configured".to_string(),
+            };
+            let b =
+                bincode::serialize(&resp).map_err(|e| aeon_types::AeonError::Serialization {
+                    message: format!("serialize PartitionCutoverResponse: {e}"),
+                    source: None,
+                })?;
+            framing::write_frame(&mut send, MessageType::PartitionCutoverResponse, &b).await?;
+            let _ = send.finish();
+            return Ok(());
+        }
+    };
+
+    let req: PartitionCutoverRequest = bincode::deserialize(&request_payload).map_err(|e| {
+        aeon_types::AeonError::Serialization {
+            message: format!("deserialize PartitionCutoverRequest: {e}"),
+            source: None,
+        }
+    })?;
+    serve_partition_cutover_with_request(coordinator, send, &req).await
 }
 
 async fn handle_append_entries(
@@ -220,8 +402,15 @@ async fn handle_full_snapshot(
 }
 
 /// Handle a join request — add the requesting node as learner then promote to voter.
+///
+/// `self_id` is the configured `ClusterConfig::node_id` (same value REST
+/// `/api/v1/cluster/status` reports). G15: we used to compare against
+/// `raft.metrics().borrow().id`, but on a multi-node cluster that value can
+/// lag or differ from the configured id, causing the leader itself to
+/// reject valid joins with `"not the leader"` — breaking STS scale-up.
 async fn handle_add_node(
     raft: &Raft<AeonRaftConfig>,
+    self_id: NodeId,
     payload: &[u8],
     send: &mut quinn::SendStream,
 ) -> Result<(), aeon_types::AeonError> {
@@ -233,11 +422,18 @@ async fn handle_add_node(
 
     tracing::info!(node_id = req.node_id, addr = %req.addr, "received AddNodeRequest");
 
-    // Check if we are the leader; if not, redirect
     let leader_id = raft.current_leader().await;
-    let my_id = raft.metrics().borrow().id;
 
-    if leader_id != Some(my_id) {
+    if leader_id != Some(self_id) {
+        let metrics_id = raft.metrics().borrow().id;
+        if metrics_id != self_id {
+            tracing::warn!(
+                configured_id = self_id,
+                metrics_id,
+                leader_id = ?leader_id,
+                "G15 diagnostic: raft.metrics().id diverges from ClusterConfig::node_id on AddNode reject"
+            );
+        }
         let resp = JoinResponse {
             success: false,
             leader_id,
@@ -260,7 +456,7 @@ async fn handle_add_node(
     if let Err(e) = raft.add_learner(req.node_id, req.addr.clone(), true).await {
         let resp = JoinResponse {
             success: false,
-            leader_id: Some(my_id),
+            leader_id: Some(self_id),
             message: format!("failed to add learner: {e}"),
         };
         let resp_bytes =
@@ -284,7 +480,7 @@ async fn handle_add_node(
     {
         let resp = JoinResponse {
             success: false,
-            leader_id: Some(my_id),
+            leader_id: Some(self_id),
             message: format!("learner added but promotion failed: {e}"),
         };
         let resp_bytes =
@@ -301,7 +497,7 @@ async fn handle_add_node(
 
     let resp = JoinResponse {
         success: true,
-        leader_id: Some(my_id),
+        leader_id: Some(self_id),
         message: "node added and promoted to voter".to_string(),
     };
     let resp_bytes =
@@ -317,6 +513,7 @@ async fn handle_add_node(
 /// Handle a remove-node request — demote from voter then remove from cluster.
 async fn handle_remove_node(
     raft: &Raft<AeonRaftConfig>,
+    self_id: NodeId,
     payload: &[u8],
     send: &mut quinn::SendStream,
 ) -> Result<(), aeon_types::AeonError> {
@@ -328,11 +525,18 @@ async fn handle_remove_node(
 
     tracing::info!(node_id = req.node_id, "received RemoveNodeRequest");
 
-    // Check if we are the leader
     let leader_id = raft.current_leader().await;
-    let my_id = raft.metrics().borrow().id;
 
-    if leader_id != Some(my_id) {
+    if leader_id != Some(self_id) {
+        let metrics_id = raft.metrics().borrow().id;
+        if metrics_id != self_id {
+            tracing::warn!(
+                configured_id = self_id,
+                metrics_id,
+                leader_id = ?leader_id,
+                "G15 diagnostic: raft.metrics().id diverges from ClusterConfig::node_id on RemoveNode reject"
+            );
+        }
         let resp = RemoveNodeResponse {
             success: false,
             leader_id,
@@ -349,10 +553,10 @@ async fn handle_remove_node(
     }
 
     // Cannot remove self (leader) — transfer leadership first
-    if req.node_id == my_id {
+    if req.node_id == self_id {
         let resp = RemoveNodeResponse {
             success: false,
-            leader_id: Some(my_id),
+            leader_id: Some(self_id),
             message: "cannot remove the leader node; transfer leadership first".to_string(),
         };
         let resp_bytes =
@@ -377,7 +581,7 @@ async fn handle_remove_node(
     {
         let resp = RemoveNodeResponse {
             success: false,
-            leader_id: Some(my_id),
+            leader_id: Some(self_id),
             message: format!("failed to demote voter: {e}"),
         };
         let resp_bytes =
@@ -397,7 +601,7 @@ async fn handle_remove_node(
     {
         let resp = RemoveNodeResponse {
             success: false,
-            leader_id: Some(my_id),
+            leader_id: Some(self_id),
             message: format!("voter demoted but node removal failed: {e}"),
         };
         let resp_bytes =
@@ -414,7 +618,7 @@ async fn handle_remove_node(
 
     let resp = RemoveNodeResponse {
         success: true,
-        leader_id: Some(my_id),
+        leader_id: Some(self_id),
         message: "node removed from cluster".to_string(),
     };
     let resp_bytes =

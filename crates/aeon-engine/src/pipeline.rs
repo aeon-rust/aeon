@@ -117,6 +117,19 @@ pub struct PipelineConfig {
     /// a hash chain of all processed batches for integrity verification.
     #[cfg(feature = "processor-auth")]
     pub poh: Option<PohConfig>,
+    /// G11.c: shared registry of PoH chain snapshots installed by the
+    /// cluster-side `PohChainInstaller` during a CL-6 partition handover.
+    /// When this pipeline's task starts up (or a partition sub-task starts
+    /// in `run_multi_partition`), `create_poh_state` checks the registry
+    /// keyed on `(pipeline_name, partition_id)` — if the transfer driver
+    /// already installed a snapshot, `create_poh_state` resumes from it
+    /// (preserving the hash chain across node moves) instead of genesising
+    /// a fresh chain. Without this wiring, Gate 2's "PoH chain has no gaps
+    /// across transfers" row can't pass because every ownership flip
+    /// would restart the chain at sequence 0. `None` disables — safe for
+    /// all non-cluster callers.
+    #[cfg(all(feature = "processor-auth", feature = "cluster"))]
+    pub poh_installed_chains: Option<Arc<crate::partition_install::InstalledPohChainRegistry>>,
     /// FT-3: Optional L3 backend for `CheckpointBackend::StateStore`.
     /// When `delivery.checkpoint.backend == StateStore`, the sink task
     /// persists checkpoint records into this store under the `checkpoint/`
@@ -153,6 +166,26 @@ pub struct PipelineConfig {
     /// calls `adjust(+bytes)` on append; `eo2_gc_sweep` calls
     /// `adjust(-bytes)` on GC reclaim. `None` disables backpressure entirely.
     pub eo2_capacity: Option<crate::eo2_backpressure::PipelineCapacity>,
+    /// EO-2 P6: optional shared `AckSeqTracker` for multi-sink pipelines.
+    /// When `Some`, `build_sink_task_ctx` uses this tracker instead of
+    /// creating a fresh one, so every sink task in a multi-sink topology
+    /// contributes to the same `min_across_sinks()` frontier used by L2 GC.
+    /// `None` means single-sink — a per-task tracker is created as before.
+    pub eo2_shared_ack_tracker: Option<crate::eo2::AckSeqTracker>,
+    /// G2/CL-6: partition id this pipeline (sub-)task owns. Single-partition
+    /// pipelines default to `PartitionId::new(0)`; multi-partition pipelines
+    /// have their per-partition sub-tasks stamped with the real id by
+    /// `run_multi_partition`. Used as the key for `write_gate` lookups and
+    /// for future per-partition metrics labels.
+    pub partition_id: PartitionId,
+    /// G2/CL-6: optional per-partition write-freeze gate. When `Some`, the
+    /// source loop calls `try_enter` before each `next_batch`; a racing
+    /// `request_freeze_and_drain` from the cluster-side cutover coordinator
+    /// will return `None`, causing the source loop to exit cleanly after its
+    /// in-flight fetch drains. `None` means this pipeline is not subject to
+    /// partition handover (local/test use), and the gate check compiles to
+    /// a single branch.
+    pub write_gate: Option<Arc<crate::write_gate::WriteGate>>,
 }
 
 impl Default for PipelineConfig {
@@ -165,12 +198,17 @@ impl Default for PipelineConfig {
             delivery: DeliveryConfig::default(),
             #[cfg(feature = "processor-auth")]
             poh: None,
+            #[cfg(all(feature = "processor-auth", feature = "cluster"))]
+            poh_installed_chains: None,
             l3_checkpoint_store: None,
             pipeline_name: String::new(),
             l2_registry: None,
             sink_name: String::from("sink"),
             eo2_metrics: None,
             eo2_capacity: None,
+            eo2_shared_ack_tracker: None,
+            partition_id: PartitionId::new(0),
+            write_gate: None,
         }
     }
 }
@@ -179,7 +217,15 @@ impl Default for PipelineConfig {
 pub struct PipelineMetrics {
     pub events_received: AtomicU64,
     pub events_processed: AtomicU64,
+    /// Outputs the engine handed to the sink (one increment per `write_batch`
+    /// invocation, summing the delivered count returned by the sink).
     pub outputs_sent: AtomicU64,
+    /// Outputs the downstream system actually confirmed (broker ack, HTTP
+    /// 2xx, fsync return, …). Driven by sinks via the `Sink::on_ack_callback`
+    /// hook. Equals `outputs_sent` for tiers that ack inline; lags it for
+    /// async-ack tiers (Kafka `UnorderedBatch`, HTTP fire-and-forget). The
+    /// gap `outputs_sent - outputs_acked` is the in-flight pending count.
+    pub outputs_acked: AtomicU64,
     /// Number of checkpoints written (UnorderedBatch mode).
     pub checkpoints_written: AtomicU64,
     /// Events permanently failed after retry exhaustion or SkipToDlq policy.
@@ -196,11 +242,21 @@ impl PipelineMetrics {
             events_received: AtomicU64::new(0),
             events_processed: AtomicU64::new(0),
             outputs_sent: AtomicU64::new(0),
+            outputs_acked: AtomicU64::new(0),
             checkpoints_written: AtomicU64::new(0),
             events_failed: AtomicU64::new(0),
             events_retried: AtomicU64::new(0),
             poh_entries: AtomicU64::new(0),
         }
+    }
+
+    /// Build an `Arc<dyn Fn(usize) + Send + Sync>` that bumps `outputs_acked`
+    /// when invoked. Handed to a sink via `Sink::on_ack_callback`.
+    pub fn ack_callback(self: &Arc<Self>) -> aeon_types::SinkAckCallback {
+        let metrics = Arc::clone(self);
+        Arc::new(move |n: usize| {
+            metrics.outputs_acked.fetch_add(n as u64, Ordering::Relaxed);
+        })
     }
 }
 
@@ -212,14 +268,36 @@ impl Default for PipelineMetrics {
 
 /// Create a shared PoH chain from pipeline config.
 /// Returns `None` if PoH is disabled or the feature is not compiled.
+///
+/// G11.c: before genesising a fresh chain, consult
+/// `config.poh_installed_chains` (when the `cluster` feature is enabled).
+/// The cluster-side `PohChainInstaller` drops a per-`(pipeline, partition)`
+/// snapshot there during a partition handover, so resumed partitions pick
+/// up from where the previous owner left off instead of restarting at
+/// sequence 0. The registry entry is consumed (taken) so a subsequent
+/// restart without a fresh install falls back to genesis — callers that
+/// need chain continuity across restarts must re-install first.
 #[cfg(feature = "processor-auth")]
 pub fn create_poh_state(config: &PipelineConfig) -> Option<PohState> {
-    config.poh.as_ref().map(|poh_config| {
-        Arc::new(Mutex::new(aeon_crypto::poh::PohChain::new(
-            poh_config.partition,
-            poh_config.max_recent_entries,
-        )))
-    })
+    let poh_config = config.poh.as_ref()?;
+
+    #[cfg(feature = "cluster")]
+    if let Some(registry) = config.poh_installed_chains.as_ref() {
+        if let Some(chain) = registry.take(&config.pipeline_name, config.partition_id) {
+            tracing::info!(
+                pipeline = %config.pipeline_name,
+                partition = config.partition_id.as_u16(),
+                sequence = chain.sequence(),
+                "G11.c: resuming PoH chain from transfer-driver installed snapshot"
+            );
+            return Some(Arc::new(Mutex::new(chain)));
+        }
+    }
+
+    Some(Arc::new(Mutex::new(aeon_crypto::poh::PohChain::new(
+        poh_config.partition,
+        poh_config.max_recent_entries,
+    ))))
 }
 
 /// TR-2: Transfer host-side state from an outgoing processor into an
@@ -587,6 +665,7 @@ where
     let metrics_src = Arc::clone(&metrics);
     let src_capacity = config.eo2_capacity.clone();
     let src_eo2_metrics = config.eo2_metrics.clone();
+    let src_write_gate = config.write_gate.clone();
 
     // Source task: poll source, push event batches into SPSC
     let source_core = core_assignment.map(|c| c.source);
@@ -621,6 +700,21 @@ where
                 }
             }
 
+            // G2/CL-6: check per-partition write-freeze gate. When the
+            // cluster cutover coordinator has flipped to `FreezeRequested`,
+            // `try_enter` returns `None` and the source loop exits cleanly;
+            // any drain waiter observes `in_flight = 0` as soon as this
+            // task hits `drop(src_prod)` below. The guard is held across
+            // `next_batch` so a racing freeze_and_drain blocks until the
+            // in-flight fetch completes.
+            let _gate_guard = match src_write_gate.as_ref() {
+                Some(gate) => match gate.try_enter() {
+                    Some(g) => Some(g),
+                    None => break,
+                },
+                None => None,
+            };
+
             let events = match source.next_batch().await {
                 Ok(events) => events,
                 Err(e) => return Err(e),
@@ -643,6 +737,8 @@ where
                     }
                 }
             }
+            // `_gate_guard` drops here, decrementing in_flight. A parked
+            // drain waiter wakes once every gate's in-flight reaches zero.
         }
         // Signal: no more events
         drop(src_prod);
@@ -1029,7 +1125,12 @@ fn build_sink_task_ctx(config: &PipelineConfig, core: Option<usize>) -> SinkTask
         eo2_ack_tracker: if config.delivery.durability
             != aeon_types::DurabilityMode::None
         {
-            Some(crate::eo2::AckSeqTracker::new())
+            Some(
+                config
+                    .eo2_shared_ack_tracker
+                    .clone()
+                    .unwrap_or_default(),
+            )
         } else {
             None
         },
@@ -1047,6 +1148,12 @@ pub struct MultiPartitionConfig {
     pub partition_count: usize,
     /// Base pipeline config (cloned per partition, core pinning resolved automatically).
     pub pipeline: PipelineConfig,
+    /// G2/CL-6: optional shared write-gate registry. When `Some`, each
+    /// partition's `PipelineConfig` gets a gate looked up from the registry
+    /// keyed by `(pipeline_name, partition_id)`; the cluster cutover
+    /// coordinator can then freeze a single partition without affecting
+    /// the others. `None` disables gates for this multi-partition run.
+    pub gate_registry: Option<Arc<crate::write_gate::WriteGateRegistry>>,
 }
 
 /// Runs independent pipelines for each partition, with optional per-partition core pinning.
@@ -1102,6 +1209,10 @@ where
         let ledger = ledger_factory.as_ref().map(|f| f(i));
 
         // Per-partition config: override core pinning with resolved assignment
+        let partition_id = PartitionId::new(u16::try_from(i).unwrap_or(u16::MAX));
+        let write_gate = config.gate_registry.as_ref().map(|reg| {
+            reg.get_or_create(&config.pipeline.pipeline_name, partition_id)
+        });
         let mut partition_config = PipelineConfig {
             source_buffer_capacity: config.pipeline.source_buffer_capacity,
             sink_buffer_capacity: config.pipeline.sink_buffer_capacity,
@@ -1110,12 +1221,17 @@ where
             delivery: config.pipeline.delivery.clone(),
             #[cfg(feature = "processor-auth")]
             poh: config.pipeline.poh.clone(),
+            #[cfg(all(feature = "processor-auth", feature = "cluster"))]
+            poh_installed_chains: config.pipeline.poh_installed_chains.clone(),
             l3_checkpoint_store: config.pipeline.l3_checkpoint_store.clone(),
             pipeline_name: config.pipeline.pipeline_name.clone(),
             l2_registry: config.pipeline.l2_registry.clone(),
             sink_name: config.pipeline.sink_name.clone(),
             eo2_metrics: config.pipeline.eo2_metrics.clone(),
             eo2_capacity: config.pipeline.eo2_capacity.clone(),
+            eo2_shared_ack_tracker: config.pipeline.eo2_shared_ack_tracker.clone(),
+            partition_id,
+            write_gate,
         };
 
         if let Some(ref assignments) = core_assignments {
@@ -3089,6 +3205,7 @@ mod tests {
         let config = MultiPartitionConfig {
             partition_count,
             pipeline: PipelineConfig::default(),
+            gate_registry: None,
         };
         let metrics = Arc::new(PipelineMetrics::new());
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -3125,6 +3242,7 @@ mod tests {
         let config = MultiPartitionConfig {
             partition_count,
             pipeline: PipelineConfig::default(),
+            gate_registry: None,
         };
         let metrics = Arc::new(PipelineMetrics::new());
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -3169,6 +3287,7 @@ mod tests {
         let config = MultiPartitionConfig {
             partition_count: 0,
             pipeline: PipelineConfig::default(),
+            gate_registry: None,
         };
         let metrics = Arc::new(PipelineMetrics::new());
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -3196,6 +3315,7 @@ mod tests {
                 core_pinning: CorePinning::Auto,
                 ..Default::default()
             },
+            gate_registry: None,
         };
         let metrics = Arc::new(PipelineMetrics::new());
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -4343,6 +4463,79 @@ mod tests {
             assert_eq!(chain.sequence(), 0);
         }
 
+        /// G11.c — when a PoH chain has been pre-installed by the cluster-
+        /// side `PohChainInstaller` for `(pipeline_name, partition_id)`,
+        /// `create_poh_state` must resume from that snapshot instead of
+        /// genesising a fresh chain. The snapshot is consumed (taken) so a
+        /// second startup without a fresh install falls back to genesis.
+        #[cfg(feature = "cluster")]
+        #[tokio::test]
+        async fn create_poh_state_resumes_installed_chain_g11c() {
+            use crate::partition_install::InstalledPohChainRegistry;
+            use aeon_cluster::types::PohChainTransferRequest;
+            use aeon_crypto::poh::PohVerifyMode;
+
+            // Build a registry and install a chain that has already run
+            // 5 batches through it (simulating what the outgoing owner
+            // shipped to this node during CL-6).
+            let registry = InstalledPohChainRegistry::new();
+            let installer = crate::partition_install::PohChainInstallerImpl::new(
+                registry.clone(),
+                PohVerifyMode::Verify,
+            );
+            let mut src_chain = aeon_crypto::poh::PohChain::new(PartitionId::new(3), 64);
+            for i in 0..5i64 {
+                src_chain.append_batch(
+                    &[format!("evt-{i}").as_bytes()],
+                    (i + 1) * 1000,
+                    None,
+                );
+            }
+            let state_bytes = src_chain.export_state().to_bytes().unwrap();
+            let req = PohChainTransferRequest {
+                pipeline: "pl-resume".to_string(),
+                partition: PartitionId::new(3),
+            };
+            aeon_cluster::partition_driver::PohChainInstaller::install(
+                &installer,
+                &req,
+                state_bytes,
+            )
+            .unwrap();
+
+            // Now construct a PipelineConfig pointed at the same pipeline/
+            // partition and assert `create_poh_state` resumes.
+            let config = PipelineConfig {
+                pipeline_name: "pl-resume".to_string(),
+                partition_id: PartitionId::new(3),
+                poh: Some(PohConfig {
+                    partition: PartitionId::new(3),
+                    max_recent_entries: 64,
+                    signing_key: None,
+                }),
+                poh_installed_chains: Some(Arc::new(registry.clone())),
+                ..PipelineConfig::default()
+            };
+            let state = create_poh_state(&config).expect("poh enabled");
+            let chain = state.lock().await;
+            assert_eq!(chain.partition(), PartitionId::new(3));
+            assert_eq!(
+                chain.sequence(),
+                5,
+                "resumed chain must carry source sequence, not genesis"
+            );
+            drop(chain);
+
+            // Second call must genesis — the take() consumed the snapshot.
+            let state2 = create_poh_state(&config).expect("poh enabled");
+            let chain2 = state2.lock().await;
+            assert_eq!(
+                chain2.sequence(),
+                0,
+                "no fresh install → next create_poh_state must genesis"
+            );
+        }
+
         #[tokio::test]
         async fn poh_append_batch_helper_works() {
             let poh = Arc::new(Mutex::new(
@@ -4811,6 +5004,85 @@ mod tests {
                 .unwrap();
 
             assert_eq!(metrics.events_received.load(Ordering::Relaxed), 15);
+        }
+
+        #[test]
+        fn shared_ack_tracker_threaded_through_build_sink_task_ctx() {
+            // P6 multi-sink wiring: two sink configs carrying the same shared
+            // AckSeqTracker must yield SinkTaskCtxs that share one tracker
+            // handle. Fast sink's ack must be visible to the slow sink's
+            // tracker, and `min_across_sinks()` must report the lagging sink.
+            let shared = crate::eo2::AckSeqTracker::new();
+
+            let mut cfg_fast = PipelineConfig::default();
+            cfg_fast.pipeline_name = "multi-sink".into();
+            cfg_fast.sink_name = "fast".into();
+            cfg_fast.delivery.durability = DurabilityMode::OrderedBatch;
+            cfg_fast.eo2_shared_ack_tracker = Some(shared.clone());
+
+            let mut cfg_slow = PipelineConfig::default();
+            cfg_slow.pipeline_name = "multi-sink".into();
+            cfg_slow.sink_name = "slow".into();
+            cfg_slow.delivery.durability = DurabilityMode::OrderedBatch;
+            cfg_slow.eo2_shared_ack_tracker = Some(shared.clone());
+
+            let ctx_fast = super::super::build_sink_task_ctx(&cfg_fast, None);
+            let ctx_slow = super::super::build_sink_task_ctx(&cfg_slow, None);
+
+            let tracker_fast = ctx_fast
+                .eo2_ack_tracker
+                .as_ref()
+                .expect("fast sink must get a tracker under OrderedBatch");
+            let tracker_slow = ctx_slow
+                .eo2_ack_tracker
+                .as_ref()
+                .expect("slow sink must get a tracker under OrderedBatch");
+
+            tracker_fast.register_sink("fast");
+            tracker_slow.register_sink("slow");
+
+            // Fast sink acks 100; slow sink lags at 20.
+            tracker_fast.record_ack("fast", 100);
+            tracker_slow.record_ack("slow", 20);
+
+            // Shared handle: fast's record must be visible through the slow
+            // context's tracker snapshot.
+            let snap = tracker_slow.snapshot();
+            assert_eq!(snap.get("fast").copied(), Some(100));
+            assert_eq!(snap.get("slow").copied(), Some(20));
+
+            // GC frontier must be the slow sink's watermark.
+            assert_eq!(tracker_fast.min_across_sinks(), Some(20));
+            assert_eq!(tracker_slow.min_across_sinks(), Some(20));
+
+            // Advancing slow to 50 advances the frontier to 50.
+            tracker_slow.record_ack("slow", 50);
+            assert_eq!(shared.min_across_sinks(), Some(50));
+        }
+
+        #[test]
+        fn default_shared_ack_tracker_is_none_single_sink_isolated() {
+            // No shared tracker → each sink task gets its own fresh tracker.
+            // Two configs without sharing must NOT observe each other's acks.
+            let mut cfg_a = PipelineConfig::default();
+            cfg_a.sink_name = "a".into();
+            cfg_a.delivery.durability = DurabilityMode::OrderedBatch;
+
+            let mut cfg_b = PipelineConfig::default();
+            cfg_b.sink_name = "b".into();
+            cfg_b.delivery.durability = DurabilityMode::OrderedBatch;
+
+            let ctx_a = super::super::build_sink_task_ctx(&cfg_a, None);
+            let ctx_b = super::super::build_sink_task_ctx(&cfg_b, None);
+
+            let tracker_a = ctx_a.eo2_ack_tracker.as_ref().unwrap();
+            let tracker_b = ctx_b.eo2_ack_tracker.as_ref().unwrap();
+
+            tracker_a.register_sink("a");
+            tracker_a.record_ack("a", 99);
+
+            // Tracker B is isolated — must not see A's ack.
+            assert_eq!(tracker_b.snapshot().get("a"), None);
         }
 
     }

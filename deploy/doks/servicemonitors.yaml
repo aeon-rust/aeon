@@ -1,0 +1,51 @@
+# ServiceMonitor resources so kube-prometheus-stack scrapes aeon + redpanda.
+#
+# Apply after kube-prometheus-stack is installed (CRDs must exist first):
+#   kubectl apply -f deploy/doks/servicemonitors.yaml
+#
+# The Prometheus CRD is configured with
+# `serviceMonitorSelectorNilUsesHelmValues: false`, so ServiceMonitors in
+# any namespace are discovered regardless of release labels.
+
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: aeon
+  namespace: aeon
+  labels:
+    app.kubernetes.io/name: aeon
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: aeon
+  endpoints:
+    - port: api          # 4471/TCP — exposes /metrics
+      path: /metrics
+      interval: 15s
+      scrapeTimeout: 10s
+  namespaceSelector:
+    matchNames:
+      - aeon
+
+---
+# Redpanda exposes the admin API on 9644 with Prometheus text at /metrics
+# and /public_metrics (cluster-wide view). We scrape per-pod.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: redpanda
+  namespace: redpanda
+  labels:
+    app.kubernetes.io/name: redpanda
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: redpanda
+  endpoints:
+    - port: admin        # 9644/TCP — defined by the redpanda chart
+      path: /public_metrics
+      interval: 15s
+      scrapeTimeout: 10s
+  namespaceSelector:
+    matchNames:
+      - redpanda

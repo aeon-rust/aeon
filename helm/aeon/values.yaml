@@ -62,9 +62,47 @@ cluster:
   enabled: false
   replicas: 3
   partitions: 16
+  # G11.a — PoH chain verification policy on CL-6b partition-transfer install.
+  # Empty string = use binary default ("verify"). Operator override, rarely
+  # set. Valid values: verify | verify_with_key | trust_extend.
+  pohVerifyMode: ""
+  # G11.b — name of the single pipeline this node's partition-transfer driver
+  # handles. Must match the pipeline created via REST. If unset, no transfer
+  # driver is spawned and Raft-committed Transferring rows stay stuck.
+  pipelineName: ""
+  # G11.b — filesystem root for L2 body segments received during transfer.
+  # Empty = aeon-cli default (`<artifactDir>/l2body`). Point at a PVC mount
+  # for durable segments across pod restarts.
+  l2Root: ""
   tls:
     enabled: false
     secretName: aeon-tls  # K8s Secret with tls.crt, tls.key, ca.crt
+  # G14 — Raft timing overrides. Leave all three empty (or omit) to use the
+  # binary default (500/1500/3000 ms). Set all three for a custom preset;
+  # validation rejects partial overrides and values that violate
+  # heartbeat < election_min < election_max. Recommended presets:
+  #   fast_failover     : 250  /  750  / 2000   (<5 s target, reliable VPC)
+  #   prod_recommended  : 500  / 2000  / 6000   (wider jitter, ~5 s failover)
+  #   flaky_network     : 500  / 3000  / 12000  (congested / cross-region)
+  raftTiming:
+    heartbeatMs: ""
+    electionMinMs: ""
+    electionMaxMs: ""
+
+# Graceful shutdown budget. Aeon's SIGINT/SIGTERM handler flips /ready=503,
+# runs leader-relinquish + endpoint-propagation sleep in parallel, stops
+# running pipelines (SPSC drain + sink flush), and shuts down the Raft
+# node. terminationGracePeriod must cover all of that or kubelet sends
+# SIGKILL.
+#
+# G14: `leaderRelinquishMs` is how long the handler waits for Raft
+# leadership to move to a follower. Runs concurrently with the preStop
+# sleep, so no additional grace period is needed when this is less than
+# or equal to `preStopDelaySeconds * 1000`.
+gracefulShutdown:
+  terminationGracePeriodSeconds: 90
+  preStopDelaySeconds: 5
+  leaderRelinquishMs: 4000
 
 # Horizontal Pod Autoscaler
 autoscaling:

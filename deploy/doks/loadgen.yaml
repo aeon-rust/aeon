@@ -1,0 +1,28 @@
+# Loadgen pod for Session A — runs aeon-producer on demand via kubectl exec.
+# Pinned to monitoring pool so it does not steal CPU from aeon or redpanda pools.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: loadgen
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: loadgen
+  namespace: loadgen
+  labels:
+    app: loadgen
+spec:
+  nodeSelector:
+    workload: monitoring
+  containers:
+    - name: aeon
+      image: registry.digitalocean.com/rust-proxy-registry/aeon:70c68b3
+      imagePullPolicy: Always
+      command: ["sleep", "infinity"]
+      resources:
+        requests: { cpu: "500m", memory: "256Mi" }
+        limits:   { cpu: "2", memory: "1Gi" }
+  imagePullSecrets:
+    - name: registry-rust-proxy-registry
+  restartPolicy: Never

@@ -9,9 +9,9 @@
 //! 3. **L3→WAL failover**: L3 primary fails, checkpoint falls back to WAL,
 //!    primary heals, WAL drains back.
 //!
-//! Tests blocked on P6 (multi-source/multi-sink topology):
-//! - Multi-sink with one stalled (requires fan-out wiring)
-//! - Multi-source interleaving (pull + push + poll into one processor)
+//! Multi-sink / multi-source tests (P6 unblocked 2026-04-16):
+//! - Multi-sink with one stalled (shared AckSeqTracker pins GC to laggard)
+//! - Multi-source interleaving (Pull + Push + Poll fan-in via DAG runner)
 
 use aeon_engine::checkpoint::{CheckpointPersist, CheckpointRecord, WalCheckpointStore};
 use aeon_engine::delivery::{CheckpointBackend, L2BodyStoreConfig};
@@ -624,5 +624,292 @@ fn recovery_plan_from_multi_sink_checkpoint() {
             assert_eq!(seq, 200);
         }
         other => panic!("expected ReplayL2From, got {other:?}"),
+    }
+}
+
+// ── Test 7: Multi-sink with one stalled — shared AckSeqTracker pins GC ─
+
+/// Sink that delays every write_batch by `delay` before recording delivery.
+/// Used as the "stalled" sink in the multi-sink test.
+struct DelayedSink {
+    delay: Duration,
+    count: Arc<AtomicU64>,
+}
+
+impl Sink for DelayedSink {
+    async fn write_batch(&mut self, outputs: Vec<Output>) -> Result<BatchResult, AeonError> {
+        tokio::time::sleep(self.delay).await;
+        let n = outputs.len() as u64;
+        self.count.fetch_add(n, Ordering::Relaxed);
+        let ids: Vec<uuid::Uuid> = outputs.iter().filter_map(|o| o.source_event_id).collect();
+        Ok(BatchResult::all_delivered(ids))
+    }
+    async fn flush(&mut self) -> Result<(), AeonError> {
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multi_sink_shared_ack_tracker_paces_gc_by_laggard() {
+    // Two pipelines run concurrently, each with its own source emitting
+    // the same 30 events (same L2 registry + partition). They share one
+    // AckSeqTracker keyed by sink name. The fast sink is instant; the
+    // slow sink delays every batch. Verify:
+    //   (a) both sinks deliver all 30 events,
+    //   (b) the shared tracker has entries for both sinks,
+    //   (c) post-run, min_across_sinks equals the lesser of the two final
+    //       ack watermarks (both should be at max l2_seq since both finish).
+    let tmp = tempfile::tempdir().unwrap();
+
+    // Shared primitives: one L2 registry + one AckSeqTracker across both
+    // sink pipelines.
+    let registry = PipelineL2Registry::new(L2BodyStoreConfig {
+        root: Some(tmp.path().to_path_buf()),
+        segment_bytes: 4096,
+    });
+    let shared_tracker = aeon_engine::eo2::AckSeqTracker::new();
+
+    let events = make_events(30);
+
+    // Fast sink pipeline.
+    let fast_count = Arc::new(AtomicU64::new(0));
+    let fast_source = OneShotPushSource {
+        batch: Some(events.clone()),
+    };
+    let fast_sink = DelayedSink {
+        delay: Duration::from_millis(0),
+        count: Arc::clone(&fast_count),
+    };
+    let mut fast_cfg = PipelineConfig::default();
+    fast_cfg.pipeline_name = "multi-sink".into();
+    fast_cfg.sink_name = "fast".into();
+    fast_cfg.l2_registry = Some(registry.clone());
+    fast_cfg.delivery.durability = DurabilityMode::OrderedBatch;
+    fast_cfg.delivery.flush.interval = Duration::from_millis(1);
+    fast_cfg.eo2_shared_ack_tracker = Some(shared_tracker.clone());
+    let fast_metrics = Arc::new(PipelineMetrics::new());
+    let fast_shutdown = Arc::new(AtomicBool::new(false));
+
+    // Slow sink pipeline — same pipeline_name + partition, so it shares L2.
+    let slow_count = Arc::new(AtomicU64::new(0));
+    let slow_source = OneShotPushSource {
+        batch: Some(events.clone()),
+    };
+    let slow_sink = DelayedSink {
+        delay: Duration::from_millis(8),
+        count: Arc::clone(&slow_count),
+    };
+    let mut slow_cfg = PipelineConfig::default();
+    slow_cfg.pipeline_name = "multi-sink".into();
+    slow_cfg.sink_name = "slow".into();
+    slow_cfg.l2_registry = Some(registry.clone());
+    slow_cfg.delivery.durability = DurabilityMode::OrderedBatch;
+    slow_cfg.delivery.flush.interval = Duration::from_millis(1);
+    slow_cfg.eo2_shared_ack_tracker = Some(shared_tracker.clone());
+    let slow_metrics = Arc::new(PipelineMetrics::new());
+    let slow_shutdown = Arc::new(AtomicBool::new(false));
+
+    // Run both pipelines concurrently.
+    let fast_fut = run_buffered(
+        fast_source,
+        PassthroughProcessor::new(Arc::from("out")),
+        fast_sink,
+        fast_cfg,
+        fast_metrics.clone(),
+        fast_shutdown,
+        None,
+    );
+    let slow_fut = run_buffered(
+        slow_source,
+        PassthroughProcessor::new(Arc::from("out")),
+        slow_sink,
+        slow_cfg,
+        slow_metrics.clone(),
+        slow_shutdown,
+        None,
+    );
+    let (fast_res, slow_res) = tokio::join!(fast_fut, slow_fut);
+    fast_res.unwrap();
+    slow_res.unwrap();
+
+    // (a) Both sinks delivered every event.
+    assert_eq!(fast_count.load(Ordering::Relaxed), 30);
+    assert_eq!(slow_count.load(Ordering::Relaxed), 30);
+    assert_eq!(fast_metrics.outputs_sent.load(Ordering::Relaxed), 30);
+    assert_eq!(slow_metrics.outputs_sent.load(Ordering::Relaxed), 30);
+
+    // (b) Shared tracker has both sinks registered.
+    let snap = shared_tracker.snapshot();
+    assert!(snap.contains_key("fast"), "fast sink must be in shared tracker: {snap:?}");
+    assert!(snap.contains_key("slow"), "slow sink must be in shared tracker: {snap:?}");
+
+    // (c) min_across_sinks is defined — neither sink is at 0 since both
+    //     fully completed and recorded at least one ack.
+    let min_ack = shared_tracker.min_across_sinks().expect("both sinks acked");
+    assert!(min_ack > 0, "min_across_sinks should advance past 0 after delivery");
+    assert_eq!(
+        min_ack,
+        *snap.values().min().unwrap(),
+        "min_across_sinks must equal min of snapshot values"
+    );
+}
+
+// ── Test 8: Multi-source interleaving — Pull + Push + Poll fan-in ──────
+
+/// Pull source: emits one batch then EOF, declares SourceKind::Pull.
+struct PullTestSource {
+    batch: Option<Vec<Event>>,
+}
+impl Source for PullTestSource {
+    fn next_batch(
+        &mut self,
+    ) -> impl std::future::Future<Output = Result<Vec<Event>, AeonError>> + Send {
+        let b = self.batch.take().unwrap_or_default();
+        async move { Ok(b) }
+    }
+    fn source_kind(&self) -> SourceKind {
+        SourceKind::Pull
+    }
+}
+
+/// Poll source: emits one batch then EOF, declares SourceKind::Poll.
+struct PollTestSource {
+    batch: Option<Vec<Event>>,
+}
+impl Source for PollTestSource {
+    fn next_batch(
+        &mut self,
+    ) -> impl std::future::Future<Output = Result<Vec<Event>, AeonError>> + Send {
+        let b = self.batch.take().unwrap_or_default();
+        async move { Ok(b) }
+    }
+    fn source_kind(&self) -> SourceKind {
+        SourceKind::Poll
+    }
+}
+
+/// Generates events tagged with a per-source name so we can verify
+/// per-source preservation in the interleaved output.
+fn tagged_events(source_name: &str, n: usize) -> Vec<Event> {
+    let src: Arc<str> = Arc::from(source_name);
+    (0..n)
+        .map(|i| {
+            Event::new(
+                uuid::Uuid::now_v7(),
+                i as i64,
+                Arc::clone(&src),
+                PartitionId::new(0),
+                Bytes::from(format!("{source_name}-{i}")),
+            )
+        })
+        .collect()
+}
+
+/// Erased trait object boxing — `run_fan_in` needs a `&mut [S]` of a single
+/// concrete type. We wrap each source in an enum.
+enum AnyKindSource {
+    Pull(PullTestSource),
+    Push(OneShotPushSource),
+    Poll(PollTestSource),
+}
+impl Source for AnyKindSource {
+    fn next_batch(
+        &mut self,
+    ) -> impl std::future::Future<Output = Result<Vec<Event>, AeonError>> + Send {
+        async move {
+            match self {
+                AnyKindSource::Pull(s) => s.next_batch().await,
+                AnyKindSource::Push(s) => s.next_batch().await,
+                AnyKindSource::Poll(s) => s.next_batch().await,
+            }
+        }
+    }
+    fn source_kind(&self) -> SourceKind {
+        match self {
+            AnyKindSource::Pull(_) => SourceKind::Pull,
+            AnyKindSource::Push(_) => SourceKind::Push,
+            AnyKindSource::Poll(_) => SourceKind::Poll,
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn multi_source_interleaving_pull_push_poll_fan_in() {
+    // Three sources of different kinds fan-in to one processor/sink via
+    // `run_fan_in`. Each emits 10 events tagged with a distinct source
+    // name. Verify:
+    //   (a) all 30 events arrive at the sink,
+    //   (b) per-source order is preserved (events from the same source
+    //       appear in their emission order in the sink stream),
+    //   (c) the three source kinds are all represented — no kind is lost.
+    let pull_events = tagged_events("pull-src", 10);
+    let push_events = tagged_events("push-src", 10);
+    let poll_events = tagged_events("poll-src", 10);
+
+    let pull_ids: Vec<uuid::Uuid> = pull_events.iter().map(|e| e.id).collect();
+    let push_ids: Vec<uuid::Uuid> = push_events.iter().map(|e| e.id).collect();
+    let poll_ids: Vec<uuid::Uuid> = poll_events.iter().map(|e| e.id).collect();
+
+    let mut sources: Vec<AnyKindSource> = vec![
+        AnyKindSource::Pull(PullTestSource {
+            batch: Some(pull_events),
+        }),
+        AnyKindSource::Push(OneShotPushSource {
+            batch: Some(push_events),
+        }),
+        AnyKindSource::Poll(PollTestSource {
+            batch: Some(poll_events),
+        }),
+    ];
+    // Sanity: source_kind() dispatches correctly through the enum.
+    assert_eq!(sources[0].source_kind(), SourceKind::Pull);
+    assert_eq!(sources[1].source_kind(), SourceKind::Push);
+    assert_eq!(sources[2].source_kind(), SourceKind::Poll);
+
+    let processor = PassthroughProcessor::new(Arc::from("out"));
+    let mut sink = TrackingSink::new();
+    let delivered = Arc::clone(&sink.delivered_ids);
+    let metrics = aeon_engine::PipelineMetrics::new();
+    let shutdown = AtomicBool::new(false);
+
+    aeon_engine::run_fan_in(&mut sources, &processor, &mut sink, &metrics, &shutdown)
+        .await
+        .unwrap();
+
+    // (a) All 30 events arrived.
+    let ids = delivered.lock().unwrap().clone();
+    assert_eq!(ids.len(), 30, "expected 30 delivered events, got {}", ids.len());
+
+    // (c) Each source contributed all its events.
+    let delivered_set: HashSet<uuid::Uuid> = ids.iter().copied().collect();
+    for id in &pull_ids {
+        assert!(delivered_set.contains(id), "pull event {id} missing");
+    }
+    for id in &push_ids {
+        assert!(delivered_set.contains(id), "push event {id} missing");
+    }
+    for id in &poll_ids {
+        assert!(delivered_set.contains(id), "poll event {id} missing");
+    }
+
+    // (b) Per-source ordering preserved. For each source, the event IDs
+    //     must appear in their emission order in the delivered stream.
+    for (label, source_ids) in [
+        ("pull", &pull_ids),
+        ("push", &push_ids),
+        ("poll", &poll_ids),
+    ] {
+        let positions: Vec<usize> = source_ids
+            .iter()
+            .map(|id| {
+                ids.iter()
+                    .position(|d| d == id)
+                    .unwrap_or_else(|| panic!("{label} event {id} not in stream"))
+            })
+            .collect();
+        assert!(
+            positions.windows(2).all(|w| w[0] < w[1]),
+            "{label} source order violated: positions {positions:?}"
+        );
     }
 }

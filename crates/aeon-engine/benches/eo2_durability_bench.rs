@@ -1,6 +1,6 @@
 //! EO-2 Durability Benchmarks — P10
 //!
-//! Measures the cost of the durability stack across four dimensions:
+//! Measures the cost of the durability stack across five dimensions:
 //!
 //! 1. **Per-event overhead by durability mode** — `None` vs `OrderedBatch`
 //!    through a blackhole sink, isolating L2 write + checkpoint cost.
@@ -10,6 +10,9 @@
 //!    1ms / 10ms / 100ms / 500ms flush intervals.
 //! 4. **Capacity backpressure overhead** — pipeline with vs without
 //!    `PipelineCapacity` tracking enabled.
+//! 5. **Content-hash dedup cost (poll sources)** — `ContentHashDedup::
+//!    check_and_mark` ns/event for first-seen and repeat-lookup paths at
+//!    multiple payload sizes. Target: ~30 ns/event per EO-2 design §4.3.
 //!
 //! Run: `cargo bench -p aeon-engine --bench eo2_durability_bench`
 
@@ -291,11 +294,96 @@ fn capacity_tracking_overhead(c: &mut Criterion) {
     group.finish();
 }
 
+/// Bench 5 — content-hash dedup cost per payload.
+///
+/// Measures `ContentHashDedup::check_and_mark` under two access patterns:
+/// - **first_seen**: every payload is unique; we pay hash + insert.
+/// - **repeat_lookup**: every payload is a re-lookup of a warm hash; we
+///   pay hash + map-get only.
+///
+/// Payload sizes span the realistic poll-source range (64 B .. 4 KiB).
+fn content_hash_dedup(c: &mut Criterion) {
+    use aeon_engine::eo2_content_hash::{ContentHashAlgorithm, ContentHashDedup};
+
+    let mut group = c.benchmark_group("content_hash_dedup");
+
+    for size in [64usize, 256, 1024, 4096] {
+        group.throughput(Throughput::Bytes(size as u64));
+
+        // First-seen: every call gets a distinct payload, so every call
+        // hashes + inserts. Amortised by pre-building a Vec of payloads
+        // so only the hash+insert is timed.
+        group.bench_with_input(
+            BenchmarkId::new("first_seen", size),
+            &size,
+            |b, &sz| {
+                b.iter_batched(
+                    || {
+                        // Each iteration gets a fresh dedup and a pool of
+                        // 1 000 distinct payloads. Use the event-index so
+                        // every byte string is unique without hashing cost
+                        // before the measurement starts.
+                        let d = ContentHashDedup::new(
+                            ContentHashAlgorithm::Xxhash3_64,
+                            Duration::from_secs(300),
+                        );
+                        let payloads: Vec<Vec<u8>> = (0..1_000)
+                            .map(|i| {
+                                let mut v = vec![b'x'; sz];
+                                v[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                                v
+                            })
+                            .collect();
+                        (d, payloads)
+                    },
+                    |(d, payloads)| {
+                        for p in &payloads {
+                            let _ = d.check_and_mark(p);
+                        }
+                    },
+                    BatchSize::LargeInput,
+                );
+            },
+        );
+
+        // Repeat-lookup: the dedup is pre-warmed with the same payload,
+        // so every check_and_mark is a hash + get (duplicate detected).
+        // Isolates the read path cost.
+        group.bench_with_input(
+            BenchmarkId::new("repeat_lookup", size),
+            &size,
+            |b, &sz| {
+                b.iter_batched(
+                    || {
+                        let d = ContentHashDedup::new(
+                            ContentHashAlgorithm::Xxhash3_64,
+                            Duration::from_secs(300),
+                        );
+                        let payload = vec![b'x'; sz];
+                        // Pre-warm — first call inserts, benchmark hits repeat path.
+                        let _ = d.check_and_mark(&payload);
+                        (d, payload)
+                    },
+                    |(d, payload)| {
+                        for _ in 0..1_000 {
+                            let _ = d.check_and_mark(&payload);
+                        }
+                    },
+                    BatchSize::LargeInput,
+                );
+            },
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     durability_mode_overhead,
     l2_append_throughput,
     checkpoint_cadence,
     capacity_tracking_overhead,
+    content_hash_dedup,
 );
 criterion_main!(benches);

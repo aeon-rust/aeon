@@ -64,12 +64,13 @@ async fn create_quic_node(node_id: u64, endpoint: Arc<QuicEndpoint>) -> Raft<Aeo
 fn start_server(
     endpoint: &Arc<QuicEndpoint>,
     raft: &Raft<AeonRaftConfig>,
+    self_id: u64,
     shutdown: &Arc<std::sync::atomic::AtomicBool>,
 ) {
     let ep = Arc::clone(endpoint);
     let r = raft.clone();
     let s = Arc::clone(shutdown);
-    tokio::spawn(async move { server::serve(ep, r, s).await });
+    tokio::spawn(async move { server::serve(ep, r, self_id, s, None, None, None).await });
 }
 
 /// Poll until a leader is elected (up to timeout_secs).
@@ -129,9 +130,9 @@ async fn three_node_cluster_formation() {
     let raft3 = create_quic_node(3, Arc::clone(&ep3)).await;
 
     let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    start_server(&ep1, &raft1, &shutdown);
-    start_server(&ep2, &raft2, &shutdown);
-    start_server(&ep3, &raft3, &shutdown);
+    start_server(&ep1, &raft1, 1, &shutdown);
+    start_server(&ep2, &raft2, 2, &shutdown);
+    start_server(&ep3, &raft3, 3, &shutdown);
 
     let mut members = BTreeMap::new();
     members.insert(1u64, NodeAddress::new("127.0.0.1", addr1.port()));
@@ -184,9 +185,9 @@ async fn three_node_log_replication() {
     let raft3 = create_quic_node(3, Arc::clone(&ep3)).await;
 
     let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    start_server(&ep1, &raft1, &shutdown);
-    start_server(&ep2, &raft2, &shutdown);
-    start_server(&ep3, &raft3, &shutdown);
+    start_server(&ep1, &raft1, 1, &shutdown);
+    start_server(&ep2, &raft2, 2, &shutdown);
+    start_server(&ep3, &raft3, 3, &shutdown);
 
     let mut members = BTreeMap::new();
     members.insert(1u64, NodeAddress::new("127.0.0.1", addr1.port()));
@@ -244,8 +245,8 @@ async fn dynamic_add_second_node() {
     let raft2 = create_quic_node(2, Arc::clone(&ep2)).await;
 
     let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    start_server(&ep1, &raft1, &shutdown);
-    start_server(&ep2, &raft2, &shutdown);
+    start_server(&ep1, &raft1, 1, &shutdown);
+    start_server(&ep2, &raft2, 2, &shutdown);
 
     // Bootstrap single-node cluster (just node 1)
     let mut members = BTreeMap::new();
@@ -320,9 +321,9 @@ async fn dynamic_scale_one_to_three() {
     let raft3 = create_quic_node(3, Arc::clone(&ep3)).await;
 
     let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    start_server(&ep1, &raft1, &shutdown);
-    start_server(&ep2, &raft2, &shutdown);
-    start_server(&ep3, &raft3, &shutdown);
+    start_server(&ep1, &raft1, 1, &shutdown);
+    start_server(&ep2, &raft2, 2, &shutdown);
+    start_server(&ep3, &raft3, 3, &shutdown);
 
     // Bootstrap single-node
     let mut members = BTreeMap::new();
@@ -403,8 +404,8 @@ async fn scale_three_to_five() {
     }
 
     let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    for (ep, raft) in eps.iter().zip(rafts.iter()) {
-        start_server(ep, raft, &shutdown);
+    for (i, (ep, raft)) in eps.iter().zip(rafts.iter()).enumerate() {
+        start_server(ep, raft, (i + 1) as u64, &shutdown);
     }
 
     // Bootstrap 3-node cluster
@@ -495,9 +496,9 @@ async fn remove_node_from_three_node_cluster() {
     let raft3 = create_quic_node(3, Arc::clone(&ep3)).await;
 
     let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    start_server(&ep1, &raft1, &shutdown);
-    start_server(&ep2, &raft2, &shutdown);
-    start_server(&ep3, &raft3, &shutdown);
+    start_server(&ep1, &raft1, 1, &shutdown);
+    start_server(&ep2, &raft2, 2, &shutdown);
+    start_server(&ep3, &raft3, 3, &shutdown);
 
     let mut members = BTreeMap::new();
     members.insert(1u64, NodeAddress::new("127.0.0.1", addr1.port()));
@@ -569,9 +570,9 @@ async fn leader_failover() {
     let raft3 = create_quic_node(3, Arc::clone(&ep3)).await;
 
     let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    start_server(&ep1, &raft1, &shutdown);
-    start_server(&ep2, &raft2, &shutdown);
-    start_server(&ep3, &raft3, &shutdown);
+    start_server(&ep1, &raft1, 1, &shutdown);
+    start_server(&ep2, &raft2, 2, &shutdown);
+    start_server(&ep3, &raft3, 3, &shutdown);
 
     let mut members = BTreeMap::new();
     members.insert(1u64, NodeAddress::new("127.0.0.1", addr1.port()));
@@ -649,8 +650,8 @@ async fn join_via_rpc_add_node_request() {
     let raft2 = create_quic_node(2, Arc::clone(&ep2)).await;
 
     let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    start_server(&ep1, &raft1, &shutdown);
-    start_server(&ep2, &raft2, &shutdown);
+    start_server(&ep1, &raft1, 1, &shutdown);
+    start_server(&ep2, &raft2, 2, &shutdown);
 
     // Bootstrap single-node cluster
     let mut members = BTreeMap::new();
@@ -710,9 +711,9 @@ async fn remove_via_rpc() {
     let raft3 = create_quic_node(3, Arc::clone(&ep3)).await;
 
     let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    start_server(&ep1, &raft1, &shutdown);
-    start_server(&ep2, &raft2, &shutdown);
-    start_server(&ep3, &raft3, &shutdown);
+    start_server(&ep1, &raft1, 1, &shutdown);
+    start_server(&ep2, &raft2, 2, &shutdown);
+    start_server(&ep3, &raft3, 3, &shutdown);
 
     // Bootstrap single-node, add 2 and 3 via RPC
     let mut members = BTreeMap::new();
@@ -789,9 +790,9 @@ async fn replication_consistency_across_nodes() {
     let raft3 = create_quic_node(3, Arc::clone(&ep3)).await;
 
     let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    start_server(&ep1, &raft1, &shutdown);
-    start_server(&ep2, &raft2, &shutdown);
-    start_server(&ep3, &raft3, &shutdown);
+    start_server(&ep1, &raft1, 1, &shutdown);
+    start_server(&ep2, &raft2, 2, &shutdown);
+    start_server(&ep3, &raft3, 3, &shutdown);
 
     let mut members = BTreeMap::new();
     members.insert(1u64, NodeAddress::new("127.0.0.1", addr1.port()));
@@ -836,4 +837,89 @@ async fn replication_consistency_across_nodes() {
     );
 
     shutdown_all(&shutdown, &[raft1, raft2, raft3], &[ep1, ep2, ep3]).await;
+}
+
+/// G15 regression: AddNode RPC must succeed against the actual Raft leader of a
+/// 3-node cluster bootstrapped via `initial_members`. Prior to G15, the handler
+/// compared `raft.metrics().borrow().id` against `current_leader()`, which could
+/// reject joins on the real leader when the metrics-channel id diverged from
+/// `ClusterConfig::node_id`. The fix threads the configured id through
+/// `server::serve()` so the leader-self check is authoritative.
+#[tokio::test]
+async fn g15_join_targets_actual_leader_of_three_node_cluster() {
+    use aeon_cluster::transport::network::send_join_request;
+    use aeon_cluster::types::JoinRequest;
+
+    let (server_cfg, client_cfg) = dev_quic_configs();
+
+    let ep1 = create_endpoint(server_cfg.clone(), client_cfg.clone());
+    let ep2 = create_endpoint(server_cfg.clone(), client_cfg.clone());
+    let ep3 = create_endpoint(server_cfg.clone(), client_cfg.clone());
+    let ep4 = create_endpoint(server_cfg, client_cfg);
+
+    let addr1 = ep1.local_addr().unwrap();
+    let addr2 = ep2.local_addr().unwrap();
+    let addr3 = ep3.local_addr().unwrap();
+    let addr4 = ep4.local_addr().unwrap();
+
+    let raft1 = create_quic_node(1, Arc::clone(&ep1)).await;
+    let raft2 = create_quic_node(2, Arc::clone(&ep2)).await;
+    let raft3 = create_quic_node(3, Arc::clone(&ep3)).await;
+
+    let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    start_server(&ep1, &raft1, 1, &shutdown);
+    start_server(&ep2, &raft2, 2, &shutdown);
+    start_server(&ep3, &raft3, 3, &shutdown);
+
+    let mut members = BTreeMap::new();
+    members.insert(1u64, NodeAddress::new("127.0.0.1", addr1.port()));
+    members.insert(2u64, NodeAddress::new("127.0.0.1", addr2.port()));
+    members.insert(3u64, NodeAddress::new("127.0.0.1", addr3.port()));
+
+    raft1.initialize(members.clone()).await.unwrap();
+    raft2.initialize(members.clone()).await.unwrap();
+    raft3.initialize(members).await.unwrap();
+
+    let leader_id = wait_for_leader(&raft1, 10).await.expect("leader elected");
+
+    let leader_addr = match leader_id {
+        1 => NodeAddress::new("127.0.0.1", addr1.port()),
+        2 => NodeAddress::new("127.0.0.1", addr2.port()),
+        3 => NodeAddress::new("127.0.0.1", addr3.port()),
+        other => panic!("unexpected leader id {other}"),
+    };
+
+    let join_req = JoinRequest {
+        node_id: 4,
+        addr: NodeAddress::new("127.0.0.1", addr4.port()),
+    };
+
+    let resp = send_join_request(&ep4, 0, &leader_addr, &join_req)
+        .await
+        .expect("QUIC join RPC to leader");
+
+    assert!(
+        resp.success,
+        "join against actual leader {leader_id} must succeed (G15); got message={}, leader_id={:?}",
+        resp.message, resp.leader_id
+    );
+    assert_eq!(resp.leader_id, Some(leader_id));
+
+    let nodes = [(1u64, raft1.clone()), (2, raft2.clone()), (3, raft3.clone())];
+    let leader = leader_raft(leader_id, &nodes);
+    let voter_count = leader
+        .metrics()
+        .borrow()
+        .membership_config
+        .membership()
+        .voter_ids()
+        .count();
+    assert_eq!(voter_count, 4, "cluster should have 4 voters after join");
+
+    shutdown_all(
+        &shutdown,
+        &[raft1, raft2, raft3],
+        &[ep1, ep2, ep3, ep4],
+    )
+    .await;
 }

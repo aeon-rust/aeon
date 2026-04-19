@@ -1,0 +1,77 @@
+# Aeon values — local Rancher Desktop smoke test.
+#
+# Purpose: verify a freshly-built docker image boots a 3-pod Raft cluster,
+# elects a leader, serves /ready=200, and drains cleanly on SIGTERM
+# (graceful pod deletion) before shipping to DOKS for Session A.
+#
+# Usage:
+#   docker build -t aeonrust/aeon:session-a-prep .
+#   helm install aeon ./helm/aeon -f deploy/k8s/values-rancher-desktop.yaml \
+#     -n aeon --create-namespace
+#   kubectl -n aeon rollout status sts/aeon --timeout=180s
+#   kubectl -n aeon delete pod aeon-0     # observe graceful drain
+#
+# Differs from deploy/doks/values-aeon.yaml in:
+#   - uses a local image tag (no DOCR pull secret)
+#   - uses auto-tls (self-signed) instead of cert-manager secret
+#   - uses local-path storage
+#   - drops node selectors / affinity that target DOKS pools
+#   - shrinks resource requests to fit a laptop
+
+image:
+  repository: aeonrust/aeon
+  tag: session-a-prep
+  pullPolicy: IfNotPresent   # use the locally-built image
+
+# No imagePullSecrets — the image is already in the local docker daemon.
+imagePullSecrets: []
+
+config:
+  logLevel: info
+  apiAddr: "0.0.0.0:4471"
+  # Point at the redpanda service if deployed; otherwise a non-existent
+  # broker just means the kafka source/sink can't start — the cluster +
+  # /ready + SIGTERM drain path we're validating doesn't need Redpanda.
+  brokers: "redpanda.redpanda.svc.cluster.local:9092"
+  artifactDir: /app/artifacts
+
+cluster:
+  enabled: true
+  replicas: 3
+  partitions: 12
+  tls:
+    enabled: false   # uses --auto-tls (self-signed) via aeon-cluster default features
+
+gracefulShutdown:
+  terminationGracePeriodSeconds: 60
+  preStopDelaySeconds: 5
+
+resources:
+  requests:
+    cpu: "500m"
+    memory: 1Gi
+  limits:
+    cpu: "2"
+    memory: 2Gi
+
+persistence:
+  enabled: true
+  storageClass: local-path
+  size: 5Gi
+
+# Laptop = single node, so pod anti-affinity must be preferred (not required).
+# The chart's default preferred anti-affinity already handles this; we
+# explicitly override to empty so the required-anti-affinity stanza from
+# values-doks doesn't accidentally leak in via inheritance.
+affinity: {}
+nodeSelector: {}
+tolerations: []
+
+autoscaling:
+  enabled: false
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false
+  capabilities:
+    drop: [ALL]

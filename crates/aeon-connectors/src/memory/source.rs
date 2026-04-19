@@ -1,6 +1,9 @@
 //! In-memory source that serves pre-loaded events.
 
-use aeon_types::{AeonError, Event, Source};
+use std::sync::Arc;
+
+use aeon_types::{AeonError, Event, PartitionId, Source};
+use bytes::Bytes;
 
 /// A source that yields events from a pre-loaded `Vec<Event>`.
 ///
@@ -93,12 +96,93 @@ impl Source for MemorySource {
     }
 }
 
+/// A source that synthesizes events on demand inside `next_batch`,
+/// never pre-allocating the full event vec.
+///
+/// Sized for sustained load tests where the pre-loaded `MemorySource`
+/// would OOM the process — e.g., a 10 M event run at 256 B payload
+/// would pin 2.5 GiB of `Vec<Event>` up front. `StreamingMemorySource`
+/// keeps only a single `Bytes` payload alive (refcounted; each emitted
+/// event clones the `Arc`).
+///
+/// Set `count = 0` to run unbounded — every `next_batch` call produces
+/// exactly `batch_size` events until paused or stopped.
+///
+/// Added 2026-04-18 to unblock the Session A 3-minute sustained sweep
+/// called out in `docs/GATE2-ACCEPTANCE-PLAN.md § 11.5`.
+pub struct StreamingMemorySource {
+    /// Event count limit. `0` means unbounded.
+    limit: usize,
+    /// Number of events emitted so far.
+    emitted: usize,
+    batch_size: usize,
+    paused: bool,
+    payload: Bytes,
+    source_name: Arc<str>,
+    partition: PartitionId,
+}
+
+impl StreamingMemorySource {
+    /// Create a streaming memory source.
+    ///
+    /// - `count = 0`: unbounded (runs until paused or task cancelled).
+    /// - `count > 0`: bounded — emits exactly `count` events then
+    ///   returns empty batches.
+    pub fn new(count: usize, payload_size: usize, batch_size: usize) -> Self {
+        Self {
+            limit: count,
+            emitted: 0,
+            batch_size,
+            paused: false,
+            payload: Bytes::from(vec![0u8; payload_size]),
+            source_name: Arc::from("memory"),
+            partition: PartitionId::new(0),
+        }
+    }
+
+    /// Whether the bounded limit has been hit. Always `false` when
+    /// `count == 0` (unbounded).
+    pub fn is_exhausted(&self) -> bool {
+        self.limit != 0 && self.emitted >= self.limit
+    }
+}
+
+impl Source for StreamingMemorySource {
+    async fn next_batch(&mut self) -> Result<Vec<Event>, AeonError> {
+        if self.paused || self.is_exhausted() {
+            return Ok(Vec::new());
+        }
+        let want = if self.limit == 0 {
+            self.batch_size
+        } else {
+            self.batch_size.min(self.limit - self.emitted)
+        };
+        let mut batch = Vec::with_capacity(want);
+        for _ in 0..want {
+            batch.push(Event::new(
+                uuid::Uuid::nil(),
+                self.emitted as i64,
+                Arc::clone(&self.source_name),
+                self.partition,
+                self.payload.clone(),
+            ));
+            self.emitted += 1;
+        }
+        Ok(batch)
+    }
+
+    async fn pause(&mut self) {
+        self.paused = true;
+    }
+
+    async fn resume(&mut self) {
+        self.paused = false;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aeon_types::PartitionId;
-    use bytes::Bytes;
-    use std::sync::Arc;
 
     fn make_events(count: usize) -> Vec<Event> {
         (0..count)
@@ -172,5 +256,65 @@ mod tests {
         assert!(source.is_exhausted());
         source.reset(); // No-op for non-resetable source.
         assert!(source.is_exhausted());
+    }
+
+    // ── StreamingMemorySource ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn streaming_bounded_emits_exactly_count_events() {
+        let mut source = StreamingMemorySource::new(10, 32, 4);
+        let mut total = 0usize;
+        loop {
+            let batch = source.next_batch().await.unwrap();
+            if batch.is_empty() {
+                break;
+            }
+            total += batch.len();
+        }
+        assert_eq!(total, 10);
+        assert!(source.is_exhausted());
+    }
+
+    #[tokio::test]
+    async fn streaming_bounded_respects_batch_size_and_tail() {
+        let mut source = StreamingMemorySource::new(10, 16, 4);
+        let b1 = source.next_batch().await.unwrap();
+        assert_eq!(b1.len(), 4);
+        let b2 = source.next_batch().await.unwrap();
+        assert_eq!(b2.len(), 4);
+        let b3 = source.next_batch().await.unwrap();
+        assert_eq!(b3.len(), 2, "tail batch clamped to remaining");
+        let b4 = source.next_batch().await.unwrap();
+        assert!(b4.is_empty());
+    }
+
+    #[tokio::test]
+    async fn streaming_unbounded_never_exhausts() {
+        // count=0 → unbounded. Drain N batches and verify full size each time.
+        let mut source = StreamingMemorySource::new(0, 8, 16);
+        for _ in 0..1000 {
+            let batch = source.next_batch().await.unwrap();
+            assert_eq!(batch.len(), 16);
+            assert!(!source.is_exhausted());
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_pause_returns_empty_batch() {
+        let mut source = StreamingMemorySource::new(0, 8, 4);
+        source.pause().await;
+        let b = source.next_batch().await.unwrap();
+        assert!(b.is_empty());
+        source.resume().await;
+        let b = source.next_batch().await.unwrap();
+        assert_eq!(b.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn streaming_uses_payload_size() {
+        let mut source = StreamingMemorySource::new(1, 128, 1);
+        let batch = source.next_batch().await.unwrap();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].payload.len(), 128);
     }
 }

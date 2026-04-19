@@ -1,0 +1,62 @@
+# Aeon values — Session 0 (Rancher Desktop, loopback 3-peer cluster)
+# Target: single-node Rancher Desktop (k3s) with WSL2 12GB / 8CPU budget.
+# All 3 Raft peers co-locate on the one node; inter-pod traffic is
+# loopback over the headless service. This validates the Raft + pipeline
+# state-machine code paths without real inter-host network.
+#
+# Usage:
+#   helm install aeon ./helm/aeon -f ./helm/aeon/values-local.yaml \
+#     -n aeon --create-namespace
+#
+# Image: built locally via `nerdctl --namespace k8s.io build` so that
+# containerd on the Rancher Desktop VM can pull it without a registry.
+
+image:
+  repository: aeon
+  tag: session0
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+config:
+  logLevel: info
+  apiAddr: "0.0.0.0:4471"
+  brokers: "redpanda.aeon.svc.cluster.local:9092"
+  artifactDir: /app/artifacts
+
+cluster:
+  enabled: true
+  replicas: 3
+  partitions: 12
+  tls:
+    enabled: false
+
+# WSL2 budget: 12GB / 8 CPU. Leave ~4GB / 2 CPU for Redpanda + system.
+# Three Aeon pods * (1 CPU / 2 GiB) = 3 CPU / 6 GiB — fits comfortably.
+resources:
+  requests:
+    cpu: "500m"
+    memory: 1Gi
+  limits:
+    cpu: "2"
+    memory: 2Gi
+
+persistence:
+  enabled: true
+  storageClass: local-path
+  size: 5Gi
+
+# Single-node target — no anti-affinity override (the chart's default is
+# `preferred`, not `required`, so all 3 pods can co-locate).
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+autoscaling:
+  enabled: false
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false
+  capabilities:
+    drop: [ALL]

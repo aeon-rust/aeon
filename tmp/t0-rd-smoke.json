@@ -1,0 +1,32 @@
+{
+  "name": "t0-rd-smoke",
+  "sources": [
+    {
+      "type": "memory",
+      "topic": null,
+      "partitions": [],
+      "config": {
+        "count": "100000",
+        "payload_size": "256",
+        "batch_size": "256"
+      }
+    }
+  ],
+  "processor": {
+    "name": "__identity",
+    "version": "0.0.0"
+  },
+  "sinks": [
+    {
+      "type": "blackhole",
+      "topic": null,
+      "config": {}
+    }
+  ],
+  "state": "created",
+  "created_at": 0,
+  "updated_at": 0,
+  "durability": {
+    "mode": "none"
+  }
+}

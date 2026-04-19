@@ -1,0 +1,29 @@
+# Chaos Mesh NetworkChaos: isolate aeon-2 from aeon-0/aeon-1.
+# Used by run-t5-split-brain.sh and the minute-6 interleave in
+# run-t6-sustained.sh. Direction `both` = no ingress and no egress,
+# which mirrors a real L3 partition better than one-way drops.
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: isolate-aeon-2
+  namespace: aeon
+spec:
+  action: partition
+  mode: all
+  selector:
+    namespaces:
+      - aeon
+    labelSelectors:
+      statefulset.kubernetes.io/pod-name: aeon-2
+  direction: both
+  target:
+    mode: all
+    selector:
+      namespaces:
+        - aeon
+      expressionSelectors:
+        - key: statefulset.kubernetes.io/pod-name
+          operator: In
+          values:
+            - aeon-0
+            - aeon-1

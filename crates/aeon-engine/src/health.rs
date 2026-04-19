@@ -57,6 +57,7 @@ fn format_prometheus(metrics: &PipelineMetrics) -> String {
     let received = metrics.events_received.load(Ordering::Relaxed);
     let processed = metrics.events_processed.load(Ordering::Relaxed);
     let sent = metrics.outputs_sent.load(Ordering::Relaxed);
+    let acked = metrics.outputs_acked.load(Ordering::Relaxed);
 
     format!(
         "# HELP aeon_events_received_total Total events received from sources\n\
@@ -65,9 +66,12 @@ fn format_prometheus(metrics: &PipelineMetrics) -> String {
          # HELP aeon_events_processed_total Total events processed by processors\n\
          # TYPE aeon_events_processed_total counter\n\
          aeon_events_processed_total {processed}\n\
-         # HELP aeon_outputs_sent_total Total outputs sent to sinks\n\
+         # HELP aeon_outputs_sent_total Total outputs the engine handed to sinks\n\
          # TYPE aeon_outputs_sent_total counter\n\
-         aeon_outputs_sent_total {sent}\n"
+         aeon_outputs_sent_total {sent}\n\
+         # HELP aeon_outputs_acked_total Total outputs the downstream system confirmed\n\
+         # TYPE aeon_outputs_acked_total counter\n\
+         aeon_outputs_acked_total {acked}\n"
     )
 }
 

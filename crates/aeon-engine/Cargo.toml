@@ -34,6 +34,9 @@ bincode = { workspace = true }
 crc32fast = { workspace = true }
 serde_json = { workspace = true }
 
+# EO-2 P10: xxhash3_64 for content-hash dedup (see eo2_content_hash.rs)
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
 # Wasm processor loading (feature-gated behind rest-api for hot-swap)
 aeon-wasm = { workspace = true, optional = true }
 

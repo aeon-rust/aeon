@@ -1,0 +1,95 @@
+# In-cluster PPS probe — two iperf3 pods on distinct aeon-pool nodes.
+#
+# Rationale: GATE2-ACCEPTANCE-PLAN § 3.6 pps-probe.sh provisions throwaway
+# droplets. Once the DOKS cluster exists with the same g-8vcpu-32gb class,
+# running the probe on the actual nodes Aeon will run on is cheaper (free)
+# and more representative than the throwaway-droplet approach.
+#
+# Tests the DO PPS cap the same way pps-probe.sh does:
+#   iperf3 -u -b 2G -l 64 -t 60  (UDP, 64-byte payload, 2 Gbit/s target, 60s)
+#
+# Pass criteria (same as pps-probe.sh):
+#   >= 500K PPS  → no cap applied, proceed with full cluster
+#   200-400K PPS → cap higher than historical; document result
+#   <= 207K PPS  → historical cap active; revisit plan
+#
+# Usage (run from cluster):
+#   kubectl apply -f pps-probe-incluster.yaml
+#   kubectl -n pps-probe wait --for=condition=ready pod/iperf3-server --timeout=60s
+#   kubectl -n pps-probe wait --for=condition=ready pod/iperf3-client --timeout=60s
+#   SERVER_IP=$(kubectl -n pps-probe get pod iperf3-server -o jsonpath='{.status.podIP}')
+#   kubectl -n pps-probe exec iperf3-client -- iperf3 -c $SERVER_IP -u -b 2G -l 64 -t 60 -J | tee pps-probe-a-to-b.json
+#   # Then swap roles and rerun for reverse direction.
+#   kubectl delete ns pps-probe
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: iperf3-server
+  namespace: pps-probe
+  labels:
+    app: iperf3
+    role: server
+spec:
+  # Pin to the first aeon-pool node and tolerate its taint.
+  nodeSelector:
+    workload: aeon
+  tolerations:
+    - key: workload
+      operator: Equal
+      value: aeon
+      effect: NoSchedule
+  affinity:
+    podAntiAffinity:
+      # Hard-require: iperf3-client must land on a different node.
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchLabels:
+              app: iperf3
+          topologyKey: kubernetes.io/hostname
+  containers:
+    - name: iperf3
+      image: networkstatic/iperf3:latest
+      command: ["iperf3", "-s", "-p", "5201"]
+      ports:
+        - containerPort: 5201
+          protocol: TCP
+        - containerPort: 5201
+          protocol: UDP
+      resources:
+        requests: { cpu: "1", memory: "512Mi" }
+        limits:   { cpu: "2", memory: "1Gi"  }
+  restartPolicy: Never
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: iperf3-client
+  namespace: pps-probe
+  labels:
+    app: iperf3
+    role: client
+spec:
+  nodeSelector:
+    workload: aeon
+  tolerations:
+    - key: workload
+      operator: Equal
+      value: aeon
+      effect: NoSchedule
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchLabels:
+              app: iperf3
+          topologyKey: kubernetes.io/hostname
+  containers:
+    - name: iperf3
+      image: networkstatic/iperf3:latest
+      # Sleep — exec iperf3 commands into this pod interactively.
+      command: ["sleep", "3600"]
+      resources:
+        requests: { cpu: "1", memory: "512Mi" }
+        limits:   { cpu: "2", memory: "1Gi"  }
+  restartPolicy: Never

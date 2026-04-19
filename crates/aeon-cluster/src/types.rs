@@ -55,6 +55,29 @@ impl FromStr for NodeAddress {
     }
 }
 
+/// Outcome of a caller-initiated partition transfer attempt.
+///
+/// Returned by [`crate::ClusterNode::propose_partition_transfer`] so REST and
+/// CLI callers can map each business-logic outcome to a distinct HTTP status
+/// or exit code without inspecting free-form error strings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransferStatus {
+    /// `BeginTransfer` was accepted and the partition is now in the
+    /// `Transferring { source, target }` state on the committed Raft log.
+    Accepted { source: NodeId, target: NodeId },
+    /// This node is not the Raft leader. Callers should retry against
+    /// `current_leader` (if present) or discover the leader via cluster status.
+    NotLeader { current_leader: Option<NodeId> },
+    /// Requested partition is not present in the partition table.
+    UnknownPartition,
+    /// The partition already has a transfer in flight.
+    AlreadyTransferring { source: NodeId, target: NodeId },
+    /// Target equals current owner — nothing to do.
+    NoChange { owner: NodeId },
+    /// The state-machine rejected the `BeginTransfer` (e.g. racy apply).
+    Rejected(String),
+}
+
 /// Raft log entry payload — what gets replicated across the cluster.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ClusterRequest {
@@ -204,6 +227,78 @@ pub struct RemoveNodeResponse {
     /// The current leader's node ID (for redirect if this node is not leader).
     pub leader_id: Option<NodeId>,
     /// Human-readable error or status message.
+    pub message: String,
+}
+
+/// CL-6a partition transfer: client-to-server request naming which
+/// `(pipeline, partition)` the target wants to pull. The server responds
+/// on the same bidirectional stream with a manifest + chunks + end frame.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PartitionTransferRequest {
+    /// Pipeline name as known to `PipelineL2Registry`.
+    pub pipeline: String,
+    /// Partition id (maps to the `p{partition:05}` directory).
+    pub partition: PartitionId,
+}
+
+/// Terminal frame on the transfer stream. Tells the receiver whether the
+/// source was able to stream every manifested segment. If
+/// `success == false` the receiver must treat the transfer as aborted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PartitionTransferEnd {
+    pub success: bool,
+    /// Error context when `success == false`. Empty on happy path.
+    pub message: String,
+}
+
+/// CL-6b PoH chain transfer: client-to-server request naming which
+/// `(pipeline, partition)` PoH chain the target wants a snapshot of.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PohChainTransferRequest {
+    pub pipeline: String,
+    pub partition: PartitionId,
+}
+
+/// Response to a `PohChainTransferRequest` — single-shot because a
+/// `PohChainState` is small (current_hash + sequence + MMR, typically
+/// well under 16 KiB). The `state_bytes` payload is the bincode-serialized
+/// form of `aeon_crypto::poh::PohChainState`; aeon-cluster treats it as
+/// opaque so we don't need a crypto dependency at the transport layer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PohChainTransferResponse {
+    pub success: bool,
+    /// bincode-serialized `PohChainState`. Empty on failure.
+    pub state_bytes: Vec<u8>,
+    /// Error context when `success == false`. Empty on happy path.
+    pub message: String,
+}
+
+/// CL-6c partition cutover: target → source request to stop accepting
+/// writes for `(pipeline, partition)` and hand back the final offsets at
+/// the moment of freeze. Sent after a successful bulk sync + PoH chain
+/// transfer, immediately before the caller drives the Raft ownership
+/// flip.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PartitionCutoverRequest {
+    pub pipeline: String,
+    pub partition: PartitionId,
+}
+
+/// Response to a `PartitionCutoverRequest`. On success, the source
+/// guarantees it will not accept further writes for the partition until
+/// the caller completes the Raft ownership flip (or explicitly aborts).
+/// `final_source_offset` and `final_poh_sequence` are the watermarks the
+/// target must have caught up to before resuming writes on its side.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PartitionCutoverResponse {
+    pub success: bool,
+    /// Source-anchor offset (e.g. Kafka offset) at freeze. `-1` means
+    /// "no meaningful offset" (non-Kafka source or first cutover).
+    pub final_source_offset: i64,
+    /// PoH chain sequence at freeze. The target's PoH chain must have
+    /// `sequence >= final_poh_sequence` to be a valid continuation.
+    pub final_poh_sequence: u64,
+    /// Error context when `success == false`. Empty on happy path.
     pub message: String,
 }
 

@@ -1,0 +1,97 @@
+# Redpanda values — Session A (DOKS AMS3)
+# Target node: so1_5-4vcpu-32gb (4 dedicated vCPU, 32 GiB RAM, 900 GiB Regular SSD, 2 Gbps)
+# Chart: redpanda/redpanda v26.1.2
+# Usage:
+#   helm repo add redpanda https://charts.redpanda.com
+#   helm install redpanda redpanda/redpanda -f values-redpanda.yaml \
+#     -n redpanda --create-namespace --version 26.1.2
+#
+# Gate 2 test cluster — no production data. TLS/SASL disabled to keep
+# the measurement focused on throughput, not encryption CPU.
+
+statefulset:
+  replicas: 3
+  podTemplate:
+    spec:
+      nodeSelector:
+        workload: redpanda
+      tolerations:
+        - key: workload
+          operator: Equal
+          value: redpanda
+          effect: NoSchedule
+  # Spread brokers across nodes — RF=3 only works if each broker is on
+  # a distinct node, otherwise node failure loses quorum.
+  podAntiAffinity:
+    type: hard
+    topologyKey: kubernetes.io/hostname
+
+# Seastar sizing — 3 cores (leave 1 for kubelet + CSI agent on 4-vCPU node)
+# 24 GiB memory (leave 8 GiB for page cache + system on 32 GiB node)
+resources:
+  cpu:
+    cores: 3
+    overprovisioned: false
+  memory:
+    container:
+      max: 26Gi
+    enable_memory_locking: false
+    redpanda:
+      memory: 24Gi
+      reserveMemory: 1Gi
+
+# Storage — DO Block Storage (Regular SSD, ~5-20K IOPS, default DOKS class).
+# Plan doc explicitly accepts this as the DOKS-tier floor; local NVMe
+# would require a local-path provisioner which DOKS does not ship.
+storage:
+  persistentVolume:
+    enabled: true
+    size: 500Gi
+    storageClass: do-block-storage
+
+listeners:
+  admin:
+    port: 9644
+  kafka:
+    port: 9092
+  rpc:
+    port: 33145
+  schemaRegistry:
+    port: 8081
+  http:
+    port: 8082
+
+# Security disabled for Gate 2 — test cluster, no production data.
+# Throughput measurement shouldn't be contaminated by TLS CPU.
+tls:
+  enabled: false
+
+auth:
+  sasl:
+    enabled: false
+
+external:
+  enabled: false
+
+monitoring:
+  enabled: false           # re-enable after Prometheus operator + CRDs are installed
+
+console:
+  enabled: false
+
+tuning:
+  tune_aio_events: false
+
+# Redpanda configuration — partition count handled via topic creation,
+# not broker-level default. Keep broker config minimal.
+config:
+  cluster:
+    log_segment_size: 536870912          # 512 MiB segments
+    group_topic_partitions: 24
+    default_topic_partitions: 24
+    default_topic_replications: 3
+    kafka_batch_max_bytes: 10485760      # 10 MiB max batch
+    raft_learner_recovery_rate: 104857600  # 100 MiB/s learner catch-up
+  tunable:
+    kafka_connection_rate_limit: 1000
+    kafka_connections_max: 10000

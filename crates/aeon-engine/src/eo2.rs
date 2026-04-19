@@ -18,9 +18,11 @@ use std::sync::{Arc, Mutex};
 /// The source-side adapter and the sink-side GC both resolve the same
 /// `L2BodyStore` handle through this registry, so they always agree on which
 /// segment directory is authoritative for a given partition.
+type L2RegistryMap = HashMap<(String, PartitionId), Arc<Mutex<L2BodyStore>>>;
+
 #[derive(Clone, Default)]
 pub struct PipelineL2Registry {
-    inner: Arc<Mutex<HashMap<(String, PartitionId), Arc<Mutex<L2BodyStore>>>>>,
+    inner: Arc<Mutex<L2RegistryMap>>,
     root: Option<PathBuf>,
     segment_bytes: u64,
 }
@@ -140,6 +142,7 @@ impl<S: Source> L2WritingSource<S> {
     }
 }
 
+#[allow(clippy::manual_async_fn)]
 impl<S: Source> Source for L2WritingSource<S> {
     fn next_batch(
         &mut self,
@@ -263,6 +266,7 @@ impl<S: Source> MaybeL2Wrapped<S> {
     }
 }
 
+#[allow(clippy::manual_async_fn)]
 impl<S: Source> Source for MaybeL2Wrapped<S> {
     fn next_batch(
         &mut self,

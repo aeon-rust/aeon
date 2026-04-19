@@ -18,6 +18,7 @@ pub mod error;
 pub mod event;
 pub mod event_time;
 pub mod interner;
+pub mod l2_transfer;
 pub mod manifest;
 pub mod oauth;
 pub mod partition;
@@ -38,6 +39,9 @@ pub use error::{AeonError, Result};
 pub use event::{Event, Output};
 pub use event_time::EventTime;
 pub use interner::StringInterner;
+pub use l2_transfer::{
+    DEFAULT_CHUNK_BYTES, SegmentChunk, SegmentEntry, SegmentManifest,
+};
 pub use manifest::{
     BackpressureConfig, CheckpointBackendDecl, CheckpointBlock, ContentHashConfig,
     DurabilityBlock, FlushBlock, IdentityConfig, PipelineManifest, ProcessorManifest,
@@ -62,7 +66,7 @@ pub use scanner::{
 pub use state::{BatchEntry, BatchOp, KvPairs, L3Backend, L3Store};
 pub use traits::{
     CheckpointReplicator, IdempotentSink, Processor, ProcessorTransport, Seekable, Sink,
-    SinkEosTier, Source, SourceKind, StateOps, TransactionalSink,
+    SinkAckCallback, SinkEosTier, Source, SourceKind, StateOps, TransactionalSink,
 };
 pub use transport_codec::{TransportCodec, WireEvent, WireOutput};
 pub use uuid::{CoreLocalUuidGenerator, derive_pull_uuid_v7};

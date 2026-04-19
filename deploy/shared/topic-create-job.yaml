@@ -1,0 +1,67 @@
+# Create Gate 2 test topics on the running Redpanda cluster.
+# Idempotent: `rpk topic create` with --if-not-exists-like behaviour via
+# --replicas and --partitions; re-running is a no-op once topics exist.
+#
+# Topics match Scenario 1 in CLAUDE.md: Redpanda -> Aeon -> Redpanda
+#
+# Usage:
+#   kubectl apply -f topic-create-job.yaml
+#   kubectl wait --for=condition=complete job/aeon-topic-create -n redpanda --timeout=120s
+#   kubectl logs -n redpanda job/aeon-topic-create
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: aeon-topic-create
+  namespace: redpanda
+spec:
+  backoffLimit: 2
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: aeon-gate2
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: rpk
+          image: docker.redpanda.com/redpandadata/redpanda:v26.1.1
+          command: [/bin/bash, -c]
+          args:
+            - |
+              set -e
+              BROKER=redpanda.redpanda.svc.cluster.local:9092
+              echo "Waiting for Redpanda to accept API calls..."
+              for i in $(seq 1 30); do
+                rpk cluster info --brokers $BROKER >/dev/null 2>&1 && break
+                echo "  attempt $i: not ready, sleep 2s"; sleep 2
+              done
+              rpk cluster info --brokers $BROKER
+
+              echo
+              echo "Creating aeon-source (24 partitions, RF=3)..."
+              rpk topic create aeon-source \
+                --brokers $BROKER \
+                --partitions 24 \
+                --replicas 3 \
+                --config segment.bytes=536870912 \
+                --config retention.ms=3600000 \
+                --config compression.type=producer \
+                || echo "aeon-source may already exist, continuing"
+
+              echo
+              echo "Creating aeon-sink (24 partitions, RF=3)..."
+              rpk topic create aeon-sink \
+                --brokers $BROKER \
+                --partitions 24 \
+                --replicas 3 \
+                --config segment.bytes=536870912 \
+                --config retention.ms=3600000 \
+                --config compression.type=producer \
+                || echo "aeon-sink may already exist, continuing"
+
+              echo
+              echo "Final topic list:"
+              rpk topic list --brokers $BROKER
+              echo
+              echo "Partition layout for aeon-source:"
+              rpk topic describe aeon-source --brokers $BROKER -p

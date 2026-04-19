@@ -38,6 +38,7 @@ fn format_prometheus(metrics: &PipelineMetrics, config: &MetricsConfig) -> Strin
     let received = metrics.events_received.load(Ordering::Relaxed);
     let processed = metrics.events_processed.load(Ordering::Relaxed);
     let sent = metrics.outputs_sent.load(Ordering::Relaxed);
+    let acked = metrics.outputs_acked.load(Ordering::Relaxed);
 
     let mut out = format!(
         "# HELP aeon_events_received_total Total events received from sources\n\
@@ -46,9 +47,12 @@ fn format_prometheus(metrics: &PipelineMetrics, config: &MetricsConfig) -> Strin
          # HELP aeon_events_processed_total Total events processed by processors\n\
          # TYPE aeon_events_processed_total counter\n\
          aeon_events_processed_total {processed}\n\
-         # HELP aeon_outputs_sent_total Total outputs sent to sinks\n\
+         # HELP aeon_outputs_sent_total Total outputs the engine handed to sinks\n\
          # TYPE aeon_outputs_sent_total counter\n\
-         aeon_outputs_sent_total {sent}\n"
+         aeon_outputs_sent_total {sent}\n\
+         # HELP aeon_outputs_acked_total Total outputs the downstream system confirmed (broker ack, HTTP 2xx, fsync)\n\
+         # TYPE aeon_outputs_acked_total counter\n\
+         aeon_outputs_acked_total {acked}\n"
     );
 
     let cert_expiry = config.tls_cert_expiry_secs.load(Ordering::Relaxed);
@@ -170,6 +174,7 @@ mod tests {
         metrics.events_received.store(100, Ordering::Relaxed);
         metrics.events_processed.store(95, Ordering::Relaxed);
         metrics.outputs_sent.store(90, Ordering::Relaxed);
+        metrics.outputs_acked.store(88, Ordering::Relaxed);
         let config = MetricsConfig::new();
 
         let output = format_prometheus(&metrics, &config);
@@ -177,7 +182,9 @@ mod tests {
         assert!(output.contains("aeon_events_received_total 100"));
         assert!(output.contains("aeon_events_processed_total 95"));
         assert!(output.contains("aeon_outputs_sent_total 90"));
+        assert!(output.contains("aeon_outputs_acked_total 88"));
         assert!(output.contains("# TYPE aeon_events_received_total counter"));
+        assert!(output.contains("# TYPE aeon_outputs_acked_total counter"));
     }
 
     #[test]
@@ -189,8 +196,24 @@ mod tests {
         assert!(output.contains("aeon_events_received_total 0"));
         assert!(output.contains("aeon_events_processed_total 0"));
         assert!(output.contains("aeon_outputs_sent_total 0"));
+        assert!(output.contains("aeon_outputs_acked_total 0"));
         // No TLS metrics when not configured
         assert!(!output.contains("aeon_tls_cert"));
+    }
+
+    #[test]
+    fn ack_callback_bumps_outputs_acked_metric() {
+        let metrics = Arc::new(PipelineMetrics::new());
+        let cb = metrics.ack_callback();
+        assert_eq!(metrics.outputs_acked.load(Ordering::Relaxed), 0);
+
+        cb(7);
+        cb(3);
+        assert_eq!(metrics.outputs_acked.load(Ordering::Relaxed), 10);
+
+        // Zero-arg call is a no-op on the counter (still safe to invoke).
+        cb(0);
+        assert_eq!(metrics.outputs_acked.load(Ordering::Relaxed), 10);
     }
 
     #[test]

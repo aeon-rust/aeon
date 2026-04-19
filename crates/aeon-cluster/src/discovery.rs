@@ -174,6 +174,43 @@ impl K8sDiscovery {
         )
     }
 
+    /// G10 — true when this pod started as a StatefulSet scale-up (ordinal
+    /// outside the initial bootstrap cohort). `AEON_CLUSTER_REPLICAS` is
+    /// baked at helm-install time and stays stale across `kubectl scale`,
+    /// so any pod whose ordinal is `>=` that count was added after initial
+    /// bootstrap and must seed-join instead of re-running `raft.initialize`.
+    pub fn is_scale_up_pod(&self) -> bool {
+        self.ordinal >= self.replicas
+    }
+
+    /// Own FQDN inside the headless Service — the address peers use to
+    /// reach this pod once it joins. Required for `ClusterConfig.advertise_addr`
+    /// on the scale-up path so the leader writes the correct learner address
+    /// into Raft membership.
+    pub fn self_advertise_addr(&self) -> NodeAddress {
+        let hostname = format!(
+            "{}-{}.{}.{}.svc.cluster.local",
+            self.statefulset_name, self.ordinal, self.service, self.namespace,
+        );
+        NodeAddress::new(hostname, self.quic_port)
+    }
+
+    /// G10 — addresses of the initial bootstrap cohort (ordinals
+    /// `0..replicas`). Used as seed nodes when this pod is a scale-up —
+    /// the joining pod contacts one of these, which forwards to the Raft
+    /// leader for `add_learner → change_membership`.
+    pub fn initial_cohort_addrs(&self) -> Vec<NodeAddress> {
+        (0..self.replicas)
+            .map(|i| {
+                let hostname = format!(
+                    "{}-{i}.{}.{}.svc.cluster.local",
+                    self.statefulset_name, self.service, self.namespace,
+                );
+                NodeAddress::new(hostname, self.quic_port)
+            })
+            .collect()
+    }
+
     /// Build a ClusterConfig from the discovered K8s environment.
     pub fn to_cluster_config(&self) -> ClusterConfig {
         let peers: Vec<NodeAddress> = self.peers().into_iter().map(|(_, addr)| addr).collect();
@@ -193,6 +230,36 @@ impl K8sDiscovery {
             initial_members,
             advertise_addr: None,
             raft_timing: crate::config::RaftTiming::default(),
+            poh_verify_mode: "verify".to_string(),
+            rest_api_port: None,
+            rest_scheme: None,
+        }
+    }
+
+    /// G10 — scale-up ClusterConfig for `ClusterNode::join()`. Differs from
+    /// `to_cluster_config()`:
+    ///   - `initial_members` is empty (we are NOT bootstrapping)
+    ///   - `seed_nodes` holds the initial cohort's FQDNs so the joiner can
+    ///     reach whichever one is leader
+    ///   - `advertise_addr` is set so the leader writes our FQDN into Raft
+    pub fn to_join_config(&self) -> ClusterConfig {
+        // FT-10: formatting "0.0.0.0:{u16}" always produces a valid SocketAddr.
+        #[allow(clippy::unwrap_used)]
+        let bind = format!("0.0.0.0:{}", self.quic_port).parse().unwrap();
+        ClusterConfig {
+            node_id: self.node_id,
+            bind,
+            num_partitions: self.partitions,
+            peers: Vec::new(),
+            seed_nodes: self.initial_cohort_addrs(),
+            tls: None,
+            auto_tls: true,
+            initial_members: Vec::new(),
+            advertise_addr: Some(self.self_advertise_addr()),
+            raft_timing: crate::config::RaftTiming::default(),
+            poh_verify_mode: "verify".to_string(),
+            rest_api_port: None,
+            rest_scheme: None,
         }
     }
 }
@@ -224,6 +291,9 @@ mod tests {
             initial_members: Vec::new(),
             advertise_addr: None,
             raft_timing: crate::config::RaftTiming::default(),
+            poh_verify_mode: "verify".to_string(),
+            rest_api_port: None,
+            rest_scheme: None,
         };
         let peers = resolve_peers(&config);
         assert_eq!(peers.len(), 2);
@@ -247,6 +317,9 @@ mod tests {
             initial_members: Vec::new(),
             advertise_addr: None,
             raft_timing: crate::config::RaftTiming::default(),
+            poh_verify_mode: "verify".to_string(),
+            rest_api_port: None,
+            rest_scheme: None,
         };
         let members = initial_members(&config);
         assert_eq!(members.len(), 3);
@@ -314,5 +387,74 @@ mod tests {
         assert_eq!(config.node_id, 2);
         assert_eq!(config.num_partitions, 16);
         assert_eq!(config.peers.len(), 2); // 3 replicas - 1 self = 2 peers
+    }
+
+    // ── G10 scale-up discovery tests ────────────────────────────────
+
+    fn scale_up_disc(ordinal: u32, replicas: u32) -> K8sDiscovery {
+        K8sDiscovery {
+            pod_name: format!("aeon-{ordinal}"),
+            namespace: "default".to_string(),
+            service: "aeon-headless".to_string(),
+            statefulset_name: "aeon".to_string(),
+            replicas,
+            quic_port: 4470,
+            partitions: 16,
+            node_id: (ordinal as u64) + 1,
+            ordinal,
+        }
+    }
+
+    #[test]
+    fn is_scale_up_pod_false_for_initial_cohort() {
+        assert!(!scale_up_disc(0, 3).is_scale_up_pod());
+        assert!(!scale_up_disc(1, 3).is_scale_up_pod());
+        assert!(!scale_up_disc(2, 3).is_scale_up_pod());
+    }
+
+    #[test]
+    fn is_scale_up_pod_true_for_added_pods() {
+        // Initial helm install baked AEON_CLUSTER_REPLICAS=3; operator then
+        // ran `kubectl scale sts/aeon --replicas=5`. Pods at ordinal 3, 4
+        // see the stale replicas=3 env and must take the seed-join path.
+        assert!(scale_up_disc(3, 3).is_scale_up_pod());
+        assert!(scale_up_disc(4, 3).is_scale_up_pod());
+    }
+
+    #[test]
+    fn initial_cohort_addrs_covers_bootstrap_pods() {
+        let disc = scale_up_disc(3, 3);
+        let seeds = disc.initial_cohort_addrs();
+        assert_eq!(seeds.len(), 3);
+        assert!(seeds[0].to_string().contains("aeon-0.aeon-headless"));
+        assert!(seeds[2].to_string().contains("aeon-2.aeon-headless"));
+        // Self is NOT in the seed list — we're joining, not bootstrapping.
+        assert!(!seeds
+            .iter()
+            .any(|a| a.to_string().contains("aeon-3.aeon-headless")));
+    }
+
+    #[test]
+    fn to_join_config_has_empty_initial_members_and_populated_seeds() {
+        let disc = scale_up_disc(3, 3);
+        let cfg = disc.to_join_config();
+        assert_eq!(cfg.node_id, 4);
+        assert!(cfg.initial_members.is_empty(),
+            "scale-up path must not carry initial_members (no bootstrap)");
+        assert_eq!(cfg.seed_nodes.len(), 3, "seeds = initial cohort");
+        assert!(cfg.advertise_addr.is_some(),
+            "leader needs our FQDN to write into Raft membership");
+        assert!(cfg.peers.is_empty(),
+            "peers is for static bootstrap — scale-up uses seed_nodes");
+        // auto_tls satisfies the multi-node TLS requirement for seed_nodes.
+        cfg.validate().expect("join config must validate");
+    }
+
+    #[test]
+    fn to_join_config_self_advertise_uses_pod_fqdn() {
+        let disc = scale_up_disc(4, 3);
+        let cfg = disc.to_join_config();
+        let addr = cfg.advertise_addr.expect("advertise_addr set");
+        assert!(addr.to_string().contains("aeon-4.aeon-headless.default.svc.cluster.local"));
     }
 }

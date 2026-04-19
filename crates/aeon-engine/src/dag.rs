@@ -419,6 +419,151 @@ where
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Topology dispatch
+// ---------------------------------------------------------------------------
+
+/// Detected topology based on source/sink counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Topology {
+    /// 1 source → 1 processor → 1 sink (default SPSC-buffered path).
+    Linear,
+    /// N sources → 1 processor → 1 sink.
+    FanIn,
+    /// 1 source → 1 processor → M sinks.
+    FanOut,
+    /// N sources → 1 processor → M sinks (fan-in then fan-out).
+    FanInFanOut,
+}
+
+impl Topology {
+    /// Derive topology from source and sink counts.
+    pub fn detect(source_count: usize, sink_count: usize) -> Self {
+        match (source_count > 1, sink_count > 1) {
+            (false, false) => Self::Linear,
+            (true, false) => Self::FanIn,
+            (false, true) => Self::FanOut,
+            (true, true) => Self::FanInFanOut,
+        }
+    }
+}
+
+/// Run a pipeline with automatic topology selection based on source/sink
+/// count. Uses the DAG runners for multi-source/multi-sink topologies and
+/// the simple `run()` path for linear pipelines.
+///
+/// For multi-source + multi-sink (`FanInFanOut`), events are merged via
+/// round-robin fan-in, then cloned to each sink via fan-out.
+pub async fn run_topology<S, P, K>(
+    sources: &mut [S],
+    processor: &P,
+    sinks: &mut [K],
+    metrics: &PipelineMetrics,
+    shutdown: &AtomicBool,
+) -> Result<(), AeonError>
+where
+    S: Source,
+    P: Processor,
+    K: Sink,
+{
+    let topo = Topology::detect(sources.len(), sinks.len());
+
+    match topo {
+        Topology::Linear => {
+            let source = sources.first_mut().ok_or_else(|| {
+                AeonError::config("pipeline requires at least one source")
+            })?;
+            let sink = sinks.first_mut().ok_or_else(|| {
+                AeonError::config("pipeline requires at least one sink")
+            })?;
+            crate::pipeline::run(source, processor, sink, metrics, shutdown).await
+        }
+        Topology::FanIn => {
+            let sink = sinks.first_mut().ok_or_else(|| {
+                AeonError::config("fan-in requires at least one sink")
+            })?;
+            run_fan_in(sources, processor, sink, metrics, shutdown).await
+        }
+        Topology::FanOut => {
+            let source = sources.first_mut().ok_or_else(|| {
+                AeonError::config("fan-out requires at least one source")
+            })?;
+            run_fan_out(source, processor, sinks, metrics, shutdown).await
+        }
+        Topology::FanInFanOut => {
+            run_fan_in_fan_out(sources, processor, sinks, metrics, shutdown).await
+        }
+    }
+}
+
+/// N sources → 1 processor → M sinks. Round-robin sources, then fan-out
+/// to all sinks per batch.
+async fn run_fan_in_fan_out<S, P, K>(
+    sources: &mut [S],
+    processor: &P,
+    sinks: &mut [K],
+    metrics: &PipelineMetrics,
+    shutdown: &AtomicBool,
+) -> Result<(), AeonError>
+where
+    S: Source,
+    P: Processor,
+    K: Sink,
+{
+    if sources.is_empty() || sinks.is_empty() {
+        return Err(AeonError::config(
+            "fan-in-fan-out requires at least one source and one sink",
+        ));
+    }
+
+    let mut exhausted = vec![false; sources.len()];
+
+    while !shutdown.load(Ordering::Relaxed) {
+        let mut any_active = false;
+
+        for (i, source) in sources.iter_mut().enumerate() {
+            if exhausted[i] {
+                continue;
+            }
+
+            let events = source.next_batch().await?;
+            if events.is_empty() {
+                exhausted[i] = true;
+                continue;
+            }
+
+            any_active = true;
+            let count = events.len() as u64;
+            metrics.events_received.fetch_add(count, Ordering::Relaxed);
+
+            let outputs = processor.process_batch(events)?;
+            metrics.events_processed.fetch_add(count, Ordering::Relaxed);
+
+            let out_count = outputs.len() as u64;
+
+            let sink_count = sinks.len();
+            for sink in sinks.iter_mut().take(sink_count - 1) {
+                let cloned = outputs.to_vec();
+                sink.write_batch(cloned).await?;
+            }
+            if let Some(last) = sinks.last_mut() {
+                last.write_batch(outputs).await?;
+            }
+
+            metrics.outputs_sent.fetch_add(out_count, Ordering::Relaxed);
+        }
+
+        if !any_active {
+            break;
+        }
+    }
+
+    for sink in sinks.iter_mut() {
+        sink.flush().await?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -827,5 +972,112 @@ mod tests {
 
         assert_eq!(sinks[0].count(), 1_000);
         assert_eq!(sinks[1].count(), 1_000);
+    }
+
+    #[test]
+    fn topology_detect_linear() {
+        assert_eq!(Topology::detect(1, 1), Topology::Linear);
+    }
+
+    #[test]
+    fn topology_detect_fan_in() {
+        assert_eq!(Topology::detect(3, 1), Topology::FanIn);
+    }
+
+    #[test]
+    fn topology_detect_fan_out() {
+        assert_eq!(Topology::detect(1, 4), Topology::FanOut);
+    }
+
+    #[test]
+    fn topology_detect_fan_in_fan_out() {
+        assert_eq!(Topology::detect(2, 3), Topology::FanInFanOut);
+    }
+
+    #[tokio::test]
+    async fn run_topology_linear_path() {
+        let events = make_events(100);
+        let mut sources = vec![MemorySource::new(events, 32)];
+        let processor = PassthroughProcessor::new(Arc::from("out"));
+        let mut sinks = vec![MemorySink::new()];
+        let metrics = PipelineMetrics::new();
+        let shutdown = AtomicBool::new(false);
+
+        run_topology(&mut sources, &processor, &mut sinks, &metrics, &shutdown)
+            .await
+            .unwrap();
+
+        assert_eq!(sinks[0].outputs().len(), 100);
+    }
+
+    #[tokio::test]
+    async fn run_topology_fan_in_path() {
+        let events_a = make_events(50);
+        let events_b = make_events(50);
+        let mut sources = vec![
+            MemorySource::new(events_a, 32),
+            MemorySource::new(events_b, 32),
+        ];
+        let processor = PassthroughProcessor::new(Arc::from("out"));
+        let mut sinks = vec![MemorySink::new()];
+        let metrics = PipelineMetrics::new();
+        let shutdown = AtomicBool::new(false);
+
+        run_topology(&mut sources, &processor, &mut sinks, &metrics, &shutdown)
+            .await
+            .unwrap();
+
+        assert_eq!(sinks[0].outputs().len(), 100);
+    }
+
+    #[tokio::test]
+    async fn run_topology_fan_out_path() {
+        let events = make_events(100);
+        let mut sources = vec![MemorySource::new(events, 32)];
+        let processor = PassthroughProcessor::new(Arc::from("out"));
+        let mut sinks = vec![BlackholeSink::new(), BlackholeSink::new()];
+        let metrics = PipelineMetrics::new();
+        let shutdown = AtomicBool::new(false);
+
+        run_topology(&mut sources, &processor, &mut sinks, &metrics, &shutdown)
+            .await
+            .unwrap();
+
+        assert_eq!(sinks[0].count(), 100);
+        assert_eq!(sinks[1].count(), 100);
+    }
+
+    #[tokio::test]
+    async fn run_topology_fan_in_fan_out_path() {
+        let events_a = make_events(40);
+        let events_b = make_events(60);
+        let mut sources = vec![
+            MemorySource::new(events_a, 32),
+            MemorySource::new(events_b, 32),
+        ];
+        let processor = PassthroughProcessor::new(Arc::from("out"));
+        let mut sinks = vec![BlackholeSink::new(), BlackholeSink::new()];
+        let metrics = PipelineMetrics::new();
+        let shutdown = AtomicBool::new(false);
+
+        run_topology(&mut sources, &processor, &mut sinks, &metrics, &shutdown)
+            .await
+            .unwrap();
+
+        assert_eq!(sinks[0].count(), 100);
+        assert_eq!(sinks[1].count(), 100);
+    }
+
+    #[tokio::test]
+    async fn run_topology_empty_sources_errors() {
+        let mut sources: Vec<MemorySource> = vec![];
+        let processor = PassthroughProcessor::new(Arc::from("out"));
+        let mut sinks = vec![BlackholeSink::new()];
+        let metrics = PipelineMetrics::new();
+        let shutdown = AtomicBool::new(false);
+
+        let result =
+            run_topology(&mut sources, &processor, &mut sinks, &metrics, &shutdown).await;
+        assert!(result.is_err());
     }
 }

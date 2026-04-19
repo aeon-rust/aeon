@@ -175,17 +175,29 @@ impl ThreeNodeCluster {
         tokio::spawn(server::serve(
             Arc::clone(&ep1),
             raft1.clone(),
+            1,
             Arc::clone(&shutdown),
+            None,
+            None,
+            None,
         ));
         tokio::spawn(server::serve(
             Arc::clone(&ep2),
             raft2.clone(),
+            2,
             Arc::clone(&shutdown),
+            None,
+            None,
+            None,
         ));
         tokio::spawn(server::serve(
             Arc::clone(&ep3),
             raft3.clone(),
+            3,
             Arc::clone(&shutdown),
+            None,
+            None,
+            None,
         ));
 
         let mut members = BTreeMap::new();

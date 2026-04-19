@@ -3,6 +3,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[cfg(feature = "rest-api")]
+mod connectors;
+
 /// Default REST API address for CLI commands.
 /// Overridable via `AEON_API_URL` environment variable (12-Factor Config).
 fn default_api() -> String {
@@ -144,6 +147,14 @@ enum Commands {
         /// Artifact storage directory
         #[arg(long, default_value = "/app/artifacts")]
         artifact_dir: String,
+    },
+    /// Inspect and control the Aeon cluster (Raft status, partition handover)
+    Cluster {
+        /// Aeon REST API address
+        #[arg(long, default_value_t = default_api(), global = true)]
+        api: String,
+        #[command(subcommand)]
+        action: ClusterAction,
     },
     /// Check environment readiness (DX-2): ports, connectivity, state dir, artifacts
     Doctor {
@@ -300,6 +311,51 @@ enum DevAction {
 }
 
 #[derive(Subcommand)]
+enum ClusterAction {
+    /// Show cluster status: node ID, leader, partition assignments, Raft metrics.
+    ///
+    /// With `--watch`, polls the endpoint on an interval and re-renders a
+    /// compact human-readable view (partition ownership, transfers in flight,
+    /// Raft term/index). Ctrl-C to exit. Without `--watch`, prints a raw JSON
+    /// snapshot — script-friendly.
+    Status {
+        /// Watch mode: clear + re-render on each tick until Ctrl-C.
+        #[arg(long)]
+        watch: bool,
+        /// Poll interval in seconds when `--watch` is set.
+        #[arg(long, default_value_t = 2.0)]
+        interval: f64,
+    },
+    /// Initiate a partition handover from the current owner to a target node.
+    ///
+    /// Must be issued against the current Raft leader. If you hit a follower,
+    /// the server replies `409 Conflict` with an `X-Leader-Id` header pointing
+    /// to the real leader — rerun against that node.
+    TransferPartition {
+        /// Partition ID to transfer
+        #[arg(long)]
+        partition: u16,
+        /// Target node ID (the partition's new owner)
+        #[arg(long)]
+        target: u64,
+    },
+    /// Send every partition currently owned by `--node` to the other live members.
+    ///
+    /// Must be issued against the current Raft leader. Follower replies carry
+    /// `X-Leader-Id` — rerun against that node.
+    Drain {
+        /// Node ID to drain (all its partitions handed off to remaining live members)
+        #[arg(long)]
+        node: u64,
+    },
+    /// Redistribute partitions across live members toward an even split.
+    ///
+    /// Must be issued against the current Raft leader. Follower replies carry
+    /// `X-Leader-Id` — rerun against that node.
+    Rebalance,
+}
+
+#[derive(Subcommand)]
 enum TlsAction {
     /// Export the CA certificate (for distributing to clients)
     ExportCa {
@@ -450,6 +506,7 @@ fn run(cli: Cli) -> Result<()> {
             cmd_dev(&action)
         }
         Some(Commands::Tls { action }) => cmd_tls(&action),
+        Some(Commands::Cluster { api, action }) => cmd_cluster(&api, &action),
         #[cfg(feature = "rest-api")]
         Some(Commands::Serve { addr, artifact_dir }) => cmd_serve(&addr, &artifact_dir),
         Some(Commands::Doctor {
@@ -494,6 +551,16 @@ fn cmd_serve(addr: &str, artifact_dir: &str) -> Result<()> {
         let pipelines = Arc::new(aeon_engine::pipeline_manager::PipelineManager::new());
         let identities = Arc::new(aeon_engine::identity_store::ProcessorIdentityStore::new());
 
+        // Build the ConnectorRegistry and register every default connector
+        // factory this binary ships with (memory / kafka sources and
+        // blackhole / stdout / kafka sinks). The supervisor then drives
+        // running tokio tasks off that registry — both through the REST
+        // start/stop path and through Raft-committed SetPipelineState.
+        let mut connectors = aeon_engine::ConnectorRegistry::new();
+        crate::connectors::register_defaults(&mut connectors);
+        let connectors = Arc::new(connectors);
+        let supervisor = Arc::new(aeon_engine::PipelineSupervisor::new(Arc::clone(&connectors)));
+
         // Cluster initialization — detect K8s environment
         let cluster_enabled = std::env::var("AEON_CLUSTER_ENABLED")
             .map(|v| v.to_lowercase() == "true")
@@ -510,7 +577,79 @@ fn cmd_serve(addr: &str, artifact_dir: &str) -> Result<()> {
                         "K8s cluster discovery: initializing Raft node"
                     );
 
-                    let config = k8s.to_cluster_config();
+                    // G10 — scale-up pods (StatefulSet ordinal >= initial
+                    // replicas count) must not re-run `raft.initialize`; they
+                    // seed-join the existing cluster instead. `is_scale_up_pod`
+                    // reads the stale `AEON_CLUSTER_REPLICAS` env that helm
+                    // baked at install time against this pod's ordinal.
+                    let scale_up = k8s.is_scale_up_pod();
+                    let mut config = if scale_up {
+                        tracing::info!(
+                            ordinal = k8s.ordinal,
+                            replicas = k8s.replicas,
+                            "scale-up pod detected — will seed-join existing cluster"
+                        );
+                        k8s.to_join_config()
+                    } else {
+                        k8s.to_cluster_config()
+                    };
+
+                    // G11.a: allow operators to override the PoH chain verification
+                    // mode at install time via env (Helm values set this on the
+                    // StatefulSet). YAML is the source of truth; env is the
+                    // operator override because the k8s path doesn't read YAML.
+                    if let Ok(mode) = std::env::var("AEON_CLUSTER_POH_VERIFY_MODE") {
+                        config.poh_verify_mode = mode;
+                    }
+
+                    // G14: raft_timing env overrides. Helm surfaces
+                    // `cluster.raftTiming.*` as these env vars so operators can
+                    // pick `fast_failover` (<5s target) vs `prod_recommended`
+                    // vs `flaky_network` without rebuilding. Validation runs
+                    // below so an invalid combo fails fast at startup.
+                    if let Some(v) = std::env::var("AEON_RAFT_HEARTBEAT_MS")
+                        .ok()
+                        .and_then(|s| s.parse::<u64>().ok())
+                    {
+                        config.raft_timing.heartbeat_ms = v;
+                    }
+                    if let Some(v) = std::env::var("AEON_RAFT_ELECTION_MIN_MS")
+                        .ok()
+                        .and_then(|s| s.parse::<u64>().ok())
+                    {
+                        config.raft_timing.election_min_ms = v;
+                    }
+                    if let Some(v) = std::env::var("AEON_RAFT_ELECTION_MAX_MS")
+                        .ok()
+                        .and_then(|s| s.parse::<u64>().ok())
+                    {
+                        config.raft_timing.election_max_ms = v;
+                    }
+
+                    // G9: auto-forward REST writes to leader needs to know
+                    // (a) what port peers listen on — all pods share the same
+                    // REST port because the StatefulSet's headless service
+                    // publishes it on every pod FQDN — and (b) the scheme.
+                    // Parse the bind address string (CLI flag or AEON_API_ADDR
+                    // env) once so follower pods can synthesise a 307 Location.
+                    let rest_listen = std::env::var("AEON_API_ADDR")
+                        .unwrap_or_else(|_| addr.to_string());
+                    if let Ok(parsed) = rest_listen.parse::<std::net::SocketAddr>() {
+                        config.rest_api_port = Some(parsed.port());
+                    } else if let Some(port) = rest_listen
+                        .rsplit(':')
+                        .next()
+                        .and_then(|p| p.parse::<u16>().ok())
+                    {
+                        config.rest_api_port = Some(port);
+                    }
+                    if config.rest_scheme.is_none() {
+                        config.rest_scheme = Some("http".to_string());
+                    }
+
+                    config
+                        .validate()
+                        .map_err(|e| anyhow::anyhow!("cluster config: {e}"))?;
 
                     // Select TLS mode based on cluster config (FT-8):
                     //   - config.tls = Some(...)  → production mTLS (file-based)
@@ -529,13 +668,22 @@ fn cmd_serve(addr: &str, artifact_dir: &str) -> Result<()> {
                         .map_err(|e| anyhow::anyhow!("QUIC bind failed: {e}"))?,
                     );
 
-                    // All nodes call bootstrap_multi with the same membership.
-                    // openraft requires every node to initialize with identical
-                    // membership for fresh cluster bootstrap. Raft election then
-                    // determines the actual leader.
-                    let node = aeon_cluster::ClusterNode::bootstrap_multi(config, endpoint)
+                    // G10 — branch on bootstrap vs join. bootstrap_multi()
+                    // runs `raft.initialize(members)`; join() seed-contacts an
+                    // existing leader and lets it `add_learner → change_membership`.
+                    let poh_mode_str = config.poh_verify_mode.clone();
+                    let node = if scale_up {
+                        aeon_cluster::ClusterNode::join(config, Arc::clone(&endpoint))
+                            .await
+                            .map_err(|e| anyhow::anyhow!("Cluster seed-join failed: {e}"))?
+                    } else {
+                        aeon_cluster::ClusterNode::bootstrap_multi(
+                            config,
+                            Arc::clone(&endpoint),
+                        )
                         .await
-                        .map_err(|e| anyhow::anyhow!("Cluster bootstrap failed: {e}"))?;
+                        .map_err(|e| anyhow::anyhow!("Cluster bootstrap failed: {e}"))?
+                    };
 
                     let node = Arc::new(node);
 
@@ -545,12 +693,109 @@ fn cmd_serve(addr: &str, artifact_dir: &str) -> Result<()> {
                     // pipelines created via REST on one node would replicate but
                     // never take effect on follower replicas.
                     node.install_registry_applier(Arc::new(
-                        aeon_engine::ClusterRegistryApplier::new(
+                        aeon_engine::ClusterRegistryApplier::with_supervisor(
                             Arc::clone(&registry),
                             Arc::clone(&pipelines),
+                            Arc::clone(&supervisor),
                         ),
                     ))
                     .await;
+
+                    // G1: install the cluster-backed partition-ownership
+                    // resolver onto the supervisor. When a pipeline manifest
+                    // leaves `partitions` empty, start() now fills it with
+                    // this node's owned slice from the Raft-replicated
+                    // PartitionTable rather than silently defaulting to [0].
+                    supervisor
+                        .set_ownership_resolver(Arc::new(
+                            aeon_engine::ClusterPartitionOwnership::new(
+                                node.shared_state(),
+                                node.config().node_id,
+                            ),
+                        ))
+                        .map_err(|e| {
+                            anyhow::anyhow!("install ownership resolver: {e}")
+                        })?;
+
+                    // G11.b — spawn the leader-side partition-transfer driver.
+                    // Without this, Raft-committed `Transferring` entries never
+                    // drive the three-step CL-6 handover and T4 / T2 cutovers
+                    // stall with `owner=null` forever. We gate on an explicit
+                    // pipeline name (single-pipeline deployment assumption —
+                    // see partition_driver.rs) — if unset, skip driver setup
+                    // and log. The driver itself is a no-op on nodes that are
+                    // never picked as a transfer target.
+                    if let Ok(pipeline_name) = std::env::var("AEON_PIPELINE_NAME") {
+                        let poh_mode: aeon_crypto::poh::PohVerifyMode = poh_mode_str
+                            .parse()
+                            .map_err(|e| anyhow::anyhow!(
+                                "invalid cluster.poh_verify_mode '{poh_mode_str}': {e}"
+                            ))?;
+
+                        let l2_root = std::env::var("AEON_L2_ROOT").unwrap_or_else(|_| {
+                            format!("{dir}/l2body")
+                        });
+                        let seg_installer = Arc::new(
+                            aeon_engine::L2SegmentInstaller::new(&l2_root, &pipeline_name),
+                        );
+
+                        let poh_registry = aeon_engine::InstalledPohChainRegistry::new();
+                        let poh_installer = Arc::new(
+                            aeon_engine::PohChainInstallerImpl::new(
+                                poh_registry.clone(),
+                                poh_mode,
+                            ),
+                        );
+
+                        // G11.c: the supervisor reads from the same registry
+                        // the installer writes to, so a chain installed during
+                        // CL-6 handover is picked up by `create_poh_state`
+                        // when the post-transfer pipeline task starts on this
+                        // node. Without this, every ownership flip would
+                        // restart the PoH chain at sequence 0 and Gate 2's
+                        // "PoH chain has no gaps across transfers" row can't
+                        // pass.
+                        supervisor
+                            .set_poh_installed_chains(Arc::new(poh_registry.clone()))
+                            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+                        let resolver: Arc<dyn aeon_cluster::NodeResolver> =
+                            Arc::new(aeon_cluster::RaftNodeResolver::new(
+                                node.raft().clone(),
+                            ));
+
+                        let driver = Arc::new(aeon_cluster::PartitionTransferDriver::new(
+                            Arc::clone(&endpoint),
+                            node.raft().clone(),
+                            node.shared_state(),
+                            resolver,
+                            node.config().node_id,
+                            pipeline_name.clone(),
+                            seg_installer,
+                            poh_installer,
+                        ));
+
+                        node.install_transfer_driver(Arc::clone(&driver)).await;
+
+                        let driver_shutdown = node.shutdown_flag();
+                        let driver_for_loop = Arc::clone(&driver);
+                        tokio::spawn(async move {
+                            driver_for_loop.watch_loop(driver_shutdown).await;
+                        });
+
+                        tracing::info!(
+                            pipeline = %pipeline_name,
+                            verify_mode = %poh_mode_str,
+                            l2_root = %l2_root,
+                            "PartitionTransferDriver spawned — transfers will drive automatically"
+                        );
+                    } else {
+                        tracing::warn!(
+                            "AEON_PIPELINE_NAME unset — skipping PartitionTransferDriver. \
+                             Raft-committed partition transfers will not make progress \
+                             on this node. Set AEON_PIPELINE_NAME to enable CL-6 handover."
+                        );
+                    }
 
                     // Spawn background task for leader election + partition assignment.
                     // Retries for up to 120s. Each iteration checks:
@@ -619,6 +864,7 @@ fn cmd_serve(addr: &str, artifact_dir: &str) -> Result<()> {
         let state = Arc::new(aeon_engine::AppState {
             registry,
             pipelines,
+            supervisor,
             delivery_ledgers: dashmap::DashMap::new(),
             pipeline_controls: dashmap::DashMap::new(),
             pipeline_metrics: dashmap::DashMap::new(),
@@ -627,6 +873,7 @@ fn cmd_serve(addr: &str, artifact_dir: &str) -> Result<()> {
             authenticator: None,
             ws_host: None,
             cluster_node: cluster_node.clone(),
+            shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
 
         let listen_addr =
@@ -1434,6 +1681,211 @@ fn cmd_pipeline(api: &str, action: &PipelineAction) -> Result<()> {
             Ok(())
         }
     }
+}
+
+// ── aeon cluster ──────────────────────────────────────────────────────
+
+fn cmd_cluster(api: &str, action: &ClusterAction) -> Result<()> {
+    match action {
+        ClusterAction::Status { watch, interval } => {
+            cmd_cluster_status(api, *watch, *interval)
+        }
+        ClusterAction::TransferPartition { partition, target } => {
+            let url = format!("{api}/api/v1/cluster/partitions/{partition}/transfer");
+            let payload = serde_json::json!({ "target_node_id": target });
+            post_cluster_mutation(&url, Some(payload), "transfer")
+        }
+        ClusterAction::Drain { node } => {
+            let url = format!("{api}/api/v1/cluster/drain");
+            let payload = serde_json::json!({ "node_id": node });
+            post_cluster_mutation(&url, Some(payload), "drain")
+        }
+        ClusterAction::Rebalance => {
+            let url = format!("{api}/api/v1/cluster/rebalance");
+            post_cluster_mutation(&url, None, "rebalance")
+        }
+    }
+}
+
+/// POST a cluster mutation (transfer / drain / rebalance) and pretty-print the
+/// response. Translates 409 Conflict into an operator-friendly "hit a follower,
+/// leader is node N" message using the `X-Leader-Id` header set by the server.
+fn post_cluster_mutation(
+    url: &str,
+    body: Option<serde_json::Value>,
+    op: &str,
+) -> Result<()> {
+    let req = ureq::post(url);
+    let result = match body {
+        Some(ref json) => req.send_json(json),
+        None => req.call(),
+    };
+    match result {
+        Ok(resp) => {
+            let body: serde_json::Value = resp
+                .into_json()
+                .with_context(|| format!("invalid JSON response from {op}"))?;
+            println!("{}", serde_json::to_string_pretty(&body)?);
+            Ok(())
+        }
+        Err(ureq::Error::Status(code, resp)) => {
+            let leader_hint = resp.header("X-Leader-Id").map(|s| s.to_string());
+            let body_text = resp.into_string().unwrap_or_default();
+            if let Some(leader_id) = leader_hint {
+                bail!(
+                    "{op} rejected (HTTP {code}); current Raft leader is node {leader_id}\n\
+                     body: {body_text}"
+                );
+            }
+            bail!("{op} rejected (HTTP {code}): {body_text}");
+        }
+        Err(e) => Err(anyhow::Error::new(e).context("failed to reach Aeon API")),
+    }
+}
+
+/// Fetch `/api/v1/cluster/status`. Once-shot prints the raw JSON (script
+/// friendly); `--watch` re-renders a compact human view on every tick.
+/// Ctrl-C exits (the loop runs on the main thread; SIGINT/Ctrl-C kills
+/// the process, which is the right UX for a terminal watch command).
+fn cmd_cluster_status(api: &str, watch: bool, interval_secs: f64) -> Result<()> {
+    let url = format!("{api}/api/v1/cluster/status");
+    if !watch {
+        let body: serde_json::Value = ureq::get(&url)
+            .call()
+            .context("failed to reach Aeon API")?
+            .into_json()
+            .context("invalid JSON response")?;
+        println!("{}", serde_json::to_string_pretty(&body)?);
+        return Ok(());
+    }
+
+    if !interval_secs.is_finite() || interval_secs < 0.1 {
+        bail!("--interval must be >= 0.1 seconds");
+    }
+    let sleep_ms = (interval_secs * 1000.0) as u64;
+
+    loop {
+        let rendered = match fetch_cluster_status(&url) {
+            Ok(body) => render_cluster_status(&body, interval_secs),
+            Err(e) => format!("error: {e}\n(retrying in {interval_secs}s)"),
+        };
+        // ANSI clear screen + home cursor. Every terminal Aeon targets
+        // (Linux, macOS Terminal, Windows Terminal, PowerShell) handles
+        // these; the old conhost does not, but that's not a supported
+        // Aeon target any more.
+        print!("\x1b[2J\x1b[H{rendered}");
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
+    }
+}
+
+fn fetch_cluster_status(url: &str) -> Result<serde_json::Value> {
+    let resp = ureq::get(url).call().context("HTTP GET failed")?;
+    resp.into_json::<serde_json::Value>()
+        .context("invalid JSON response")
+}
+
+/// Render the `/api/v1/cluster/status` JSON body as an operator-friendly
+/// plain-text block. Falls back to the raw JSON if the body shape does
+/// not match the expected cluster schema (e.g. standalone mode).
+fn render_cluster_status(body: &serde_json::Value, interval_secs: f64) -> String {
+    let now = chrono_like_hms();
+    let mode = body.get("mode").and_then(|v| v.as_str()).unwrap_or("?");
+
+    if mode != "cluster" {
+        let msg = body
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("no cluster");
+        return format!(
+            "Aeon cluster status  ({now})\n\nmode: {mode}\n{msg}\n\n(every {interval_secs}s, Ctrl-C to exit)\n"
+        );
+    }
+
+    let node_id = body.get("node_id").and_then(|v| v.as_u64()).unwrap_or(0);
+    let leader = body
+        .get("leader_id")
+        .and_then(|v| v.as_u64())
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "<none>".to_string());
+    let num_partitions = body.get("num_partitions").and_then(|v| v.as_u64()).unwrap_or(0);
+
+    let raft = body.get("raft").cloned().unwrap_or(serde_json::Value::Null);
+    let raft_state = raft.get("state").and_then(|v| v.as_str()).unwrap_or("?");
+    let term = raft.get("current_term").and_then(|v| v.as_u64()).unwrap_or(0);
+    let last_applied = raft
+        .get("last_applied")
+        .and_then(|v| v.as_u64())
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let last_log = raft
+        .get("last_log_index")
+        .and_then(|v| v.as_u64())
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "-".to_string());
+
+    let mut out = String::new();
+    out.push_str(&format!("Aeon cluster status  ({now})\n\n"));
+    out.push_str(&format!(
+        "node: {node_id}    leader: {leader}    raft: {raft_state}\n"
+    ));
+    out.push_str(&format!(
+        "term: {term}    last_applied: {last_applied}    last_log: {last_log}\n\n"
+    ));
+    out.push_str(&format!("Partitions ({num_partitions} total)\n"));
+
+    // Partitions come back as a map keyed by stringified partition id.
+    // Sort numerically so the output order is stable.
+    let mut rows: Vec<(u16, String)> = Vec::new();
+    if let Some(map) = body.get("partitions").and_then(|v| v.as_object()) {
+        for (k, v) in map.iter() {
+            let pid: u16 = match k.parse() {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+            let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("?");
+            let cell = match status {
+                "owned" => {
+                    let owner = v.get("owner").and_then(|n| n.as_u64()).unwrap_or(0);
+                    format!("owned   node {owner}")
+                }
+                "transferring" => {
+                    let src = v.get("source").and_then(|n| n.as_u64()).unwrap_or(0);
+                    let tgt = v.get("target").and_then(|n| n.as_u64()).unwrap_or(0);
+                    format!("transfer  {src} → {tgt}")
+                }
+                other => other.to_string(),
+            };
+            rows.push((pid, cell));
+        }
+    }
+    rows.sort_by_key(|(pid, _)| *pid);
+    for (pid, cell) in rows {
+        out.push_str(&format!("  P{pid:<3}  {cell}\n"));
+    }
+
+    out.push_str(&format!(
+        "\n(every {interval_secs}s, Ctrl-C to exit)\n"
+    ));
+    out
+}
+
+/// `HH:MM:SS` wall clock without pulling `chrono` — used only for the
+/// watch header. Never parses, never does timezone arithmetic, just
+/// turns local elapsed-since-epoch seconds into a stable UTC string so
+/// the rendered block has *some* time marker the operator can correlate
+/// with log timestamps. UTC is fine — operators cross-reference by
+/// matching HH:MM:SS, not by reading off a specific zone.
+fn chrono_like_hms() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let hh = (now / 3600) % 24;
+    let mm = (now / 60) % 60;
+    let ss = now % 60;
+    format!("{hh:02}:{mm:02}:{ss:02}Z")
 }
 
 // ── aeon deploy ───────────────────────────────────────────────────────
@@ -2808,5 +3260,122 @@ fn check_artifact(path: &Path) -> CheckResult {
             format!("{} has unexpected extension '.{ext}'", path.display()),
             "expected .wasm, .so, .dll, or .dylib",
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_cluster_body() -> serde_json::Value {
+        serde_json::json!({
+            "mode": "cluster",
+            "node_id": 2,
+            "leader_id": 1,
+            "num_partitions": 4,
+            "partitions": {
+                "0": { "status": "owned", "owner": 1 },
+                "1": { "status": "owned", "owner": 2 },
+                "2": { "status": "transferring", "source": 1, "target": 3 },
+                "3": { "status": "owned", "owner": 2 },
+            },
+            "raft": {
+                "state": "Follower",
+                "current_term": 5,
+                "last_applied": 127,
+                "last_log_index": 127,
+                "membership": "[1, 2, 3]"
+            }
+        })
+    }
+
+    #[test]
+    fn render_cluster_body_includes_leader_and_partition_rows_in_id_order() {
+        let rendered = render_cluster_status(&sample_cluster_body(), 2.0);
+
+        assert!(rendered.contains("node: 2"), "header missing node id: {rendered}");
+        assert!(rendered.contains("leader: 1"), "header missing leader: {rendered}");
+        assert!(rendered.contains("term: 5"), "term missing: {rendered}");
+        assert!(rendered.contains("last_applied: 127"), "last_applied missing");
+
+        let p0 = rendered.find("P0").expect("P0 row");
+        let p1 = rendered.find("P1").expect("P1 row");
+        let p2 = rendered.find("P2").expect("P2 row");
+        let p3 = rendered.find("P3").expect("P3 row");
+        assert!(
+            p0 < p1 && p1 < p2 && p2 < p3,
+            "partition rows must render in ascending partition-id order: {rendered}"
+        );
+
+        assert!(
+            rendered.contains("transfer  1 → 3"),
+            "transfer row shape wrong: {rendered}"
+        );
+        assert!(rendered.contains("(every 2s, Ctrl-C to exit)"));
+    }
+
+    #[test]
+    fn render_cluster_body_falls_back_on_standalone_mode() {
+        let body = serde_json::json!({
+            "mode": "standalone",
+            "message": "no cluster node configured"
+        });
+        let rendered = render_cluster_status(&body, 1.5);
+        assert!(rendered.contains("mode: standalone"));
+        assert!(rendered.contains("no cluster node configured"));
+        // No partition table when not in cluster mode.
+        assert!(!rendered.contains("Partitions ("));
+    }
+
+    #[test]
+    fn render_cluster_body_handles_missing_leader_gracefully() {
+        let mut body = sample_cluster_body();
+        body["leader_id"] = serde_json::Value::Null;
+        let rendered = render_cluster_status(&body, 2.0);
+        assert!(
+            rendered.contains("leader: <none>"),
+            "no-leader must render as <none>: {rendered}"
+        );
+    }
+
+    #[test]
+    fn render_cluster_body_sorts_partitions_by_numeric_id_not_lexicographic() {
+        // Keys "10" and "2" would sort lexicographically as "10" < "2".
+        // Confirm we parse and sort numerically.
+        let body = serde_json::json!({
+            "mode": "cluster",
+            "node_id": 1,
+            "leader_id": 1,
+            "num_partitions": 12,
+            "partitions": {
+                "2":  { "status": "owned", "owner": 1 },
+                "10": { "status": "owned", "owner": 1 },
+            },
+            "raft": {
+                "state": "Leader",
+                "current_term": 1,
+                "last_applied": 0,
+                "last_log_index": 0,
+                "membership": "[1]"
+            }
+        });
+        let rendered = render_cluster_status(&body, 2.0);
+        let p2 = rendered.find("P2 ").expect("P2");
+        let p10 = rendered.find("P10").expect("P10");
+        assert!(p2 < p10, "numeric sort: P2 must come before P10: {rendered}");
+    }
+
+    #[test]
+    fn chrono_like_hms_returns_eight_char_utc_timestamp() {
+        let ts = chrono_like_hms();
+        assert_eq!(ts.len(), 9, "HH:MM:SSZ expected, got {ts:?}");
+        assert!(ts.ends_with('Z'));
+        let parts: Vec<&str> = ts.trim_end_matches('Z').split(':').collect();
+        assert_eq!(parts.len(), 3);
+        for p in &parts {
+            assert_eq!(p.len(), 2);
+            let n: u32 = p.parse().expect("numeric");
+            assert!(n < 60);
+        }
     }
 }

@@ -1,0 +1,49 @@
+# Host-network PPS probe — iperf3 pods using the node's network stack
+# directly, bypassing the CNI overlay. Isolates the DO droplet PPS cap
+# from pod-to-pod CNI overhead.
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: iperf3-server-host
+  namespace: pps-probe
+  labels:
+    app: iperf3-host
+    role: server
+spec:
+  hostNetwork: true
+  dnsPolicy: ClusterFirstWithHostNet
+  nodeName: pool-f5vm1izlt-9q983
+  tolerations:
+    - key: workload
+      operator: Equal
+      value: aeon
+      effect: NoSchedule
+  containers:
+    - name: iperf3
+      image: networkstatic/iperf3:latest
+      command: ["iperf3", "-s", "-p", "5202"]
+  restartPolicy: Never
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: iperf3-client-host
+  namespace: pps-probe
+  labels:
+    app: iperf3-host
+    role: client
+spec:
+  hostNetwork: true
+  dnsPolicy: ClusterFirstWithHostNet
+  nodeName: pool-f5vm1izlt-9q988
+  tolerations:
+    - key: workload
+      operator: Equal
+      value: aeon
+      effect: NoSchedule
+  containers:
+    - name: iperf3
+      image: networkstatic/iperf3:latest
+      command: ["sleep", "600"]
+  restartPolicy: Never

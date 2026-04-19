@@ -258,6 +258,12 @@ pub struct PipelineDefinition {
     /// In-progress upgrade state (blue-green or canary). None when stable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upgrade_state: Option<UpgradeInfo>,
+    /// EO-2 durability block — drives engine-side DeliveryConfig (durability
+    /// mode, checkpoint backend, flush cadence, L2 byte cap) when the
+    /// pipeline runtime spawns. Defaults to `None` mode for backward
+    /// compatibility with pre-EO-2 serialized forms.
+    #[serde(default)]
+    pub durability: crate::manifest::DurabilityBlock,
 }
 
 impl PipelineDefinition {
@@ -281,6 +287,7 @@ impl PipelineDefinition {
             assigned_node: None,
             transport_codec: crate::transport_codec::TransportCodec::default(),
             upgrade_state: None,
+            durability: crate::manifest::DurabilityBlock::default(),
         }
     }
 }

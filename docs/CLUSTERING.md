@@ -11,6 +11,24 @@
 > CL-6, cluster metrics) is tracked in `docs/FAULT-TOLERANCE-ANALYSIS.md` Section 7
 > (Pillar 3). Note that local Rancher Desktop K3s is single-node; multi-node testing
 > requires DOKS/EKS/GKE or a real multi-node K3s cluster.
+>
+> **Gate 2 code-path status (2026-04-19):** all Aeon code blockers for
+> horizontal scale-up/down are closed. G11.a/b/c shipped the transfer
+> driver + installer hooks. G15 shipped the fix for the
+> `handle_add_node` leader-self-equality check — `server::serve()` now
+> takes `self_id: NodeId` sourced from `ClusterConfig::node_id`
+> (authoritative for REST), so the leader-self check in
+> `handle_add_node` / `handle_remove_node` no longer relies on the
+> watch-channel `raft.metrics().borrow().id`, which can diverge from the
+> configured id. A `tracing::warn!` stays on the reject path as a
+> diagnostic if future divergence occurs. Regression test
+> `g15_join_targets_actual_leader_of_three_node_cluster` in
+> `crates/aeon-cluster/tests/multi_node.rs` asserts the QUIC join RPC
+> succeeds against the actual leader of a 3-node cluster bootstrapped
+> via `initial_members`. End-to-end T2/T3 verification on DOKS
+> (3→5→3→1 STS events with live T1 load + zero event loss) folds into
+> the next DOKS re-spin; see `docs/ROADMAP.md` "Phase 3b" +
+> `docs/GATE2-ACCEPTANCE-PLAN.md § 10.9` for the post-bundle evidence.
 
 ---
 
@@ -218,6 +236,21 @@ stable `term` counters (no term churn under load), the default is fine.
 If you see frequent leadership changes without actual node failures,
 move up to `prod_recommended`. Only use `flaky_network` if your latency
 distribution has multi-second tails.
+
+#### QUIC transport timeouts (derived from `raft_timing`)
+
+The Raft-layer timing above drives two QUIC-level knobs on every
+inter-node connection. Operators don't set these directly — they're
+derived automatically — but knowing the values matters when reading
+QUIC metrics or diagnosing stale connections:
+
+| QUIC knob | Value | Why |
+|-----------|-------|-----|
+| `keep_alive_interval` | `heartbeat_ms` (500 ms default) | Forces PING frames at the Raft heartbeat cadence so a silently-gone peer is noticed at the transport layer, not only via openraft's heartbeat-miss. |
+| `max_idle_timeout` | `2 × election_max_ms` (6 s default, 12 s prod, 24 s flaky) | Closes orphaned connections after a peer crashes. Sized well above the election window so normal traffic never trips it. |
+
+Raising `election_max_ms` automatically widens the idle-timeout, so the
+three presets scale together — there's no separate QUIC knob to forget.
 
 ### Connection retry and backoff — layering
 

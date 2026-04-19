@@ -18,7 +18,9 @@ mod inner {
     use crate::transport::endpoint::QuicEndpoint;
     use crate::transport::network::QuicNetworkFactory;
     use crate::transport::server;
-    use crate::types::{ClusterRequest, ClusterResponse, JoinRequest, NodeAddress, NodeId};
+    use crate::types::{
+        ClusterRequest, ClusterResponse, JoinRequest, NodeAddress, NodeId, TransferStatus,
+    };
 
     /// A stub RaftNetworkFactory that does nothing (for single-node clusters).
     /// Multi-node networking is implemented in Phase 8c.
@@ -121,7 +123,7 @@ mod inner {
         config: ClusterConfig,
         /// QUIC endpoint (None in single-node stub mode).
         endpoint: Option<Arc<QuicEndpoint>>,
-        /// Shutdown signal for the QUIC server task.
+        /// Shutdown signal for the QUIC server task + transfer watch loop.
         shutdown: Arc<std::sync::atomic::AtomicBool>,
         /// Shared read handle to the committed cluster state.
         shared_state: crate::store::SharedClusterState,
@@ -129,6 +131,14 @@ mod inner {
         /// `install_registry_applier` to wire up the node-local engine after
         /// bootstrap, since openraft takes ownership of the state machine.
         applier_slot: crate::store::RegistryApplierSlot,
+        /// G11.b — optional leader-side partition-transfer driver. Installed
+        /// after bootstrap (the driver depends on engine-side installers).
+        /// `propose_partition_transfer` calls `notify()` here so the watcher
+        /// wakes immediately instead of polling. None on nodes that don't
+        /// run the driver (e.g. single-node dev mode).
+        transfer_driver: tokio::sync::RwLock<
+            Option<Arc<crate::partition_driver::PartitionTransferDriver>>,
+        >,
     }
 
     impl ClusterNode {
@@ -185,6 +195,7 @@ mod inner {
                 shutdown,
                 shared_state,
                 applier_slot,
+                transfer_driver: tokio::sync::RwLock::new(None),
             };
 
             // Assign all partitions to self
@@ -293,6 +304,7 @@ mod inner {
                 shutdown,
                 shared_state,
                 applier_slot,
+                transfer_driver: tokio::sync::RwLock::new(None),
             };
 
             // Skip partition assignment on restart — the applied state machine
@@ -368,9 +380,19 @@ mod inner {
             let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let server_ep = Arc::clone(&endpoint);
             let server_raft = raft.clone();
+            let server_node_id = config.node_id;
             let server_shutdown = Arc::clone(&shutdown);
             tokio::spawn(async move {
-                server::serve(server_ep, server_raft, server_shutdown).await;
+                server::serve(
+                    server_ep,
+                    server_raft,
+                    server_node_id,
+                    server_shutdown,
+                    None,
+                    None,
+                    None,
+                )
+                .await;
             });
 
             // Build membership — use pre-computed initial_members if available,
@@ -408,6 +430,7 @@ mod inner {
                 shutdown,
                 shared_state,
                 applier_slot,
+                transfer_driver: tokio::sync::RwLock::new(None),
             };
 
             // NOTE: InitialAssignment is NOT proposed here — it must happen
@@ -466,9 +489,19 @@ mod inner {
             let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let server_ep = Arc::clone(&endpoint);
             let server_raft = raft.clone();
+            let server_node_id = config.node_id;
             let server_shutdown = Arc::clone(&shutdown);
             tokio::spawn(async move {
-                server::serve(server_ep, server_raft, server_shutdown).await;
+                server::serve(
+                    server_ep,
+                    server_raft,
+                    server_node_id,
+                    server_shutdown,
+                    None,
+                    None,
+                    None,
+                )
+                .await;
             });
 
             let shared_state = crate::store::SharedClusterState::default();
@@ -486,6 +519,7 @@ mod inner {
                 shutdown,
                 shared_state,
                 applier_slot,
+                transfer_driver: tokio::sync::RwLock::new(None),
             };
 
             Ok(node)
@@ -538,9 +572,19 @@ mod inner {
             let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let server_ep = Arc::clone(&endpoint);
             let server_raft = raft.clone();
+            let server_node_id = config.node_id;
             let server_shutdown = Arc::clone(&shutdown);
             tokio::spawn(async move {
-                server::serve(server_ep, server_raft, server_shutdown).await;
+                server::serve(
+                    server_ep,
+                    server_raft,
+                    server_node_id,
+                    server_shutdown,
+                    None,
+                    None,
+                    None,
+                )
+                .await;
             });
 
             // Use advertise_addr if set; otherwise fall back to bind address.
@@ -618,6 +662,7 @@ mod inner {
                 shutdown,
                 shared_state: crate::store::SharedClusterState::default(),
                 applier_slot,
+                transfer_driver: tokio::sync::RwLock::new(None),
             };
 
             Ok(node)
@@ -890,7 +935,18 @@ mod inner {
         }
 
         /// Propose a ClusterRequest through Raft consensus.
+        ///
+        /// G8 — if the node has just bootstrapped and self-election is still
+        /// in-flight, `client_write` would return `ForwardToLeader { None, None }`.
+        /// Block up to `leader_wait_budget()` for a leader to be known before
+        /// submitting, so callers (including REST `create_pipeline` issued
+        /// seconds after `aeon server` start) don't see a transient
+        /// "has to forward request to: None, None" 500.
         pub async fn propose(&self, request: ClusterRequest) -> Result<ClusterResponse, AeonError> {
+            if self.raft.metrics().borrow().current_leader.is_none() {
+                let _ = self.wait_for_leader(self.leader_wait_budget()).await;
+            }
+
             let response =
                 self.raft
                     .client_write(request)
@@ -903,6 +959,56 @@ mod inner {
             Ok(response.data)
         }
 
+        /// Budget for waiting on self-election / leader-discovery before a
+        /// proposal. Scaled off the configured election timeout (3x the max,
+        /// floored at 2s and capped at 10s) so a tightened `raft_timing`
+        /// preset shortens the wait and a loose one doesn't hang forever.
+        fn leader_wait_budget(&self) -> std::time::Duration {
+            let scaled = self
+                .config
+                .raft_timing
+                .election_max_ms
+                .saturating_mul(3);
+            let ms = scaled.clamp(2_000, 10_000);
+            std::time::Duration::from_millis(ms)
+        }
+
+        /// Wait until `raft.metrics().current_leader` is `Some(_)` or the
+        /// timeout expires. Returns the observed leader id on success.
+        ///
+        /// Used by [`propose`] to smooth the single-node self-election race
+        /// (G8) and available to callers that want to block before issuing a
+        /// first write after startup.
+        pub async fn wait_for_leader(
+            &self,
+            timeout: std::time::Duration,
+        ) -> Result<NodeId, AeonError> {
+            if let Some(id) = self.raft.metrics().borrow().current_leader {
+                return Ok(id);
+            }
+
+            let metrics = self
+                .raft
+                .wait(Some(timeout))
+                .metrics(
+                    |m| m.current_leader.is_some(),
+                    "wait_for_leader: current_leader set",
+                )
+                .await
+                .map_err(|e| AeonError::Cluster {
+                    message: format!(
+                        "no Raft leader elected within {}ms: {e}",
+                        timeout.as_millis()
+                    ),
+                    source: None,
+                })?;
+
+            metrics.current_leader.ok_or_else(|| AeonError::Cluster {
+                message: "wait_for_leader observed metrics with no current_leader".to_string(),
+                source: None,
+            })
+        }
+
         /// Install (or replace) the registry applier that receives committed
         /// `ClusterRequest::Registry` entries. Typically called once at
         /// startup from `aeon-engine` after constructing the local
@@ -912,6 +1018,23 @@ mod inner {
             applier: Arc<dyn aeon_types::RegistryApplier>,
         ) {
             *self.applier_slot.write().await = Some(applier);
+        }
+
+        /// G11.b — install the leader-side partition-transfer driver.
+        /// Called by `aeon-cli` once the engine-side installers are built.
+        /// Idempotent: re-installing replaces the existing driver.
+        pub async fn install_transfer_driver(
+            &self,
+            driver: Arc<crate::partition_driver::PartitionTransferDriver>,
+        ) {
+            *self.transfer_driver.write().await = Some(driver);
+        }
+
+        /// Shutdown flag shared with `ClusterNode`'s QUIC server. Exposed so
+        /// callers can run the driver's `watch_loop` tied to the same lifecycle
+        /// (`ClusterNode::shutdown()` will flip this bit).
+        pub fn shutdown_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+            Arc::clone(&self.shutdown)
         }
 
         /// Propose a `RegistryCommand` through Raft and decode the response.
@@ -934,6 +1057,113 @@ mod inner {
         /// Get the current leader's NodeId.
         pub async fn current_leader(&self) -> Option<NodeId> {
             self.raft.current_leader().await
+        }
+
+        /// G9 — build the REST URL of the current leader for auto-forwarding
+        /// cluster-write requests from a follower.
+        ///
+        /// Returns `Some(url)` only when all of these hold:
+        ///   - `ClusterConfig::rest_api_port` is set (operator opted in);
+        ///   - there is a known current leader that is NOT this node;
+        ///   - the leader's `NodeAddress` is recorded in Raft membership so
+        ///     we can use its host string.
+        ///
+        /// Returns `None` on a leaderless quorum, when self is leader, or
+        /// when auto-forward has not been configured — the caller should
+        /// fall back to the pre-G9 behaviour in those cases.
+        pub fn leader_rest_url(&self, path_and_query: &str) -> Option<String> {
+            let port = self.config.rest_api_port?;
+            let metrics = self.raft.metrics().borrow().clone();
+            let leader_id = metrics.current_leader?;
+            if leader_id == self.config.node_id {
+                return None;
+            }
+            let leader_addr = metrics
+                .membership_config
+                .membership()
+                .get_node(&leader_id)
+                .cloned()?;
+            let scheme = self
+                .config
+                .rest_scheme
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("http");
+            let path = if path_and_query.starts_with('/') {
+                path_and_query.to_string()
+            } else {
+                format!("/{path_and_query}")
+            };
+            Some(format!("{scheme}://{host}:{port}{path}", host = leader_addr.host))
+        }
+
+        /// Initiate a partition handover from the current owner to `target`.
+        ///
+        /// Validates on the caller side (must be leader, partition exists, not
+        /// already transferring, target differs from source) and then submits
+        /// `ClusterRequest::BeginTransfer` through Raft. The state-machine
+        /// re-validates on apply so racing callers can't corrupt the table.
+        ///
+        /// Intended for operator-driven handover (REST/CLI) — the Row 5
+        /// Gate 2 cutover test in `docs/GATE2-ACCEPTANCE-PLAN.md §11.5` needs
+        /// a way to measure transfer latency without waiting for rebalance.
+        ///
+        /// Returns [`TransferStatus`] indicating whether the begin-transfer was
+        /// accepted, rejected, or would be a no-op. Only raises `AeonError`
+        /// for plumbing failures (Raft proposal errored, etc).
+        pub async fn propose_partition_transfer(
+            &self,
+            partition: PartitionId,
+            target: NodeId,
+        ) -> Result<TransferStatus, AeonError> {
+            if !self.is_leader().await {
+                return Ok(TransferStatus::NotLeader {
+                    current_leader: self.current_leader().await,
+                });
+            }
+
+            let source = {
+                let state = self.shared_state.read().await;
+                match state.partition_table.get(partition) {
+                    None => return Ok(TransferStatus::UnknownPartition),
+                    Some(crate::types::PartitionOwnership::Transferring { source, target: t }) => {
+                        return Ok(TransferStatus::AlreadyTransferring {
+                            source: *source,
+                            target: *t,
+                        });
+                    }
+                    Some(crate::types::PartitionOwnership::Owned(owner)) => *owner,
+                }
+            };
+
+            if source == target {
+                return Ok(TransferStatus::NoChange { owner: source });
+            }
+
+            match self
+                .propose(ClusterRequest::BeginTransfer {
+                    partition,
+                    source,
+                    target,
+                })
+                .await?
+            {
+                ClusterResponse::Ok => {
+                    // G11.b — wake the watch loop so it picks up the fresh
+                    // Transferring entry without waiting for the poll tick.
+                    // `notify` is best-effort; a missing driver (e.g. on a
+                    // single-node test node) just falls back to the poll
+                    // interval the driver configures for itself.
+                    if let Some(driver) = self.transfer_driver.read().await.clone() {
+                        driver.notify();
+                    }
+                    Ok(TransferStatus::Accepted { source, target })
+                }
+                ClusterResponse::Error(msg) => Ok(TransferStatus::Rejected(msg)),
+                ClusterResponse::Registry(_) => Ok(TransferStatus::Rejected(
+                    "unexpected Registry response to BeginTransfer".to_string(),
+                )),
+            }
         }
 
         /// Propose initial partition assignment via Raft.
@@ -989,6 +1219,85 @@ mod inner {
             &self.raft
         }
 
+        /// G14 — relinquish leadership ahead of graceful shutdown.
+        ///
+        /// If this node is the current Raft leader, disables heartbeats so
+        /// followers election-timeout and elect a new leader while our
+        /// process is still alive and able to respond to `AppendEntries` /
+        /// `RequestVote`. Waits up to `timeout` for `metrics.current_leader`
+        /// to flip away from this node and returns.
+        ///
+        /// No-op if we are not leader, or if the cluster is a single-node
+        /// bootstrap (no quorum to hand off to).
+        ///
+        /// The caller is expected to follow up with `shutdown()` shortly
+        /// after this returns — re-enabling heartbeats is NOT attempted on
+        /// the success path because we're about to tear the node down. On
+        /// timeout, heartbeats are re-enabled so we don't leave the cluster
+        /// silently without a leader if shutdown is aborted.
+        pub async fn relinquish_leadership(
+            &self,
+            timeout: std::time::Duration,
+        ) -> Result<(), AeonError> {
+            let self_id = self.config.node_id;
+
+            let metrics = self.raft.metrics().borrow().clone();
+            if metrics.current_leader != Some(self_id) {
+                return Ok(());
+            }
+
+            let voters = metrics
+                .membership_config
+                .membership()
+                .voter_ids()
+                .filter(|id| *id != self_id)
+                .count();
+            if voters == 0 {
+                // Single-node cluster — no one to hand off to.
+                return Ok(());
+            }
+
+            tracing::info!(
+                node_id = self_id,
+                timeout_ms = timeout.as_millis() as u64,
+                "relinquishing Raft leadership before shutdown"
+            );
+
+            self.raft.runtime_config().heartbeat(false);
+
+            let res = self
+                .raft
+                .wait(Some(timeout))
+                .metrics(
+                    |m| m.current_leader != Some(self_id),
+                    "relinquish_leadership: leader moved",
+                )
+                .await;
+
+            match res {
+                Ok(m) => {
+                    tracing::info!(
+                        node_id = self_id,
+                        new_leader = ?m.current_leader,
+                        "leadership relinquished"
+                    );
+                    Ok(())
+                }
+                Err(e) => {
+                    // Re-enable heartbeats: if shutdown is aborted we don't
+                    // want the cluster stuck without a leader.
+                    self.raft.runtime_config().heartbeat(true);
+                    Err(AeonError::Cluster {
+                        message: format!(
+                            "leadership did not move within {}ms: {e}",
+                            timeout.as_millis()
+                        ),
+                        source: None,
+                    })
+                }
+            }
+        }
+
         /// Shut down the Raft node and QUIC transport gracefully.
         pub async fn shutdown(&self) -> Result<(), AeonError> {
             // Signal the QUIC server to stop accepting connections
@@ -1038,6 +1347,54 @@ mod inner {
             // Should become leader
             let leader = node.current_leader().await;
             assert_eq!(leader, Some(1));
+
+            node.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn relinquish_leadership_single_node_is_noop() {
+            // G14: single-node cluster has no one to hand off to, so
+            // relinquish must short-circuit as Ok without disabling
+            // heartbeats. Leadership stays on node 1.
+            let config = ClusterConfig::single_node(1, 4);
+            let node = ClusterNode::bootstrap_single(config).await.unwrap();
+
+            let before = node.current_leader().await;
+            assert_eq!(before, Some(1));
+
+            node.relinquish_leadership(std::time::Duration::from_millis(100))
+                .await
+                .unwrap();
+
+            let after = node.current_leader().await;
+            assert_eq!(after, Some(1), "single-node must remain leader");
+
+            node.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn wait_for_leader_returns_self_on_single_node_g8() {
+            // G8: on a freshly-bootstrapped single-node cluster, wait_for_leader
+            // must return Self as the elected leader within the bounded budget,
+            // and a subsequent propose must not hit "forward request to: None, None".
+            let config = ClusterConfig::single_node(1, 4);
+            let node = ClusterNode::bootstrap_single(config).await.unwrap();
+
+            let leader = node
+                .wait_for_leader(std::time::Duration::from_secs(2))
+                .await
+                .expect("single-node must self-elect within 2s");
+            assert_eq!(leader, 1);
+
+            // A write issued immediately after wait_for_leader must succeed.
+            let resp = node
+                .propose(ClusterRequest::AssignPartition {
+                    partition: PartitionId::new(0),
+                    node: 1,
+                })
+                .await
+                .unwrap();
+            assert_eq!(resp, ClusterResponse::Ok);
 
             node.shutdown().await.unwrap();
         }
@@ -1231,6 +1588,82 @@ mod inner {
                 .await
                 .unwrap();
             assert_eq!(resp, ClusterResponse::Ok);
+
+            node.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn propose_partition_transfer_accepts_on_leader() {
+            let config = ClusterConfig::single_node(1, 4);
+            let node = ClusterNode::bootstrap_single(config).await.unwrap();
+
+            // P0 is owned by node 1 after bootstrap — transfer to node 2.
+            let status = node
+                .propose_partition_transfer(PartitionId::new(0), 2)
+                .await
+                .unwrap();
+            assert_eq!(
+                status,
+                TransferStatus::Accepted {
+                    source: 1,
+                    target: 2,
+                }
+            );
+
+            node.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn propose_partition_transfer_noop_when_target_is_owner() {
+            let config = ClusterConfig::single_node(1, 4);
+            let node = ClusterNode::bootstrap_single(config).await.unwrap();
+
+            let status = node
+                .propose_partition_transfer(PartitionId::new(0), 1)
+                .await
+                .unwrap();
+            assert_eq!(status, TransferStatus::NoChange { owner: 1 });
+
+            node.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn propose_partition_transfer_unknown_partition() {
+            let config = ClusterConfig::single_node(1, 4);
+            let node = ClusterNode::bootstrap_single(config).await.unwrap();
+
+            // Partition 99 is out of range — not in the table.
+            let status = node
+                .propose_partition_transfer(PartitionId::new(99), 2)
+                .await
+                .unwrap();
+            assert_eq!(status, TransferStatus::UnknownPartition);
+
+            node.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn propose_partition_transfer_already_transferring() {
+            let config = ClusterConfig::single_node(1, 4);
+            let node = ClusterNode::bootstrap_single(config).await.unwrap();
+
+            // First transfer goes through.
+            node.propose_partition_transfer(PartitionId::new(0), 2)
+                .await
+                .unwrap();
+
+            // Second attempt observes the in-flight transfer.
+            let status = node
+                .propose_partition_transfer(PartitionId::new(0), 3)
+                .await
+                .unwrap();
+            assert_eq!(
+                status,
+                TransferStatus::AlreadyTransferring {
+                    source: 1,
+                    target: 2,
+                }
+            );
 
             node.shutdown().await.unwrap();
         }

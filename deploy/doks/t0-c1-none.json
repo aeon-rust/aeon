@@ -1,0 +1,1 @@
+{"name":"t0-c1-none","sources":[{"type":"kafka","topic":"aeon-source","partitions":[],"config":{"brokers":"redpanda.redpanda.svc.cluster.local:9092","group.id":"aeon-c1-none"}}],"processor":{"name":"__identity","version":"0.0.0"},"sinks":[{"type":"blackhole","topic":null,"config":{}}],"state":"created","created_at":0,"updated_at":0,"durability":{"mode":"none"}}

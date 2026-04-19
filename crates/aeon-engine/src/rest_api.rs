@@ -37,6 +37,7 @@
 //! - `GET    /ready`                                — readiness check (no auth)
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::extract::{Path, Request, State};
 use axum::http::{HeaderValue, StatusCode};
@@ -54,6 +55,7 @@ use crate::delivery_ledger::DeliveryLedger;
 use crate::identity_store::ProcessorIdentityStore;
 use crate::pipeline::PipelineControl;
 use crate::pipeline_manager::PipelineManager;
+use crate::pipeline_supervisor::PipelineSupervisor;
 use crate::registry::ProcessorRegistry;
 
 /// Maximum request body size (10 MB).
@@ -63,6 +65,11 @@ const MAX_REQUEST_BODY_BYTES: usize = 10 * 1024 * 1024;
 pub struct AppState {
     pub registry: Arc<ProcessorRegistry>,
     pub pipelines: Arc<PipelineManager>,
+    /// Bridge from `PipelineManager`'s declarative state to actually-running
+    /// tokio tasks. Handlers for `/start` and `/stop` consult this *after*
+    /// updating the manager (or after the Raft commit in cluster mode) so
+    /// that the process converges on what the manifest declares.
+    pub supervisor: Arc<PipelineSupervisor>,
     /// Per-pipeline delivery ledgers (pipeline_name → ledger).
     /// Populated when pipelines run with delivery tracking enabled.
     pub delivery_ledgers: dashmap::DashMap<String, Arc<DeliveryLedger>>,
@@ -92,6 +99,10 @@ pub struct AppState {
     /// `None` in standalone (non-cluster) mode.
     #[cfg(feature = "cluster")]
     pub cluster_node: Option<Arc<aeon_cluster::ClusterNode>>,
+    /// Flipped to `true` when the process has received SIGINT/SIGTERM and is
+    /// draining. `/ready` returns 503 while this is set so K8s removes the
+    /// pod from service endpoints before the pipeline stops.
+    pub shutting_down: Arc<AtomicBool>,
 }
 
 /// Build the axum Router with all API routes.
@@ -174,6 +185,12 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/pipelines/{name}/verify", get(verify_pipeline))
         // Cluster status
         .route("/api/v1/cluster/status", get(cluster_status))
+        .route(
+            "/api/v1/cluster/partitions/{partition}/transfer",
+            post(transfer_partition),
+        )
+        .route("/api/v1/cluster/drain", post(cluster_drain))
+        .route("/api/v1/cluster/rebalance", post(cluster_rebalance))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -292,6 +309,17 @@ async fn auth_middleware(
 }
 
 /// Start the REST API server on the given address.
+///
+/// Installs a SIGINT/SIGTERM handler that drives graceful shutdown:
+///   1. Flips `AppState.shutting_down` so `/ready` starts returning 503.
+///   2. Sleeps `AEON_PRESTOP_DELAY_SECS` (default 5s) to let K8s endpoints
+///      propagate the not-ready status through kube-proxy / iptables.
+///   3. Stops every running pipeline via the supervisor (which drains SPSC
+///      buffers and flushes sinks).
+///   4. Shuts the Raft cluster node down cleanly so leadership and partition
+///      ownership don't need to be rediscovered on restart.
+///   5. Returns, letting axum's `with_graceful_shutdown` finish in-flight
+///      HTTP requests before the server exits.
 pub async fn serve(state: Arc<AppState>, addr: &str) -> Result<(), Box<dyn std::error::Error>> {
     let auth_enabled = {
         #[cfg(feature = "processor-auth")]
@@ -311,10 +339,118 @@ pub async fn serve(state: Arc<AppState>, addr: &str) -> Result<(), Box<dyn std::
             "REST API server listening (auth DISABLED — configure api_keys to enable)"
         );
     }
-    let app = api_router(state);
+    let app = api_router(Arc::clone(&state));
     let listener = TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+
+    let shutdown_state = Arc::clone(&state);
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal(shutdown_state))
+        .await?;
     Ok(())
+}
+
+/// Future that resolves when the process should begin draining.
+///
+/// Listens for SIGINT and (on Unix) SIGTERM. On the first received signal,
+/// drives the drain sequence documented on `serve()`.
+async fn shutdown_signal(state: Arc<AppState>) {
+    wait_for_terminate().await;
+
+    tracing::warn!("shutdown signal received — beginning graceful drain");
+    state.shutting_down.store(true, Ordering::Relaxed);
+
+    // G14 — relinquish Raft leadership in parallel with endpoint propagation.
+    // If this pod is the leader, disabling heartbeats lets followers
+    // election-timeout and pick a new leader while we're still alive to
+    // answer their RPCs. Running it concurrently with `AEON_PRESTOP_DELAY_SECS`
+    // means the handoff mostly hides inside the window K8s needs to propagate
+    // the /ready=503 flip through kube-proxy.
+    let prestop = std::env::var("AEON_PRESTOP_DELAY_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(5);
+
+    let relinquish = async {
+        #[cfg(feature = "cluster")]
+        {
+            if let Some(node) = &state.cluster_node {
+                let budget = std::time::Duration::from_millis(
+                    std::env::var("AEON_LEADER_RELINQUISH_MS")
+                        .ok()
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .unwrap_or(4_000),
+                );
+                if let Err(e) = node.relinquish_leadership(budget).await {
+                    tracing::warn!(error = %e, "leader relinquish failed — proceeding with shutdown anyway");
+                }
+            }
+        }
+    };
+
+    let prestop_sleep = async {
+        if prestop > 0 {
+            tracing::info!(
+                secs = prestop,
+                "waiting for endpoint propagation before stopping pipelines"
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(prestop)).await;
+        }
+    };
+
+    tokio::join!(relinquish, prestop_sleep);
+
+    // Stop every running pipeline. PipelineSupervisor::stop flips the
+    // per-pipeline shutdown flag, awaits the task handle, and lets the
+    // pipeline drain SPSC buffers and flush sinks.
+    let running = state.supervisor.list_running().await;
+    if !running.is_empty() {
+        tracing::info!(count = running.len(), "stopping pipelines");
+        for name in running {
+            if let Err(e) = state.supervisor.stop(&name).await {
+                tracing::warn!(pipeline = %name, error = %e, "pipeline stop failed during shutdown");
+            }
+        }
+    }
+
+    // Shut down the cluster node so Raft logs are flushed and the QUIC
+    // endpoint closes cleanly. Followers will notice our absence and let
+    // openraft re-elect if we were leader.
+    #[cfg(feature = "cluster")]
+    {
+        if let Some(node) = &state.cluster_node {
+            if let Err(e) = node.shutdown().await {
+                tracing::warn!(error = %e, "cluster node shutdown reported error");
+            }
+        }
+    }
+
+    tracing::info!("drain complete — axum will stop accepting new requests");
+}
+
+/// Wait for SIGINT or (on Unix) SIGTERM, whichever arrives first.
+#[cfg(unix)]
+async fn wait_for_terminate() {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut sigterm = match signal(SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to install SIGTERM handler; falling back to SIGINT only");
+            let _ = tokio::signal::ctrl_c().await;
+            return;
+        }
+    };
+
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => tracing::info!("received SIGINT"),
+        _ = sigterm.recv() => tracing::info!("received SIGTERM"),
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_terminate() {
+    let _ = tokio::signal::ctrl_c().await;
+    tracing::info!("received Ctrl+C");
 }
 
 // ── Input validation (OWASP A03) ──────────────────────────────────────
@@ -367,6 +503,49 @@ fn api_error(status: StatusCode, msg: impl Into<String>) -> impl IntoResponse {
     (status, Json(ApiError { error: msg.into() }))
 }
 
+/// G9 — auto-forward cluster-write requests from a follower to the Raft leader.
+///
+/// Returns `Some(307 Temporary Redirect)` when this pod is not the current
+/// leader and the leader's REST URL can be derived; the caller should
+/// short-circuit the handler and return this response. Returns `None`
+/// when this pod IS the leader (proceed locally), or when auto-forward
+/// is not configured / leader is unknown (fall through to the existing
+/// `NotLeader`-style error path).
+///
+/// Always emits `X-Leader-Node-Id` when a leader is known, so scripted
+/// clients that don't follow 307 can still route themselves without
+/// parsing redirect URLs.
+#[cfg(feature = "cluster")]
+fn maybe_forward_to_leader(
+    state: &Arc<AppState>,
+    uri: &axum::http::Uri,
+) -> Option<axum::response::Response> {
+    let node = state.cluster_node.as_ref()?;
+    let path_and_query = uri
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or_else(|| uri.path());
+    let location = node.leader_rest_url(path_and_query)?;
+
+    let leader_id = node
+        .raft()
+        .metrics()
+        .borrow()
+        .current_leader
+        .unwrap_or_default();
+
+    let mut resp = axum::response::Response::builder()
+        .status(StatusCode::TEMPORARY_REDIRECT)
+        .header(axum::http::header::LOCATION, &location)
+        .header("X-Leader-Node-Id", leader_id.to_string())
+        .body(axum::body::Body::empty())
+        .ok()?;
+    // Don't let a UTF-8 oddity in the host silently drop the redirect.
+    resp.headers_mut()
+        .insert("X-Aeon-Forwarded", HeaderValue::from_static("1"));
+    Some(resp)
+}
+
 #[derive(Serialize)]
 struct HealthResponse {
     status: &'static str,
@@ -382,11 +561,23 @@ async fn health() -> Json<HealthResponse> {
     })
 }
 
-async fn ready() -> Json<HealthResponse> {
-    Json(HealthResponse {
-        status: "ready",
-        version: env!("CARGO_PKG_VERSION"),
-    })
+async fn ready(State(state): State<Arc<AppState>>) -> (StatusCode, Json<HealthResponse>) {
+    if state.shutting_down.load(Ordering::Relaxed) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(HealthResponse {
+                status: "shutting_down",
+                version: env!("CARGO_PKG_VERSION"),
+            }),
+        );
+    }
+    (
+        StatusCode::OK,
+        Json(HealthResponse {
+            status: "ready",
+            version: env!("CARGO_PKG_VERSION"),
+        }),
+    )
 }
 
 // ── Prometheus metrics endpoint ───────────────────────────────────────
@@ -406,11 +597,17 @@ async fn metrics_prometheus(State(state): State<Arc<AppState>>) -> impl IntoResp
 
     let mut out = String::with_capacity(4096);
 
+    // Single source of truth: the supervisor knows what's actually running
+    // on this node regardless of whether start() came from the REST handler
+    // or the Raft applier. (Previously this read from AppState.pipeline_metrics,
+    // which was only populated by the REST path — cluster-mode pipelines
+    // started via Raft had no Prometheus samples.)
+    let pipelines = state.supervisor.metrics_snapshot().await;
+
     // Per-pipeline aggregates
     out.push_str("# HELP aeon_pipeline_events_received_total Events received by a pipeline's source\n");
     out.push_str("# TYPE aeon_pipeline_events_received_total counter\n");
-    for entry in state.pipeline_metrics.iter() {
-        let (name, m) = (entry.key(), entry.value());
+    for (name, m) in &pipelines {
         out.push_str(&format!(
             "aeon_pipeline_events_received_total{{pipeline=\"{name}\"}} {}\n",
             m.events_received.load(Ordering::Relaxed)
@@ -419,28 +616,34 @@ async fn metrics_prometheus(State(state): State<Arc<AppState>>) -> impl IntoResp
 
     out.push_str("# HELP aeon_pipeline_events_processed_total Events processed by a pipeline's processor\n");
     out.push_str("# TYPE aeon_pipeline_events_processed_total counter\n");
-    for entry in state.pipeline_metrics.iter() {
-        let (name, m) = (entry.key(), entry.value());
+    for (name, m) in &pipelines {
         out.push_str(&format!(
             "aeon_pipeline_events_processed_total{{pipeline=\"{name}\"}} {}\n",
             m.events_processed.load(Ordering::Relaxed)
         ));
     }
 
-    out.push_str("# HELP aeon_pipeline_outputs_sent_total Outputs delivered by a pipeline's sink\n");
+    out.push_str("# HELP aeon_pipeline_outputs_sent_total Outputs the pipeline handed to its sink\n");
     out.push_str("# TYPE aeon_pipeline_outputs_sent_total counter\n");
-    for entry in state.pipeline_metrics.iter() {
-        let (name, m) = (entry.key(), entry.value());
+    for (name, m) in &pipelines {
         out.push_str(&format!(
             "aeon_pipeline_outputs_sent_total{{pipeline=\"{name}\"}} {}\n",
             m.outputs_sent.load(Ordering::Relaxed)
         ));
     }
 
+    out.push_str("# HELP aeon_pipeline_outputs_acked_total Outputs the downstream system confirmed (broker ack, HTTP 2xx, fsync)\n");
+    out.push_str("# TYPE aeon_pipeline_outputs_acked_total counter\n");
+    for (name, m) in &pipelines {
+        out.push_str(&format!(
+            "aeon_pipeline_outputs_acked_total{{pipeline=\"{name}\"}} {}\n",
+            m.outputs_acked.load(Ordering::Relaxed)
+        ));
+    }
+
     out.push_str("# HELP aeon_pipeline_events_failed_total Events permanently failed (retry-exhausted or skip-to-dlq)\n");
     out.push_str("# TYPE aeon_pipeline_events_failed_total counter\n");
-    for entry in state.pipeline_metrics.iter() {
-        let (name, m) = (entry.key(), entry.value());
+    for (name, m) in &pipelines {
         out.push_str(&format!(
             "aeon_pipeline_events_failed_total{{pipeline=\"{name}\"}} {}\n",
             m.events_failed.load(Ordering::Relaxed)
@@ -449,8 +652,7 @@ async fn metrics_prometheus(State(state): State<Arc<AppState>>) -> impl IntoResp
 
     out.push_str("# HELP aeon_pipeline_events_retried_total Individual retry attempts\n");
     out.push_str("# TYPE aeon_pipeline_events_retried_total counter\n");
-    for entry in state.pipeline_metrics.iter() {
-        let (name, m) = (entry.key(), entry.value());
+    for (name, m) in &pipelines {
         out.push_str(&format!(
             "aeon_pipeline_events_retried_total{{pipeline=\"{name}\"}} {}\n",
             m.events_retried.load(Ordering::Relaxed)
@@ -459,8 +661,7 @@ async fn metrics_prometheus(State(state): State<Arc<AppState>>) -> impl IntoResp
 
     out.push_str("# HELP aeon_pipeline_checkpoints_written_total Checkpoint records appended\n");
     out.push_str("# TYPE aeon_pipeline_checkpoints_written_total counter\n");
-    for entry in state.pipeline_metrics.iter() {
-        let (name, m) = (entry.key(), entry.value());
+    for (name, m) in &pipelines {
         out.push_str(&format!(
             "aeon_pipeline_checkpoints_written_total{{pipeline=\"{name}\"}} {}\n",
             m.checkpoints_written.load(Ordering::Relaxed)
@@ -469,8 +670,7 @@ async fn metrics_prometheus(State(state): State<Arc<AppState>>) -> impl IntoResp
 
     out.push_str("# HELP aeon_pipeline_poh_entries_total PoH chain entries appended (per batch)\n");
     out.push_str("# TYPE aeon_pipeline_poh_entries_total counter\n");
-    for entry in state.pipeline_metrics.iter() {
-        let (name, m) = (entry.key(), entry.value());
+    for (name, m) in &pipelines {
         out.push_str(&format!(
             "aeon_pipeline_poh_entries_total{{pipeline=\"{name}\"}} {}\n",
             m.poh_entries.load(Ordering::Relaxed)
@@ -559,6 +759,359 @@ async fn cluster_status(State(state): State<Arc<AppState>>) -> impl IntoResponse
     }
 }
 
+// ── Partition transfer endpoint (CL-6) ─────────────────────────────────
+
+/// Body for `POST /api/v1/cluster/partitions/{partition}/transfer`.
+///
+/// Initiates a partition handover to `target_node_id`. The source is read
+/// from the committed partition table; callers don't need to know it.
+#[derive(Deserialize)]
+#[cfg_attr(not(feature = "cluster"), allow(dead_code))]
+struct TransferPartitionBody {
+    target_node_id: u64,
+}
+
+/// Operator-triggered CL-6 partition handover. Leader-only: followers reply
+/// with `409 Conflict` and an `X-Leader-Id` header so the client can retry
+/// against the actual leader. Measures Row 5 cutover latency in the Gate 2
+/// plan (`docs/GATE2-ACCEPTANCE-PLAN.md §11.5`).
+async fn transfer_partition(
+    State(state): State<Arc<AppState>>,
+    Path(partition): Path<u16>,
+    #[cfg_attr(not(feature = "cluster"), allow(unused))] uri: axum::http::Uri,
+    Json(body): Json<TransferPartitionBody>,
+) -> axum::response::Response {
+    #[cfg(feature = "cluster")]
+    {
+        let Some(ref node) = state.cluster_node else {
+            return api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "cluster mode not enabled on this node",
+            )
+            .into_response();
+        };
+        if let Some(resp) = maybe_forward_to_leader(&state, &uri) {
+            return resp;
+        }
+
+        let pid = aeon_types::PartitionId::new(partition);
+        let status = match node
+            .propose_partition_transfer(pid, body.target_node_id)
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                return api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+                    .into_response();
+            }
+        };
+
+        use aeon_cluster::TransferStatus;
+        match status {
+            TransferStatus::Accepted { source, target } => (
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({
+                    "status": "accepted",
+                    "partition": partition,
+                    "source": source,
+                    "target": target,
+                })),
+            )
+                .into_response(),
+            TransferStatus::NotLeader { current_leader } => {
+                let mut resp = (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": "not the Raft leader",
+                        "current_leader": current_leader,
+                    })),
+                )
+                    .into_response();
+                if let Some(leader_id) = current_leader {
+                    if let Ok(v) = HeaderValue::from_str(&leader_id.to_string()) {
+                        resp.headers_mut().insert("X-Leader-Id", v);
+                    }
+                }
+                resp
+            }
+            TransferStatus::UnknownPartition => api_error(
+                StatusCode::NOT_FOUND,
+                format!("partition {partition} not found in partition table"),
+            )
+            .into_response(),
+            TransferStatus::AlreadyTransferring { source, target } => (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "partition already has a transfer in flight",
+                    "partition": partition,
+                    "source": source,
+                    "target": target,
+                })),
+            )
+                .into_response(),
+            TransferStatus::NoChange { owner } => (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": "no-change",
+                    "partition": partition,
+                    "owner": owner,
+                })),
+            )
+                .into_response(),
+            TransferStatus::Rejected(msg) => api_error(StatusCode::CONFLICT, msg).into_response(),
+        }
+    }
+    #[cfg(not(feature = "cluster"))]
+    {
+        let _ = (state, partition, body, uri);
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "cluster feature not enabled in this build",
+        )
+        .into_response()
+    }
+}
+
+// ── Drain / rebalance endpoints (P1.1g / G5) ─────────────────────────
+
+/// Body for `POST /api/v1/cluster/drain`.
+///
+/// `node_id` is the node operators want to take out of rotation. The leader
+/// reassigns every partition currently owned by that node to other live
+/// members (round-robin in ascending NodeId order). Used by T3 (scale-down)
+/// runs and any operator-driven evacuation.
+#[derive(Deserialize)]
+#[cfg_attr(not(feature = "cluster"), allow(dead_code))]
+struct DrainBody {
+    node_id: u64,
+}
+
+/// Operator-triggered bulk evacuation: drive every partition off `node_id`.
+/// Leader-only — followers reply 409 with `X-Leader-Id` so the CLI can
+/// retry against the real leader (mirrors `transfer_partition`).
+async fn cluster_drain(
+    State(state): State<Arc<AppState>>,
+    #[cfg_attr(not(feature = "cluster"), allow(unused))] uri: axum::http::Uri,
+    Json(body): Json<DrainBody>,
+) -> axum::response::Response {
+    #[cfg(feature = "cluster")]
+    {
+        if let Some(resp) = maybe_forward_to_leader(&state, &uri) {
+            return resp;
+        }
+        cluster_bulk_transfer(&state, BulkPlan::Drain(body.node_id)).await
+    }
+    #[cfg(not(feature = "cluster"))]
+    {
+        let _ = (state, body, uri);
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "cluster feature not enabled in this build",
+        )
+        .into_response()
+    }
+}
+
+/// Operator-triggered rebalance: redistribute partitions evenly across all
+/// live cluster members. Used after T2 (scale-up) to push load onto the
+/// freshly-joined nodes.
+async fn cluster_rebalance(
+    State(state): State<Arc<AppState>>,
+    #[cfg_attr(not(feature = "cluster"), allow(unused))] uri: axum::http::Uri,
+) -> axum::response::Response {
+    #[cfg(feature = "cluster")]
+    {
+        if let Some(resp) = maybe_forward_to_leader(&state, &uri) {
+            return resp;
+        }
+        cluster_bulk_transfer(&state, BulkPlan::Rebalance).await
+    }
+    #[cfg(not(feature = "cluster"))]
+    {
+        let _ = (state, uri);
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "cluster feature not enabled in this build",
+        )
+        .into_response()
+    }
+}
+
+#[cfg(feature = "cluster")]
+enum BulkPlan {
+    Drain(u64),
+    Rebalance,
+}
+
+/// Shared backbone for `cluster_drain` and `cluster_rebalance`. Builds the
+/// transfer plan via `aeon_cluster::plan_drain` / `plan_rebalance`, then
+/// loops the plan through `propose_partition_transfer`. Each per-partition
+/// outcome is reported in the response so operators can see exactly what
+/// landed and what fought an in-flight transfer.
+#[cfg(feature = "cluster")]
+async fn cluster_bulk_transfer(
+    state: &Arc<AppState>,
+    plan: BulkPlan,
+) -> axum::response::Response {
+    let Some(ref node) = state.cluster_node else {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "cluster mode not enabled on this node",
+        )
+        .into_response();
+    };
+
+    // Leader-only — fail fast with the same `X-Leader-Id` hint that
+    // `transfer_partition` returns so the CLI can re-route.
+    if !node.is_leader().await {
+        let current_leader = node.current_leader().await;
+        let mut resp = (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "not the Raft leader",
+                "current_leader": current_leader,
+            })),
+        )
+            .into_response();
+        if let Some(leader_id) = current_leader {
+            if let Ok(v) = HeaderValue::from_str(&leader_id.to_string()) {
+                resp.headers_mut().insert("X-Leader-Id", v);
+            }
+        }
+        return resp;
+    }
+
+    let table = node.partition_table_snapshot().await;
+    let members: Vec<u64> = match node.members().await {
+        Ok(m) => m.keys().copied().collect(),
+        Err(e) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("read cluster membership: {e}"),
+            )
+            .into_response();
+        }
+    };
+
+    let (op_label, transfers) = match plan {
+        BulkPlan::Drain(target) => (
+            "drain",
+            aeon_cluster::plan_drain(&table, target, &members),
+        ),
+        BulkPlan::Rebalance => ("rebalance", aeon_cluster::plan_rebalance(&table, &members)),
+    };
+
+    if transfers.is_empty() {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "noop",
+                "operation": op_label,
+                "planned": 0,
+                "results": [],
+            })),
+        )
+            .into_response();
+    }
+
+    use aeon_cluster::TransferStatus;
+    let mut results = Vec::with_capacity(transfers.len());
+    let mut accepted: usize = 0;
+    let mut rejected: usize = 0;
+    let mut noop: usize = 0;
+
+    for (pid, target) in transfers.iter().copied() {
+        let status = match node.propose_partition_transfer(pid, target).await {
+            Ok(s) => s,
+            Err(e) => {
+                rejected += 1;
+                results.push(serde_json::json!({
+                    "partition": pid.as_u16(),
+                    "target": target,
+                    "status": "error",
+                    "message": e.to_string(),
+                }));
+                continue;
+            }
+        };
+        let outcome = match status {
+            TransferStatus::Accepted { source, target: t } => {
+                accepted += 1;
+                serde_json::json!({
+                    "partition": pid.as_u16(),
+                    "source": source,
+                    "target": t,
+                    "status": "accepted",
+                })
+            }
+            TransferStatus::NoChange { owner } => {
+                noop += 1;
+                serde_json::json!({
+                    "partition": pid.as_u16(),
+                    "owner": owner,
+                    "status": "no-change",
+                })
+            }
+            TransferStatus::AlreadyTransferring { source, target: t } => {
+                noop += 1;
+                serde_json::json!({
+                    "partition": pid.as_u16(),
+                    "source": source,
+                    "target": t,
+                    "status": "already-transferring",
+                })
+            }
+            TransferStatus::UnknownPartition => {
+                rejected += 1;
+                serde_json::json!({
+                    "partition": pid.as_u16(),
+                    "status": "unknown-partition",
+                })
+            }
+            TransferStatus::Rejected(msg) => {
+                rejected += 1;
+                serde_json::json!({
+                    "partition": pid.as_u16(),
+                    "target": target,
+                    "status": "rejected",
+                    "message": msg,
+                })
+            }
+            TransferStatus::NotLeader { current_leader } => {
+                // Lost leadership mid-loop — surface a partial outcome and stop.
+                rejected += 1;
+                results.push(serde_json::json!({
+                    "partition": pid.as_u16(),
+                    "target": target,
+                    "status": "lost-leadership",
+                    "current_leader": current_leader,
+                }));
+                break;
+            }
+        };
+        results.push(outcome);
+    }
+
+    let http_status = if rejected == 0 {
+        StatusCode::ACCEPTED
+    } else {
+        StatusCode::MULTI_STATUS
+    };
+    (
+        http_status,
+        Json(serde_json::json!({
+            "status": if rejected == 0 { "accepted" } else { "partial" },
+            "operation": op_label,
+            "planned": transfers.len(),
+            "accepted": accepted,
+            "noop": noop,
+            "rejected": rejected,
+            "results": results,
+        })),
+    )
+        .into_response()
+}
+
 // ── Processor endpoints ────────────────────────────────────────────────
 
 #[derive(Serialize)]
@@ -596,6 +1149,7 @@ struct RegisterProcessorRequest {
 
 async fn register_processor(
     State(state): State<Arc<AppState>>,
+    #[cfg_attr(not(feature = "cluster"), allow(unused))] uri: axum::http::Uri,
     Json(req): Json<RegisterProcessorRequest>,
 ) -> impl IntoResponse {
     let cmd = aeon_types::registry::RegistryCommand::RegisterProcessor {
@@ -608,6 +1162,9 @@ async fn register_processor(
     // registry observes the new processor version.
     #[cfg(feature = "cluster")]
     if let Some(node) = state.cluster_node.as_ref() {
+        if let Some(resp) = maybe_forward_to_leader(&state, &uri) {
+            return resp;
+        }
         return match node.propose_registry(cmd).await {
             Ok(aeon_types::RegistryResponse::ProcessorRegistered { name, version }) => (
                 StatusCode::CREATED,
@@ -721,6 +1278,7 @@ struct CreatePipelineRequest {
 
 async fn create_pipeline(
     State(state): State<Arc<AppState>>,
+    #[cfg_attr(not(feature = "cluster"), allow(unused))] uri: axum::http::Uri,
     Json(req): Json<CreatePipelineRequest>,
 ) -> impl IntoResponse {
     if let Err(e) = validate_resource_name(&req.definition.name, "pipeline") {
@@ -732,6 +1290,9 @@ async fn create_pipeline(
     // registered `ClusterRegistryApplier` after the log entry commits.
     #[cfg(feature = "cluster")]
     if let Some(node) = state.cluster_node.as_ref() {
+        if let Some(resp) = maybe_forward_to_leader(&state, &uri) {
+            return resp;
+        }
         let cmd = aeon_types::RegistryCommand::CreatePipeline {
             definition: Box::new(req.definition),
         };
@@ -779,9 +1340,16 @@ async fn get_pipeline(
 async fn start_pipeline(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
+    #[cfg_attr(not(feature = "cluster"), allow(unused))] uri: axum::http::Uri,
 ) -> impl IntoResponse {
+    // Cluster path: go through Raft. The supervisor side-effect runs in
+    // `ClusterRegistryApplier::apply` after the commit lands on every node,
+    // so there's nothing for this handler to do beyond proposing.
     #[cfg(feature = "cluster")]
     if let Some(node) = state.cluster_node.as_ref() {
+        if let Some(resp) = maybe_forward_to_leader(&state, &uri) {
+            return resp;
+        }
         let cmd = aeon_types::RegistryCommand::SetPipelineState {
             name: name.clone(),
             state: aeon_types::registry::PipelineState::Running,
@@ -796,8 +1364,29 @@ async fn start_pipeline(
         };
     }
 
-    match state.pipelines.start(&name, "api").await {
-        Ok(()) => Json(serde_json::json!({"status": "started"})).into_response(),
+    // Standalone path: flip the declarative state, then ask the supervisor
+    // to spin up the real runtime task. Install the returned control /
+    // metrics handles into AppState so the existing upgrade / metrics
+    // endpoints can find them by pipeline name.
+    if let Err(e) = state.pipelines.start(&name, "api").await {
+        return api_error(StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+    let def = match state.pipelines.get(&name).await {
+        Some(d) => d,
+        None => {
+            return api_error(
+                StatusCode::NOT_FOUND,
+                format!("pipeline '{name}' not found after start"),
+            )
+            .into_response();
+        }
+    };
+    match state.supervisor.start(&def).await {
+        Ok((control, metrics)) => {
+            state.pipeline_controls.insert(name.clone(), control);
+            state.pipeline_metrics.insert(name.clone(), metrics);
+            Json(serde_json::json!({"status": "started"})).into_response()
+        }
         Err(e) => api_error(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     }
 }
@@ -805,9 +1394,13 @@ async fn start_pipeline(
 async fn stop_pipeline(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
+    #[cfg_attr(not(feature = "cluster"), allow(unused))] uri: axum::http::Uri,
 ) -> impl IntoResponse {
     #[cfg(feature = "cluster")]
     if let Some(node) = state.cluster_node.as_ref() {
+        if let Some(resp) = maybe_forward_to_leader(&state, &uri) {
+            return resp;
+        }
         let cmd = aeon_types::RegistryCommand::SetPipelineState {
             name: name.clone(),
             state: aeon_types::registry::PipelineState::Stopped,
@@ -822,10 +1415,15 @@ async fn stop_pipeline(
         };
     }
 
-    match state.pipelines.stop(&name, "api").await {
-        Ok(()) => Json(serde_json::json!({"status": "stopped"})).into_response(),
-        Err(e) => api_error(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    if let Err(e) = state.pipelines.stop(&name, "api").await {
+        return api_error(StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
+    if let Err(e) = state.supervisor.stop(&name).await {
+        tracing::warn!(pipeline = %name, error = %e, "supervisor stop returned error");
+    }
+    state.pipeline_controls.remove(&name);
+    state.pipeline_metrics.remove(&name);
+    Json(serde_json::json!({"status": "stopped"})).into_response()
 }
 
 #[derive(Deserialize)]
@@ -932,6 +1530,7 @@ async fn instantiate_processor(
 async fn upgrade_pipeline(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
+    #[cfg_attr(not(feature = "cluster"), allow(unused))] uri: axum::http::Uri,
     Json(req): Json<UpgradeRequest>,
 ) -> impl IntoResponse {
     let proc_ref = aeon_types::registry::ProcessorRef::new(
@@ -945,6 +1544,9 @@ async fn upgrade_pipeline(
     // own the pipeline's PipelineControl handle can swap the running processor.
     #[cfg(feature = "cluster")]
     if let Some(node) = state.cluster_node.as_ref() {
+        if let Some(resp) = maybe_forward_to_leader(&state, &uri) {
+            return resp;
+        }
         let cmd = aeon_types::RegistryCommand::UpgradePipeline {
             name: name.clone(),
             new_processor: proc_ref.clone(),
@@ -1222,9 +1824,13 @@ async fn reconfigure_sink(
 async fn delete_pipeline(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
+    #[cfg_attr(not(feature = "cluster"), allow(unused))] uri: axum::http::Uri,
 ) -> impl IntoResponse {
     #[cfg(feature = "cluster")]
     if let Some(node) = state.cluster_node.as_ref() {
+        if let Some(resp) = maybe_forward_to_leader(&state, &uri) {
+            return resp;
+        }
         let cmd = aeon_types::RegistryCommand::DeletePipeline { name: name.clone() };
         return match node.propose_registry(cmd).await {
             Ok(aeon_types::RegistryResponse::Error { message }) => {
@@ -1614,7 +2220,7 @@ async fn pipeline_tail(
     }
 
     let pipelines = state.pipelines.clone();
-    let metrics_map = state.pipeline_metrics.clone();
+    let supervisor = Arc::clone(&state.supervisor);
     ws.on_upgrade(move |mut socket| async move {
         use axum::extract::ws::Message;
         use std::sync::atomic::Ordering;
@@ -1630,13 +2236,14 @@ async fn pipeline_tail(
                 .map(|p| format!("{}", p.state))
                 .unwrap_or_else(|| "unknown".into());
 
-            let metrics_json = if let Some(m) = metrics_map.get(&name) {
+            let metrics_json = if let Some(m) = supervisor.get_metrics(&name).await {
                 serde_json::json!({
                     "pipeline": name,
                     "state": state_str,
                     "events_received": m.events_received.load(Ordering::Relaxed),
                     "events_processed": m.events_processed.load(Ordering::Relaxed),
                     "outputs_sent": m.outputs_sent.load(Ordering::Relaxed),
+                    "outputs_acked": m.outputs_acked.load(Ordering::Relaxed),
                     "checkpoints_written": m.checkpoints_written.load(Ordering::Relaxed),
                     "events_failed": m.events_failed.load(Ordering::Relaxed),
                     "events_retried": m.events_retried.load(Ordering::Relaxed),
@@ -1680,11 +2287,64 @@ async fn pipeline_tail(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connector_registry::{
+        ConnectorRegistry, DynSink, DynSource, SinkFactory, SourceFactory,
+    };
     use aeon_types::registry::{PipelineDefinition, ProcessorRef, SinkConfig, SourceConfig};
+    use aeon_types::{AeonError, BatchResult, Event, Output, Sink, Source};
     use axum::body::Body;
     use axum::http::Request;
     use std::collections::BTreeMap;
     use tower::ServiceExt;
+
+    /// Stub source that immediately returns empty (the pipeline exits on its
+    /// own). Lets `supervisor.start()` succeed in REST lifecycle tests that
+    /// only care about state transitions, not actual data flow.
+    struct StubSource;
+    impl Source for StubSource {
+        async fn next_batch(&mut self) -> Result<Vec<Event>, AeonError> {
+            Ok(vec![])
+        }
+    }
+    struct StubSourceFactory;
+    impl SourceFactory for StubSourceFactory {
+        fn build(&self, _cfg: &SourceConfig) -> Result<Box<dyn DynSource>, AeonError> {
+            Ok(Box::new(StubSource))
+        }
+    }
+
+    struct StubSink;
+    impl Sink for StubSink {
+        async fn write_batch(
+            &mut self,
+            outputs: Vec<Output>,
+        ) -> Result<BatchResult, AeonError> {
+            Ok(BatchResult::all_delivered(
+                outputs.iter().map(|_| uuid::Uuid::nil()).collect(),
+            ))
+        }
+        async fn flush(&mut self) -> Result<(), AeonError> {
+            Ok(())
+        }
+    }
+    struct StubSinkFactory;
+    impl SinkFactory for StubSinkFactory {
+        fn build(&self, _cfg: &SinkConfig) -> Result<Box<dyn DynSink>, AeonError> {
+            Ok(Box::new(StubSink))
+        }
+    }
+
+    /// Build a `PipelineSupervisor` pre-registered with stub factories for
+    /// the connector names the REST tests declare in their fixtures
+    /// (currently `kafka`). Extend here if tests start referencing other
+    /// source/sink types — the stubs only need to satisfy the lifecycle,
+    /// not the data path.
+    fn test_supervisor() -> Arc<PipelineSupervisor> {
+        let mut reg = ConnectorRegistry::new();
+        reg.register_source("kafka", Arc::new(StubSourceFactory));
+        reg.register_sink("kafka", Arc::new(StubSinkFactory));
+        Arc::new(PipelineSupervisor::new(Arc::new(reg)))
+    }
 
     fn test_state() -> Arc<AppState> {
         let dir = std::env::temp_dir().join(format!(
@@ -1697,6 +2357,7 @@ mod tests {
         Arc::new(AppState {
             registry: Arc::new(ProcessorRegistry::new(&dir).unwrap()),
             pipelines: Arc::new(PipelineManager::new()),
+            supervisor: test_supervisor(),
             delivery_ledgers: dashmap::DashMap::new(),
             pipeline_controls: dashmap::DashMap::new(),
             pipeline_metrics: dashmap::DashMap::new(),
@@ -1711,6 +2372,7 @@ mod tests {
             ws_host: None,
             #[cfg(feature = "cluster")]
             cluster_node: None,
+            shutting_down: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -1737,6 +2399,7 @@ mod tests {
         Arc::new(AppState {
             registry: Arc::new(ProcessorRegistry::new(&dir).unwrap()),
             pipelines: Arc::new(PipelineManager::new()),
+            supervisor: test_supervisor(),
             delivery_ledgers: dashmap::DashMap::new(),
             pipeline_controls: dashmap::DashMap::new(),
             pipeline_metrics: dashmap::DashMap::new(),
@@ -1759,6 +2422,7 @@ mod tests {
             ws_host: None,
             #[cfg(feature = "cluster")]
             cluster_node: None,
+            shutting_down: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -1773,8 +2437,12 @@ mod tests {
         m.events_received.store(1234, Ordering::Relaxed);
         m.events_processed.store(1200, Ordering::Relaxed);
         m.outputs_sent.store(1180, Ordering::Relaxed);
+        m.outputs_acked.store(1175, Ordering::Relaxed);
         m.events_failed.store(7, Ordering::Relaxed);
-        state.pipeline_metrics.insert("demo".into(), m);
+        state
+            .supervisor
+            .insert_metrics_for_test("demo", Arc::clone(&m))
+            .await;
 
         let app = api_router(state);
         let resp = app
@@ -1805,6 +2473,8 @@ mod tests {
         assert!(text.contains("aeon_pipeline_events_received_total{pipeline=\"demo\"} 1234"));
         assert!(text.contains("aeon_pipeline_events_processed_total{pipeline=\"demo\"} 1200"));
         assert!(text.contains("aeon_pipeline_outputs_sent_total{pipeline=\"demo\"} 1180"));
+        assert!(text.contains("aeon_pipeline_outputs_acked_total{pipeline=\"demo\"} 1175"));
+        assert!(text.contains("# TYPE aeon_pipeline_outputs_acked_total counter"));
         assert!(text.contains("aeon_pipeline_events_failed_total{pipeline=\"demo\"} 7"));
     }
 
@@ -1823,6 +2493,7 @@ mod tests {
         let state = Arc::new(AppState {
             registry: base.registry.clone(),
             pipelines: base.pipelines.clone(),
+            supervisor: base.supervisor.clone(),
             delivery_ledgers: dashmap::DashMap::new(),
             pipeline_controls: dashmap::DashMap::new(),
             pipeline_metrics: dashmap::DashMap::new(),
@@ -1836,12 +2507,16 @@ mod tests {
             #[cfg(feature = "websocket-host")]
             ws_host: None,
             cluster_node: Some(Arc::clone(&node)),
+            shutting_down: Arc::new(AtomicBool::new(false)),
         });
 
         // Touch a pipeline metric so the pipeline section is non-empty too.
         let m = Arc::new(crate::pipeline::PipelineMetrics::new());
         m.events_received.store(5, Ordering::Relaxed);
-        state.pipeline_metrics.insert("demo".into(), m);
+        state
+            .supervisor
+            .insert_metrics_for_test("demo", Arc::clone(&m))
+            .await;
 
         let app = api_router(state);
         let resp = app
@@ -1881,6 +2556,37 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["status"], "ok");
+    }
+
+    #[tokio::test]
+    async fn ready_flips_to_503_when_shutting_down() {
+        let state = test_state();
+        let app = api_router(Arc::clone(&state));
+
+        let resp = app
+            .clone()
+            .oneshot(Request::get("/ready").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "ready");
+
+        state.shutting_down.store(true, Ordering::Relaxed);
+
+        let resp = app
+            .oneshot(Request::get("/ready").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "shutting_down");
     }
 
     #[tokio::test]
