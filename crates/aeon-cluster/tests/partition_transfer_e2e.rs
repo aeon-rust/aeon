@@ -387,7 +387,7 @@ async fn three_node_partition_transfer_walks_cl6_and_flips_ownership() {
         let ep = Arc::clone(&n1.endpoint);
         let r = n1.raft.clone();
         let sd = Arc::clone(&shutdown);
-        tokio::spawn(async move { server::serve(ep, r, sd, None, None, None).await });
+        tokio::spawn(async move { server::serve(ep, r, 1, sd, None, None, None).await });
     }
     {
         let ep = Arc::clone(&n2.endpoint);
@@ -397,14 +397,14 @@ async fn three_node_partition_transfer_walks_cl6_and_flips_ownership() {
         let pp = Arc::clone(&poh_provider);
         let cc = Arc::clone(&cutover_dyn);
         tokio::spawn(async move {
-            server::serve(ep, r, sd, Some(bp), Some(pp), Some(cc)).await
+            server::serve(ep, r, 2, sd, Some(bp), Some(pp), Some(cc)).await
         });
     }
     {
         let ep = Arc::clone(&n3.endpoint);
         let r = n3.raft.clone();
         let sd = Arc::clone(&shutdown);
-        tokio::spawn(async move { server::serve(ep, r, sd, None, None, None).await });
+        tokio::spawn(async move { server::serve(ep, r, 3, sd, None, None, None).await });
     }
 
     // Bring the cluster up.
@@ -580,7 +580,7 @@ async fn three_node_watcher_picks_up_transferring_entry_and_completes() {
         let ep = Arc::clone(&n1.endpoint);
         let r = n1.raft.clone();
         let sd = Arc::clone(&shutdown);
-        tokio::spawn(async move { server::serve(ep, r, sd, None, None, None).await });
+        tokio::spawn(async move { server::serve(ep, r, 1, sd, None, None, None).await });
     }
     {
         let ep = Arc::clone(&n2.endpoint);
@@ -590,14 +590,14 @@ async fn three_node_watcher_picks_up_transferring_entry_and_completes() {
         let pp = Arc::clone(&poh_provider);
         let cc = Arc::clone(&cutover_dyn);
         tokio::spawn(async move {
-            server::serve(ep, r, sd, Some(bp), Some(pp), Some(cc)).await
+            server::serve(ep, r, 2, sd, Some(bp), Some(pp), Some(cc)).await
         });
     }
     {
         let ep = Arc::clone(&n3.endpoint);
         let r = n3.raft.clone();
         let sd = Arc::clone(&shutdown);
-        tokio::spawn(async move { server::serve(ep, r, sd, None, None, None).await });
+        tokio::spawn(async move { server::serve(ep, r, 3, sd, None, None, None).await });
     }
 
     let mut members = BTreeMap::new();

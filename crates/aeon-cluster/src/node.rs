@@ -380,9 +380,19 @@ mod inner {
             let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let server_ep = Arc::clone(&endpoint);
             let server_raft = raft.clone();
+            let server_node_id = config.node_id;
             let server_shutdown = Arc::clone(&shutdown);
             tokio::spawn(async move {
-                server::serve(server_ep, server_raft, server_shutdown, None, None, None).await;
+                server::serve(
+                    server_ep,
+                    server_raft,
+                    server_node_id,
+                    server_shutdown,
+                    None,
+                    None,
+                    None,
+                )
+                .await;
             });
 
             // Build membership — use pre-computed initial_members if available,
@@ -479,9 +489,19 @@ mod inner {
             let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let server_ep = Arc::clone(&endpoint);
             let server_raft = raft.clone();
+            let server_node_id = config.node_id;
             let server_shutdown = Arc::clone(&shutdown);
             tokio::spawn(async move {
-                server::serve(server_ep, server_raft, server_shutdown, None, None, None).await;
+                server::serve(
+                    server_ep,
+                    server_raft,
+                    server_node_id,
+                    server_shutdown,
+                    None,
+                    None,
+                    None,
+                )
+                .await;
             });
 
             let shared_state = crate::store::SharedClusterState::default();
@@ -552,9 +572,19 @@ mod inner {
             let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let server_ep = Arc::clone(&endpoint);
             let server_raft = raft.clone();
+            let server_node_id = config.node_id;
             let server_shutdown = Arc::clone(&shutdown);
             tokio::spawn(async move {
-                server::serve(server_ep, server_raft, server_shutdown, None, None, None).await;
+                server::serve(
+                    server_ep,
+                    server_raft,
+                    server_node_id,
+                    server_shutdown,
+                    None,
+                    None,
+                    None,
+                )
+                .await;
             });
 
             // Use advertise_addr if set; otherwise fall back to bind address.

@@ -24,6 +24,14 @@ use crate::types::{
 
 /// Run the QUIC server accept loop, dispatching incoming RPCs to the Raft node.
 ///
+/// `self_id` is the authoritative node id for this process — the value that
+/// was passed to `Raft::new()` via `ClusterConfig::node_id`, and the same
+/// value that `GET /api/v1/cluster/status` reports. Using this explicitly
+/// (rather than re-reading `raft.metrics().borrow().id`) closes G15: the
+/// watch-channel id can diverge from the configured node id during openraft
+/// initialization / metric-update races, which made `handle_add_node` reject
+/// valid joins on the actual Raft leader.
+///
 /// `transfer_provider` is plugged in by the engine to service
 /// `PartitionTransferRequest` streams (CL-6a). `poh_provider` services
 /// `PohChainTransferRequest` streams (CL-6b). `cutover_coordinator`
@@ -35,6 +43,7 @@ use crate::types::{
 pub async fn serve(
     endpoint: Arc<QuicEndpoint>,
     raft: Raft<AeonRaftConfig>,
+    self_id: NodeId,
     shutdown: Arc<AtomicBool>,
     transfer_provider: Option<Arc<dyn PartitionTransferProvider>>,
     poh_provider: Option<Arc<dyn PohChainProvider>>,
@@ -64,7 +73,6 @@ pub async fn serve(
                 }
             };
 
-            let self_id: NodeId = raft.metrics().borrow().id;
             loop {
                 let stream = match connection.accept_bi().await {
                     Ok(s) => s,
@@ -117,8 +125,12 @@ async fn handle_stream(
         MessageType::Vote => handle_vote(&raft, &payload, &mut send).await,
         MessageType::InstallSnapshot => handle_install_snapshot(&raft, &payload, &mut send).await,
         MessageType::FullSnapshot => handle_full_snapshot(&raft, &payload, &mut send).await,
-        MessageType::AddNodeRequest => handle_add_node(&raft, &payload, &mut send).await,
-        MessageType::RemoveNodeRequest => handle_remove_node(&raft, &payload, &mut send).await,
+        MessageType::AddNodeRequest => {
+            handle_add_node(&raft, self_id, &payload, &mut send).await
+        }
+        MessageType::RemoveNodeRequest => {
+            handle_remove_node(&raft, self_id, &payload, &mut send).await
+        }
         MessageType::HealthPing => health::handle_health_ping(self_id, &payload, &mut send).await,
         MessageType::PartitionTransferRequest => {
             handle_partition_transfer(transfer_provider.as_deref(), payload, send).await
@@ -390,8 +402,15 @@ async fn handle_full_snapshot(
 }
 
 /// Handle a join request — add the requesting node as learner then promote to voter.
+///
+/// `self_id` is the configured `ClusterConfig::node_id` (same value REST
+/// `/api/v1/cluster/status` reports). G15: we used to compare against
+/// `raft.metrics().borrow().id`, but on a multi-node cluster that value can
+/// lag or differ from the configured id, causing the leader itself to
+/// reject valid joins with `"not the leader"` — breaking STS scale-up.
 async fn handle_add_node(
     raft: &Raft<AeonRaftConfig>,
+    self_id: NodeId,
     payload: &[u8],
     send: &mut quinn::SendStream,
 ) -> Result<(), aeon_types::AeonError> {
@@ -403,11 +422,18 @@ async fn handle_add_node(
 
     tracing::info!(node_id = req.node_id, addr = %req.addr, "received AddNodeRequest");
 
-    // Check if we are the leader; if not, redirect
     let leader_id = raft.current_leader().await;
-    let my_id = raft.metrics().borrow().id;
 
-    if leader_id != Some(my_id) {
+    if leader_id != Some(self_id) {
+        let metrics_id = raft.metrics().borrow().id;
+        if metrics_id != self_id {
+            tracing::warn!(
+                configured_id = self_id,
+                metrics_id,
+                leader_id = ?leader_id,
+                "G15 diagnostic: raft.metrics().id diverges from ClusterConfig::node_id on AddNode reject"
+            );
+        }
         let resp = JoinResponse {
             success: false,
             leader_id,
@@ -430,7 +456,7 @@ async fn handle_add_node(
     if let Err(e) = raft.add_learner(req.node_id, req.addr.clone(), true).await {
         let resp = JoinResponse {
             success: false,
-            leader_id: Some(my_id),
+            leader_id: Some(self_id),
             message: format!("failed to add learner: {e}"),
         };
         let resp_bytes =
@@ -454,7 +480,7 @@ async fn handle_add_node(
     {
         let resp = JoinResponse {
             success: false,
-            leader_id: Some(my_id),
+            leader_id: Some(self_id),
             message: format!("learner added but promotion failed: {e}"),
         };
         let resp_bytes =
@@ -471,7 +497,7 @@ async fn handle_add_node(
 
     let resp = JoinResponse {
         success: true,
-        leader_id: Some(my_id),
+        leader_id: Some(self_id),
         message: "node added and promoted to voter".to_string(),
     };
     let resp_bytes =
@@ -487,6 +513,7 @@ async fn handle_add_node(
 /// Handle a remove-node request — demote from voter then remove from cluster.
 async fn handle_remove_node(
     raft: &Raft<AeonRaftConfig>,
+    self_id: NodeId,
     payload: &[u8],
     send: &mut quinn::SendStream,
 ) -> Result<(), aeon_types::AeonError> {
@@ -498,11 +525,18 @@ async fn handle_remove_node(
 
     tracing::info!(node_id = req.node_id, "received RemoveNodeRequest");
 
-    // Check if we are the leader
     let leader_id = raft.current_leader().await;
-    let my_id = raft.metrics().borrow().id;
 
-    if leader_id != Some(my_id) {
+    if leader_id != Some(self_id) {
+        let metrics_id = raft.metrics().borrow().id;
+        if metrics_id != self_id {
+            tracing::warn!(
+                configured_id = self_id,
+                metrics_id,
+                leader_id = ?leader_id,
+                "G15 diagnostic: raft.metrics().id diverges from ClusterConfig::node_id on RemoveNode reject"
+            );
+        }
         let resp = RemoveNodeResponse {
             success: false,
             leader_id,
@@ -519,10 +553,10 @@ async fn handle_remove_node(
     }
 
     // Cannot remove self (leader) — transfer leadership first
-    if req.node_id == my_id {
+    if req.node_id == self_id {
         let resp = RemoveNodeResponse {
             success: false,
-            leader_id: Some(my_id),
+            leader_id: Some(self_id),
             message: "cannot remove the leader node; transfer leadership first".to_string(),
         };
         let resp_bytes =
@@ -547,7 +581,7 @@ async fn handle_remove_node(
     {
         let resp = RemoveNodeResponse {
             success: false,
-            leader_id: Some(my_id),
+            leader_id: Some(self_id),
             message: format!("failed to demote voter: {e}"),
         };
         let resp_bytes =
@@ -567,7 +601,7 @@ async fn handle_remove_node(
     {
         let resp = RemoveNodeResponse {
             success: false,
-            leader_id: Some(my_id),
+            leader_id: Some(self_id),
             message: format!("voter demoted but node removal failed: {e}"),
         };
         let resp_bytes =
@@ -584,7 +618,7 @@ async fn handle_remove_node(
 
     let resp = RemoveNodeResponse {
         success: true,
-        leader_id: Some(my_id),
+        leader_id: Some(self_id),
         message: "node removed from cluster".to_string(),
     };
     let resp_bytes =
