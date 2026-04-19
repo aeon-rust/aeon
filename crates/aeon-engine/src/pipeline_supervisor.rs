@@ -28,20 +28,23 @@
 //! (`PipelineManager`).
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use aeon_types::durability::DurabilityMode;
 use aeon_types::error::AeonError;
 use aeon_types::registry::PipelineDefinition;
+use aeon_types::traits::Sink;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
-use crate::connector_registry::ConnectorRegistry;
+use crate::connector_registry::{ConnectorRegistry, PartitionOwnershipResolver};
 use crate::pipeline::{
     PipelineConfig, PipelineControl, PipelineMetrics, run_buffered_managed,
 };
 use crate::processor::PassthroughProcessor;
+use crate::write_gate::WriteGateRegistry;
+use aeon_types::partition::PartitionId;
 
 /// Reserved processor name that resolves to `PassthroughProcessor`. Any
 /// pipeline whose `processor.name` matches this gets the identity processor —
@@ -68,6 +71,21 @@ pub struct PipelineSupervisor {
     /// start/stop already serialise on per-pipeline tokio operations and the
     /// map mutations are rare; readability wins over micro-throughput.
     running: Mutex<HashMap<String, Arc<RunningPipeline>>>,
+    /// G2/CL-6: per-(pipeline, partition) write-freeze gates. The supervisor
+    /// installs a gate for each running partition at `start()` time and
+    /// stamps it into the pipeline's `PipelineConfig.write_gate`. The cluster
+    /// `CutoverCoordinator` impl looks up the gate here during partition
+    /// handover to freeze the source and read a stable watermark. `Arc`
+    /// makes the registry cheaply shareable with the cluster crate.
+    gate_registry: Arc<WriteGateRegistry>,
+    /// G1 fix: cluster ownership resolver. Installed post-`bootstrap_multi`
+    /// in `cmd_serve` (the supervisor is constructed before the cluster
+    /// node exists, so this is write-once via `OnceLock`). When a source
+    /// manifest leaves `partitions` empty, `start()` consults this to fill
+    /// in this node's owned slice rather than silently defaulting to `[0]`.
+    /// Absent resolver → sources keep their own fallbacks (single-node
+    /// tests / benches). See `PartitionOwnershipResolver` for the contract.
+    ownership: OnceLock<Arc<dyn PartitionOwnershipResolver>>,
 }
 
 impl PipelineSupervisor {
@@ -75,11 +93,34 @@ impl PipelineSupervisor {
         Self {
             connectors,
             running: Mutex::new(HashMap::new()),
+            gate_registry: Arc::new(WriteGateRegistry::new()),
+            ownership: OnceLock::new(),
         }
     }
 
     pub fn connectors(&self) -> &ConnectorRegistry {
         &self.connectors
+    }
+
+    /// Shared write-gate registry. Cluster-side cutover coordinator uses
+    /// this to look up `(pipeline, partition)` gates during handover.
+    pub fn gate_registry(&self) -> Arc<WriteGateRegistry> {
+        Arc::clone(&self.gate_registry)
+    }
+
+    /// Install the cluster-ownership resolver. Intended to be called once
+    /// by `cmd_serve` after `ClusterNode::bootstrap_multi`. Returns `Err`
+    /// if a resolver is already installed — callers treat this as a bug
+    /// (startup ordering violation), not a runtime condition.
+    pub fn set_ownership_resolver(
+        &self,
+        resolver: Arc<dyn PartitionOwnershipResolver>,
+    ) -> Result<(), AeonError> {
+        self.ownership.set(resolver).map_err(|_| {
+            AeonError::state(
+                "PipelineSupervisor: ownership resolver already installed",
+            )
+        })
     }
 
     /// Start a pipeline from its `PipelineDefinition`. Idempotent: a second
@@ -114,16 +155,64 @@ impl PipelineSupervisor {
             .first()
             .ok_or_else(|| AeonError::config(format!("pipeline '{name}' has no sinks")))?;
 
-        let source = self.connectors.build_source(source_cfg)?;
-        let sink = self.connectors.build_sink(sink_cfg)?;
+        // G1: if the manifest left `partitions` empty and a cluster
+        // ownership resolver is installed, fill in this node's owned
+        // slice before the factory sees the config — so cluster-aware
+        // sources (Kafka today) read only their local share instead of
+        // silently defaulting to `[0]`. Empty result from the resolver
+        // means "this node owns nothing yet" — the factory's own
+        // fallback decides what to do (Kafka logs a warn + uses `[0]`).
+        let resolved_source_cfg: aeon_types::registry::SourceConfig;
+        let source_cfg_ref = if source_cfg.partitions.is_empty() {
+            if let Some(r) = self.ownership.get() {
+                let owned = r.owned_partitions().await.unwrap_or_default();
+                if !owned.is_empty() {
+                    resolved_source_cfg = aeon_types::registry::SourceConfig {
+                        partitions: owned,
+                        ..source_cfg.clone()
+                    };
+                    &resolved_source_cfg
+                } else {
+                    source_cfg
+                }
+            } else {
+                source_cfg
+            }
+        } else {
+            source_cfg
+        };
+
+        let source = self.connectors.build_source(source_cfg_ref)?;
+        let mut sink = self.connectors.build_sink(sink_cfg)?;
 
         let processor = build_processor(&def.processor.name, &name)?;
 
-        let pipeline_config = pipeline_config_for(def);
+        // G2/CL-6: install a write-freeze gate for this pipeline's owned
+        // partition. T0 supervisor is single-partition (partition 0);
+        // multi-partition pipelines go through `run_multi_partition` which
+        // installs its own per-partition gates. The gate Arc is stamped into
+        // `PipelineConfig.write_gate` so the source loop calls `try_enter`
+        // before every `next_batch`.
+        let partition_id = PartitionId::new(0);
+        let gate = self
+            .gate_registry
+            .get_or_create(&name, partition_id);
+
+        let mut pipeline_config = pipeline_config_for(def);
+        pipeline_config.partition_id = partition_id;
+        pipeline_config.write_gate = Some(gate);
 
         let metrics = Arc::new(PipelineMetrics::new());
         let control = PipelineControl::new();
         let shutdown = Arc::new(AtomicBool::new(false));
+
+        // G4: install the ack callback so sinks that observe broker acks
+        // (Kafka today; HTTP/NATS/etc as they adopt) drive the
+        // `outputs_acked_total` companion metric. Sinks that don't override
+        // `Sink::on_ack_callback` keep the trait's no-op default — for them
+        // `outputs_acked` stays at 0 and dashboards should fall back to
+        // `outputs_sent`.
+        Sink::on_ack_callback(&mut sink, metrics.ack_callback());
 
         let metrics_task = Arc::clone(&metrics);
         let control_task = Arc::clone(&control);
@@ -200,6 +289,13 @@ impl PipelineSupervisor {
                 }
             }
         }
+
+        // G2/CL-6: drop all gates owned by this pipeline so a restart
+        // starts with fresh `Open` state. If a cluster-side cutover was
+        // mid-flight when stop() was called, its drain future resolves on
+        // the DrainGuard drop inside the source task; the `Frozen` state
+        // dies with the Arc once every holder releases.
+        self.gate_registry.remove_pipeline(name);
 
         tracing::info!(pipeline = %name, "supervisor stopped pipeline");
         Ok(())
@@ -523,5 +619,181 @@ mod tests {
             Err(other) => panic!("expected Config error, got {other:?}"),
             Ok(_) => panic!("expected error, got Ok"),
         }
+    }
+
+    // ─── G1: cluster-ownership-aware source partition defaulting ───
+
+    /// Source factory that records the `SourceConfig` it was handed so
+    /// tests can assert the supervisor filled `partitions` from the
+    /// installed ownership resolver before the factory built.
+    struct RecordingSourceFactory {
+        seen_partitions: Arc<std::sync::Mutex<Option<Vec<u16>>>>,
+        remaining: usize,
+    }
+    impl SourceFactory for RecordingSourceFactory {
+        fn build(&self, cfg: &SourceConfig) -> Result<Box<dyn DynSource>, AeonError> {
+            *self.seen_partitions.lock().expect("lock") = Some(cfg.partitions.clone());
+            Ok(Box::new(CountingSource {
+                remaining: self.remaining,
+            }))
+        }
+    }
+
+    /// Stub resolver that returns a fixed owned-partitions vec.
+    struct StubOwnershipResolver(Option<Vec<u16>>);
+    impl crate::connector_registry::PartitionOwnershipResolver
+        for StubOwnershipResolver
+    {
+        fn owned_partitions<'a>(
+            &'a self,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Option<Vec<u16>>> + Send + 'a>,
+        > {
+            let out = self.0.clone();
+            Box::pin(async move { out })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn empty_partitions_are_filled_from_ownership_resolver() {
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let mut reg = ConnectorRegistry::new();
+        reg.register_source(
+            "count",
+            Arc::new(RecordingSourceFactory {
+                seen_partitions: Arc::clone(&seen),
+                remaining: 100,
+            }),
+        );
+        let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        reg.register_sink("capture", Arc::new(CapturingSinkFactory(counter)));
+
+        let sup = PipelineSupervisor::new(Arc::new(reg));
+        sup.set_ownership_resolver(Arc::new(StubOwnershipResolver(Some(vec![
+            5, 11, 17,
+        ]))))
+        .expect("install resolver");
+
+        let def = def_for("p1"); // partitions: vec![]
+        let _ = sup.start(&def).await.expect("start");
+
+        let got = seen
+            .lock()
+            .expect("lock")
+            .clone()
+            .expect("factory was called");
+        assert_eq!(
+            got,
+            vec![5, 11, 17],
+            "supervisor must fill empty partitions from resolver"
+        );
+
+        sup.stop("p1").await.expect("stop");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn explicit_partitions_are_not_overridden_by_resolver() {
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let mut reg = ConnectorRegistry::new();
+        reg.register_source(
+            "count",
+            Arc::new(RecordingSourceFactory {
+                seen_partitions: Arc::clone(&seen),
+                remaining: 50,
+            }),
+        );
+        let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        reg.register_sink("capture", Arc::new(CapturingSinkFactory(counter)));
+
+        let sup = PipelineSupervisor::new(Arc::new(reg));
+        sup.set_ownership_resolver(Arc::new(StubOwnershipResolver(Some(vec![
+            99,
+        ]))))
+        .expect("install resolver");
+
+        let mut def = def_for("p1");
+        def.sources[0].partitions = vec![1, 2, 3]; // explicit
+
+        let _ = sup.start(&def).await.expect("start");
+
+        let got = seen.lock().expect("lock").clone().expect("called");
+        assert_eq!(
+            got,
+            vec![1, 2, 3],
+            "explicit partitions must win over resolver output"
+        );
+        sup.stop("p1").await.expect("stop");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn empty_partitions_without_resolver_pass_through_unchanged() {
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let mut reg = ConnectorRegistry::new();
+        reg.register_source(
+            "count",
+            Arc::new(RecordingSourceFactory {
+                seen_partitions: Arc::clone(&seen),
+                remaining: 10,
+            }),
+        );
+        let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        reg.register_sink("capture", Arc::new(CapturingSinkFactory(counter)));
+
+        let sup = PipelineSupervisor::new(Arc::new(reg));
+        // No resolver installed — factory sees the empty list and
+        // applies its own fallback (Kafka → [0] + warn).
+
+        let def = def_for("p1");
+        let _ = sup.start(&def).await.expect("start");
+
+        let got = seen.lock().expect("lock").clone().expect("called");
+        assert!(
+            got.is_empty(),
+            "no resolver → supervisor must pass partitions through unchanged, got {got:?}"
+        );
+        sup.stop("p1").await.expect("stop");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resolver_returning_none_preserves_empty_partitions() {
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let mut reg = ConnectorRegistry::new();
+        reg.register_source(
+            "count",
+            Arc::new(RecordingSourceFactory {
+                seen_partitions: Arc::clone(&seen),
+                remaining: 10,
+            }),
+        );
+        let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        reg.register_sink("capture", Arc::new(CapturingSinkFactory(counter)));
+
+        let sup = PipelineSupervisor::new(Arc::new(reg));
+        sup.set_ownership_resolver(Arc::new(StubOwnershipResolver(None)))
+            .expect("install resolver");
+
+        let def = def_for("p1");
+        let _ = sup.start(&def).await.expect("start");
+
+        // Resolver said "I know nothing" — supervisor falls through,
+        // factory sees an empty list and applies its own default.
+        let got = seen.lock().expect("lock").clone().expect("called");
+        assert!(got.is_empty(), "None from resolver must not fill partitions");
+        sup.stop("p1").await.expect("stop");
+    }
+
+    #[tokio::test]
+    async fn ownership_resolver_install_is_once_only() {
+        let sup = PipelineSupervisor::new(Arc::new(ConnectorRegistry::new()));
+        sup.set_ownership_resolver(Arc::new(StubOwnershipResolver(Some(vec![0]))))
+            .expect("first install ok");
+        let err = sup
+            .set_ownership_resolver(Arc::new(StubOwnershipResolver(Some(vec![1]))))
+            .expect_err("second install must fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("already installed"),
+            "error must explain the reason, got: {msg}"
+        );
     }
 }

@@ -126,6 +126,7 @@ pub async fn start_ws_test_server(pipeline_name: &str) -> WsTestServer {
         ws_host: Some(Arc::clone(&ws_host)),
         #[cfg(feature = "cluster")]
         cluster_node: None,
+        shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
 
     let router = api_router(state);

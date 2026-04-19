@@ -9,6 +9,10 @@
 pub mod affinity;
 #[cfg(feature = "cluster")]
 pub mod cluster_applier;
+#[cfg(feature = "cluster")]
+pub mod engine_cutover;
+#[cfg(feature = "cluster")]
+pub mod partition_ownership;
 pub mod batch_tuner;
 pub mod batch_wire;
 pub mod checkpoint;
@@ -36,6 +40,7 @@ pub mod registry;
 pub mod retry;
 pub mod shutdown;
 pub mod transport;
+pub mod write_gate;
 
 #[cfg(feature = "native-loader")]
 pub mod native_loader;
@@ -63,8 +68,8 @@ pub use checkpoint::{
 };
 pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitState};
 pub use connector_registry::{
-    BoxedSinkAdapter, BoxedSourceAdapter, ConnectorRegistry, DynSink, DynSource, SinkFactory,
-    SourceFactory,
+    BoxedSinkAdapter, BoxedSourceAdapter, ConnectorRegistry, DynSink, DynSource,
+    PartitionOwnershipResolver, SinkFactory, SourceFactory,
 };
 pub use dag::{DagGraph, NodeKind, Topology, run_chain, run_fan_in, run_fan_out, run_routed, run_topology};
 pub use delivery::{CheckpointBackend, CheckpointConfig, DeliveryConfig, FlushStrategy};
@@ -86,6 +91,7 @@ pub use registry::ProcessorRegistry;
 pub use retry::{RetryConfig, RetryOutcome, backoff_delay, retry_async, retry_sync};
 pub use shutdown::{ShutdownConfig, ShutdownCoordinator};
 pub use transport::InProcessTransport;
+pub use write_gate::{DrainError, DrainGuard, GateState, WriteGate, WriteGateRegistry};
 pub use transport::{
     AwppSession, BatchInflight, ControlChannel, HandshakeConfig, PipelineResolver, SessionState,
 };
@@ -95,6 +101,12 @@ pub use native_loader::NativeProcessor;
 
 #[cfg(feature = "cluster")]
 pub use cluster_applier::ClusterRegistryApplier;
+
+#[cfg(feature = "cluster")]
+pub use engine_cutover::{CutoverWatermarkReader, EngineCutoverCoordinator};
+
+#[cfg(feature = "cluster")]
+pub use partition_ownership::ClusterPartitionOwnership;
 
 #[cfg(feature = "rest-api")]
 pub use rest_api::{AppState, api_router, serve};

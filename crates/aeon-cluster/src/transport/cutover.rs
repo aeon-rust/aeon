@@ -16,6 +16,9 @@
 //! responsibility (CL-6c.4) — this module is purely the transport
 //! primitive, kept crypto-agnostic and engine-agnostic like CL-6a/b.
 
+use std::future::Future;
+use std::pin::Pin;
+
 use aeon_types::AeonError;
 
 use crate::transfer::{TransferState, TransferTracker};
@@ -40,11 +43,16 @@ pub struct CutoverOffsets {
 ///
 /// Returning `Err` surfaces as `success=false` on the wire so the target
 /// can abort the transfer cleanly rather than seeing the stream drop.
+///
+/// Async via `Pin<Box<dyn Future>>` (not `impl Future`) so the trait stays
+/// dyn-compatible — the transport dispatcher holds
+/// `Arc<dyn CutoverCoordinator>` so the engine-crate implementor can be
+/// installed without a generic parameter propagating through the server.
 pub trait CutoverCoordinator: Send + Sync {
-    fn drain_and_freeze(
-        &self,
-        req: &PartitionCutoverRequest,
-    ) -> Result<CutoverOffsets, AeonError>;
+    fn drain_and_freeze<'a>(
+        &'a self,
+        req: &'a PartitionCutoverRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<CutoverOffsets, AeonError>> + Send + 'a>>;
 }
 
 /// Client side — request cutover for a partition and return the
@@ -137,7 +145,7 @@ pub async fn serve_partition_cutover_with_request<C>(
 where
     C: CutoverCoordinator + ?Sized,
 {
-    let resp = match coordinator.drain_and_freeze(req) {
+    let resp = match coordinator.drain_and_freeze(req).await {
         Ok(offsets) => PartitionCutoverResponse {
             success: true,
             final_source_offset: offsets.final_source_offset,
@@ -220,22 +228,27 @@ mod tests {
     }
 
     impl CutoverCoordinator for StubCoordinator {
-        fn drain_and_freeze(
-            &self,
-            _req: &PartitionCutoverRequest,
-        ) -> Result<CutoverOffsets, AeonError> {
+        fn drain_and_freeze<'a>(
+            &'a self,
+            _req: &'a PartitionCutoverRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<CutoverOffsets, AeonError>> + Send + 'a>>
+        {
             self.calls.fetch_add(1, Ordering::Relaxed);
-            Ok(self.offsets)
+            let offsets = self.offsets;
+            Box::pin(async move { Ok(offsets) })
         }
     }
 
     struct FailingCoordinator;
     impl CutoverCoordinator for FailingCoordinator {
-        fn drain_and_freeze(
-            &self,
-            _req: &PartitionCutoverRequest,
-        ) -> Result<CutoverOffsets, AeonError> {
-            Err(AeonError::state("stub: intentional cutover failure"))
+        fn drain_and_freeze<'a>(
+            &'a self,
+            _req: &'a PartitionCutoverRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<CutoverOffsets, AeonError>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                Err(AeonError::state("stub: intentional cutover failure"))
+            })
         }
     }
 
@@ -559,17 +572,21 @@ mod tests {
             seen: std::sync::Mutex<Option<PartitionCutoverRequest>>,
         }
         impl CutoverCoordinator for CapturingCoordinator {
-            fn drain_and_freeze(
-                &self,
-                req: &PartitionCutoverRequest,
-            ) -> Result<CutoverOffsets, AeonError> {
-                *self
-                    .seen
-                    .lock()
-                    .map_err(|e| AeonError::state(format!("lock: {e}")))? = Some(req.clone());
-                Ok(CutoverOffsets {
-                    final_source_offset: 0,
-                    final_poh_sequence: 0,
+            fn drain_and_freeze<'a>(
+                &'a self,
+                req: &'a PartitionCutoverRequest,
+            ) -> Pin<Box<dyn Future<Output = Result<CutoverOffsets, AeonError>> + Send + 'a>>
+            {
+                let req = req.clone();
+                Box::pin(async move {
+                    *self
+                        .seen
+                        .lock()
+                        .map_err(|e| AeonError::state(format!("lock: {e}")))? = Some(req);
+                    Ok(CutoverOffsets {
+                        final_source_offset: 0,
+                        final_poh_sequence: 0,
+                    })
                 })
             }
         }

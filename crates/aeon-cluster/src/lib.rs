@@ -9,12 +9,15 @@
 pub mod config;
 pub mod discovery;
 pub mod partition_manager;
+pub mod rebalance;
 pub mod snapshot;
 pub mod transfer;
 pub mod types;
 
 #[cfg(feature = "cluster")]
 pub mod node;
+#[cfg(feature = "cluster")]
+pub mod partition_driver;
 #[cfg(feature = "cluster")]
 pub mod raft_config;
 #[cfg(feature = "cluster")]
@@ -25,6 +28,7 @@ pub mod store;
 pub mod transport;
 
 pub use config::{ClusterConfig, TlsConfig};
+pub use rebalance::{plan_drain, plan_rebalance};
 pub use snapshot::ClusterSnapshot;
 pub use types::{
     ClusterRequest, ClusterResponse, NodeAddress, NodeId, PartitionCutoverRequest,
@@ -34,5 +38,10 @@ pub use types::{
 
 #[cfg(feature = "cluster")]
 pub use node::ClusterNode;
+#[cfg(feature = "cluster")]
+pub use partition_driver::{
+    NodeResolver, PartitionTransferDriver, PohChainInstaller, RaftNodeResolver,
+    SegmentInstaller,
+};
 #[cfg(feature = "cluster")]
 pub use store::SharedClusterState;

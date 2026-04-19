@@ -114,6 +114,19 @@ impl SourceFactory for KafkaSourceFactory {
             .ok_or_else(|| AeonError::config("kafka source requires config.brokers"))?;
 
         let partitions: Vec<i32> = if cfg.partitions.is_empty() {
+            // G1 fallback. Reached only when the supervisor couldn't
+            // resolve cluster ownership (no resolver installed, or the
+            // partition table is still empty at pipeline-start time) —
+            // in a healthy cluster the supervisor fills partitions
+            // before we see the cfg, so this is a loud signal that
+            // something upstream didn't get wired.
+            tracing::warn!(
+                topic,
+                "kafka source: no partitions specified and no cluster ownership \
+                 resolved — falling back to [0]. This will silently under-read a \
+                 multi-partition topic. Ensure `AEON_CLUSTER_ENABLED=true` or \
+                 supply an explicit `partitions:` list."
+            );
             vec![0]
         } else {
             cfg.partitions.iter().map(|p| *p as i32).collect()
@@ -162,7 +175,14 @@ impl SinkFactory for KafkaSinkFactory {
             kcfg = kcfg.with_strategy(parse_strategy(s)?);
         }
         if let Some(tid) = cfg.config.get("transactional_id") {
-            kcfg = kcfg.with_transactional_id(tid.clone());
+            // G3: Kafka fences any second producer that opens a
+            // transaction with a `transactional_id` already in use by a
+            // live producer — so two pods in a ReplicaSet that share a
+            // manifest must NOT resolve to the same id. We support
+            // `${HOSTNAME}` and `${POD_NAME}` placeholders so a single
+            // manifest works across every pod without hand-editing.
+            let resolved = substitute_env_placeholders(tid)?;
+            kcfg = kcfg.with_transactional_id(resolved);
         }
 
         Ok(Box::new(KafkaSink::new(kcfg)?))
@@ -203,6 +223,62 @@ fn parse_u32(s: Option<&String>, default: u32) -> Result<u32, AeonError> {
     }
 }
 
+/// Substitute `${VAR}` placeholders in `input` with the values of the
+/// corresponding process environment variables. Only `HOSTNAME` and
+/// `POD_NAME` are recognised — deliberately narrow, because the only
+/// caller today is Kafka `transactional_id` resolution (G3), and
+/// accepting arbitrary env vars here would turn config parsing into an
+/// implicit exfil vector.
+///
+/// Returns `AeonError::Config` if a referenced variable is unset. We
+/// fail-loud rather than substituting empty because an empty string
+/// silently collides across pods — exactly the fencing scenario this
+/// fix exists to prevent.
+///
+/// Supports multiple placeholders in one string (e.g.
+/// `"aeon-${POD_NAME}-${HOSTNAME}"`). Unknown placeholder names
+/// (`${FOO}`) are also an error, not a passthrough — typos surface at
+/// startup rather than causing runtime fencing in prod.
+fn substitute_env_placeholders(input: &str) -> Result<String, AeonError> {
+    // Fast path: nothing to substitute.
+    if !input.contains("${") {
+        return Ok(input.to_string());
+    }
+
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let end = after.find('}').ok_or_else(|| {
+            AeonError::config(format!(
+                "transactional_id template: unterminated '${{' in '{input}'"
+            ))
+        })?;
+        let name = &after[..end];
+        let value = match name {
+            "HOSTNAME" | "POD_NAME" => std::env::var(name).map_err(|_| {
+                AeonError::config(format!(
+                    "transactional_id template references ${{{name}}} but \
+                     environment variable is unset — set it via the K8s \
+                     downward API or `env:` spec"
+                ))
+            })?,
+            other => {
+                return Err(AeonError::config(format!(
+                    "transactional_id template: unknown placeholder \
+                     '${{{other}}}' — only ${{HOSTNAME}} and ${{POD_NAME}} \
+                     are supported"
+                )));
+            }
+        };
+        out.push_str(&value);
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
 fn parse_strategy(s: &str) -> Result<DeliveryStrategy, AeonError> {
     match s {
         "per_event" | "PerEvent" => Ok(DeliveryStrategy::PerEvent),
@@ -217,6 +293,7 @@ fn parse_strategy(s: &str) -> Result<DeliveryStrategy, AeonError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use std::collections::BTreeMap;
 
     #[test]
@@ -335,5 +412,96 @@ mod tests {
             DeliveryStrategy::OrderedBatch
         );
         assert!(parse_strategy("nope").is_err());
+    }
+
+    // ─── G3: transactional_id template substitution ───
+
+    /// Env mutation is process-global, so all substitution tests share
+    /// a mutex to avoid racing each other's `set_var`/`remove_var` calls
+    /// when `cargo test` runs the module with multiple threads.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::{Mutex, OnceLock};
+        static L: OnceLock<Mutex<()>> = OnceLock::new();
+        L.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
+    #[test]
+    fn env_substitution_fast_path_without_placeholders() {
+        let _g = env_lock();
+        let out = substitute_env_placeholders("aeon-static-tx-id").unwrap();
+        assert_eq!(out, "aeon-static-tx-id");
+    }
+
+    #[test]
+    fn env_substitution_resolves_hostname() {
+        let _g = env_lock();
+        // SAFETY: test-only env mutation, guarded by `env_lock()` so
+        // no concurrent test observes the half-applied state.
+        unsafe {
+            std::env::set_var("HOSTNAME", "pod-7");
+        }
+        let out = substitute_env_placeholders("aeon-${HOSTNAME}-tx").unwrap();
+        assert_eq!(out, "aeon-pod-7-tx");
+    }
+
+    #[test]
+    fn env_substitution_resolves_pod_name() {
+        let _g = env_lock();
+        unsafe {
+            std::env::set_var("POD_NAME", "aeon-3");
+        }
+        let out = substitute_env_placeholders("${POD_NAME}").unwrap();
+        assert_eq!(out, "aeon-3");
+    }
+
+    #[test]
+    fn env_substitution_handles_multiple_placeholders_in_one_string() {
+        let _g = env_lock();
+        unsafe {
+            std::env::set_var("HOSTNAME", "h");
+            std::env::set_var("POD_NAME", "p");
+        }
+        let out =
+            substitute_env_placeholders("aeon-${POD_NAME}-on-${HOSTNAME}-tx").unwrap();
+        assert_eq!(out, "aeon-p-on-h-tx");
+    }
+
+    #[test]
+    fn env_substitution_rejects_unset_variable() {
+        let _g = env_lock();
+        unsafe {
+            std::env::remove_var("HOSTNAME");
+        }
+        let err = substitute_env_placeholders("aeon-${HOSTNAME}").unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("HOSTNAME") && msg.contains("unset"),
+            "error must name the missing var, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn env_substitution_rejects_unknown_placeholder() {
+        let _g = env_lock();
+        let err = substitute_env_placeholders("aeon-${USER}-tx").unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("USER") && msg.contains("HOSTNAME"),
+            "error must name the offender and list allowed vars, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn env_substitution_rejects_unterminated_placeholder() {
+        let _g = env_lock();
+        let err =
+            substitute_env_placeholders("aeon-${HOSTNAME-tx").unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("unterminated"),
+            "error must explain the syntax problem, got: {msg}"
+        );
     }
 }

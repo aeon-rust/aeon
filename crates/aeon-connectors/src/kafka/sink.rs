@@ -9,8 +9,8 @@
 //!   pending deliveries. Higher throughput, downstream sorts by UUIDv7.
 
 use aeon_types::{
-    AeonError, BatchResult, DeliveryStrategy, IdempotentSink, Output, Sink, SinkEosTier,
-    TransactionalSink,
+    AeonError, BatchResult, DeliveryStrategy, IdempotentSink, Output, Sink, SinkAckCallback,
+    SinkEosTier, TransactionalSink,
 };
 use futures_util::future::join_all;
 use rdkafka::config::ClientConfig;
@@ -129,6 +129,12 @@ pub struct KafkaSink {
     /// that lets the same producer serve both the EO-1 per-batch model
     /// and the EO-2 two-phase-L3 model.
     in_outer_txn: bool,
+    /// G4: optional ack callback installed by the engine to drive the
+    /// `outputs_acked_total` companion metric. Fired with the count of
+    /// newly broker-confirmed deliveries — once per `produce_inner()`
+    /// outcome for `PerEvent`/`OrderedBatch`, and once per `flush()` for
+    /// `UnorderedBatch` (where librdkafka's background thread acks).
+    ack_callback: Option<SinkAckCallback>,
 }
 
 impl KafkaSink {
@@ -187,7 +193,21 @@ impl KafkaSink {
             pending: 0,
             transactional,
             in_outer_txn: false,
+            ack_callback: None,
         })
+    }
+
+    /// Fire the engine-installed ack callback if one is present. Called
+    /// from inside `produce_inner` and `flush` whenever `delivered` is
+    /// advanced. Helper centralises the `Option` check so the produce arms
+    /// stay readable.
+    fn fire_ack(&self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        if let Some(cb) = self.ack_callback.as_ref() {
+            cb(n);
+        }
     }
 
     /// Returns `true` when this sink was constructed with a `transactional_id`
@@ -270,7 +290,10 @@ impl KafkaSink {
 
         match self.config.strategy {
             DeliveryStrategy::PerEvent => {
-                // All futures already awaited above.
+                // All futures already awaited above. Each successful await
+                // bumped `delivered` by 1 — fire the ack callback once with
+                // the full count (cheaper than N callback calls).
+                self.fire_ack(count);
                 Ok(BatchResult::all_delivered(event_ids))
             }
             DeliveryStrategy::OrderedBatch => {
@@ -284,16 +307,23 @@ impl KafkaSink {
                 // Idempotent producer guarantees ordering even with pipelining.
                 let results = join_all(futures).await;
                 let mut errors = Vec::new();
+                let mut newly_acked: usize = 0;
                 for result in results {
                     match result {
                         Ok(_) => {
                             self.delivered += 1;
+                            newly_acked += 1;
                         }
                         Err((e, _)) => {
                             errors.push(format!("{e}"));
                         }
                     }
                 }
+
+                // Fire ack callback for the partial-or-full successful set.
+                // Even on error we want operators to see the partial deliveries
+                // that did land — `acked` reflects broker truth, not batch outcome.
+                self.fire_ack(newly_acked);
 
                 if errors.is_empty() {
                     Ok(BatchResult::all_delivered(event_ids))
@@ -308,10 +338,9 @@ impl KafkaSink {
             DeliveryStrategy::UnorderedBatch => {
                 // Drop the futures — rdkafka's internal queue holds the messages.
                 // Delivery confirmations happen in the background via librdkafka's
-                // polling thread. flush() will wait for all pending deliveries.
-                //
-                // We intentionally do NOT await futures here — that's the entire
-                // point of UnorderedBatch. The data is already in librdkafka's buffer.
+                // polling thread. flush() will wait for all pending deliveries —
+                // the ack callback fires there, not here, because at this point
+                // nothing is broker-confirmed yet.
                 //
                 // NOTE: UnorderedBatch + transactional is a degenerate combination —
                 // the transaction would commit before futures resolve, defeating
@@ -416,10 +445,18 @@ impl Sink for KafkaSink {
             .flush(self.config.flush_timeout)
             .map_err(|e| AeonError::connection(format!("kafka producer flush failed: {e}")))?;
 
-        // All pending messages are now delivered.
-        self.delivered += self.pending;
+        // All pending messages are now broker-confirmed.
+        let newly_acked = self.pending;
+        self.delivered += newly_acked;
         self.pending = 0;
+        // UnorderedBatch ack point: fire the engine callback now that
+        // librdkafka's background thread has confirmed every queued send.
+        self.fire_ack(newly_acked as usize);
         Ok(())
+    }
+
+    fn on_ack_callback(&mut self, cb: SinkAckCallback) {
+        self.ack_callback = Some(cb);
     }
 }
 
@@ -520,6 +557,8 @@ pub fn redpanda_sink_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn config_defaults_non_transactional() {
@@ -532,6 +571,40 @@ mod tests {
         let cfg = KafkaSinkConfig::new("localhost:9092", "test-topic")
             .with_transactional_id("aeon-sink-node-1");
         assert_eq!(cfg.transactional_id.as_deref(), Some("aeon-sink-node-1"));
+    }
+
+    #[test]
+    fn ack_callback_starts_unset_and_installs_via_trait() {
+        // KafkaSink::new with a non-transactional config does not contact the
+        // broker (rdkafka is lazy), so this constructs cleanly even without a
+        // running cluster — fine for verifying the callback wiring slot.
+        let cfg = KafkaSinkConfig::new("localhost:9092", "ack-cb-test");
+        let mut sink = KafkaSink::new(cfg).expect("non-txn KafkaSink construction is local");
+        assert!(sink.ack_callback.is_none(), "callback must start unset");
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_for_cb = Arc::clone(&counter);
+        let cb: SinkAckCallback =
+            Arc::new(move |n| { counter_for_cb.fetch_add(n, Ordering::Relaxed); });
+        Sink::on_ack_callback(&mut sink, cb);
+        assert!(sink.ack_callback.is_some(), "callback must be stored");
+
+        // fire_ack with N forwards N to the stored callback.
+        sink.fire_ack(42);
+        assert_eq!(counter.load(Ordering::Relaxed), 42);
+
+        // fire_ack(0) is a no-op — short-circuited before the closure call.
+        sink.fire_ack(0);
+        assert_eq!(counter.load(Ordering::Relaxed), 42);
+    }
+
+    #[test]
+    fn fire_ack_without_callback_is_a_no_op() {
+        let cfg = KafkaSinkConfig::new("localhost:9092", "no-cb-test");
+        let sink = KafkaSink::new(cfg).expect("non-txn KafkaSink construction is local");
+        // No callback installed — must not panic on fire_ack.
+        sink.fire_ack(0);
+        sink.fire_ack(7);
     }
 
     /// Compile-time proof that `KafkaSink` satisfies `IdempotentSink`.

@@ -312,8 +312,20 @@ enum DevAction {
 
 #[derive(Subcommand)]
 enum ClusterAction {
-    /// Show cluster status: node ID, leader, partition assignments, Raft metrics
-    Status,
+    /// Show cluster status: node ID, leader, partition assignments, Raft metrics.
+    ///
+    /// With `--watch`, polls the endpoint on an interval and re-renders a
+    /// compact human-readable view (partition ownership, transfers in flight,
+    /// Raft term/index). Ctrl-C to exit. Without `--watch`, prints a raw JSON
+    /// snapshot — script-friendly.
+    Status {
+        /// Watch mode: clear + re-render on each tick until Ctrl-C.
+        #[arg(long)]
+        watch: bool,
+        /// Poll interval in seconds when `--watch` is set.
+        #[arg(long, default_value_t = 2.0)]
+        interval: f64,
+    },
     /// Initiate a partition handover from the current owner to a target node.
     ///
     /// Must be issued against the current Raft leader. If you hit a follower,
@@ -327,6 +339,20 @@ enum ClusterAction {
         #[arg(long)]
         target: u64,
     },
+    /// Send every partition currently owned by `--node` to the other live members.
+    ///
+    /// Must be issued against the current Raft leader. Follower replies carry
+    /// `X-Leader-Id` — rerun against that node.
+    Drain {
+        /// Node ID to drain (all its partitions handed off to remaining live members)
+        #[arg(long)]
+        node: u64,
+    },
+    /// Redistribute partitions across live members toward an even split.
+    ///
+    /// Must be issued against the current Raft leader. Follower replies carry
+    /// `X-Leader-Id` — rerun against that node.
+    Rebalance,
 }
 
 #[derive(Subcommand)]
@@ -594,6 +620,22 @@ fn cmd_serve(addr: &str, artifact_dir: &str) -> Result<()> {
                     ))
                     .await;
 
+                    // G1: install the cluster-backed partition-ownership
+                    // resolver onto the supervisor. When a pipeline manifest
+                    // leaves `partitions` empty, start() now fills it with
+                    // this node's owned slice from the Raft-replicated
+                    // PartitionTable rather than silently defaulting to [0].
+                    supervisor
+                        .set_ownership_resolver(Arc::new(
+                            aeon_engine::ClusterPartitionOwnership::new(
+                                node.shared_state(),
+                                node.config().node_id,
+                            ),
+                        ))
+                        .map_err(|e| {
+                            anyhow::anyhow!("install ownership resolver: {e}")
+                        })?;
+
                     // Spawn background task for leader election + partition assignment.
                     // Retries for up to 120s. Each iteration checks:
                     //   1. Is a leader elected?
@@ -670,6 +712,7 @@ fn cmd_serve(addr: &str, artifact_dir: &str) -> Result<()> {
             authenticator: None,
             ws_host: None,
             cluster_node: cluster_node.clone(),
+            shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
 
         let listen_addr =
@@ -1483,45 +1526,205 @@ fn cmd_pipeline(api: &str, action: &PipelineAction) -> Result<()> {
 
 fn cmd_cluster(api: &str, action: &ClusterAction) -> Result<()> {
     match action {
-        ClusterAction::Status => {
-            let body: serde_json::Value = ureq::get(&format!("{api}/api/v1/cluster/status"))
-                .call()
-                .context("failed to reach Aeon API")?
-                .into_json()
-                .context("invalid JSON response")?;
-            println!("{}", serde_json::to_string_pretty(&body)?);
-            Ok(())
+        ClusterAction::Status { watch, interval } => {
+            cmd_cluster_status(api, *watch, *interval)
         }
         ClusterAction::TransferPartition { partition, target } => {
             let url = format!("{api}/api/v1/cluster/partitions/{partition}/transfer");
             let payload = serde_json::json!({ "target_node_id": target });
-            // ureq raises an Err on non-2xx. Capture the response body on
-            // error so the operator sees the leader hint / rejection reason.
-            match ureq::post(&url).send_json(&payload) {
-                Ok(resp) => {
-                    let body: serde_json::Value = resp
-                        .into_json()
-                        .context("invalid JSON response from transfer-partition")?;
-                    println!("{}", serde_json::to_string_pretty(&body)?);
-                    Ok(())
-                }
-                Err(ureq::Error::Status(code, resp)) => {
-                    let leader_hint = resp
-                        .header("X-Leader-Id")
-                        .map(|s| s.to_string());
-                    let body_text = resp.into_string().unwrap_or_default();
-                    if let Some(leader_id) = leader_hint {
-                        bail!(
-                            "transfer rejected (HTTP {code}); current Raft leader is node {leader_id}\n\
-                             body: {body_text}"
-                        );
-                    }
-                    bail!("transfer rejected (HTTP {code}): {body_text}");
-                }
-                Err(e) => Err(anyhow::Error::new(e).context("failed to reach Aeon API")),
-            }
+            post_cluster_mutation(&url, Some(payload), "transfer")
+        }
+        ClusterAction::Drain { node } => {
+            let url = format!("{api}/api/v1/cluster/drain");
+            let payload = serde_json::json!({ "node_id": node });
+            post_cluster_mutation(&url, Some(payload), "drain")
+        }
+        ClusterAction::Rebalance => {
+            let url = format!("{api}/api/v1/cluster/rebalance");
+            post_cluster_mutation(&url, None, "rebalance")
         }
     }
+}
+
+/// POST a cluster mutation (transfer / drain / rebalance) and pretty-print the
+/// response. Translates 409 Conflict into an operator-friendly "hit a follower,
+/// leader is node N" message using the `X-Leader-Id` header set by the server.
+fn post_cluster_mutation(
+    url: &str,
+    body: Option<serde_json::Value>,
+    op: &str,
+) -> Result<()> {
+    let req = ureq::post(url);
+    let result = match body {
+        Some(ref json) => req.send_json(json),
+        None => req.call(),
+    };
+    match result {
+        Ok(resp) => {
+            let body: serde_json::Value = resp
+                .into_json()
+                .with_context(|| format!("invalid JSON response from {op}"))?;
+            println!("{}", serde_json::to_string_pretty(&body)?);
+            Ok(())
+        }
+        Err(ureq::Error::Status(code, resp)) => {
+            let leader_hint = resp.header("X-Leader-Id").map(|s| s.to_string());
+            let body_text = resp.into_string().unwrap_or_default();
+            if let Some(leader_id) = leader_hint {
+                bail!(
+                    "{op} rejected (HTTP {code}); current Raft leader is node {leader_id}\n\
+                     body: {body_text}"
+                );
+            }
+            bail!("{op} rejected (HTTP {code}): {body_text}");
+        }
+        Err(e) => Err(anyhow::Error::new(e).context("failed to reach Aeon API")),
+    }
+}
+
+/// Fetch `/api/v1/cluster/status`. Once-shot prints the raw JSON (script
+/// friendly); `--watch` re-renders a compact human view on every tick.
+/// Ctrl-C exits (the loop runs on the main thread; SIGINT/Ctrl-C kills
+/// the process, which is the right UX for a terminal watch command).
+fn cmd_cluster_status(api: &str, watch: bool, interval_secs: f64) -> Result<()> {
+    let url = format!("{api}/api/v1/cluster/status");
+    if !watch {
+        let body: serde_json::Value = ureq::get(&url)
+            .call()
+            .context("failed to reach Aeon API")?
+            .into_json()
+            .context("invalid JSON response")?;
+        println!("{}", serde_json::to_string_pretty(&body)?);
+        return Ok(());
+    }
+
+    if !interval_secs.is_finite() || interval_secs < 0.1 {
+        bail!("--interval must be >= 0.1 seconds");
+    }
+    let sleep_ms = (interval_secs * 1000.0) as u64;
+
+    loop {
+        let rendered = match fetch_cluster_status(&url) {
+            Ok(body) => render_cluster_status(&body, interval_secs),
+            Err(e) => format!("error: {e}\n(retrying in {interval_secs}s)"),
+        };
+        // ANSI clear screen + home cursor. Every terminal Aeon targets
+        // (Linux, macOS Terminal, Windows Terminal, PowerShell) handles
+        // these; the old conhost does not, but that's not a supported
+        // Aeon target any more.
+        print!("\x1b[2J\x1b[H{rendered}");
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
+    }
+}
+
+fn fetch_cluster_status(url: &str) -> Result<serde_json::Value> {
+    let resp = ureq::get(url).call().context("HTTP GET failed")?;
+    resp.into_json::<serde_json::Value>()
+        .context("invalid JSON response")
+}
+
+/// Render the `/api/v1/cluster/status` JSON body as an operator-friendly
+/// plain-text block. Falls back to the raw JSON if the body shape does
+/// not match the expected cluster schema (e.g. standalone mode).
+fn render_cluster_status(body: &serde_json::Value, interval_secs: f64) -> String {
+    let now = chrono_like_hms();
+    let mode = body.get("mode").and_then(|v| v.as_str()).unwrap_or("?");
+
+    if mode != "cluster" {
+        let msg = body
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("no cluster");
+        return format!(
+            "Aeon cluster status  ({now})\n\nmode: {mode}\n{msg}\n\n(every {interval_secs}s, Ctrl-C to exit)\n"
+        );
+    }
+
+    let node_id = body.get("node_id").and_then(|v| v.as_u64()).unwrap_or(0);
+    let leader = body
+        .get("leader_id")
+        .and_then(|v| v.as_u64())
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "<none>".to_string());
+    let num_partitions = body.get("num_partitions").and_then(|v| v.as_u64()).unwrap_or(0);
+
+    let raft = body.get("raft").cloned().unwrap_or(serde_json::Value::Null);
+    let raft_state = raft.get("state").and_then(|v| v.as_str()).unwrap_or("?");
+    let term = raft.get("current_term").and_then(|v| v.as_u64()).unwrap_or(0);
+    let last_applied = raft
+        .get("last_applied")
+        .and_then(|v| v.as_u64())
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let last_log = raft
+        .get("last_log_index")
+        .and_then(|v| v.as_u64())
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "-".to_string());
+
+    let mut out = String::new();
+    out.push_str(&format!("Aeon cluster status  ({now})\n\n"));
+    out.push_str(&format!(
+        "node: {node_id}    leader: {leader}    raft: {raft_state}\n"
+    ));
+    out.push_str(&format!(
+        "term: {term}    last_applied: {last_applied}    last_log: {last_log}\n\n"
+    ));
+    out.push_str(&format!("Partitions ({num_partitions} total)\n"));
+
+    // Partitions come back as a map keyed by stringified partition id.
+    // Sort numerically so the output order is stable.
+    let mut rows: Vec<(u16, String)> = Vec::new();
+    if let Some(map) = body.get("partitions").and_then(|v| v.as_object()) {
+        for (k, v) in map.iter() {
+            let pid: u16 = match k.parse() {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+            let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("?");
+            let cell = match status {
+                "owned" => {
+                    let owner = v.get("owner").and_then(|n| n.as_u64()).unwrap_or(0);
+                    format!("owned   node {owner}")
+                }
+                "transferring" => {
+                    let src = v.get("source").and_then(|n| n.as_u64()).unwrap_or(0);
+                    let tgt = v.get("target").and_then(|n| n.as_u64()).unwrap_or(0);
+                    format!("transfer  {src} → {tgt}")
+                }
+                other => other.to_string(),
+            };
+            rows.push((pid, cell));
+        }
+    }
+    rows.sort_by_key(|(pid, _)| *pid);
+    for (pid, cell) in rows {
+        out.push_str(&format!("  P{pid:<3}  {cell}\n"));
+    }
+
+    out.push_str(&format!(
+        "\n(every {interval_secs}s, Ctrl-C to exit)\n"
+    ));
+    out
+}
+
+/// `HH:MM:SS` wall clock without pulling `chrono` — used only for the
+/// watch header. Never parses, never does timezone arithmetic, just
+/// turns local elapsed-since-epoch seconds into a stable UTC string so
+/// the rendered block has *some* time marker the operator can correlate
+/// with log timestamps. UTC is fine — operators cross-reference by
+/// matching HH:MM:SS, not by reading off a specific zone.
+fn chrono_like_hms() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let hh = (now / 3600) % 24;
+    let mm = (now / 60) % 60;
+    let ss = now % 60;
+    format!("{hh:02}:{mm:02}:{ss:02}Z")
 }
 
 // ── aeon deploy ───────────────────────────────────────────────────────
@@ -2896,5 +3099,122 @@ fn check_artifact(path: &Path) -> CheckResult {
             format!("{} has unexpected extension '.{ext}'", path.display()),
             "expected .wasm, .so, .dll, or .dylib",
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_cluster_body() -> serde_json::Value {
+        serde_json::json!({
+            "mode": "cluster",
+            "node_id": 2,
+            "leader_id": 1,
+            "num_partitions": 4,
+            "partitions": {
+                "0": { "status": "owned", "owner": 1 },
+                "1": { "status": "owned", "owner": 2 },
+                "2": { "status": "transferring", "source": 1, "target": 3 },
+                "3": { "status": "owned", "owner": 2 },
+            },
+            "raft": {
+                "state": "Follower",
+                "current_term": 5,
+                "last_applied": 127,
+                "last_log_index": 127,
+                "membership": "[1, 2, 3]"
+            }
+        })
+    }
+
+    #[test]
+    fn render_cluster_body_includes_leader_and_partition_rows_in_id_order() {
+        let rendered = render_cluster_status(&sample_cluster_body(), 2.0);
+
+        assert!(rendered.contains("node: 2"), "header missing node id: {rendered}");
+        assert!(rendered.contains("leader: 1"), "header missing leader: {rendered}");
+        assert!(rendered.contains("term: 5"), "term missing: {rendered}");
+        assert!(rendered.contains("last_applied: 127"), "last_applied missing");
+
+        let p0 = rendered.find("P0").expect("P0 row");
+        let p1 = rendered.find("P1").expect("P1 row");
+        let p2 = rendered.find("P2").expect("P2 row");
+        let p3 = rendered.find("P3").expect("P3 row");
+        assert!(
+            p0 < p1 && p1 < p2 && p2 < p3,
+            "partition rows must render in ascending partition-id order: {rendered}"
+        );
+
+        assert!(
+            rendered.contains("transfer  1 → 3"),
+            "transfer row shape wrong: {rendered}"
+        );
+        assert!(rendered.contains("(every 2s, Ctrl-C to exit)"));
+    }
+
+    #[test]
+    fn render_cluster_body_falls_back_on_standalone_mode() {
+        let body = serde_json::json!({
+            "mode": "standalone",
+            "message": "no cluster node configured"
+        });
+        let rendered = render_cluster_status(&body, 1.5);
+        assert!(rendered.contains("mode: standalone"));
+        assert!(rendered.contains("no cluster node configured"));
+        // No partition table when not in cluster mode.
+        assert!(!rendered.contains("Partitions ("));
+    }
+
+    #[test]
+    fn render_cluster_body_handles_missing_leader_gracefully() {
+        let mut body = sample_cluster_body();
+        body["leader_id"] = serde_json::Value::Null;
+        let rendered = render_cluster_status(&body, 2.0);
+        assert!(
+            rendered.contains("leader: <none>"),
+            "no-leader must render as <none>: {rendered}"
+        );
+    }
+
+    #[test]
+    fn render_cluster_body_sorts_partitions_by_numeric_id_not_lexicographic() {
+        // Keys "10" and "2" would sort lexicographically as "10" < "2".
+        // Confirm we parse and sort numerically.
+        let body = serde_json::json!({
+            "mode": "cluster",
+            "node_id": 1,
+            "leader_id": 1,
+            "num_partitions": 12,
+            "partitions": {
+                "2":  { "status": "owned", "owner": 1 },
+                "10": { "status": "owned", "owner": 1 },
+            },
+            "raft": {
+                "state": "Leader",
+                "current_term": 1,
+                "last_applied": 0,
+                "last_log_index": 0,
+                "membership": "[1]"
+            }
+        });
+        let rendered = render_cluster_status(&body, 2.0);
+        let p2 = rendered.find("P2 ").expect("P2");
+        let p10 = rendered.find("P10").expect("P10");
+        assert!(p2 < p10, "numeric sort: P2 must come before P10: {rendered}");
+    }
+
+    #[test]
+    fn chrono_like_hms_returns_eight_char_utc_timestamp() {
+        let ts = chrono_like_hms();
+        assert_eq!(ts.len(), 9, "HH:MM:SSZ expected, got {ts:?}");
+        assert!(ts.ends_with('Z'));
+        let parts: Vec<&str> = ts.trim_end_matches('Z').split(':').collect();
+        assert_eq!(parts.len(), 3);
+        for p in &parts {
+            assert_eq!(p.len(), 2);
+            let n: u32 = p.parse().expect("numeric");
+            assert!(n < 60);
+        }
     }
 }

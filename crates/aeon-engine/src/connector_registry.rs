@@ -28,7 +28,7 @@ use aeon_types::delivery::BatchResult;
 use aeon_types::error::AeonError;
 use aeon_types::event::{Event, Output};
 use aeon_types::registry::{SinkConfig, SourceConfig};
-use aeon_types::traits::{Sink, Source, SourceKind};
+use aeon_types::traits::{Sink, SinkAckCallback, Source, SourceKind};
 
 // ─── Dyn-compatible shims ──────────────────────────────────────────────────
 
@@ -82,6 +82,9 @@ pub trait DynSink: Send + Sync {
     fn flush_boxed<'a>(
         &'a mut self,
     ) -> Pin<Box<dyn Future<Output = Result<(), AeonError>> + Send + 'a>>;
+
+    /// Forward `Sink::on_ack_callback` through the dyn boundary.
+    fn on_ack_callback_dyn(&mut self, cb: SinkAckCallback);
 }
 
 impl<S: Sink + 'static> DynSink for S {
@@ -96,6 +99,10 @@ impl<S: Sink + 'static> DynSink for S {
         &'a mut self,
     ) -> Pin<Box<dyn Future<Output = Result<(), AeonError>> + Send + 'a>> {
         Box::pin(self.flush())
+    }
+
+    fn on_ack_callback_dyn(&mut self, cb: SinkAckCallback) {
+        Sink::on_ack_callback(self, cb);
     }
 }
 
@@ -144,6 +151,10 @@ impl Sink for BoxedSinkAdapter {
     fn flush(&mut self) -> impl Future<Output = Result<(), AeonError>> + Send {
         self.0.flush_boxed()
     }
+
+    fn on_ack_callback(&mut self, cb: SinkAckCallback) {
+        self.0.on_ack_callback_dyn(cb);
+    }
 }
 
 // ─── Factories ─────────────────────────────────────────────────────────────
@@ -157,6 +168,28 @@ pub trait SourceFactory: Send + Sync {
 /// Builds a sink from a `SinkConfig`. One implementation per connector type.
 pub trait SinkFactory: Send + Sync {
     fn build(&self, cfg: &SinkConfig) -> Result<Box<dyn DynSink>, AeonError>;
+}
+
+// ─── Partition-ownership resolver ──────────────────────────────────────────
+
+/// Supplies the set of partition ids this node currently owns (per the
+/// cluster's replicated `PartitionTable`). Queried by the supervisor when
+/// a source manifest leaves its `partitions` list empty — lets cluster-
+/// aware sources (Kafka today, other partitioned pulls tomorrow) read
+/// only the slice this node is responsible for rather than silently
+/// falling back to `[0]` (the G1 under-read from DOKS Session A).
+///
+/// Keyless by design: the current runtime hosts one pipeline per node.
+/// Multi-pipeline support (P5) will add a pipeline parameter.
+///
+/// Method returns a boxed future for dyn-compat (mirrors the pattern
+/// used by `CutoverCoordinator`). Returning `None` means "this node has
+/// no committed ownership yet" — the caller must decide whether to
+/// fall back (single-node / pre-cluster paths) or fail loudly.
+pub trait PartitionOwnershipResolver: Send + Sync {
+    fn owned_partitions<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Option<Vec<u16>>> + Send + 'a>>;
 }
 
 // ─── Registry ──────────────────────────────────────────────────────────────
@@ -340,5 +373,88 @@ mod tests {
             Err(other) => panic!("expected Config error, got {other:?}"),
             Ok(_) => panic!("expected error, got Ok"),
         }
+    }
+
+    /// G4: a sink that records every ack-callback invocation so we can
+    /// assert the trait default and the dyn-forward both work.
+    struct AckSpySink {
+        cb: Option<SinkAckCallback>,
+    }
+    impl Sink for AckSpySink {
+        async fn write_batch(
+            &mut self,
+            outputs: Vec<Output>,
+        ) -> Result<BatchResult, AeonError> {
+            // Fire the installed callback for every output so the test can
+            // observe the count that bubbles up through `BoxedSinkAdapter`.
+            if let Some(cb) = self.cb.as_ref() {
+                cb(outputs.len());
+            }
+            Ok(BatchResult::all_delivered(
+                outputs.iter().map(|_| uuid::Uuid::nil()).collect(),
+            ))
+        }
+        async fn flush(&mut self) -> Result<(), AeonError> {
+            Ok(())
+        }
+        fn on_ack_callback(&mut self, cb: SinkAckCallback) {
+            self.cb = Some(cb);
+        }
+    }
+
+    #[tokio::test]
+    async fn boxed_sink_adapter_forwards_on_ack_callback_through_dyn_boundary() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        // Wrap an AckSpySink behind the same dyn-erasure path the supervisor uses.
+        let inner: Box<dyn DynSink> = Box::new(AckSpySink { cb: None });
+        let mut adapter = BoxedSinkAdapter(inner);
+
+        // Counter shared with the callback so we can verify forwarding.
+        let counter = StdArc::new(AtomicUsize::new(0));
+        let counter_for_cb = StdArc::clone(&counter);
+        let cb: SinkAckCallback =
+            StdArc::new(move |n| { counter_for_cb.fetch_add(n, AtomicOrdering::Relaxed); });
+
+        // Install through the adapter — must reach the inner spy via
+        // `DynSink::on_ack_callback_dyn` → `Sink::on_ack_callback`.
+        Sink::on_ack_callback(&mut adapter, cb);
+
+        // Drive a batch through the adapter — the spy fires the callback
+        // with `outputs.len()`, which the counter should now reflect.
+        let outputs: Vec<Output> = (0..5)
+            .map(|_| Output::new(StdArc::from("dest"), Bytes::from_static(b"x")))
+            .collect();
+        let result = adapter.write_batch(outputs).await.unwrap();
+        assert_eq!(result.delivered.len(), 5);
+        assert_eq!(counter.load(AtomicOrdering::Relaxed), 5);
+    }
+
+    #[tokio::test]
+    async fn dyn_sink_default_on_ack_callback_is_no_op_for_non_overriding_sinks() {
+        // DroppingSink does not override `on_ack_callback`; installing a
+        // callback through the dyn boundary must not crash and the callback
+        // simply never fires.
+        let inner: Box<dyn DynSink> = Box::new(DroppingSink);
+        let mut adapter = BoxedSinkAdapter(inner);
+
+        let fired = StdArc::new(std::sync::atomic::AtomicBool::new(false));
+        let fired_for_cb = StdArc::clone(&fired);
+        let cb: SinkAckCallback = StdArc::new(move |_| {
+            fired_for_cb.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+
+        Sink::on_ack_callback(&mut adapter, cb);
+        let _ = adapter
+            .write_batch(vec![Output::new(
+                StdArc::from("dest"),
+                Bytes::from_static(b"x"),
+            )])
+            .await
+            .unwrap();
+        assert!(
+            !fired.load(std::sync::atomic::Ordering::Relaxed),
+            "default trait impl must not fire the engine callback"
+        );
     }
 }

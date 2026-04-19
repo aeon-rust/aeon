@@ -100,16 +100,22 @@ struct StubCutoverCoordinator {
 }
 
 impl CutoverCoordinator for StubCutoverCoordinator {
-    fn drain_and_freeze(
-        &self,
-        req: &PartitionCutoverRequest,
-    ) -> Result<CutoverOffsets, AeonError> {
+    fn drain_and_freeze<'a>(
+        &'a self,
+        req: &'a PartitionCutoverRequest,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<CutoverOffsets, AeonError>> + Send + 'a>,
+    > {
         self.calls.fetch_add(1, Ordering::Relaxed);
-        *self
-            .seen
-            .lock()
-            .map_err(|e| AeonError::state(format!("lock: {e}")))? = Some(req.clone());
-        Ok(self.offsets)
+        let offsets = self.offsets;
+        let req = req.clone();
+        Box::pin(async move {
+            *self
+                .seen
+                .lock()
+                .map_err(|e| AeonError::state(format!("lock: {e}")))? = Some(req);
+            Ok(offsets)
+        })
     }
 }
 

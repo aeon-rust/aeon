@@ -11,6 +11,17 @@
 > CL-6, cluster metrics) is tracked in `docs/FAULT-TOLERANCE-ANALYSIS.md` Section 7
 > (Pillar 3). Note that local Rancher Desktop K3s is single-node; multi-node testing
 > requires DOKS/EKS/GKE or a real multi-node K3s cluster.
+>
+> **Known limitation (2026-04-18, Session A — gap G2):** the CL-6 partition
+> transfer transport (BulkSync / Cutover / Throttle RPCs) is shipped, but the
+> leader-side driver that observes `PartitionOwnership::Transferring` and runs
+> the two-phase protocol is **not yet wired**. Calling
+> `POST /api/v1/cluster/partitions/{id}/transfer` (or `aeon cluster
+> transfer-partition`) commits the state transition through Raft but the actual
+> ownership flip never happens — the partition stays in `transferring` state.
+> This blocks zero-loss scale-up, scale-down, drain, and explicit handover.
+> Tracked in `docs/ROADMAP.md` "Session A status (2026-04-18)" → fix bundle
+> item 1; targeted for the next DOKS re-spin.
 
 ---
 

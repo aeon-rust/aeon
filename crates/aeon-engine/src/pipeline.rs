@@ -159,6 +159,20 @@ pub struct PipelineConfig {
     /// contributes to the same `min_across_sinks()` frontier used by L2 GC.
     /// `None` means single-sink — a per-task tracker is created as before.
     pub eo2_shared_ack_tracker: Option<crate::eo2::AckSeqTracker>,
+    /// G2/CL-6: partition id this pipeline (sub-)task owns. Single-partition
+    /// pipelines default to `PartitionId::new(0)`; multi-partition pipelines
+    /// have their per-partition sub-tasks stamped with the real id by
+    /// `run_multi_partition`. Used as the key for `write_gate` lookups and
+    /// for future per-partition metrics labels.
+    pub partition_id: PartitionId,
+    /// G2/CL-6: optional per-partition write-freeze gate. When `Some`, the
+    /// source loop calls `try_enter` before each `next_batch`; a racing
+    /// `request_freeze_and_drain` from the cluster-side cutover coordinator
+    /// will return `None`, causing the source loop to exit cleanly after its
+    /// in-flight fetch drains. `None` means this pipeline is not subject to
+    /// partition handover (local/test use), and the gate check compiles to
+    /// a single branch.
+    pub write_gate: Option<Arc<crate::write_gate::WriteGate>>,
 }
 
 impl Default for PipelineConfig {
@@ -178,6 +192,8 @@ impl Default for PipelineConfig {
             eo2_metrics: None,
             eo2_capacity: None,
             eo2_shared_ack_tracker: None,
+            partition_id: PartitionId::new(0),
+            write_gate: None,
         }
     }
 }
@@ -186,7 +202,15 @@ impl Default for PipelineConfig {
 pub struct PipelineMetrics {
     pub events_received: AtomicU64,
     pub events_processed: AtomicU64,
+    /// Outputs the engine handed to the sink (one increment per `write_batch`
+    /// invocation, summing the delivered count returned by the sink).
     pub outputs_sent: AtomicU64,
+    /// Outputs the downstream system actually confirmed (broker ack, HTTP
+    /// 2xx, fsync return, …). Driven by sinks via the `Sink::on_ack_callback`
+    /// hook. Equals `outputs_sent` for tiers that ack inline; lags it for
+    /// async-ack tiers (Kafka `UnorderedBatch`, HTTP fire-and-forget). The
+    /// gap `outputs_sent - outputs_acked` is the in-flight pending count.
+    pub outputs_acked: AtomicU64,
     /// Number of checkpoints written (UnorderedBatch mode).
     pub checkpoints_written: AtomicU64,
     /// Events permanently failed after retry exhaustion or SkipToDlq policy.
@@ -203,11 +227,21 @@ impl PipelineMetrics {
             events_received: AtomicU64::new(0),
             events_processed: AtomicU64::new(0),
             outputs_sent: AtomicU64::new(0),
+            outputs_acked: AtomicU64::new(0),
             checkpoints_written: AtomicU64::new(0),
             events_failed: AtomicU64::new(0),
             events_retried: AtomicU64::new(0),
             poh_entries: AtomicU64::new(0),
         }
+    }
+
+    /// Build an `Arc<dyn Fn(usize) + Send + Sync>` that bumps `outputs_acked`
+    /// when invoked. Handed to a sink via `Sink::on_ack_callback`.
+    pub fn ack_callback(self: &Arc<Self>) -> aeon_types::SinkAckCallback {
+        let metrics = Arc::clone(self);
+        Arc::new(move |n: usize| {
+            metrics.outputs_acked.fetch_add(n as u64, Ordering::Relaxed);
+        })
     }
 }
 
@@ -594,6 +628,7 @@ where
     let metrics_src = Arc::clone(&metrics);
     let src_capacity = config.eo2_capacity.clone();
     let src_eo2_metrics = config.eo2_metrics.clone();
+    let src_write_gate = config.write_gate.clone();
 
     // Source task: poll source, push event batches into SPSC
     let source_core = core_assignment.map(|c| c.source);
@@ -628,6 +663,21 @@ where
                 }
             }
 
+            // G2/CL-6: check per-partition write-freeze gate. When the
+            // cluster cutover coordinator has flipped to `FreezeRequested`,
+            // `try_enter` returns `None` and the source loop exits cleanly;
+            // any drain waiter observes `in_flight = 0` as soon as this
+            // task hits `drop(src_prod)` below. The guard is held across
+            // `next_batch` so a racing freeze_and_drain blocks until the
+            // in-flight fetch completes.
+            let _gate_guard = match src_write_gate.as_ref() {
+                Some(gate) => match gate.try_enter() {
+                    Some(g) => Some(g),
+                    None => break,
+                },
+                None => None,
+            };
+
             let events = match source.next_batch().await {
                 Ok(events) => events,
                 Err(e) => return Err(e),
@@ -650,6 +700,8 @@ where
                     }
                 }
             }
+            // `_gate_guard` drops here, decrementing in_flight. A parked
+            // drain waiter wakes once every gate's in-flight reaches zero.
         }
         // Signal: no more events
         drop(src_prod);
@@ -1059,6 +1111,12 @@ pub struct MultiPartitionConfig {
     pub partition_count: usize,
     /// Base pipeline config (cloned per partition, core pinning resolved automatically).
     pub pipeline: PipelineConfig,
+    /// G2/CL-6: optional shared write-gate registry. When `Some`, each
+    /// partition's `PipelineConfig` gets a gate looked up from the registry
+    /// keyed by `(pipeline_name, partition_id)`; the cluster cutover
+    /// coordinator can then freeze a single partition without affecting
+    /// the others. `None` disables gates for this multi-partition run.
+    pub gate_registry: Option<Arc<crate::write_gate::WriteGateRegistry>>,
 }
 
 /// Runs independent pipelines for each partition, with optional per-partition core pinning.
@@ -1114,6 +1172,10 @@ where
         let ledger = ledger_factory.as_ref().map(|f| f(i));
 
         // Per-partition config: override core pinning with resolved assignment
+        let partition_id = PartitionId::new(u16::try_from(i).unwrap_or(u16::MAX));
+        let write_gate = config.gate_registry.as_ref().map(|reg| {
+            reg.get_or_create(&config.pipeline.pipeline_name, partition_id)
+        });
         let mut partition_config = PipelineConfig {
             source_buffer_capacity: config.pipeline.source_buffer_capacity,
             sink_buffer_capacity: config.pipeline.sink_buffer_capacity,
@@ -1129,6 +1191,8 @@ where
             eo2_metrics: config.pipeline.eo2_metrics.clone(),
             eo2_capacity: config.pipeline.eo2_capacity.clone(),
             eo2_shared_ack_tracker: config.pipeline.eo2_shared_ack_tracker.clone(),
+            partition_id,
+            write_gate,
         };
 
         if let Some(ref assignments) = core_assignments {
@@ -3102,6 +3166,7 @@ mod tests {
         let config = MultiPartitionConfig {
             partition_count,
             pipeline: PipelineConfig::default(),
+            gate_registry: None,
         };
         let metrics = Arc::new(PipelineMetrics::new());
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -3138,6 +3203,7 @@ mod tests {
         let config = MultiPartitionConfig {
             partition_count,
             pipeline: PipelineConfig::default(),
+            gate_registry: None,
         };
         let metrics = Arc::new(PipelineMetrics::new());
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -3182,6 +3248,7 @@ mod tests {
         let config = MultiPartitionConfig {
             partition_count: 0,
             pipeline: PipelineConfig::default(),
+            gate_registry: None,
         };
         let metrics = Arc::new(PipelineMetrics::new());
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -3209,6 +3276,7 @@ mod tests {
                 core_pinning: CorePinning::Auto,
                 ..Default::default()
             },
+            gate_registry: None,
         };
         let metrics = Arc::new(PipelineMetrics::new());
         let shutdown = Arc::new(AtomicBool::new(false));

@@ -66,6 +66,14 @@ cluster:
     enabled: false
     secretName: aeon-tls  # K8s Secret with tls.crt, tls.key, ca.crt
 
+# Graceful shutdown budget. Aeon's SIGINT/SIGTERM handler flips /ready=503,
+# waits `preStopDelaySeconds` for endpoint propagation, stops running
+# pipelines (SPSC drain + sink flush), and shuts down the Raft node.
+# terminationGracePeriod must cover all of that or kubelet sends SIGKILL.
+gracefulShutdown:
+  terminationGracePeriodSeconds: 90
+  preStopDelaySeconds: 5
+
 # Horizontal Pod Autoscaler
 autoscaling:
   enabled: false

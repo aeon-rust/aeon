@@ -11,6 +11,18 @@ use crate::event::{Event, Output};
 use crate::processor_transport::{ProcessorHealth, ProcessorInfo};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
+
+/// Callback invoked by a sink each time deliveries are confirmed by the
+/// downstream system (broker ack, HTTP 2xx, fsync return, etc.).
+///
+/// The argument is the number of outputs newly acked since the last call.
+/// Sinks fire this from inside `write_batch()` (for tiers that ack inline)
+/// or `flush()` (for tiers that ack asynchronously, e.g. Kafka
+/// `UnorderedBatch`). The callback must be cheap and non-blocking — it is
+/// called on the sink's hot path. The engine installs it to drive the
+/// `outputs_acked_total` companion metric.
+pub type SinkAckCallback = Arc<dyn Fn(usize) + Send + Sync>;
 
 /// Classification of how a source obtains events from its upstream.
 ///
@@ -143,6 +155,21 @@ pub trait Sink: Send + Sync {
     /// For `PerEvent` and `OrderedBatch`, this is typically a no-op since
     /// acks are already collected in `write_batch()`.
     fn flush(&mut self) -> impl std::future::Future<Output = Result<(), AeonError>> + Send;
+
+    /// Install a callback fired each time downstream-confirmed deliveries
+    /// land. Drives the engine's `outputs_acked_total` companion metric so
+    /// operators can see the gap between `write_batch()` calls (counted as
+    /// `outputs_sent`) and broker-confirmed acks. The argument is the
+    /// number of outputs newly acked since the last call.
+    ///
+    /// Default: no-op. Connectors that can observe genuine downstream acks
+    /// override this — Kafka fires on `delivered` increments, HTTP fires
+    /// on 2xx response, etc. Fire-and-forget tiers (stdout, blackhole)
+    /// keep the default since `sent == acked` trivially for them.
+    ///
+    /// The callback must be cheap and non-blocking — it runs on the sink's
+    /// hot path. See `SinkAckCallback` for the type alias.
+    fn on_ack_callback(&mut self, _cb: SinkAckCallback) {}
 }
 
 /// Event transformation processor.
