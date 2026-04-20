@@ -353,6 +353,15 @@ enum ClusterAction {
     /// Must be issued against the current Raft leader. Follower replies carry
     /// `X-Leader-Id` — rerun against that node.
     Rebalance,
+    /// Ask the Raft leader to remove THIS node from the cluster.
+    ///
+    /// Issued against the local node's API (typically `http://localhost:4471`
+    /// from inside the pod). The server reads its own `node_id`, forwards a
+    /// `RemoveNodeRequest` to the current leader, and returns the result. If
+    /// this node IS the leader the request is rejected with 409 — transfer
+    /// leadership first. Used by the K8s preStop hook so scale-down doesn't
+    /// leave a stale voter behind.
+    Leave,
 }
 
 #[derive(Subcommand)]
@@ -1800,6 +1809,10 @@ fn cmd_cluster(api: &str, action: &ClusterAction) -> Result<()> {
         ClusterAction::Rebalance => {
             let url = format!("{api}/api/v1/cluster/rebalance");
             post_cluster_mutation(&url, None, "rebalance")
+        }
+        ClusterAction::Leave => {
+            let url = format!("{api}/api/v1/cluster/leave");
+            post_cluster_mutation(&url, None, "leave")
         }
     }
 }

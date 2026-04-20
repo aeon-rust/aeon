@@ -191,6 +191,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/v1/cluster/drain", post(cluster_drain))
         .route("/api/v1/cluster/rebalance", post(cluster_rebalance))
+        .route("/api/v1/cluster/leave", post(cluster_leave))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -929,6 +930,113 @@ async fn cluster_rebalance(
     #[cfg(not(feature = "cluster"))]
     {
         let _ = (state, uri);
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "cluster feature not enabled in this build",
+        )
+        .into_response()
+    }
+}
+
+/// Graceful self-removal: the node hosting this endpoint asks the current
+/// Raft leader to remove it from the voter set. Called from the K8s preStop
+/// hook (see `helm/aeon/templates/statefulset.yaml`) so scale-down doesn't
+/// leave a stale voter behind and partition ownership rebalances away before
+/// the pod terminates.
+///
+/// Unlike drain/rebalance this endpoint does **not** forward to the leader —
+/// the departing node must run the RPC from its own identity (the leader
+/// derives the target `node_id` from the RPC source, not from the body).
+/// The leader cannot remove itself, so if this node is the current leader
+/// the endpoint returns 409 and the operator must transfer leadership first.
+async fn cluster_leave(
+    State(state): State<Arc<AppState>>,
+) -> axum::response::Response {
+    #[cfg(feature = "cluster")]
+    {
+        let Some(ref node) = state.cluster_node else {
+            return api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "cluster mode not enabled on this node",
+            )
+            .into_response();
+        };
+
+        let self_id = node.config().node_id;
+
+        if node.is_leader().await {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "this node is the current Raft leader; transfer leadership before leaving",
+                    "node_id": self_id,
+                })),
+            )
+                .into_response();
+        }
+
+        let metrics = node.raft().metrics().borrow().clone();
+        let Some(leader_id) = metrics.current_leader else {
+            return api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no current Raft leader; cannot propose self-removal",
+            )
+            .into_response();
+        };
+        let Some(leader_addr) = metrics
+            .membership_config
+            .membership()
+            .get_node(&leader_id)
+            .cloned()
+        else {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("leader {leader_id} has no address in Raft membership"),
+            )
+            .into_response();
+        };
+        let Some(endpoint) = node.endpoint() else {
+            return api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "node has no QUIC endpoint (single-node bootstrap?)",
+            )
+            .into_response();
+        };
+
+        let req = aeon_cluster::types::RemoveNodeRequest { node_id: self_id };
+        match aeon_cluster::transport::network::send_remove_request(
+            endpoint,
+            leader_id,
+            &leader_addr,
+            &req,
+        )
+        .await
+        {
+            Ok(resp) if resp.success => (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": "left",
+                    "node_id": self_id,
+                    "leader_id": resp.leader_id,
+                    "message": resp.message,
+                })),
+            )
+                .into_response(),
+            Ok(resp) => api_error(
+                StatusCode::CONFLICT,
+                format!("leader rejected remove: {}", resp.message),
+            )
+            .into_response(),
+            Err(e) => api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("remove RPC to leader {leader_id} failed: {e}"),
+            )
+            .into_response(),
+        }
+    }
+    #[cfg(not(feature = "cluster"))]
+    {
+        let _ = state;
         api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "cluster feature not enabled in this build",

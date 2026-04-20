@@ -1154,8 +1154,14 @@ V2 T4 / Session 0 Row 5).
 
 #### V6.3 Known code gaps carried into Session A/B
 
-1. **Helm preStop + `aeon cluster leave`** — scale-down doesn't emit
-   Raft RemoveNode. Gap confirmed in V2 T3; same finding as Session 0.
+1. ~~**Helm preStop + `aeon cluster leave`**~~ — **closed post-V6.**
+   New `POST /api/v1/cluster/leave` REST endpoint + `aeon cluster leave`
+   CLI subcommand. Helm preStop hook now runs
+   `aeon cluster leave --api http://localhost:4471 || true` before the
+   endpoint-propagation sleep so the Raft leader removes the departing
+   voter and rebalances partitions before SIGTERM. Leader-self case
+   returns 409 (operator must transfer leadership first); `|| true`
+   guards the sleep so the pod still terminates.
 2. ~~**`AEON_PIPELINE_NAME` gate on `PartitionTransferDriver`**~~ —
    **closed post-V6.** `cmd_serve` now auto-discovers the pipeline
    name from the Raft-replicated catalog when the env var is unset:
@@ -1187,8 +1193,10 @@ Before spinning EKS for Session B:
       fallback in `install_partition_transfer_driver`. Session B can
       now exercise partition-transfer + PoH-resume without touching
       helm values.
-- [ ] Close gap #1 (helm preStop + `aeon cluster leave`) so Session A's
-      scale-down correctness row can pass cleanly.
+- [x] Close gap #1 (helm preStop + `aeon cluster leave`). Shipped —
+      REST `/cluster/leave` + CLI `aeon cluster leave` + StatefulSet
+      preStop hook. Session A's scale-down correctness row can now
+      pass cleanly.
 - [ ] Bake `aeon:<commit>` to ECR us-east-1 (blocked by task #6;
       Session B's `imagePullPolicy: Always` expects it).
 - [ ] Session A first, on the already-provisioned DOKS cluster —
