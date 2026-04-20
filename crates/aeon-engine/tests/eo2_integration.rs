@@ -46,6 +46,27 @@ fn make_events(n: usize) -> Vec<Event> {
         .collect()
 }
 
+/// Push/Poll sources treat empty `next_batch()` as a lull (P5.d), so
+/// finite-batch test sources no longer self-terminate. This watcher flips
+/// `shutdown` once `events_received` reaches `target` with a short grace
+/// to let downstream tasks drain.
+fn shutdown_after_target(
+    metrics: Arc<PipelineMetrics>,
+    shutdown: Arc<AtomicBool>,
+    target: u64,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            if metrics.events_received.load(Ordering::Relaxed) >= target {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                shutdown.store(true, Ordering::Release);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+}
+
 /// Push source that delivers one batch then EOF.
 struct OneShotPushSource {
     batch: Option<Vec<Event>>,
@@ -223,9 +244,11 @@ async fn crash_recovery_push_source_no_loss_no_duplicates() {
     let metrics = Arc::new(PipelineMetrics::new());
     let shutdown = Arc::new(AtomicBool::new(false));
 
+    let stopper = shutdown_after_target(Arc::clone(&metrics), Arc::clone(&shutdown), 50);
     run_buffered(source, processor, sink, config, metrics.clone(), shutdown, None)
         .await
         .unwrap();
+    stopper.await.unwrap();
 
     assert_eq!(metrics.events_received.load(Ordering::Relaxed), 50);
 
@@ -265,6 +288,7 @@ async fn crash_recovery_push_source_no_loss_no_duplicates() {
     config2.delivery.checkpoint.backend = CheckpointBackend::Wal;
     config2.delivery.checkpoint.dir = Some(ckpt_dir.clone());
 
+    let replay_target = replay_events.len() as u64;
     let source2 = L2ReplaySource {
         events: replay_events,
         emitted: false,
@@ -274,6 +298,8 @@ async fn crash_recovery_push_source_no_loss_no_duplicates() {
     let metrics2 = Arc::new(PipelineMetrics::new());
     let shutdown2 = Arc::new(AtomicBool::new(false));
 
+    let stopper2 =
+        shutdown_after_target(Arc::clone(&metrics2), Arc::clone(&shutdown2), replay_target);
     run_buffered(
         source2,
         processor2,
@@ -285,6 +311,7 @@ async fn crash_recovery_push_source_no_loss_no_duplicates() {
     )
     .await
     .unwrap();
+    stopper2.await.unwrap();
 
     // All original events must have been delivered in phase 1.
     assert_eq!(event_ids.len(), 50);
@@ -356,6 +383,7 @@ async fn crash_mid_batch_l2_replay_fills_gap() {
     config2.delivery.checkpoint.backend = CheckpointBackend::Wal;
     config2.delivery.checkpoint.dir = Some(ckpt_dir);
 
+    let phase2_target = l2_events.len() as u64;
     let source2 = L2ReplaySource {
         events: l2_events.clone(),
         emitted: false,
@@ -366,6 +394,8 @@ async fn crash_mid_batch_l2_replay_fills_gap() {
     let metrics2 = Arc::new(PipelineMetrics::new());
     let shutdown2 = Arc::new(AtomicBool::new(false));
 
+    let stopper2 =
+        shutdown_after_target(Arc::clone(&metrics2), Arc::clone(&shutdown2), phase2_target);
     run_buffered(
         source2,
         processor2,
@@ -377,6 +407,7 @@ async fn crash_mid_batch_l2_replay_fills_gap() {
     )
     .await
     .unwrap();
+    stopper2.await.unwrap();
 
     let phase2_delivered: HashSet<uuid::Uuid> = sink2_ids
         .lock()
@@ -537,9 +568,11 @@ async fn slow_sink_backpressure_completes_under_capacity() {
     let metrics = Arc::new(PipelineMetrics::new());
     let shutdown = Arc::new(AtomicBool::new(false));
 
+    let stopper = shutdown_after_target(Arc::clone(&metrics), Arc::clone(&shutdown), 30);
     run_buffered(source, processor, sink, config, metrics.clone(), shutdown, None)
         .await
         .unwrap();
+    stopper.await.unwrap();
 
     assert_eq!(metrics.events_received.load(Ordering::Relaxed), 30);
     assert_eq!(metrics.outputs_sent.load(Ordering::Relaxed), 30);
@@ -566,9 +599,11 @@ async fn l2_gc_reclaims_after_full_delivery() {
     let metrics = Arc::new(PipelineMetrics::new());
     let shutdown = Arc::new(AtomicBool::new(false));
 
+    let stopper = shutdown_after_target(Arc::clone(&metrics), Arc::clone(&shutdown), 100);
     run_buffered(source, processor, sink, config, metrics.clone(), shutdown, None)
         .await
         .unwrap();
+    stopper.await.unwrap();
 
     assert_eq!(metrics.events_received.load(Ordering::Relaxed), 100);
     assert_eq!(metrics.outputs_sent.load(Ordering::Relaxed), 100);
@@ -710,6 +745,10 @@ async fn multi_sink_shared_ack_tracker_paces_gc_by_laggard() {
     let slow_shutdown = Arc::new(AtomicBool::new(false));
 
     // Run both pipelines concurrently.
+    let fast_stopper =
+        shutdown_after_target(Arc::clone(&fast_metrics), Arc::clone(&fast_shutdown), 30);
+    let slow_stopper =
+        shutdown_after_target(Arc::clone(&slow_metrics), Arc::clone(&slow_shutdown), 30);
     let fast_fut = run_buffered(
         fast_source,
         PassthroughProcessor::new(Arc::from("out")),
@@ -731,6 +770,8 @@ async fn multi_sink_shared_ack_tracker_paces_gc_by_laggard() {
     let (fast_res, slow_res) = tokio::join!(fast_fut, slow_fut);
     fast_res.unwrap();
     slow_res.unwrap();
+    fast_stopper.await.unwrap();
+    slow_stopper.await.unwrap();
 
     // (a) Both sinks delivered every event.
     assert_eq!(fast_count.load(Ordering::Relaxed), 30);

@@ -17,6 +17,7 @@ use crate::delivery::{CheckpointBackend, DeliveryConfig};
 use crate::delivery_ledger::DeliveryLedger;
 use aeon_types::{
     AeonError, BatchFailurePolicy, Event, Output, PartitionId, Processor, Sink, Source,
+    SourceKind,
 };
 use std::any::Any;
 use std::collections::HashMap;
@@ -392,10 +393,17 @@ where
     P: Processor,
     K: Sink,
 {
+    let source_kind = source.source_kind();
     while !shutdown.load(Ordering::Relaxed) {
         let events = source.next_batch().await?;
         if events.is_empty() {
-            break;
+            match source_kind {
+                SourceKind::Pull => break,
+                SourceKind::Push | SourceKind::Poll => {
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+            }
         }
 
         let count = events.len() as u64;
@@ -432,10 +440,17 @@ where
     P: Processor,
     K: Sink,
 {
+    let source_kind = source.source_kind();
     while !shutdown.load(Ordering::Relaxed) {
         let events = source.next_batch().await?;
         if events.is_empty() {
-            break;
+            match source_kind {
+                SourceKind::Pull => break,
+                SourceKind::Push | SourceKind::Poll => {
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+            }
         }
 
         let count = events.len() as u64;
@@ -720,7 +735,13 @@ where
                 Err(e) => return Err(e),
             };
             if events.is_empty() {
-                break;
+                match source_kind {
+                    SourceKind::Pull => break,
+                    SourceKind::Push | SourceKind::Poll => {
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
+                }
             }
             metrics_src
                 .events_received
@@ -933,7 +954,13 @@ where
                 Err(e) => return Err(e),
             };
             if events.is_empty() {
-                break;
+                match source_kind {
+                    SourceKind::Pull => break,
+                    SourceKind::Push | SourceKind::Poll => {
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
+                }
             }
             metrics_src
                 .events_received
@@ -2132,6 +2159,7 @@ where
         if let Some(core) = source_core {
             pin_to_core(core);
         }
+        let mut source_kind = source.source_kind();
         while !shutdown_src.load(Ordering::Relaxed) {
             // Pause check: check for source swap, then yield
             if control_src.paused.load(Ordering::Acquire) {
@@ -2143,6 +2171,7 @@ where
                     if let Some(new_source_any) = slot.take() {
                         if let Ok(new_source) = new_source_any.downcast::<S>() {
                             source = *new_source;
+                            source_kind = source.source_kind();
                             control_src.swap_complete.notify_one();
                         }
                     }
@@ -2161,7 +2190,13 @@ where
                 if control_src.paused.load(Ordering::Acquire) {
                     continue;
                 }
-                break;
+                match source_kind {
+                    SourceKind::Pull => break,
+                    SourceKind::Push | SourceKind::Poll => {
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
+                }
             }
             metrics_src
                 .events_received
@@ -4633,6 +4668,27 @@ mod tests {
                 .collect()
         }
 
+        /// Push/Poll sources now treat empty `next_batch()` as a lull (not EOF),
+        /// so finite-batch test sources no longer self-terminate. This spawns
+        /// a watcher that flips `shutdown` once `events_received` reaches the
+        /// target, after a short grace to let downstream tasks drain.
+        fn shutdown_after_target(
+            metrics: Arc<PipelineMetrics>,
+            shutdown: Arc<AtomicBool>,
+            target: u64,
+        ) -> tokio::task::JoinHandle<()> {
+            tokio::spawn(async move {
+                loop {
+                    if metrics.events_received.load(Ordering::Relaxed) >= target {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        shutdown.store(true, Ordering::Release);
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+        }
+
         #[tokio::test]
         async fn push_source_writes_l2_when_durability_requires_it() {
             let tmp = tempfile::tempdir().unwrap();
@@ -4654,9 +4710,12 @@ mod tests {
             let metrics = Arc::new(PipelineMetrics::new());
             let shutdown = Arc::new(AtomicBool::new(false));
 
+            let stopper =
+                shutdown_after_target(Arc::clone(&metrics), Arc::clone(&shutdown), 50);
             run_buffered(source, processor, sink, config, metrics.clone(), shutdown, None)
                 .await
                 .unwrap();
+            stopper.await.unwrap();
 
             assert_eq!(metrics.events_received.load(Ordering::Relaxed), 50);
             // Registry must have opened a store for partition 0.
@@ -4699,6 +4758,8 @@ mod tests {
             let metrics = Arc::new(PipelineMetrics::new());
             let shutdown = Arc::new(AtomicBool::new(false));
 
+            // Pull source: MemorySource returns empty when drained, which the
+            // engine still treats as EOF, so no watcher is required here.
             run_buffered(source, processor, sink, config, metrics.clone(), shutdown, None)
                 .await
                 .unwrap();
@@ -4733,9 +4794,12 @@ mod tests {
             let metrics = Arc::new(PipelineMetrics::new());
             let shutdown = Arc::new(AtomicBool::new(false));
 
+            let stopper =
+                shutdown_after_target(Arc::clone(&metrics), Arc::clone(&shutdown), 20);
             run_buffered(source, processor, sink, config, metrics.clone(), shutdown, None)
                 .await
                 .unwrap();
+            stopper.await.unwrap();
 
             assert_eq!(metrics.events_received.load(Ordering::Relaxed), 20);
             assert!(registry.keys().is_empty());
@@ -4770,9 +4834,12 @@ mod tests {
             let metrics = Arc::new(PipelineMetrics::new());
             let shutdown = Arc::new(AtomicBool::new(false));
 
+            let stopper =
+                shutdown_after_target(Arc::clone(&metrics), Arc::clone(&shutdown), 30);
             run_buffered(source, processor, sink, config, metrics.clone(), shutdown, None)
                 .await
                 .unwrap();
+            stopper.await.unwrap();
 
             assert_eq!(metrics.events_received.load(Ordering::Relaxed), 30);
             assert_eq!(metrics.outputs_sent.load(Ordering::Relaxed), 30);
@@ -4819,9 +4886,12 @@ mod tests {
             let metrics = Arc::new(PipelineMetrics::new());
             let shutdown = Arc::new(AtomicBool::new(false));
 
+            let stopper =
+                shutdown_after_target(Arc::clone(&metrics), Arc::clone(&shutdown), 30);
             run_buffered(source, processor, sink, config, metrics.clone(), shutdown, None)
                 .await
                 .unwrap();
+            stopper.await.unwrap();
 
             let rendered = eo2_metrics.render_prometheus();
             assert!(
@@ -4873,9 +4943,12 @@ mod tests {
             let metrics = Arc::new(PipelineMetrics::new());
             let shutdown = Arc::new(AtomicBool::new(false));
 
+            let stopper =
+                shutdown_after_target(Arc::clone(&metrics), Arc::clone(&shutdown), 30);
             run_buffered(source, processor, sink, config, metrics.clone(), shutdown, None)
                 .await
                 .unwrap();
+            stopper.await.unwrap();
 
             assert_eq!(metrics.events_received.load(Ordering::Relaxed), 30);
             assert_eq!(metrics.outputs_sent.load(Ordering::Relaxed), 30);
@@ -4969,9 +5042,12 @@ mod tests {
             let metrics = Arc::new(PipelineMetrics::new());
             let shutdown = Arc::new(AtomicBool::new(false));
 
+            let stopper =
+                shutdown_after_target(Arc::clone(&metrics), Arc::clone(&shutdown), 3);
             run_buffered(source, processor, sink, config, metrics.clone(), shutdown, None)
                 .await
                 .unwrap();
+            stopper.await.unwrap();
 
             assert_eq!(
                 captured_calls.load(Ordering::SeqCst),
@@ -4999,9 +5075,12 @@ mod tests {
             let metrics = Arc::new(PipelineMetrics::new());
             let shutdown = Arc::new(AtomicBool::new(false));
 
+            let stopper =
+                shutdown_after_target(Arc::clone(&metrics), Arc::clone(&shutdown), 15);
             run_buffered(source, processor, sink, config, metrics.clone(), shutdown, None)
                 .await
                 .unwrap();
+            stopper.await.unwrap();
 
             assert_eq!(metrics.events_received.load(Ordering::Relaxed), 15);
         }

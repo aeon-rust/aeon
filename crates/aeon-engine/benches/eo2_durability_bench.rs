@@ -61,6 +61,29 @@ impl aeon_types::traits::Source for OneShotPushSource {
     }
 }
 
+/// Push sources now loop on empty (P5.d), so bench pipelines need a watcher
+/// that flips `shutdown` once the run has ingested all events.
+fn shutdown_after_target(
+    metrics: Arc<PipelineMetrics>,
+    shutdown: Arc<AtomicBool>,
+    target: u64,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            if metrics
+                .events_received
+                .load(std::sync::atomic::Ordering::Relaxed)
+                >= target
+            {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                shutdown.store(true, std::sync::atomic::Ordering::Release);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+}
+
 // ── Benchmark 1: Per-event overhead by durability mode ─────────────────
 
 fn durability_mode_overhead(c: &mut Criterion) {
@@ -101,6 +124,7 @@ fn durability_mode_overhead(c: &mut Criterion) {
                 },
                 |(events, config, _tmp)| {
                     rt.block_on(async {
+                        let target = events.len() as u64;
                         let source = OneShotPushSource {
                             batch: Some(events),
                         };
@@ -108,9 +132,15 @@ fn durability_mode_overhead(c: &mut Criterion) {
                         let sink = BlackholeSink::new();
                         let metrics = Arc::new(PipelineMetrics::new());
                         let shutdown = Arc::new(AtomicBool::new(false));
+                        let stopper = shutdown_after_target(
+                            Arc::clone(&metrics),
+                            Arc::clone(&shutdown),
+                            target,
+                        );
                         run_buffered(source, processor, sink, config, metrics, shutdown, None)
                             .await
                             .unwrap();
+                        stopper.await.unwrap();
                     });
                 },
                 BatchSize::LargeInput,
@@ -197,6 +227,7 @@ fn checkpoint_cadence(c: &mut Criterion) {
                     },
                     |(events, config, _tmp)| {
                         rt.block_on(async {
+                            let target = events.len() as u64;
                             let source = OneShotPushSource {
                                 batch: Some(events),
                             };
@@ -204,11 +235,17 @@ fn checkpoint_cadence(c: &mut Criterion) {
                             let sink = BlackholeSink::new();
                             let metrics = Arc::new(PipelineMetrics::new());
                             let shutdown = Arc::new(AtomicBool::new(false));
+                            let stopper = shutdown_after_target(
+                                Arc::clone(&metrics),
+                                Arc::clone(&shutdown),
+                                target,
+                            );
                             run_buffered(
                                 source, processor, sink, config, metrics, shutdown, None,
                             )
                             .await
                             .unwrap();
+                            stopper.await.unwrap();
                         });
                     },
                     BatchSize::LargeInput,
@@ -274,6 +311,7 @@ fn capacity_tracking_overhead(c: &mut Criterion) {
                 },
                 |(events, config, _tmp)| {
                     rt.block_on(async {
+                        let target = events.len() as u64;
                         let source = OneShotPushSource {
                             batch: Some(events),
                         };
@@ -281,9 +319,15 @@ fn capacity_tracking_overhead(c: &mut Criterion) {
                         let sink = BlackholeSink::new();
                         let metrics = Arc::new(PipelineMetrics::new());
                         let shutdown = Arc::new(AtomicBool::new(false));
+                        let stopper = shutdown_after_target(
+                            Arc::clone(&metrics),
+                            Arc::clone(&shutdown),
+                            target,
+                        );
                         run_buffered(source, processor, sink, config, metrics, shutdown, None)
                             .await
                             .unwrap();
+                        stopper.await.unwrap();
                     });
                 },
                 BatchSize::LargeInput,
