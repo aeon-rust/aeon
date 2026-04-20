@@ -48,7 +48,7 @@ decoupled (`UnorderedBatch`, flushed at interval).
 |---|---|---|---|---|---|---|
 | Memory | Pull | Bounded (Vec) | — | N/A | No | Test-only, OK |
 | Kafka | Pull | Bounded (offsets) | rdkafka prefetch | Implicit (offsets) | **Yes** | Production-grade |
-| HTTP Polling | Pull | Controlled interval | — | N/A | No | OK |
+| HTTP Polling | Poll | Controlled interval | — | N/A | No | OK |
 | HTTP Webhook | Push | Unbounded | PushBuffer | **HTTP 503** | No | OK — best Phase 3 |
 | WebSocket | Push | Unbounded | PushBuffer | TCP window (blocking send) | No | OK (fixed §4.1) |
 | NATS JetStream | Pull | Bounded (consumer grp) | — | Implicit (ack) | Implicit | OK |
@@ -90,6 +90,46 @@ three-phase backpressure primitive used by every push source:
 | QUIC | None differentiated | New stream per batch | no-op | Functional, see §4.6 |
 | WebTransport | None differentiated | New stream per batch | no-op | Functional, see §4.6 |
 | WebSocket | None differentiated | Per-output `send` + loop await | `writer.flush()` | Functional |
+
+---
+
+## 3.5 CLI Registry Wiring Status (2026-04-20)
+
+Separate from "is the library code correct?" is "can it be declared in a YAML
+manifest?" Today, `aeon-cli/src/connectors.rs::register_defaults` only registers
+**two sources** and **three sinks**. Everything else in this audit exists as
+library code but is unreachable from a pipeline manifest. Surfaced during V4
+(`docs/ROADMAP.md` §Phase 3.5) on 2026-04-20.
+
+| Connector | Library exists? | Audited OK? | Wired into CLI? |
+|---|---|---|---|
+| memory (source + sink) | ✅ | ✅ | ✅ source only |
+| blackhole sink | ✅ | ✅ | ✅ |
+| stdout sink | ✅ | ✅ | ✅ |
+| kafka (source + sink) | ✅ | ✅ | ✅ |
+| http-webhook source (push) | ✅ | ✅ | ⏳ V4 (this session) |
+| http-polling source (poll) | ✅ | ✅ | ⏳ P5.c (post-V6) |
+| http sink | ✅ | — | ⏳ P5.c |
+| file (source + sink) | ✅ | ✅ | ⏳ P5.c |
+| websocket (source + sink) | ✅ | ✅ | ⏳ P5.c |
+| mqtt (source + sink) | ✅ | ✅ | ⏳ P5.c |
+| rabbitmq (source + sink) | ✅ | ✅ | ⏳ P5.c |
+| nats (source + sink) | ✅ | ✅ | ⏳ P5.c |
+| redis-streams (source + sink) | ✅ | ✅ | ⏳ P5.c |
+| quic (source + sink) | ✅ | ✅ | ⏳ P5.c |
+| webtransport (streams + datagrams + sink) | ✅ | ✅ | ⏳ P5.c |
+| mongodb-cdc source | ✅ | ✅ | ⏳ P5.c |
+| postgres-cdc source | ✅ | ✅ | ⏳ P5.c |
+| mysql-cdc source | ✅ | ✅ | ⏳ P5.c |
+
+**P5.c** (`docs/ROADMAP.md` §Phase 5) is the follow-up that wires the remaining
+11 sources and 9 sinks using the pattern established by V4. Pattern-repetition
+work (~0.5–1 day): feature-gate in `aeon-cli/Cargo.toml`, add `*Factory` stubs
+following the `KafkaSourceFactory` shape, extend `register_defaults`, extend
+the unit tests in `connectors.rs`, and document YAML schema in
+`docs/CONNECTORS.md`. Not a Session B blocker — runs after V6.
+
+---
 
 **Pipeline-level metric bug** (see §4.0): the sink task only credits `outputs_sent`
 from `batch_result.delivered.len()`. For `UnorderedBatch`, sinks return

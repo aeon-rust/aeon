@@ -29,8 +29,10 @@
 use std::sync::Arc;
 
 use aeon_connectors::{
-    BlackholeSink, StreamingMemorySource, StdoutSink,
+    BlackholeSink, StdoutSink, StreamingMemorySource,
+    http::{HttpWebhookSource, HttpWebhookSourceConfig},
     kafka::{KafkaSink, KafkaSinkConfig, KafkaSource, KafkaSourceConfig},
+    push_buffer::PushBufferConfig,
 };
 use aeon_engine::{ConnectorRegistry, DynSink, DynSource, SinkFactory, SourceFactory};
 use aeon_types::{
@@ -189,6 +191,81 @@ impl SinkFactory for KafkaSinkFactory {
     }
 }
 
+// ─── HTTP webhook source (push) ────────────────────────────────────────────
+
+/// Builds an `HttpWebhookSource` — axum-based HTTP server that accepts POST
+/// requests as events. First push source exposed through the YAML manifest
+/// layer (V4, 2026-04-20). Others (websocket / mqtt / rabbitmq / quic /
+/// webtransport / mongodb-cdc) follow the same pattern — tracked as P5.c in
+/// `docs/ROADMAP.md` §Phase 5.
+///
+/// Required keys (config map):
+/// - `bind_addr` (e.g. `0.0.0.0:8080`)
+///
+/// Optional keys (config map):
+/// - `path` (default `/webhook`)
+/// - `source_name` (default `http-webhook`; goes into `Event.source`)
+/// - `channel_capacity` (push-buffer Phase 1 bounded channel, default 8192)
+/// - `batch_size` (default 1024; events per `next_batch()` drain)
+/// - `poll_timeout_ms` (default 1000; first-event wait before returning empty)
+///
+/// The shared `push_buffer.rs` three-phase contract applies: Phase 1 bounded
+/// mpsc → Phase 2 await on full → Phase 3 returns HTTP 503 once
+/// `spill_threshold` (default 4096) is crossed. See
+/// `docs/CONNECTOR-AUDIT.md` §2 for the full matrix.
+pub struct HttpWebhookSourceFactory;
+
+impl SourceFactory for HttpWebhookSourceFactory {
+    fn build(&self, cfg: &SourceConfig) -> Result<Box<dyn DynSource>, AeonError> {
+        let bind_addr_str = cfg.config.get("bind_addr").ok_or_else(|| {
+            AeonError::config("http-webhook source requires config.bind_addr (e.g. 0.0.0.0:8080)")
+        })?;
+        let bind_addr: std::net::SocketAddr = bind_addr_str.parse().map_err(|e| {
+            AeonError::config(format!(
+                "http-webhook source: invalid bind_addr '{bind_addr_str}': {e}"
+            ))
+        })?;
+
+        let mut buffer_config = PushBufferConfig::default();
+        if let Some(cap) = cfg.config.get("channel_capacity") {
+            buffer_config.channel_capacity = parse_usize(Some(cap), 8192)?;
+        }
+        if let Some(bs) = cfg.config.get("batch_size") {
+            buffer_config.batch_size = parse_usize(Some(bs), 1024)?;
+        }
+
+        let poll_timeout_ms = cfg
+            .config
+            .get("poll_timeout_ms")
+            .map(|v| parse_u64(Some(v), 1000))
+            .transpose()?
+            .unwrap_or(1000);
+
+        let mut hcfg = HttpWebhookSourceConfig::new(bind_addr)
+            .with_channel_capacity(buffer_config.channel_capacity)
+            .with_poll_timeout(std::time::Duration::from_millis(poll_timeout_ms));
+
+        if let Some(path) = cfg.config.get("path") {
+            hcfg = hcfg.with_path(path.clone());
+        }
+        if let Some(name) = cfg.config.get("source_name") {
+            hcfg = hcfg.with_source_name(Arc::<str>::from(name.as_str()));
+        }
+
+        // HttpWebhookSource::new is async (binds the TCP listener). The
+        // supervisor builds factories from a blocking context, so we enter
+        // the tokio runtime via Handle::current(). If no runtime is
+        // installed this returns a clear Config error rather than
+        // panicking — factories are also exercised from unit tests that
+        // construct a runtime explicitly.
+        let handle = tokio::runtime::Handle::try_current().map_err(|_| {
+            AeonError::config("http-webhook source must be built from within a tokio runtime")
+        })?;
+        let src = tokio::task::block_in_place(|| handle.block_on(HttpWebhookSource::new(hcfg)))?;
+        Ok(Box::new(src))
+    }
+}
+
 // ─── Registration ──────────────────────────────────────────────────────────
 
 /// Register every connector compiled into the binary onto the registry.
@@ -197,6 +274,7 @@ impl SinkFactory for KafkaSinkFactory {
 pub fn register_defaults(reg: &mut ConnectorRegistry) {
     reg.register_source("memory", Arc::new(MemorySourceFactory));
     reg.register_source("kafka", Arc::new(KafkaSourceFactory));
+    reg.register_source("http-webhook", Arc::new(HttpWebhookSourceFactory));
 
     reg.register_sink("blackhole", Arc::new(BlackholeSinkFactory));
     reg.register_sink("stdout", Arc::new(StdoutSinkFactory));
@@ -219,6 +297,15 @@ fn parse_u32(s: Option<&String>, default: u32) -> Result<u32, AeonError> {
         Some(v) => v
             .parse::<u32>()
             .map_err(|e| AeonError::config(format!("invalid u32 '{v}': {e}"))),
+        None => Ok(default),
+    }
+}
+
+fn parse_u64(s: Option<&String>, default: u64) -> Result<u64, AeonError> {
+    match s {
+        Some(v) => v
+            .parse::<u64>()
+            .map_err(|e| AeonError::config(format!("invalid u64 '{v}': {e}"))),
         None => Ok(default),
     }
 }
@@ -301,7 +388,7 @@ mod tests {
         let mut reg = ConnectorRegistry::new();
         register_defaults(&mut reg);
 
-        for k in ["memory", "kafka"] {
+        for k in ["memory", "kafka", "http-webhook"] {
             assert!(reg.has_source(k), "missing source: {k}");
         }
         for k in ["blackhole", "stdout", "kafka"] {
@@ -401,6 +488,72 @@ mod tests {
         let _ = reg.build_source(&topic_only);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn http_webhook_source_requires_bind_addr() {
+        let mut reg = ConnectorRegistry::new();
+        register_defaults(&mut reg);
+
+        // Missing bind_addr must surface as Config, not panic.
+        let cfg = SourceConfig {
+            source_type: "http-webhook".into(),
+            topic: None,
+            partitions: vec![],
+            config: BTreeMap::new(),
+        };
+        match reg.build_source(&cfg) {
+            Err(AeonError::Config { .. }) => {}
+            Err(other) => {
+                panic!("expected Config error for missing bind_addr, got {other:?}")
+            }
+            Ok(_) => panic!("expected error for missing bind_addr, got Ok"),
+        }
+
+        // Malformed bind_addr must also surface as Config.
+        let mut bad = BTreeMap::new();
+        bad.insert("bind_addr".into(), "not-a-socket-addr".into());
+        let cfg = SourceConfig {
+            source_type: "http-webhook".into(),
+            topic: None,
+            partitions: vec![],
+            config: bad,
+        };
+        match reg.build_source(&cfg) {
+            Err(AeonError::Config { .. }) => {}
+            Err(other) => panic!("expected Config for malformed bind_addr, got {other:?}"),
+            Ok(_) => panic!("expected error for malformed bind_addr, got Ok"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn http_webhook_source_binds_ephemeral_port() {
+        let mut reg = ConnectorRegistry::new();
+        register_defaults(&mut reg);
+
+        // 127.0.0.1:0 — kernel picks a free port, confirms the factory
+        // actually drives HttpWebhookSource::new's async bind through
+        // block_in_place without hanging.
+        let mut config = BTreeMap::new();
+        config.insert("bind_addr".into(), "127.0.0.1:0".into());
+        config.insert("path".into(), "/ingest".into());
+        config.insert("source_name".into(), "v4-smoke".into());
+        config.insert("channel_capacity".into(), "256".into());
+        config.insert("poll_timeout_ms".into(), "50".into());
+
+        let cfg = SourceConfig {
+            source_type: "http-webhook".into(),
+            topic: None,
+            partitions: vec![],
+            config,
+        };
+        let mut src = reg.build_source(&cfg).expect("build http-webhook");
+
+        // No events have been posted; next_batch returns empty within the
+        // configured poll timeout rather than blocking indefinitely.
+        use aeon_types::Source;
+        let batch = src.next_batch().await.expect("next_batch");
+        assert!(batch.is_empty(), "idle source should return empty batch");
+    }
+
     #[test]
     fn parse_strategy_accepts_snake_and_camel() {
         assert_eq!(
@@ -463,8 +616,7 @@ mod tests {
             std::env::set_var("HOSTNAME", "h");
             std::env::set_var("POD_NAME", "p");
         }
-        let out =
-            substitute_env_placeholders("aeon-${POD_NAME}-on-${HOSTNAME}-tx").unwrap();
+        let out = substitute_env_placeholders("aeon-${POD_NAME}-on-${HOSTNAME}-tx").unwrap();
         assert_eq!(out, "aeon-p-on-h-tx");
     }
 
@@ -496,8 +648,7 @@ mod tests {
     #[test]
     fn env_substitution_rejects_unterminated_placeholder() {
         let _g = env_lock();
-        let err =
-            substitute_env_placeholders("aeon-${HOSTNAME-tx").unwrap_err();
+        let err = substitute_env_placeholders("aeon-${HOSTNAME-tx").unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("unterminated"),
