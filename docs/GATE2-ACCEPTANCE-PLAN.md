@@ -987,6 +987,221 @@ already logged and did not introduce new code-layer blockers.
 Remaining RD rehearsal work (V3 processor validation, V5 crypto chain
 E2E, V6 consolidated report) continues separately.
 
+### 11.7 Results — V3 processor validation (Rancher Desktop)
+
+Same 3-pod `aeon:717a397` cluster used for V2. Leader = node 3
+(aeon-2). Port-forward 127.0.0.1:4471 → aeon-2:4471.
+
+#### V3a — Built-in `__identity` processor
+
+Already validated under V2 §11.6 T0 matrix: 4M events total across
+4 durability modes × 1M events, zero `events_failed`, 314-320K ev/s
+per node.
+
+#### V3b — Wasm guest (`rust-processor.wasm`)
+
+Shipped artifact at `/app/processors/rust-processor.wasm` (2911 B,
+`sha512:791c27dc…47de`) staged into `/app/artifacts/rust-processor/1.0.0`
+on all three pods, then registered via leader REST; register
+replicated (`"replicated": true`) through Raft to all nodes.
+
+Two pipeline runs using Wasm processor, memory source, blackhole sink:
+
+| cell         | events | processed | outputs | failed | rate      | notes |
+|--------------|--------|-----------|---------|--------|-----------|-------|
+| v3-wasm-100k | 100000 | 100000    | 100000  | 0      | ~30.6K/s  | small run — fixed drain-poll overhead dominates |
+| v3-wasm-1m   | 1000000| 1000000   | 1000000 | 0      | ~295K/s   | apples-to-apples vs V2 T0 scale |
+
+At 1M scale the Wasm path is within ~7% of the `__identity` baseline
+(295K vs 314-320K ev/s). Zero event loss on either run.
+
+Cells + logs: `tmp/v3-rd/cells/v3-wasm-{100k,1m}.json`,
+`tmp/v3-rd/v3-wasm-{100k,1m}.log`.
+
+#### V3c — Native `.so` cdylib — deferred
+
+No sample cdylib processor exists in the repo; only Wasm samples are
+present (`samples/processors/rust-wasm{,-sdk}`). The `native-loader`
+feature is compiled into the shipped image (via `aeon-cli`'s default
+`native-validate` feature set), and `NativeProcessor::load` is on the
+REST path, but without a shipped `.so` sample — and no image build
+pipeline that produces one — there is nothing to register and execute.
+
+This is a **feature gap, not a defect**. Closing it is a small work
+item (add `samples/processors/rust-native` cdylib crate + Dockerfile
+stage that copies the `.so` to `/app/processors/`). Tracked as a
+post-Gate 2 item, not a Session A blocker — DOKS Session A and EKS
+Session B can use the Wasm path alone for processor validation.
+
+#### Processor registration artifact-upload gap
+
+The current `POST /api/v1/processors` endpoint and matching
+`aeon processor register` CLI submit metadata only — artifact bytes are
+expected to already exist on each node's `artifact_dir`. This worked
+here only because the image pre-ships the wasm in `/app/processors/`
+and we `kubectl cp`'d it into place on every pod manually.
+
+For a real operator flow the registry needs a byte-upload path
+(multipart POST + Raft-replicate-or-QUIC-fan-out of the artifact).
+Already documented in `crates/aeon-engine/src/registry.rs` preamble
+("artifacts are transferred via QUIC") — that transfer path is
+not yet implemented. Adding to the post-Gate 2 registry work.
+
+#### V3 verdict
+
+**Green for processor-model validation.** Wasm path works end-to-end
+at production scale with zero loss. Built-in path already exercised
+in V2. Native `.so` path is a feature-complete gap (deferred), and
+artifact-upload/distribution is a registry UX gap (deferred). Neither
+blocks Session A or Session B — both will continue using `__identity`
+and/or Wasm.
+
+### 11.8 Results — V5 crypto chain E2E (Rancher Desktop + unit)
+
+Phase 14 shipped PoH + Merkle + MMR + Ed25519 signing primitives in
+`aeon-crypto`, and Phase 14 runtime wired them into the pipeline task
+behind `feature = "processor-auth"` (always on in default image).
+
+#### V5a — Crypto primitives (unit)
+
+`cargo test -p aeon-crypto` — **159 tests green, 0 failed, 0 ignored,
+0.68s.** Covers: PoH multi-batch chain integrity; Merkle tree builder
++ proof verify; MMR node-count formula + append/verify; Ed25519 sign
++ verify; encryption round-trip; TLS cert + mTLS path.
+
+#### V5b — PoH + pipeline-runtime integration
+
+`cargo test -p aeon-engine --features processor-auth --lib
+pipeline::tests::poh_tests` — **8 tests green, 0 failed, 0.03s.**
+Covers: `run_buffered_with_poh_records_chain`,
+`poh_chain_integrity_after_pipeline`, `poh_with_signing_key`,
+`create_poh_state_resumes_installed_chain_g11c` (G11.c transfer-side
+resume), empty-batch no-op, disabled/enabled state toggle.
+
+#### V5c — REST `/verify` surface (live cluster)
+
+`GET /api/v1/pipelines/all/verify` against live leader on RD returns:
+
+```json
+{"modules":{"merkle":"available","mmr":"available","poh":"available","signing":"available"},"pipelines":[],"status":"ok"}
+```
+
+All four modules reported `"available"` — confirms the
+`processor-auth` feature is compiled into the shipped image.
+
+#### V5d — REST-layer PoH enablement gap
+
+The JSON payload for `POST /api/v1/pipelines` (a `PipelineDefinition`
+per `aeon-types/src/registry.rs`) has **no `poh` field**. Today, the
+only code path that sets `PipelineConfig.poh = Some(PohConfig {...})`
+in production is the cluster-side partition transfer installer
+(`PohChainInstaller`, G11.c path), which resumes a chain that another
+node already had. That means:
+
+- **REST-created pipelines** (the ones V2 T0 used, the ones an
+  operator creates via `aeon pipeline create` or `aeon apply`) always
+  run with `poh: None`. `verify_pipeline` will report
+  `"poh_active": false` for them.
+- **Transfer-resumed pipelines** get PoH because the snapshot includes
+  a live chain — but V2 T4 and Session 0 Row 5 both failed to drive
+  the transfer path end-to-end (`AEON_PIPELINE_NAME` env-var gate on
+  `PartitionTransferDriver`).
+
+This is a **code-wiring gap, not a crypto correctness issue.** The
+primitives are sound (V5a); the runtime wiring is sound when the
+config reaches it (V5b); the REST exposure is missing. Closing it is
+small work: add `poh: Option<PohManifestConfig>` to
+`PipelineDefinition` and `PipelineManifest` (YAML + JSON), plumb it
+through the supervisor's pipeline-build path into `PipelineConfig`.
+
+Tracked as a post-Gate 2 registry/manifest item alongside V3's
+artifact-upload gap. Does not block Session A or Session B — EKS can
+still exercise V5b semantics via the transfer-driver path once the
+AEON_PIPELINE_NAME gate is lifted.
+
+#### V5 verdict
+
+**Green at primitive + runtime level, amber at REST surface.** Crypto
+chain modules are fully validated in code. Live cluster exposes the
+verify endpoint and reports the modules available. Operator-driven
+PoH enablement via REST/YAML is a deferred feature-wiring gap; EKS
+Session B can still verify PoH-under-transfer once
+`AEON_PIPELINE_NAME` gating is fixed (same code change that unblocks
+V2 T4 / Session 0 Row 5).
+
+### 11.9 V6 — Consolidated RD validation + pre-Session-B checklist
+
+**Purpose:** summarise V1..V5 in one place and state a clear
+"ready / not ready" for Session A (DOKS) and Session B (EKS).
+
+#### V6.1 RD rehearsal — section index
+
+| Phase | Section | Verdict |
+|-------|---------|---------|
+| V1 — Rancher Desktop pre-flight | §11.5 (Session 0) + §11.6 preamble | Green |
+| V2 — Pull-source T0..T6 matrix | §11.6 | Green on T0/T2 (post-G16); T3/T4 carry known gaps |
+| V3 — Processor validation | §11.7 | Green for Wasm + `__identity`; native-`.so` + artifact-upload deferred |
+| V4 — Push-source HTTP ingest | separate session notes | Green |
+| V5 — Crypto chain E2E | §11.8 | Green at unit + runtime; REST-surface gap |
+
+#### V6.2 Code changes shipped during RD rehearsal
+
+- **G16 — uncached QUIC seed-join RPC** (commit `717a397`): fixes
+  multi-seed join hang when non-first seed is leader. Regression test
+  in `multi_node.rs`.
+- **V2 + V3 + V5 documentation** (this section): `GATE2-ACCEPTANCE-PLAN.md`
+  §11.6 / §11.7 / §11.8 results sections.
+
+#### V6.3 Known code gaps carried into Session A/B
+
+1. **Helm preStop + `aeon cluster leave`** — scale-down doesn't emit
+   Raft RemoveNode. Gap confirmed in V2 T3; same finding as Session 0.
+2. **`AEON_PIPELINE_NAME` gate on `PartitionTransferDriver`** — REST
+   accepts transfer requests but no driver runs to cut over when env
+   var missing. Gap confirmed in V2 T4 + Session 0 Row 5; blocks V5
+   transfer-driven PoH path.
+3. **Native-`.so` processor sample** — no cdylib sample in
+   `samples/processors/`; no image build stage produces one. Gap from
+   V3. Wasm path covers the processor-model validation need.
+4. **Processor artifact-upload path** — `POST /api/v1/processors` is
+   metadata-only; bytes must be pre-staged per-node. Gap from V3. OK
+   for image-shipped artifacts; blocks operator-driven uploads.
+5. **PoH enablement via REST/YAML** — no `poh` field on
+   `PipelineDefinition` / `PipelineManifest`. Gap from V5. Transfer
+   path is the only way to activate today.
+
+**None of these block Session A (correctness floor) or Session B
+(ceiling claim).** Sessions A/B use `__identity` + Wasm processors,
+image-shipped artifacts, and transfer-driven PoH (once gap #2 is
+lifted).
+
+#### V6.4 Pre-Session-B checklist
+
+Before spinning EKS for Session B:
+
+- [ ] Tear down current RD cluster (`helm uninstall aeon -n aeon &&
+      kubectl delete ns aeon`).
+- [ ] Close gap #2 (`AEON_PIPELINE_NAME` gate) in a follow-up PR so
+      Session B can exercise partition-transfer + PoH-resume in one
+      shot. (Small: either drop the gate or have the pod read its own
+      name from `POD_NAME`/`HOSTNAME`.)
+- [ ] Close gap #1 (helm preStop + `aeon cluster leave`) in the same
+      window so Session A's scale-down correctness row can pass cleanly.
+- [ ] Bake `aeon:<commit>` to ECR us-east-1 (blocked by task #6;
+      Session B's `imagePullPolicy: Always` expects it).
+- [ ] Session A first, on the already-provisioned DOKS cluster —
+      validate correctness floor (small nodes, Regular SSD) before
+      paying EKS premium-tier dollars.
+
+#### V6.5 RD tear-down status
+
+Ready. The RD rehearsal has served its purpose: validated the current
+HEAD image on a real K8s, surfaced G16 mid-session, and proved V2 T0
+/ V3 / V5 unit+runtime paths green. The remaining RD T3/T4 gaps are
+already logged and are blocked on feature work, not on "try harder on
+RD." Post-V6 the RD cluster can be torn down; Session A (DOKS)
+proceeds with the gap-#1 and gap-#2 fixes in flight.
+
 ---
 
 ## 12. Session B — AWS EKS (post-v0.1, weekend window)
