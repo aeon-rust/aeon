@@ -1156,10 +1156,12 @@ V2 T4 / Session 0 Row 5).
 
 1. **Helm preStop + `aeon cluster leave`** — scale-down doesn't emit
    Raft RemoveNode. Gap confirmed in V2 T3; same finding as Session 0.
-2. **`AEON_PIPELINE_NAME` gate on `PartitionTransferDriver`** — REST
-   accepts transfer requests but no driver runs to cut over when env
-   var missing. Gap confirmed in V2 T4 + Session 0 Row 5; blocks V5
-   transfer-driven PoH path.
+2. ~~**`AEON_PIPELINE_NAME` gate on `PartitionTransferDriver`**~~ —
+   **closed post-V6.** `cmd_serve` now auto-discovers the pipeline
+   name from the Raft-replicated catalog when the env var is unset:
+   once exactly one pipeline is registered, the driver installs and
+   binds to that name. Env-var path preserved for operators who want
+   explicit control. `aeon-cli/src/main.rs:install_partition_transfer_driver`.
 3. **Native-`.so` processor sample** — no cdylib sample in
    `samples/processors/`; no image build stage produces one. Gap from
    V3. Wasm path covers the processor-model validation need.
@@ -1181,12 +1183,12 @@ Before spinning EKS for Session B:
 
 - [ ] Tear down current RD cluster (`helm uninstall aeon -n aeon &&
       kubectl delete ns aeon`).
-- [ ] Close gap #2 (`AEON_PIPELINE_NAME` gate) in a follow-up PR so
-      Session B can exercise partition-transfer + PoH-resume in one
-      shot. (Small: either drop the gate or have the pod read its own
-      name from `POD_NAME`/`HOSTNAME`.)
-- [ ] Close gap #1 (helm preStop + `aeon cluster leave`) in the same
-      window so Session A's scale-down correctness row can pass cleanly.
+- [x] Close gap #2 (`AEON_PIPELINE_NAME` gate). Shipped — auto-discovery
+      fallback in `install_partition_transfer_driver`. Session B can
+      now exercise partition-transfer + PoH-resume without touching
+      helm values.
+- [ ] Close gap #1 (helm preStop + `aeon cluster leave`) so Session A's
+      scale-down correctness row can pass cleanly.
 - [ ] Bake `aeon:<commit>` to ECR us-east-1 (blocked by task #6;
       Session B's `imagePullPolicy: Always` expects it).
 - [ ] Session A first, on the already-provisioned DOKS cluster —
