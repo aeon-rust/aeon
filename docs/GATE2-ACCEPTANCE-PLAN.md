@@ -887,6 +887,106 @@ uninstall aeon -n aeon && kubectl delete ns aeon`; image
 `aeon:session0` can stay in Rancher Desktop for quick re-load if a
 Session 0 re-run is needed.
 
+### 11.6 Results — V2 Rancher Desktop rehearsal (pre-Session-B)
+
+**Date:** 2026-04-20
+**Cluster:** same Rancher Desktop / WSL2 as §11.5, fresh helm release
+with image `aeon:717a397` (commit `717a397`, includes G15 + P5.d +
+**G16** fix introduced mid-session — see below). 3-pod STS, loopback
+QUIC over headless service.
+
+**Purpose:** re-run §5 T-scenarios against current HEAD before any
+DOKS re-spin or EKS Session B, per `project_pre_session_b_validation`.
+
+#### T0 — Isolation matrix (C0 × 4 modes)
+
+| Cell | Events | Elapsed (adj.) | Per-node rate |
+|------|--------|----------------|---------------|
+| C0 · None            | 1,000,000 | 3,182 ms | **314,267 ev/s** |
+| C0 · UnorderedBatch  | 1,000,000 | 3,163 ms | **316,155 ev/s** |
+| C0 · OrderedBatch    | 1,000,000 | 3,131 ms | **319,386 ev/s** |
+| C0 · PerEvent        | 1,000,000 | 3,120 ms | **320,512 ev/s** |
+
+Same payload/batch/processor/sink as §11.5. All four modes land within
+**2 %** of each other — confirms §11.5 finding (blackhole hides mode
+cost; C1/C2 needed to expose). **~23 % slower** than 2026-04-18 on
+commit `4d05b02` (~409 K ev/s at `C0·None`); overhead attributable to
+G1–G15 correctness wiring + P5.d source-loop `yield_now()` on each
+empty batch. Zero loss on all cells.
+
+#### T2 — Scale-up 3 → 5 (membership only)
+
+**Observed: 4.2 s to grow Raft voter set from {1,2,3} to {1,2,3,4,5}.**
+No crashes. Partition ownership did NOT auto-rebalance — partitions
+0–11 remained on nodes {1,2,3}. Per acceptance plan §5, this is the
+expected split: voter membership is an openraft add-learner +
+change-membership flow; partition rebalance is a separate operator or
+controller action.
+
+**G16 blocker found and fixed in-session.** First attempt had aeon-3 /
+aeon-4 crash-loop with `failed to join cluster via any seed node`.
+Root cause: `QuicEndpoint::connect()` keyed its connection pool by
+`NodeId`, and the seed-join loop passed the placeholder `0` for every
+seed attempt. The first seed's connection cached at key `0` and every
+subsequent "retry against a different seed" silently re-used it, so
+the client never reached the real leader. G15 (committed 2026-04-19)
+correctly fixed the *server-side* leader-self check but the client
+never made it there. Fix: uncached QUIC path for seed-join RPCs
+(`connect_uncached` on endpoint + `cluster_rpc_uncached` in network
+module), new regression test
+`g16_multi_seed_join_reaches_each_address_from_single_endpoint`.
+Committed as `717a397`. 194 `aeon-cluster` tests green post-fix.
+
+#### T3 — Scale-down 5 → 3
+
+**Observed: pods deleted cleanly; Raft membership stayed at
+{1,2,3,4,5}.** Cluster quorum still achievable (3/5 alive) and remains
+operational, but voter list is stale — exactly the gap the Session 0
+"Open sub-question" in §5 T3 described. Kubernetes `scale --replicas`
+only terminates pods; no `preStop` hook sends a `RemoveNode` RPC. Fix
+is a helm-chart change + a `aeon cluster leave --node $POD_NAME`
+command (or reuse of existing `remove-node` path), not a code bug in
+the Raft layer. **Keep deferred to Session A** per original plan.
+
+#### T4 — Partition transfer cutover
+
+**Observed: REST `POST /api/v1/cluster/partitions/0/transfer` returned
+HTTP 202 in 172 ms and Raft accepted the transfer (partition 0
+flipped to `status=transferring`). After 35 s+ the transfer was still
+`transferring` and never reached `owned` at the target.** Not a
+transfer-state-machine bug — the pods started with
+`WARN AEON_PIPELINE_NAME unset — skipping PartitionTransferDriver.
+Raft-committed partition transfers will not make progress on this
+node. Set AEON_PIPELINE_NAME to enable CL-6 handover.` So the Raft
+intent is committed but there is no driver in the pod to execute the
+bulk-sync → drain → ownership-flip sequence. Same gap as Session 0
+Row 5 (measurement deferred to Session A). Fix is helm-chart env var
+plus an actual running pipeline on the source partition; belongs with
+T4 on DOKS/EKS.
+
+#### G16 commit
+
+`fix(cluster): G16 — use uncached QUIC connect in seed-join RPCs`
+(`717a397`). Changes:
+- `crates/aeon-cluster/src/transport/endpoint.rs` — `connect_uncached`
+- `crates/aeon-cluster/src/transport/network.rs` — `cluster_rpc_uncached`;
+  `send_join_request` delegates to it
+- `crates/aeon-cluster/src/node.rs` — seed loop comment updated
+- `crates/aeon-cluster/tests/multi_node.rs` — regression test
+
+All other RPCs (health, partition transfer, remove, openraft inner
+traffic) still use the pooled path. Only the seed-join flow is
+uncached, because only it iterates unknown-id seeds from one endpoint.
+
+#### V2 tear-down status
+
+Ready for tear-down. V2's purpose — "catch any code gap exposed by the
+current HEAD image on a real K8s before spending cloud dollars" — is
+fully served by the G16 fix. T3/T4 gaps are the same ones Session 0
+already logged and did not introduce new code-layer blockers.
+Remaining RD rehearsal work (V3 processor validation, V5 crypto chain
+E2E, V6 consolidated report) continues separately.
+
 ---
 
 ## 12. Session B — AWS EKS (post-v0.1, weekend window)
