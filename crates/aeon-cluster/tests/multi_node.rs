@@ -923,3 +923,121 @@ async fn g15_join_targets_actual_leader_of_three_node_cluster() {
     )
     .await;
 }
+
+/// G16 regression — the seed-join loop iterates multiple seed addresses through
+/// a SINGLE joining endpoint. Before G16 the pooled QUIC `connect()` cached
+/// the first seed under placeholder id 0 and every retry silently reused it,
+/// so a non-leader first seed never allowed the client to actually reach the
+/// real leader. With G16 the join path is uncached, so iterating
+/// `[non_leader_a, leader, non_leader_b]` from one endpoint must land each
+/// attempt at its own host and the leader attempt must succeed.
+#[tokio::test]
+async fn g16_multi_seed_join_reaches_each_address_from_single_endpoint() {
+    use aeon_cluster::transport::network::send_join_request;
+    use aeon_cluster::types::{JoinRequest, NodeId};
+
+    let (server_cfg, client_cfg) = dev_quic_configs();
+
+    let ep1 = create_endpoint(server_cfg.clone(), client_cfg.clone());
+    let ep2 = create_endpoint(server_cfg.clone(), client_cfg.clone());
+    let ep3 = create_endpoint(server_cfg.clone(), client_cfg.clone());
+    let ep4 = create_endpoint(server_cfg, client_cfg);
+
+    let addr1 = ep1.local_addr().unwrap();
+    let addr2 = ep2.local_addr().unwrap();
+    let addr3 = ep3.local_addr().unwrap();
+    let addr4 = ep4.local_addr().unwrap();
+
+    let raft1 = create_quic_node(1, Arc::clone(&ep1)).await;
+    let raft2 = create_quic_node(2, Arc::clone(&ep2)).await;
+    let raft3 = create_quic_node(3, Arc::clone(&ep3)).await;
+
+    let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    start_server(&ep1, &raft1, 1, &shutdown);
+    start_server(&ep2, &raft2, 2, &shutdown);
+    start_server(&ep3, &raft3, 3, &shutdown);
+
+    let mut members = BTreeMap::new();
+    members.insert(1u64, NodeAddress::new("127.0.0.1", addr1.port()));
+    members.insert(2u64, NodeAddress::new("127.0.0.1", addr2.port()));
+    members.insert(3u64, NodeAddress::new("127.0.0.1", addr3.port()));
+
+    raft1.initialize(members.clone()).await.unwrap();
+    raft2.initialize(members.clone()).await.unwrap();
+    raft3.initialize(members).await.unwrap();
+
+    let leader_id = wait_for_leader(&raft1, 10).await.expect("leader elected");
+
+    // Build a seed list that always starts with a NON-leader, so the buggy
+    // pre-G16 code would cache that first connection and "retry" by reusing
+    // it — never actually hitting the real leader.
+    let seeds: Vec<(NodeId, NodeAddress)> = [1u64, 2, 3]
+        .iter()
+        .map(|id| {
+            let addr = match *id {
+                1 => addr1,
+                2 => addr2,
+                3 => addr3,
+                _ => unreachable!(),
+            };
+            (*id, NodeAddress::new("127.0.0.1", addr.port()))
+        })
+        .filter(|(id, _)| *id != leader_id)
+        .chain(std::iter::once((
+            leader_id,
+            match leader_id {
+                1 => NodeAddress::new("127.0.0.1", addr1.port()),
+                2 => NodeAddress::new("127.0.0.1", addr2.port()),
+                3 => NodeAddress::new("127.0.0.1", addr3.port()),
+                _ => unreachable!(),
+            },
+        )))
+        .collect();
+
+    assert_ne!(
+        seeds[0].0, leader_id,
+        "test setup: first seed must be a non-leader to exercise the G16 path"
+    );
+
+    let join_req = JoinRequest {
+        node_id: 4,
+        addr: NodeAddress::new("127.0.0.1", addr4.port()),
+    };
+
+    // Iterate seeds from a SINGLE endpoint — this is the production shape.
+    let mut reached_leader = false;
+    let mut last_msg = String::new();
+    for (seed_id, seed_addr) in &seeds {
+        let resp = send_join_request(&ep4, *seed_id, seed_addr, &join_req)
+            .await
+            .expect("QUIC join RPC");
+        if resp.success {
+            reached_leader = true;
+            break;
+        }
+        last_msg = resp.message;
+    }
+
+    assert!(
+        reached_leader,
+        "multi-seed loop from single endpoint must eventually reach the leader (G16); last_msg={last_msg}"
+    );
+
+    let nodes = [(1u64, raft1.clone()), (2, raft2.clone()), (3, raft3.clone())];
+    let leader = leader_raft(leader_id, &nodes);
+    let voter_count = leader
+        .metrics()
+        .borrow()
+        .membership_config
+        .membership()
+        .voter_ids()
+        .count();
+    assert_eq!(voter_count, 4, "cluster should have 4 voters after join");
+
+    shutdown_all(
+        &shutdown,
+        &[raft1, raft2, raft3],
+        &[ep1, ep2, ep3, ep4],
+    )
+    .await;
+}

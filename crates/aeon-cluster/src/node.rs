@@ -609,14 +609,13 @@ mod inner {
             let mut joined = false;
 
             for seed in &config.seed_nodes {
-                // Use a temporary node_id of 0 for the seed connection target
-                // (we don't know the seed's Raft ID, but the connection only
-                // needs the address for DNS resolution).
+                // Seed ids are unknown — send_join_request uses the uncached
+                // QUIC path (G16) so each seed gets its own real handshake.
                 tracing::info!(seed = %seed, "attempting to join cluster via seed node");
 
                 match crate::transport::network::send_join_request(
                     &endpoint,
-                    0, // target_id is only used for connection caching
+                    0, // placeholder — uncached path does not read this
                     seed,
                     &join_req,
                 )

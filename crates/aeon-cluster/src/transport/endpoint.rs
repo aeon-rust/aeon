@@ -90,6 +90,53 @@ impl QuicEndpoint {
         Ok(connection)
     }
 
+    /// Connect to a remote node without touching the connection pool.
+    ///
+    /// G16: used by the seed-join flow where the caller iterates over multiple
+    /// seed addresses but does not know their real Raft ids. Passing a
+    /// placeholder id (e.g. `0`) through the pooled `connect()` causes the
+    /// first seed's connection to be cached under that placeholder and every
+    /// subsequent seed attempt to silently re-use it — so retries against the
+    /// actual leader never leave node A. The uncached path does a fresh
+    /// resolve + handshake for each call and lets the returned `Connection`
+    /// drop naturally when the one-shot RPC completes.
+    pub async fn connect_uncached(
+        &self,
+        addr: &NodeAddress,
+    ) -> Result<Connection, AeonError> {
+        let socket_addr = tokio::net::lookup_host(addr.to_string())
+            .await
+            .map_err(|e| AeonError::Connection {
+                message: format!("failed to resolve {addr}: {e}"),
+                source: None,
+                retryable: true,
+            })?
+            .next()
+            .ok_or_else(|| AeonError::Connection {
+                message: format!("no addresses found for {addr}"),
+                source: None,
+                retryable: false,
+            })?;
+
+        let connecting = self
+            .endpoint
+            .connect_with(self.client_config.clone(), socket_addr, &addr.host)
+            .map_err(|e| AeonError::Connection {
+                message: format!("failed to initiate QUIC connection to {addr}: {e}"),
+                source: None,
+                retryable: true,
+            })?;
+
+        let connection = connecting.await.map_err(|e| AeonError::Connection {
+            message: format!("QUIC handshake failed with {addr}: {e}"),
+            source: None,
+            retryable: true,
+        })?;
+
+        tracing::debug!(%addr, "QUIC connection established (uncached)");
+        Ok(connection)
+    }
+
     /// Connect with retry on retryable errors (TR-3).
     ///
     /// Intended for bootstrap/join flows where the target may not be ready
