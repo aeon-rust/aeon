@@ -7,9 +7,9 @@
 //! For streaming replication protocol, a future version will use
 //! START_REPLICATION with a walsender connection.
 
-use aeon_types::{AeonError, BackoffPolicy, Event, PartitionId, Source};
+use aeon_types::{AeonError, BackoffPolicy, CoreLocalUuidGenerator, Event, PartitionId, Source};
 use bytes::Bytes;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
 
@@ -104,6 +104,7 @@ pub struct PostgresCdcSource {
     /// TR-3 reconnect backoff. Advanced on query/connection errors; reset on
     /// every successful query (even when the result set is empty).
     backoff: aeon_types::Backoff,
+    uuid_gen: Mutex<CoreLocalUuidGenerator>,
 }
 
 impl PostgresCdcSource {
@@ -116,6 +117,7 @@ impl PostgresCdcSource {
             config,
             _connection_handle: Some(conn_handle),
             backoff,
+            uuid_gen: Mutex::new(CoreLocalUuidGenerator::new(0)),
         })
     }
 }
@@ -244,14 +246,25 @@ impl Source for PostgresCdcSource {
 
                 let payload_bytes = Bytes::from(serde_json::to_vec(&payload).unwrap_or_default());
 
+                let event_id = self
+                    .uuid_gen
+                    .lock()
+                    .map_err(|_| AeonError::connection("UUID generator mutex poisoned"))?
+                    .next_uuid();
                 let mut event = Event::new(
-                    uuid::Uuid::nil(),
+                    event_id,
                     0,
                     Arc::clone(&self.config.source_name),
                     PartitionId::new(0),
                     payload_bytes,
                 );
                 event = event.with_source_ts(now);
+                // B2: pg_lsn format is "X/Y" where X and Y are hex u32s
+                // representing the high/low halves of a 64-bit WAL offset.
+                // Pack into a single i64 for checkpoint ordering.
+                if let Some(offset) = parse_pg_lsn_to_i64(lsn_str) {
+                    event = event.with_source_offset(offset);
+                }
                 event
                     .metadata
                     .push((Arc::from("pg.lsn"), Arc::from(lsn_str)));
@@ -265,5 +278,45 @@ impl Source for PostgresCdcSource {
         }
 
         Ok(events)
+    }
+}
+
+/// Parse a PostgreSQL LSN string `"X/Y"` (hex-high/hex-low halves of a
+/// 64-bit WAL offset) into an `i64`. The sign bit is cleared so the
+/// result stays non-negative for the life of the database (64-bit
+/// LSN addresses 16 EiB of WAL — running out is not a concern).
+///
+/// Returns `None` on malformed input.
+fn parse_pg_lsn_to_i64(lsn: &str) -> Option<i64> {
+    let (high_s, low_s) = lsn.split_once('/')?;
+    let high = u64::from_str_radix(high_s.trim(), 16).ok()?;
+    let low = u64::from_str_radix(low_s.trim(), 16).ok()?;
+    let packed = (high << 32) | (low & 0xFFFF_FFFF);
+    Some((packed & 0x7FFF_FFFF_FFFF_FFFF) as i64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_lsn_basic() {
+        // "0/16B2468" → (0 << 32) | 0x16B2468 = 23_799_400
+        let v = parse_pg_lsn_to_i64("0/16B2468").unwrap();
+        assert_eq!(v, 0x16B2468);
+    }
+
+    #[test]
+    fn parse_lsn_monotonic_across_halves() {
+        let a = parse_pg_lsn_to_i64("0/FFFFFFFF").unwrap();
+        let b = parse_pg_lsn_to_i64("1/0").unwrap();
+        assert!(b > a, "high-half increment strictly greater than max low");
+    }
+
+    #[test]
+    fn parse_lsn_malformed_returns_none() {
+        assert!(parse_pg_lsn_to_i64("nope").is_none());
+        assert!(parse_pg_lsn_to_i64("0/ZZZ").is_none());
+        assert!(parse_pg_lsn_to_i64("123").is_none());
     }
 }

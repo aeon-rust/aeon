@@ -5,7 +5,7 @@
 //! Protocol: `[length: u32 LE][payload]` per message on each stream.
 
 use crate::push_buffer::{PushBufferConfig, PushBufferRx, push_buffer};
-use aeon_types::{AeonError, Event, PartitionId, Source};
+use aeon_types::{AeonError, CoreLocalUuidGenerator, Event, PartitionId, Source};
 use bytes::Bytes;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -133,7 +133,10 @@ async fn quic_accept_loop(
                 let source_name = Arc::clone(&source_name);
 
                 tokio::spawn(async move {
-                    if let Err(e) = handle_stream(stream, tx, source_name).await {
+                    // Per-stream UUID generator — each stream task owns its own
+                    // generator to avoid holding a MutexGuard across await.
+                    let id_gen = CoreLocalUuidGenerator::new(0);
+                    if let Err(e) = handle_stream(stream, tx, source_name, id_gen).await {
                         tracing::debug!(error = %e, "quic stream handler error");
                     }
                 });
@@ -147,6 +150,7 @@ async fn handle_stream(
     (mut send, mut recv): (quinn::SendStream, quinn::RecvStream),
     tx: crate::push_buffer::PushBufferTx,
     source_name: Arc<str>,
+    mut id_gen: CoreLocalUuidGenerator,
 ) -> Result<(), AeonError> {
     loop {
         // Phase 3: if overloaded, send backpressure signal
@@ -183,7 +187,7 @@ async fn handle_stream(
             .map_err(|e| AeonError::connection(format!("quic read payload failed: {e}")))?;
 
         let event = Event::new(
-            uuid::Uuid::nil(),
+            id_gen.next_uuid(),
             0,
             Arc::clone(&source_name),
             PartitionId::new(0),

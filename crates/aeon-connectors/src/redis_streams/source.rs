@@ -3,12 +3,12 @@
 //! Uses consumer groups for reliable delivery with acknowledgment.
 //! Pull-source: `next_batch()` issues XREADGROUP with COUNT and BLOCK.
 
-use aeon_types::{AeonError, Backoff, BackoffPolicy, Event, PartitionId, Source};
+use aeon_types::{AeonError, Backoff, BackoffPolicy, CoreLocalUuidGenerator, Event, PartitionId, Source};
 use bytes::Bytes;
 use redis::AsyncCommands;
 use redis::aio::MultiplexedConnection;
 use redis::streams::{StreamReadOptions, StreamReadReply};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Configuration for `RedisSource`.
 pub struct RedisSourceConfig {
@@ -91,6 +91,7 @@ pub struct RedisSource {
     config: RedisSourceConfig,
     pending_ack_ids: Vec<String>,
     backoff: Backoff,
+    uuid_gen: Mutex<CoreLocalUuidGenerator>,
 }
 
 impl RedisSource {
@@ -118,6 +119,7 @@ impl RedisSource {
             config,
             pending_ack_ids: Vec::new(),
             backoff,
+            uuid_gen: Mutex::new(CoreLocalUuidGenerator::new(0)),
         })
     }
 
@@ -280,14 +282,27 @@ impl Source for RedisSource {
                     }
                 };
 
+                let event_id = self
+                    .uuid_gen
+                    .lock()
+                    .map_err(|_| AeonError::connection("UUID generator mutex poisoned"))?
+                    .next_uuid();
                 let mut event = Event::new(
-                    uuid::Uuid::nil(),
+                    event_id,
                     0,
                     Arc::clone(&self.config.source_name),
                     PartitionId::new(0),
                     payload_bytes,
                 );
                 event = event.with_source_ts(now);
+                // B2: encode Redis stream entry ID "<ms>-<seq>" into a
+                // monotonic i64 for checkpoint persistence. High 48 bits
+                // hold the ms timestamp, low 16 bits hold the intra-ms seq.
+                // Actual resume is via consumer-group PEL (XACK); this
+                // offset is for observability and checkpoint ordering.
+                if let Some(offset) = parse_stream_id_to_i64(&entry.id) {
+                    event = event.with_source_offset(offset);
+                }
                 events.push(event);
 
                 self.pending_ack_ids.push(entry.id.clone());
@@ -295,5 +310,50 @@ impl Source for RedisSource {
         }
 
         Ok(events)
+    }
+}
+
+/// Pack a Redis stream entry ID `"<ms>-<seq>"` into a monotonic `i64`.
+/// Returns `None` if the ID is malformed.
+///
+/// Layout: `[ms: high 48 bits][seq: low 16 bits]`. The bit layout is
+/// internal — consumers should treat the value as an opaque monotonic
+/// ordering key for checkpoint purposes. `seq` saturates at 0xFFFF; in
+/// the pathological case of >65k entries at the same ms the ordering
+/// between late entries is lost but the checkpoint remains monotonic.
+fn parse_stream_id_to_i64(id: &str) -> Option<i64> {
+    let (ms_s, seq_s) = id.split_once('-')?;
+    let ms: u64 = ms_s.parse().ok()?;
+    let seq: u64 = seq_s.parse().ok()?;
+    let packed = (ms << 16) | (seq.min(0xFFFF));
+    // Clear the sign bit to keep the result non-negative as an i64.
+    Some((packed & 0x7FFF_FFFF_FFFF_FFFF) as i64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_stream_id_round_trips_ordering() {
+        let a = parse_stream_id_to_i64("1713456789123-0").unwrap();
+        let b = parse_stream_id_to_i64("1713456789123-1").unwrap();
+        let c = parse_stream_id_to_i64("1713456789124-0").unwrap();
+        assert!(a < b, "seq monotonic within same ms");
+        assert!(b < c, "later ms dominates");
+    }
+
+    #[test]
+    fn parse_stream_id_malformed_returns_none() {
+        assert!(parse_stream_id_to_i64("nope").is_none());
+        assert!(parse_stream_id_to_i64("123").is_none());
+        assert!(parse_stream_id_to_i64("abc-0").is_none());
+    }
+
+    #[test]
+    fn parse_stream_id_saturates_large_seq() {
+        let a = parse_stream_id_to_i64("1-65535").unwrap();
+        let b = parse_stream_id_to_i64("1-99999").unwrap();
+        assert_eq!(a, b, "seq saturates at 0xFFFF");
     }
 }

@@ -12,7 +12,7 @@
 //! never dropped.
 
 use crate::push_buffer::{PushBufferConfig, PushBufferRx, PushBufferTx, push_buffer};
-use aeon_types::{AeonError, Backoff, BackoffPolicy, Event, PartitionId, Source};
+use aeon_types::{AeonError, Backoff, BackoffPolicy, CoreLocalUuidGenerator, Event, PartitionId, Source};
 use bytes::Bytes;
 use std::sync::Arc;
 use std::time::Duration;
@@ -105,11 +105,12 @@ impl WebSocketSource {
         let source_name = config.source_name;
         let url = config.url;
         let mut backoff = Backoff::new(config.backoff);
+        let mut uuid_gen = CoreLocalUuidGenerator::new(0);
 
         let handle = tokio::spawn(async move {
             // Drive the initial connection first, then fall into the
             // reconnect loop on drop.
-            if !run_ws_reader(ws_stream, &tx, &source_name).await {
+            if !run_ws_reader(ws_stream, &tx, &source_name, &mut uuid_gen).await {
                 return; // Buffer closed — caller dropped the source.
             }
 
@@ -126,7 +127,7 @@ impl WebSocketSource {
                     Ok((stream, _)) => {
                         tracing::info!(%url, "websocket reconnected");
                         backoff.reset();
-                        if !run_ws_reader(stream, &tx, &source_name).await {
+                        if !run_ws_reader(stream, &tx, &source_name, &mut uuid_gen).await {
                             return;
                         }
                     }
@@ -155,6 +156,7 @@ async fn run_ws_reader<S>(
     ws_stream: tokio_tungstenite::WebSocketStream<S>,
     tx: &PushBufferTx,
     source_name: &Arc<str>,
+    uuid_gen: &mut CoreLocalUuidGenerator,
 ) -> bool
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -166,7 +168,7 @@ where
         match msg_result {
             Ok(Message::Text(text)) => {
                 let event = Event::new(
-                    uuid::Uuid::nil(),
+                    uuid_gen.next_uuid(),
                     0,
                     Arc::clone(source_name),
                     PartitionId::new(0),
@@ -182,7 +184,7 @@ where
             }
             Ok(Message::Binary(data)) => {
                 let event = Event::new(
-                    uuid::Uuid::nil(),
+                    uuid_gen.next_uuid(),
                     0,
                     Arc::clone(source_name),
                     PartitionId::new(0),

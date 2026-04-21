@@ -8,7 +8,7 @@
 //! occasional loss is acceptable and low latency is critical.
 
 use crate::push_buffer::{PushBufferConfig, PushBufferRx, push_buffer};
-use aeon_types::{AeonError, Event, PartitionId, Source};
+use aeon_types::{AeonError, CoreLocalUuidGenerator, Event, PartitionId, Source};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -126,6 +126,7 @@ async fn datagram_accept_loop(
         let source_name = Arc::clone(&source_name);
 
         tokio::spawn(async move {
+            let mut id_gen = CoreLocalUuidGenerator::new(0);
             loop {
                 match session.receive_datagram().await {
                     Ok(datagram) => {
@@ -137,7 +138,7 @@ async fn datagram_accept_loop(
                         // FT-11: datagram.payload() returns bytes::Bytes directly.
                         let payload = datagram.payload();
                         let event = Event::new(
-                            uuid::Uuid::nil(),
+                            id_gen.next_uuid(),
                             0,
                             Arc::clone(&source_name),
                             PartitionId::new(0),

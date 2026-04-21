@@ -139,6 +139,25 @@ mod inner {
         transfer_driver: tokio::sync::RwLock<
             Option<Arc<crate::partition_driver::PartitionTransferDriver>>,
         >,
+        /// P5: receiver for the per-node owned-partitions watch. Subscribers
+        /// (pipeline source loop) clone this via `watch_owned_partitions()`
+        /// and select on `changed()` to re-assign the live source without
+        /// tearing down the pipeline task on a CL-6 transfer commit.
+        owned_partitions_rx: tokio::sync::watch::Receiver<Vec<PartitionId>>,
+    }
+
+    /// Install an `OwnedPartitionsWatch` into the state machine's slot and
+    /// return the paired receiver. Shared helper used by every bootstrap
+    /// path so the sender is in place before the initial partition-assignment
+    /// proposals commit — if it weren't, those early applies would fire
+    /// against an empty slot and subscribers would start out-of-sync.
+    async fn install_owned_partitions_watch(
+        slot: &crate::store::OwnedPartitionsWatchSlot,
+        node_id: NodeId,
+    ) -> tokio::sync::watch::Receiver<Vec<PartitionId>> {
+        let (sender, rx) = tokio::sync::watch::channel(Vec::<PartitionId>::new());
+        *slot.write().await = Some(crate::store::OwnedPartitionsWatch { node_id, sender });
+        rx
     }
 
     impl ClusterNode {
@@ -158,6 +177,7 @@ mod inner {
             let state_machine = StateMachineStore::new();
             let shared_state = state_machine.shared_state();
             let applier_slot = state_machine.applier_slot();
+            let owned_watch_slot = state_machine.owned_partitions_watch_slot();
             let network = StubNetworkFactory;
 
             let raft = Raft::new(
@@ -172,6 +192,9 @@ mod inner {
                 message: format!("failed to create Raft node: {e}"),
                 source: None,
             })?;
+
+            let owned_partitions_rx =
+                install_owned_partitions_watch(&owned_watch_slot, config.node_id).await;
 
             // Initialize as single-node cluster
             let mut members = BTreeMap::new();
@@ -196,6 +219,7 @@ mod inner {
                 shared_state,
                 applier_slot,
                 transfer_driver: tokio::sync::RwLock::new(None),
+                owned_partitions_rx,
             };
 
             // Assign all partitions to self
@@ -253,6 +277,7 @@ mod inner {
             let state_machine = StateMachineStore::new_persistent(log_backend)?;
             let shared_state = state_machine.shared_state();
             let applier_slot = state_machine.applier_slot();
+            let owned_watch_slot = state_machine.owned_partitions_watch_slot();
             let network = StubNetworkFactory;
 
             let raft = Raft::new(
@@ -277,6 +302,9 @@ mod inner {
                 config.node_id,
                 NodeAddress::new(config.bind.ip().to_string(), config.bind.port()),
             );
+            let owned_partitions_rx =
+                install_owned_partitions_watch(&owned_watch_slot, config.node_id).await;
+
             match raft.initialize(members).await {
                 Ok(()) => {}
                 Err(openraft::error::RaftError::APIError(
@@ -305,6 +333,7 @@ mod inner {
                 shared_state,
                 applier_slot,
                 transfer_driver: tokio::sync::RwLock::new(None),
+                owned_partitions_rx,
             };
 
             // Skip partition assignment on restart — the applied state machine
@@ -361,6 +390,7 @@ mod inner {
             let state_machine = StateMachineStore::new();
             let shared_state = state_machine.shared_state();
             let applier_slot = state_machine.applier_slot();
+            let owned_watch_slot = state_machine.owned_partitions_watch_slot();
             let network = QuicNetworkFactory::new(Arc::clone(&endpoint));
 
             let raft = Raft::new(
@@ -375,6 +405,9 @@ mod inner {
                 message: format!("failed to create Raft node: {e}"),
                 source: None,
             })?;
+
+            let owned_partitions_rx =
+                install_owned_partitions_watch(&owned_watch_slot, config.node_id).await;
 
             // Start the QUIC RPC server
             let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -431,6 +464,7 @@ mod inner {
                 shared_state,
                 applier_slot,
                 transfer_driver: tokio::sync::RwLock::new(None),
+                owned_partitions_rx,
             };
 
             // NOTE: InitialAssignment is NOT proposed here — it must happen
@@ -470,6 +504,7 @@ mod inner {
             let log_store = MemLogStore::new();
             let state_machine = StateMachineStore::new();
             let applier_slot = state_machine.applier_slot();
+            let owned_watch_slot = state_machine.owned_partitions_watch_slot();
             let network = QuicNetworkFactory::new(Arc::clone(&endpoint));
 
             let raft = Raft::new(
@@ -484,6 +519,9 @@ mod inner {
                 message: format!("failed to create Raft node: {e}"),
                 source: None,
             })?;
+
+            let owned_partitions_rx =
+                install_owned_partitions_watch(&owned_watch_slot, config.node_id).await;
 
             // Start the QUIC RPC server so the bootstrap leader can reach us
             let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -520,6 +558,7 @@ mod inner {
                 shared_state,
                 applier_slot,
                 transfer_driver: tokio::sync::RwLock::new(None),
+                owned_partitions_rx,
             };
 
             Ok(node)
@@ -553,6 +592,7 @@ mod inner {
             let log_store = MemLogStore::new();
             let state_machine = StateMachineStore::new();
             let applier_slot = state_machine.applier_slot();
+            let owned_watch_slot = state_machine.owned_partitions_watch_slot();
             let network = QuicNetworkFactory::new(Arc::clone(&endpoint));
 
             let raft = Raft::new(
@@ -567,6 +607,9 @@ mod inner {
                 message: format!("failed to create Raft node: {e}"),
                 source: None,
             })?;
+
+            let owned_partitions_rx =
+                install_owned_partitions_watch(&owned_watch_slot, config.node_id).await;
 
             // Start the QUIC RPC server so peers can reach us
             let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -609,14 +652,13 @@ mod inner {
             let mut joined = false;
 
             for seed in &config.seed_nodes {
-                // Use a temporary node_id of 0 for the seed connection target
-                // (we don't know the seed's Raft ID, but the connection only
-                // needs the address for DNS resolution).
+                // Seed ids are unknown — send_join_request uses the uncached
+                // QUIC path (G16) so each seed gets its own real handshake.
                 tracing::info!(seed = %seed, "attempting to join cluster via seed node");
 
                 match crate::transport::network::send_join_request(
                     &endpoint,
-                    0, // target_id is only used for connection caching
+                    0, // placeholder — uncached path does not read this
                     seed,
                     &join_req,
                 )
@@ -663,6 +705,7 @@ mod inner {
                 shared_state: crate::store::SharedClusterState::default(),
                 applier_slot,
                 transfer_driver: tokio::sync::RwLock::new(None),
+                owned_partitions_rx,
             };
 
             Ok(node)
@@ -1200,6 +1243,20 @@ mod inner {
         /// Get a read handle to the committed cluster state.
         pub fn shared_state(&self) -> crate::store::SharedClusterState {
             Arc::clone(&self.shared_state)
+        }
+
+        /// P5: subscribe to this node's owned-partitions changes.
+        ///
+        /// Returns a `watch::Receiver` that is notified every time a Raft
+        /// commit (or snapshot install) changes the slice of partitions
+        /// assigned to this node id. The engine's pipeline source loop
+        /// clones this handle and selects on `changed()` so a CL-6 transfer
+        /// can re-assign a live source (e.g. KafkaSource's `consumer.assign`)
+        /// without tearing down the pipeline task.
+        pub fn watch_owned_partitions(
+            &self,
+        ) -> tokio::sync::watch::Receiver<Vec<PartitionId>> {
+            self.owned_partitions_rx.clone()
         }
 
         /// Get the current partition table from the committed state.

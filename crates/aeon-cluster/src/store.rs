@@ -30,7 +30,10 @@ mod inner {
     use crate::partition_manager;
     use crate::raft_config::AeonRaftConfig;
     use crate::snapshot::ClusterSnapshot;
-    use crate::types::{ClusterRequest, ClusterResponse, NodeAddress, PartitionOwnership};
+    use crate::types::{
+        ClusterRequest, ClusterResponse, NodeAddress, NodeId, PartitionOwnership,
+    };
+    use aeon_types::PartitionId;
 
     // ─── Shared Log Data ──────────────────────────────────────────────
 
@@ -192,6 +195,11 @@ mod inner {
         /// silently — nodes that wire an applier later will converge via
         /// snapshot replay or via rebuilding state from stored definitions.
         registry_applier: RegistryApplierSlot,
+        /// P5: optional per-node owned-partitions watch. When set, the apply
+        /// loop pushes the latest owned-partitions slice to the watch after
+        /// every committed entry so the engine can re-assign a live source
+        /// without a pipeline restart. See [`OwnedPartitionsWatch`].
+        owned_partitions_watch: OwnedPartitionsWatchSlot,
     }
 
     /// Cloneable handle to the state machine's registry applier slot.
@@ -201,6 +209,29 @@ mod inner {
     /// Read-only handle to the cluster state machine snapshot.
     /// Can be cheaply cloned and shared across threads.
     pub type SharedClusterState = Arc<tokio::sync::RwLock<ClusterSnapshot>>;
+
+    /// P5: per-node owned-partitions notifier.
+    ///
+    /// Installed into the state machine by `ClusterNode` on startup once the
+    /// node knows its own `node_id`. After every committed entry (and after
+    /// any `install_snapshot`), the state machine recomputes
+    /// `partition_table.partitions_for_node(self.node_id)` and sends it on
+    /// `sender` if the set changed. The pipeline source loop subscribes to
+    /// `sender.subscribe()` so it can `reassign_partitions()` the live source
+    /// without tearing down the task on a CL-6 transfer commit.
+    ///
+    /// `sender.send_if_modified` is the fast path — identical lists skip the
+    /// channel push so receivers are only woken on real ownership churn.
+    pub struct OwnedPartitionsWatch {
+        pub node_id: NodeId,
+        pub sender: tokio::sync::watch::Sender<Vec<PartitionId>>,
+    }
+
+    /// Cloneable slot for installing an `OwnedPartitionsWatch` after the
+    /// state machine has been handed to `Raft::new`. Mirrors
+    /// `RegistryApplierSlot`.
+    pub type OwnedPartitionsWatchSlot =
+        Arc<tokio::sync::RwLock<Option<OwnedPartitionsWatch>>>;
 
     // Manual Debug impl to avoid exposing encryption key
     impl Debug for StateMachineStore {
@@ -225,6 +256,7 @@ mod inner {
                 shared_state: Arc::new(tokio::sync::RwLock::new(ClusterSnapshot::default())),
                 snapshot_store: None,
                 registry_applier: Arc::new(tokio::sync::RwLock::new(None)),
+                owned_partitions_watch: Arc::new(tokio::sync::RwLock::new(None)),
             }
         }
 
@@ -234,6 +266,36 @@ mod inner {
         /// the state machine itself.
         pub fn applier_slot(&self) -> RegistryApplierSlot {
             Arc::clone(&self.registry_applier)
+        }
+
+        /// P5: cloneable handle to the owned-partitions watch slot. The
+        /// `ClusterNode` fills this in after bootstrap, once the node's
+        /// own `node_id` is known and a `watch::Sender` has been paired
+        /// with a receiver to hand out to subscribers.
+        pub fn owned_partitions_watch_slot(&self) -> OwnedPartitionsWatchSlot {
+            Arc::clone(&self.owned_partitions_watch)
+        }
+
+        /// P5: broadcast the current owned-partitions slice for the
+        /// locally-installed node id, if any, and only when the set
+        /// differs from the last value observed on the watch. Callers
+        /// invoke this after any in-place mutation of `self.state`.
+        async fn broadcast_owned_partitions(&self) {
+            let guard = self.owned_partitions_watch.read().await;
+            let Some(watch) = guard.as_ref() else { return };
+            let mut owned: Vec<PartitionId> = self
+                .state
+                .partition_table
+                .partitions_for_node(watch.node_id);
+            owned.sort_unstable();
+            watch.sender.send_if_modified(|current| {
+                if *current == owned {
+                    false
+                } else {
+                    *current = owned.clone();
+                    true
+                }
+            });
         }
 
         /// FT-2: create a state machine backed by a persistent L3 snapshot store.
@@ -334,6 +396,7 @@ mod inner {
                 shared_state: Arc::new(tokio::sync::RwLock::new(ClusterSnapshot::default())),
                 snapshot_store: None,
                 registry_applier: Arc::new(tokio::sync::RwLock::new(None)),
+                owned_partitions_watch: Arc::new(tokio::sync::RwLock::new(None)),
             }
         }
 
@@ -610,6 +673,12 @@ mod inner {
             // Push committed state to the shared read handle.
             *self.shared_state.write().await = self.state.clone();
 
+            // P5: notify subscribers if this node's owned-partitions slice
+            // shifted as a result of this apply batch. Cheap when unchanged
+            // (watch::send_if_modified) and a no-op when no subscriber is
+            // installed.
+            self.broadcast_owned_partitions().await;
+
             Ok(responses)
         }
 
@@ -627,6 +696,7 @@ mod inner {
                 shared_state: Arc::clone(&self.shared_state),
                 snapshot_store: self.snapshot_store.clone(),
                 registry_applier: self.registry_applier.clone(),
+                owned_partitions_watch: Arc::clone(&self.owned_partitions_watch),
             })
         }
 
@@ -683,6 +753,11 @@ mod inner {
 
             // Push restored state to the shared read handle.
             *self.shared_state.write().await = self.state.clone();
+
+            // P5: a snapshot install can jump ownership without going through
+            // individual CompleteTransfer entries, so recompute + broadcast
+            // the owned-partitions set for the local node here too.
+            self.broadcast_owned_partitions().await;
 
             Ok(())
         }
@@ -1032,6 +1107,64 @@ mod inner {
             let state = store.get_log_state().await.unwrap();
             assert!(state.last_log_id.is_none());
             assert!(state.last_purged_log_id.is_none());
+        }
+
+        // ── P5: owned-partitions watch tests ────────────────────────────
+        #[tokio::test]
+        async fn owned_partitions_watch_broadcasts_on_change() {
+            let sm = StateMachineStore::new();
+            let slot = sm.owned_partitions_watch_slot();
+
+            let (sender, mut rx) =
+                tokio::sync::watch::channel(Vec::<PartitionId>::new());
+            *slot.write().await = Some(OwnedPartitionsWatch {
+                node_id: 7,
+                sender,
+            });
+
+            // Mutate state so node 7 owns P0 and P2; P1 goes elsewhere.
+            let mut sm = sm;
+            sm.state.partition_table.assign(PartitionId::new(0), 7);
+            sm.state.partition_table.assign(PartitionId::new(1), 3);
+            sm.state.partition_table.assign(PartitionId::new(2), 7);
+
+            sm.broadcast_owned_partitions().await;
+            assert!(rx.has_changed().unwrap());
+            let owned = rx.borrow_and_update().clone();
+            assert_eq!(
+                owned,
+                vec![PartitionId::new(0), PartitionId::new(2)]
+            );
+        }
+
+        #[tokio::test]
+        async fn owned_partitions_watch_noop_when_unchanged() {
+            let sm = StateMachineStore::new();
+            let slot = sm.owned_partitions_watch_slot();
+            let (sender, mut rx) =
+                tokio::sync::watch::channel(Vec::<PartitionId>::new());
+            *slot.write().await = Some(OwnedPartitionsWatch {
+                node_id: 7,
+                sender,
+            });
+
+            let mut sm = sm;
+            sm.state.partition_table.assign(PartitionId::new(0), 7);
+            sm.broadcast_owned_partitions().await;
+            assert!(rx.has_changed().unwrap());
+            rx.borrow_and_update();
+
+            // Second broadcast with no state change must not fire.
+            sm.broadcast_owned_partitions().await;
+            assert!(!rx.has_changed().unwrap());
+        }
+
+        #[tokio::test]
+        async fn owned_partitions_watch_noop_without_subscriber() {
+            let mut sm = StateMachineStore::new();
+            sm.state.partition_table.assign(PartitionId::new(0), 7);
+            // No slot installed — broadcast must be safe and silent.
+            sm.broadcast_owned_partitions().await;
         }
     }
 }

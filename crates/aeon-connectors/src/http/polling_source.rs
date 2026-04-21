@@ -4,8 +4,8 @@
 //! body as a single Event. No backpressure buffer needed — the polling
 //! interval provides natural flow control.
 
-use aeon_types::{AeonError, Backoff, BackoffPolicy, Event, PartitionId, Source};
-use std::sync::Arc;
+use aeon_types::{AeonError, Backoff, BackoffPolicy, CoreLocalUuidGenerator, Event, PartitionId, Source};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Configuration for `HttpPollingSource`.
@@ -83,6 +83,9 @@ pub struct HttpPollingSource {
     last_poll: Option<tokio::time::Instant>,
     /// TR-3: backoff state — advanced on every failure, reset on success.
     backoff: Backoff,
+    /// Per-source UUIDv7 generator (SPSC pool, ~1-2ns per UUID).
+    /// Mutex for Sync (Source: Send + Sync), only accessed in next_batch.
+    uuid_gen: Mutex<CoreLocalUuidGenerator>,
 }
 
 impl HttpPollingSource {
@@ -96,11 +99,13 @@ impl HttpPollingSource {
         tracing::info!(url = %config.url, interval = ?config.interval, "HttpPollingSource created");
 
         let backoff = Backoff::new(config.backoff);
+        let uuid_gen = CoreLocalUuidGenerator::new(0);
         Ok(Self {
             config,
             client,
             last_poll: None,
             backoff,
+            uuid_gen: Mutex::new(uuid_gen),
         })
     }
 }
@@ -179,8 +184,14 @@ impl Source for HttpPollingSource {
             return Ok(Vec::new());
         }
 
+        let event_id = self
+            .uuid_gen
+            .lock()
+            .map_err(|_| AeonError::connection("UUID generator mutex poisoned"))?
+            .next_uuid();
+
         let event = Event::new(
-            uuid::Uuid::nil(),
+            event_id,
             0,
             Arc::clone(&self.config.source_name),
             PartitionId::new(0),

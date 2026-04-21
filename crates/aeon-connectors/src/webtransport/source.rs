@@ -5,7 +5,7 @@
 //! Push-source with three-phase backpressure.
 
 use crate::push_buffer::{PushBufferConfig, PushBufferRx, push_buffer};
-use aeon_types::{AeonError, Event, PartitionId, Source};
+use aeon_types::{AeonError, CoreLocalUuidGenerator, Event, PartitionId, Source};
 use bytes::Bytes;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -128,7 +128,9 @@ async fn wt_accept_loop(
                 let source_name = Arc::clone(&source_name);
 
                 tokio::spawn(async move {
-                    if let Err(e) = handle_wt_stream(stream, tx, source_name).await {
+                    // Per-stream UUID generator — each task owns its own.
+                    let id_gen = CoreLocalUuidGenerator::new(0);
+                    if let Err(e) = handle_wt_stream(stream, tx, source_name, id_gen).await {
                         tracing::debug!(error = %e, "webtransport stream error");
                     }
                 });
@@ -141,6 +143,7 @@ async fn handle_wt_stream(
     (mut send, mut recv): (wtransport::SendStream, wtransport::RecvStream),
     tx: crate::push_buffer::PushBufferTx,
     source_name: Arc<str>,
+    mut id_gen: CoreLocalUuidGenerator,
 ) -> Result<(), AeonError> {
     loop {
         // Phase 3: backpressure signal
@@ -168,7 +171,7 @@ async fn handle_wt_stream(
             .map_err(|e| AeonError::connection(format!("webtransport read payload failed: {e}")))?;
 
         let event = Event::new(
-            uuid::Uuid::nil(),
+            id_gen.next_uuid(),
             0,
             Arc::clone(&source_name),
             PartitionId::new(0),

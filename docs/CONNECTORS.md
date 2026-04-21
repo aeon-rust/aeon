@@ -332,6 +332,59 @@ let mut source = HttpWebhookSource::new(config).await?;
 | `buffer_config` | `PushBufferConfig` | default | Push buffer settings |
 | `poll_timeout` | `Duration` | `1s` | Timeout for first event in `next_batch()` |
 
+**Handler semantics.** Each accepted POST becomes one `Event`:
+`id = Uuid::now_v7()`, `timestamp = SystemTime::now()` epoch nanos,
+`source` = the configured `source_name`, `partition = PartitionId(0)`,
+`payload = body.bytes()` (zero-copy — axum already gives us a `Bytes`).
+Responses: **202 Accepted** when buffered, **503 Service Unavailable** when
+`PushBufferTx::is_overloaded()` is set (Phase 3 of the shared three-phase
+contract — see the "Overview" section), **500 Internal Server Error** if
+the buffer channel has been closed. A `GET /health` endpoint returns `200 ok`
+for load-balancer probes.
+
+**Pipeline manifest** (since V4, 2026-04-20; registered as
+`type: http-webhook` in the CLI connector registry):
+
+```yaml
+sources:
+  - name: ingest
+    type: http-webhook
+    config:
+      bind_addr: "0.0.0.0:8088"       # required
+      path: "/webhook"                 # optional — default /webhook
+      source_name: "ingest"            # optional — default http-webhook
+      channel_capacity: "8192"         # optional — Phase 1 bounded mpsc
+      batch_size: "1024"               # optional — drain cap per next_batch()
+      poll_timeout_ms: "1000"          # optional — first-event wait
+```
+
+All `config` values are strings (Aeon's manifest schema is a
+`BTreeMap<String, String>` per source); numeric fields are parsed at factory
+build time.
+
+Smoke test (a working pipeline manifest sits at
+`tmp/http-webhook-smoke.yaml`):
+
+```bash
+# Start aeon with the manifest, then:
+curl -X POST http://127.0.0.1:8088/webhook \
+     -H 'content-type: application/json' \
+     -d '{"event":"click","user":"alice"}'
+# → HTTP 202
+```
+
+The remaining push sources (WebSocket, MQTT, RabbitMQ, QUIC, WebTransport,
+MongoDB CDC) follow the same three-phase push-buffer contract but are not
+yet wired into the CLI registry — see `docs/ROADMAP.md` §Phase 5 (P5.c).
+
+> **Engine caveat (P5.d).** The current `pipeline.rs` source loops treat an
+> empty `next_batch()` as EOF and exit, which is correct for Pull sources
+> but wrong for Push/Poll. In practice the HTTP webhook pipeline runs as
+> long as events keep arriving within `poll_timeout_ms` of one another;
+> a longer lull cleanly shuts the pipeline down. For continuous-stream
+> production use, set `poll_timeout_ms` higher than your expected
+> inter-event gap until the kind-aware dispatch fix lands (P5.d).
+
 ---
 
 ### WebSocket

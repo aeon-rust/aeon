@@ -127,6 +127,27 @@ pub trait Source: Send + Sync {
     ) -> impl std::future::Future<Output = Result<(), AeonError>> + Send {
         async { Ok(()) }
     }
+
+    /// P5: re-assign the partitions this source should be reading from.
+    ///
+    /// Called by the pipeline source loop when the cluster's replicated
+    /// partition table records an ownership change for the local node
+    /// (CL-6 transfer commit). The caller hands the new owned set; the
+    /// source must rewire its upstream binding so subsequent `next_batch`
+    /// reads from exactly those partitions — adding new ones, dropping
+    /// ones that moved away, keeping unchanged ones with their current
+    /// offsets.
+    ///
+    /// Default: no-op — single-partition and Push/Poll sources that don't
+    /// model partitions ignore this safely. Partitioned pull connectors
+    /// (Kafka today) override to re-issue `consumer.assign()` without
+    /// tearing down the pipeline task.
+    fn reassign_partitions(
+        &mut self,
+        _partitions: &[u16],
+    ) -> impl std::future::Future<Output = Result<(), AeonError>> + Send {
+        async { Ok(()) }
+    }
 }
 
 /// Event delivery sink. Batch-first: accepts `Vec<Output>` per flush.

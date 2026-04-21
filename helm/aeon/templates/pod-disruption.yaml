@@ -1,0 +1,52 @@
+{{/*
+  Aeon pod disruption policy (ROADMAP B3).
+
+  The Kubernetes object kind is `PodDisruptionBudget` — that identifier is
+  fixed by the K8s API. Everywhere Aeon controls the naming (values key,
+  comments, docs) we use "pod disruption policy" per the project's
+  Capacity-not-Budget convention.
+
+  Purpose: cap how many Aeon pods can be voluntarily evicted at once
+  (kubectl drain, node upgrades, cluster-autoscaler scale-down). Without
+  this, one `kubectl drain` of a node can remove a Raft quorum member
+  while another replica is still rolling — taking the cluster to
+  unavailable for writes until the drain completes.
+
+  minAvailable default: floor(N/2) + 1, the Raft quorum floor. For N=3
+  that is 2 (one pod may be disrupted at a time). For N=5 it is 3. This
+  matches openraft's quorum rule and keeps the cluster always-writable
+  through single-node voluntary disruption.
+
+  Disabled by default to stay non-surprising for single-replica
+  deployments and CI — enable explicitly via `podDisruption.enabled`.
+*/}}
+{{- if .Values.podDisruption.enabled }}
+{{- $replicas := 1 | int -}}
+{{- if .Values.cluster.enabled -}}
+  {{- $replicas = .Values.cluster.replicas | int -}}
+{{- else if .Values.autoscaling.enabled -}}
+  {{- $replicas = .Values.autoscaling.minReplicas | int -}}
+{{- else -}}
+  {{- $replicas = .Values.replicaCount | int -}}
+{{- end -}}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ .Release.Name }}
+  labels:
+    app.kubernetes.io/name: aeon
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  {{- if .Values.podDisruption.maxUnavailable }}
+  maxUnavailable: {{ .Values.podDisruption.maxUnavailable }}
+  {{- else if .Values.podDisruption.minAvailable }}
+  minAvailable: {{ .Values.podDisruption.minAvailable }}
+  {{- else }}
+  # Auto-computed Raft quorum floor: floor(N/2) + 1.
+  minAvailable: {{ add (div $replicas 2) 1 }}
+  {{- end }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: aeon
+      app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end }}

@@ -5,7 +5,7 @@
 //! Phase 3 backpressure: when overloaded, uses basic.cancel to stop delivery.
 
 use crate::push_buffer::{PushBufferConfig, PushBufferRx, push_buffer};
-use aeon_types::{AeonError, BackoffPolicy, Event, PartitionId, Source};
+use aeon_types::{AeonError, BackoffPolicy, CoreLocalUuidGenerator, Event, PartitionId, Source};
 use bytes::Bytes;
 use lapin::options::*;
 use lapin::types::FieldTable;
@@ -183,6 +183,7 @@ async fn connect_and_consume(
 
 async fn rabbitmq_reader(config: RabbitMqSourceConfig, tx: crate::push_buffer::PushBufferTx) {
     let mut backoff = config.backoff.iter();
+    let mut uuid_gen = CoreLocalUuidGenerator::new(0);
 
     // Outer reconnect loop. Each iteration owns a fresh
     // Connection+Channel+Consumer triple. On any disconnect the inner loop
@@ -205,7 +206,7 @@ async fn rabbitmq_reader(config: RabbitMqSourceConfig, tx: crate::push_buffer::P
             }
         };
 
-        if !drive_consumer(consumer, &channel, &tx, &config.source_name).await {
+        if !drive_consumer(consumer, &channel, &tx, &config.source_name, &mut uuid_gen).await {
             // Buffer closed — drop the connection and exit cleanly.
             drop(channel);
             drop(conn);
@@ -232,6 +233,7 @@ async fn drive_consumer(
     channel: &Channel,
     tx: &crate::push_buffer::PushBufferTx,
     source_name: &Arc<str>,
+    uuid_gen: &mut CoreLocalUuidGenerator,
 ) -> bool {
     use futures_util::StreamExt;
 
@@ -253,7 +255,7 @@ async fn drive_consumer(
 
                 let payload = Bytes::from(delivery.data.clone());
                 let mut event = Event::new(
-                    uuid::Uuid::nil(),
+                    uuid_gen.next_uuid(),
                     0,
                     Arc::clone(source_name),
                     PartitionId::new(0),

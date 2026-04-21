@@ -353,6 +353,15 @@ enum ClusterAction {
     /// Must be issued against the current Raft leader. Follower replies carry
     /// `X-Leader-Id` — rerun against that node.
     Rebalance,
+    /// Ask the Raft leader to remove THIS node from the cluster.
+    ///
+    /// Issued against the local node's API (typically `http://localhost:4471`
+    /// from inside the pod). The server reads its own `node_id`, forwards a
+    /// `RemoveNodeRequest` to the current leader, and returns the result. If
+    /// this node IS the leader the request is rejected with 409 — transfer
+    /// leadership first. Used by the K8s preStop hook so scale-down doesn't
+    /// leave a stale voter behind.
+    Leave,
 }
 
 #[derive(Subcommand)]
@@ -524,6 +533,73 @@ fn run(cli: Cli) -> Result<()> {
 }
 
 // ── Server ────────────────────────────────────────────────────────────
+
+/// G11.b — build and install the leader-side `PartitionTransferDriver`
+/// for the given `pipeline_name`. Called either from the env-var branch
+/// at boot (`AEON_PIPELINE_NAME` set) or from the auto-discovery watcher
+/// once the single-pipeline-per-node assumption is satisfied. Spawning
+/// the watch loop here ties it to the node's shutdown flag.
+#[cfg(feature = "rest-api")]
+async fn install_partition_transfer_driver(
+    endpoint: std::sync::Arc<aeon_cluster::transport::endpoint::QuicEndpoint>,
+    node: std::sync::Arc<aeon_cluster::ClusterNode>,
+    supervisor: std::sync::Arc<aeon_engine::PipelineSupervisor>,
+    l2_root: String,
+    poh_mode: aeon_crypto::poh::PohVerifyMode,
+    pipeline_name: String,
+) -> anyhow::Result<()> {
+    use std::sync::Arc;
+
+    let seg_installer = Arc::new(aeon_engine::L2SegmentInstaller::new(
+        &l2_root,
+        &pipeline_name,
+    ));
+
+    let poh_registry = aeon_engine::InstalledPohChainRegistry::new();
+    let poh_installer = Arc::new(aeon_engine::PohChainInstallerImpl::new(
+        poh_registry.clone(),
+        poh_mode,
+    ));
+
+    // G11.c: the supervisor reads from the same registry the installer
+    // writes to, so a chain installed during CL-6 handover is picked up
+    // by `create_poh_state` when the post-transfer pipeline task starts
+    // on this node. Without this, every ownership flip would restart
+    // the PoH chain at sequence 0 and Gate 2's "PoH chain has no gaps
+    // across transfers" row can't pass.
+    supervisor
+        .set_poh_installed_chains(Arc::new(poh_registry.clone()))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let resolver: Arc<dyn aeon_cluster::NodeResolver> =
+        Arc::new(aeon_cluster::RaftNodeResolver::new(node.raft().clone()));
+
+    let driver = Arc::new(aeon_cluster::PartitionTransferDriver::new(
+        Arc::clone(&endpoint),
+        node.raft().clone(),
+        node.shared_state(),
+        resolver,
+        node.config().node_id,
+        pipeline_name.clone(),
+        seg_installer,
+        poh_installer,
+    ));
+
+    node.install_transfer_driver(Arc::clone(&driver)).await;
+
+    let driver_shutdown = node.shutdown_flag();
+    let driver_for_loop = Arc::clone(&driver);
+    tokio::spawn(async move {
+        driver_for_loop.watch_loop(driver_shutdown).await;
+    });
+
+    tracing::info!(
+        pipeline = %pipeline_name,
+        l2_root = %l2_root,
+        "PartitionTransferDriver spawned — transfers will drive automatically"
+    );
+    Ok(())
+}
 
 #[cfg(feature = "rest-api")]
 fn cmd_serve(addr: &str, artifact_dir: &str) -> Result<()> {
@@ -711,7 +787,12 @@ fn cmd_serve(addr: &str, artifact_dir: &str) -> Result<()> {
                             aeon_engine::ClusterPartitionOwnership::new(
                                 node.shared_state(),
                                 node.config().node_id,
-                            ),
+                            )
+                            // P5: attach the cluster-side owned-partitions
+                            // watch so the pipeline source loop can
+                            // reassign_partitions on a CL-6 transfer commit
+                            // without a pipeline restart.
+                            .with_watch(node.watch_owned_partitions()),
                         ))
                         .map_err(|e| {
                             anyhow::anyhow!("install ownership resolver: {e}")
@@ -720,81 +801,111 @@ fn cmd_serve(addr: &str, artifact_dir: &str) -> Result<()> {
                     // G11.b — spawn the leader-side partition-transfer driver.
                     // Without this, Raft-committed `Transferring` entries never
                     // drive the three-step CL-6 handover and T4 / T2 cutovers
-                    // stall with `owner=null` forever. We gate on an explicit
-                    // pipeline name (single-pipeline deployment assumption —
-                    // see partition_driver.rs) — if unset, skip driver setup
-                    // and log. The driver itself is a no-op on nodes that are
-                    // never picked as a transfer target.
+                    // stall with `owner=null` forever.
+                    //
+                    // Activation: the driver is bound to a single pipeline name
+                    // (single-pipeline-per-node assumption — see
+                    // partition_driver.rs). Two paths to discover that name:
+                    //   1. Explicit — `AEON_PIPELINE_NAME` env var (operator
+                    //      set via helm `cluster.pipelineName`). Installs now.
+                    //   2. Auto — env var unset. Spawn a watcher that polls
+                    //      the pipeline catalog; once exactly one pipeline is
+                    //      registered, install the driver bound to its name.
+                    //      Matches the common case where the operator deploys
+                    //      Aeon first, then creates their pipeline via REST.
+                    //
+                    // If multiple pipelines coexist on a node the watcher
+                    // stays dormant — driver install requires an operator
+                    // explicitly setting the env var.
+                    let poh_mode: aeon_crypto::poh::PohVerifyMode = poh_mode_str
+                        .parse()
+                        .map_err(|e| anyhow::anyhow!(
+                            "invalid cluster.poh_verify_mode '{poh_mode_str}': {e}"
+                        ))?;
+                    let l2_root = std::env::var("AEON_L2_ROOT").unwrap_or_else(|_| {
+                        format!("{dir}/l2body")
+                    });
+
                     if let Ok(pipeline_name) = std::env::var("AEON_PIPELINE_NAME") {
-                        let poh_mode: aeon_crypto::poh::PohVerifyMode = poh_mode_str
-                            .parse()
-                            .map_err(|e| anyhow::anyhow!(
-                                "invalid cluster.poh_verify_mode '{poh_mode_str}': {e}"
-                            ))?;
-
-                        let l2_root = std::env::var("AEON_L2_ROOT").unwrap_or_else(|_| {
-                            format!("{dir}/l2body")
-                        });
-                        let seg_installer = Arc::new(
-                            aeon_engine::L2SegmentInstaller::new(&l2_root, &pipeline_name),
-                        );
-
-                        let poh_registry = aeon_engine::InstalledPohChainRegistry::new();
-                        let poh_installer = Arc::new(
-                            aeon_engine::PohChainInstallerImpl::new(
-                                poh_registry.clone(),
-                                poh_mode,
-                            ),
-                        );
-
-                        // G11.c: the supervisor reads from the same registry
-                        // the installer writes to, so a chain installed during
-                        // CL-6 handover is picked up by `create_poh_state`
-                        // when the post-transfer pipeline task starts on this
-                        // node. Without this, every ownership flip would
-                        // restart the PoH chain at sequence 0 and Gate 2's
-                        // "PoH chain has no gaps across transfers" row can't
-                        // pass.
-                        supervisor
-                            .set_poh_installed_chains(Arc::new(poh_registry.clone()))
-                            .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-                        let resolver: Arc<dyn aeon_cluster::NodeResolver> =
-                            Arc::new(aeon_cluster::RaftNodeResolver::new(
-                                node.raft().clone(),
-                            ));
-
-                        let driver = Arc::new(aeon_cluster::PartitionTransferDriver::new(
+                        install_partition_transfer_driver(
                             Arc::clone(&endpoint),
-                            node.raft().clone(),
-                            node.shared_state(),
-                            resolver,
-                            node.config().node_id,
-                            pipeline_name.clone(),
-                            seg_installer,
-                            poh_installer,
-                        ));
-
-                        node.install_transfer_driver(Arc::clone(&driver)).await;
-
-                        let driver_shutdown = node.shutdown_flag();
-                        let driver_for_loop = Arc::clone(&driver);
-                        tokio::spawn(async move {
-                            driver_for_loop.watch_loop(driver_shutdown).await;
-                        });
-
-                        tracing::info!(
-                            pipeline = %pipeline_name,
-                            verify_mode = %poh_mode_str,
-                            l2_root = %l2_root,
-                            "PartitionTransferDriver spawned — transfers will drive automatically"
-                        );
+                            Arc::clone(&node),
+                            Arc::clone(&supervisor),
+                            l2_root,
+                            poh_mode,
+                            pipeline_name,
+                        )
+                        .await?;
                     } else {
-                        tracing::warn!(
-                            "AEON_PIPELINE_NAME unset — skipping PartitionTransferDriver. \
-                             Raft-committed partition transfers will not make progress \
-                             on this node. Set AEON_PIPELINE_NAME to enable CL-6 handover."
+                        tracing::info!(
+                            "AEON_PIPELINE_NAME unset — auto-discovering pipeline name \
+                             from the Raft-replicated catalog. \
+                             PartitionTransferDriver installs once exactly one pipeline \
+                             is registered."
                         );
+                        let endpoint_disc = Arc::clone(&endpoint);
+                        let node_disc = Arc::clone(&node);
+                        let supervisor_disc = Arc::clone(&supervisor);
+                        let pipelines_disc = Arc::clone(&pipelines);
+                        let shutdown_flag = node.shutdown_flag();
+                        tokio::spawn(async move {
+                            let mut interval = tokio::time::interval(
+                                std::time::Duration::from_secs(2),
+                            );
+                            interval.set_missed_tick_behavior(
+                                tokio::time::MissedTickBehavior::Delay,
+                            );
+                            let mut logged_ambiguous = false;
+                            loop {
+                                if shutdown_flag
+                                    .load(std::sync::atomic::Ordering::Relaxed)
+                                {
+                                    return;
+                                }
+                                interval.tick().await;
+                                let names = pipelines_disc.list().await;
+                                match names.len() {
+                                    0 => {}
+                                    1 => {
+                                        let name = names.into_iter().next().unwrap();
+                                        tracing::info!(
+                                            pipeline = %name,
+                                            "auto-discovered pipeline; installing \
+                                             PartitionTransferDriver"
+                                        );
+                                        if let Err(e) = install_partition_transfer_driver(
+                                            endpoint_disc,
+                                            node_disc,
+                                            supervisor_disc,
+                                            l2_root,
+                                            poh_mode,
+                                            name,
+                                        )
+                                        .await
+                                        {
+                                            tracing::error!(
+                                                error = %e,
+                                                "failed to install PartitionTransferDriver \
+                                                 after auto-discovery"
+                                            );
+                                        }
+                                        return;
+                                    }
+                                    n => {
+                                        if !logged_ambiguous {
+                                            tracing::warn!(
+                                                count = n,
+                                                "AEON_PIPELINE_NAME unset and multiple \
+                                                 pipelines registered; \
+                                                 PartitionTransferDriver will not \
+                                                 auto-install. Set the env var to pick one."
+                                            );
+                                            logged_ambiguous = true;
+                                        }
+                                    }
+                                }
+                            }
+                        });
                     }
 
                     // Spawn background task for leader election + partition assignment.
@@ -1703,6 +1814,10 @@ fn cmd_cluster(api: &str, action: &ClusterAction) -> Result<()> {
         ClusterAction::Rebalance => {
             let url = format!("{api}/api/v1/cluster/rebalance");
             post_cluster_mutation(&url, None, "rebalance")
+        }
+        ClusterAction::Leave => {
+            let url = format!("{api}/api/v1/cluster/leave");
+            post_cluster_mutation(&url, None, "leave")
         }
     }
 }

@@ -105,11 +105,22 @@ spec:
           lifecycle:
             preStop:
               exec:
-                # Small delay so kube-proxy / service endpoints observe the
-                # pod as Terminating before the container receives SIGTERM.
-                # Aeon's in-process signal handler performs its own drain —
-                # this hook only bridges the iptables update window.
-                command: ["/bin/sh", "-c", "sleep {{ .Values.gracefulShutdown.preStopDelaySeconds }}"]
+                # Two-step graceful scale-down:
+                #   1. `aeon cluster leave` asks the Raft leader to remove this
+                #      pod from the voter set so the partition table rebalances
+                #      away before SIGTERM. `|| true` ensures the pod still
+                #      terminates cleanly if this node happens to be leader
+                #      (leader can't remove itself) or the API is unreachable.
+                #   2. `sleep` bridges the iptables/kube-proxy endpoint-removal
+                #      window so in-flight traffic observes the pod as
+                #      Terminating before the container process exits. Aeon's
+                #      in-process SIGTERM handler performs the final drain.
+                command:
+                  - /bin/sh
+                  - -c
+                  - >-
+                    aeon cluster leave --api http://localhost:{{ .Values.ports.api }} || true;
+                    sleep {{ .Values.gracefulShutdown.preStopDelaySeconds }}
           ports:
             - name: quic
               containerPort: {{ .Values.ports.quic }}

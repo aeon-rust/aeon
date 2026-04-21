@@ -17,6 +17,7 @@ use crate::delivery::{CheckpointBackend, DeliveryConfig};
 use crate::delivery_ledger::DeliveryLedger;
 use aeon_types::{
     AeonError, BatchFailurePolicy, Event, Output, PartitionId, Processor, Sink, Source,
+    SourceKind,
 };
 use std::any::Any;
 use std::collections::HashMap;
@@ -186,6 +187,14 @@ pub struct PipelineConfig {
     /// partition handover (local/test use), and the gate check compiles to
     /// a single branch.
     pub write_gate: Option<Arc<crate::write_gate::WriteGate>>,
+    /// P5: optional subscription to this node's owned-partitions slice.
+    /// When `Some`, the source loop in `run_buffered_managed` selects over
+    /// `next_batch()` and `changed()`; on every committed ownership change
+    /// it calls `source.reassign_partitions(&new)` so partitioned pulls
+    /// (Kafka) re-issue `consumer.assign()` without tearing down the task.
+    /// `None` keeps the legacy one-shot resolve-at-start behaviour used by
+    /// tests, benches, and the single-node path.
+    pub partition_reassign: Option<tokio::sync::watch::Receiver<Vec<u16>>>,
 }
 
 impl Default for PipelineConfig {
@@ -209,6 +218,7 @@ impl Default for PipelineConfig {
             eo2_shared_ack_tracker: None,
             partition_id: PartitionId::new(0),
             write_gate: None,
+            partition_reassign: None,
         }
     }
 }
@@ -392,10 +402,17 @@ where
     P: Processor,
     K: Sink,
 {
+    let source_kind = source.source_kind();
     while !shutdown.load(Ordering::Relaxed) {
         let events = source.next_batch().await?;
         if events.is_empty() {
-            break;
+            match source_kind {
+                SourceKind::Pull => break,
+                SourceKind::Push | SourceKind::Poll => {
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+            }
         }
 
         let count = events.len() as u64;
@@ -432,10 +449,17 @@ where
     P: Processor,
     K: Sink,
 {
+    let source_kind = source.source_kind();
     while !shutdown.load(Ordering::Relaxed) {
         let events = source.next_batch().await?;
         if events.is_empty() {
-            break;
+            match source_kind {
+                SourceKind::Pull => break,
+                SourceKind::Push | SourceKind::Poll => {
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+            }
         }
 
         let count = events.len() as u64;
@@ -720,7 +744,13 @@ where
                 Err(e) => return Err(e),
             };
             if events.is_empty() {
-                break;
+                match source_kind {
+                    SourceKind::Pull => break,
+                    SourceKind::Push | SourceKind::Poll => {
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
+                }
             }
             metrics_src
                 .events_received
@@ -933,7 +963,13 @@ where
                 Err(e) => return Err(e),
             };
             if events.is_empty() {
-                break;
+                match source_kind {
+                    SourceKind::Pull => break,
+                    SourceKind::Push | SourceKind::Poll => {
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
+                }
             }
             metrics_src
                 .events_received
@@ -1232,6 +1268,10 @@ where
             eo2_shared_ack_tracker: config.pipeline.eo2_shared_ack_tracker.clone(),
             partition_id,
             write_gate,
+            // run_multi_partition owns per-partition sub-tasks that are
+            // each pinned to a single partition id — dynamic re-assign at
+            // the per-task level is not meaningful. Leave disabled.
+            partition_reassign: None,
         };
 
         if let Some(ref assignments) = core_assignments {
@@ -2124,6 +2164,11 @@ where
     let shutdown_src = Arc::clone(&shutdown);
     let metrics_src = Arc::clone(&metrics);
     let control_src = Arc::clone(&control);
+    // P5: take the caller's owned-partitions watch by value into the source
+    // task. Checked non-blockingly between batches so a CL-6 transfer commit
+    // triggers `source.reassign_partitions(&new)` on the live source instead
+    // of a pipeline restart.
+    let mut reassign_rx = config.partition_reassign.clone();
 
     // Source task: identical to run_buffered, but checks control.paused.
     // When paused, checks for source swap before yielding.
@@ -2132,7 +2177,30 @@ where
         if let Some(core) = source_core {
             pin_to_core(core);
         }
+        let mut source_kind = source.source_kind();
         while !shutdown_src.load(Ordering::Relaxed) {
+            // P5: re-assign partitions if the cluster watch has advanced
+            // since the last iteration. Non-blocking — returns `Err` if the
+            // sender has dropped (cluster tore down) in which case we keep
+            // running on the last known assignment.
+            if let Some(rx) = reassign_rx.as_mut() {
+                if rx.has_changed().unwrap_or(false) {
+                    let new_partitions: Vec<u16> = rx.borrow_and_update().clone();
+                    if let Err(e) = source.reassign_partitions(&new_partitions).await {
+                        tracing::error!(
+                            error = %e,
+                            partitions = ?new_partitions,
+                            "source reassign_partitions failed; exiting source task"
+                        );
+                        return Err(e);
+                    }
+                    tracing::info!(
+                        partitions = ?new_partitions,
+                        "source re-assigned to new owned-partitions slice"
+                    );
+                }
+            }
+
             // Pause check: check for source swap, then yield
             if control_src.paused.load(Ordering::Acquire) {
                 // Check if a new source has been placed in the swap slot.
@@ -2143,6 +2211,7 @@ where
                     if let Some(new_source_any) = slot.take() {
                         if let Ok(new_source) = new_source_any.downcast::<S>() {
                             source = *new_source;
+                            source_kind = source.source_kind();
                             control_src.swap_complete.notify_one();
                         }
                     }
@@ -2161,7 +2230,13 @@ where
                 if control_src.paused.load(Ordering::Acquire) {
                     continue;
                 }
-                break;
+                match source_kind {
+                    SourceKind::Pull => break,
+                    SourceKind::Push | SourceKind::Poll => {
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
+                }
             }
             metrics_src
                 .events_received
@@ -4633,6 +4708,27 @@ mod tests {
                 .collect()
         }
 
+        /// Push/Poll sources now treat empty `next_batch()` as a lull (not EOF),
+        /// so finite-batch test sources no longer self-terminate. This spawns
+        /// a watcher that flips `shutdown` once `events_received` reaches the
+        /// target, after a short grace to let downstream tasks drain.
+        fn shutdown_after_target(
+            metrics: Arc<PipelineMetrics>,
+            shutdown: Arc<AtomicBool>,
+            target: u64,
+        ) -> tokio::task::JoinHandle<()> {
+            tokio::spawn(async move {
+                loop {
+                    if metrics.events_received.load(Ordering::Relaxed) >= target {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        shutdown.store(true, Ordering::Release);
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+        }
+
         #[tokio::test]
         async fn push_source_writes_l2_when_durability_requires_it() {
             let tmp = tempfile::tempdir().unwrap();
@@ -4654,9 +4750,12 @@ mod tests {
             let metrics = Arc::new(PipelineMetrics::new());
             let shutdown = Arc::new(AtomicBool::new(false));
 
+            let stopper =
+                shutdown_after_target(Arc::clone(&metrics), Arc::clone(&shutdown), 50);
             run_buffered(source, processor, sink, config, metrics.clone(), shutdown, None)
                 .await
                 .unwrap();
+            stopper.await.unwrap();
 
             assert_eq!(metrics.events_received.load(Ordering::Relaxed), 50);
             // Registry must have opened a store for partition 0.
@@ -4699,6 +4798,8 @@ mod tests {
             let metrics = Arc::new(PipelineMetrics::new());
             let shutdown = Arc::new(AtomicBool::new(false));
 
+            // Pull source: MemorySource returns empty when drained, which the
+            // engine still treats as EOF, so no watcher is required here.
             run_buffered(source, processor, sink, config, metrics.clone(), shutdown, None)
                 .await
                 .unwrap();
@@ -4733,9 +4834,12 @@ mod tests {
             let metrics = Arc::new(PipelineMetrics::new());
             let shutdown = Arc::new(AtomicBool::new(false));
 
+            let stopper =
+                shutdown_after_target(Arc::clone(&metrics), Arc::clone(&shutdown), 20);
             run_buffered(source, processor, sink, config, metrics.clone(), shutdown, None)
                 .await
                 .unwrap();
+            stopper.await.unwrap();
 
             assert_eq!(metrics.events_received.load(Ordering::Relaxed), 20);
             assert!(registry.keys().is_empty());
@@ -4770,9 +4874,12 @@ mod tests {
             let metrics = Arc::new(PipelineMetrics::new());
             let shutdown = Arc::new(AtomicBool::new(false));
 
+            let stopper =
+                shutdown_after_target(Arc::clone(&metrics), Arc::clone(&shutdown), 30);
             run_buffered(source, processor, sink, config, metrics.clone(), shutdown, None)
                 .await
                 .unwrap();
+            stopper.await.unwrap();
 
             assert_eq!(metrics.events_received.load(Ordering::Relaxed), 30);
             assert_eq!(metrics.outputs_sent.load(Ordering::Relaxed), 30);
@@ -4819,9 +4926,12 @@ mod tests {
             let metrics = Arc::new(PipelineMetrics::new());
             let shutdown = Arc::new(AtomicBool::new(false));
 
+            let stopper =
+                shutdown_after_target(Arc::clone(&metrics), Arc::clone(&shutdown), 30);
             run_buffered(source, processor, sink, config, metrics.clone(), shutdown, None)
                 .await
                 .unwrap();
+            stopper.await.unwrap();
 
             let rendered = eo2_metrics.render_prometheus();
             assert!(
@@ -4873,9 +4983,12 @@ mod tests {
             let metrics = Arc::new(PipelineMetrics::new());
             let shutdown = Arc::new(AtomicBool::new(false));
 
+            let stopper =
+                shutdown_after_target(Arc::clone(&metrics), Arc::clone(&shutdown), 30);
             run_buffered(source, processor, sink, config, metrics.clone(), shutdown, None)
                 .await
                 .unwrap();
+            stopper.await.unwrap();
 
             assert_eq!(metrics.events_received.load(Ordering::Relaxed), 30);
             assert_eq!(metrics.outputs_sent.load(Ordering::Relaxed), 30);
@@ -4969,9 +5082,12 @@ mod tests {
             let metrics = Arc::new(PipelineMetrics::new());
             let shutdown = Arc::new(AtomicBool::new(false));
 
+            let stopper =
+                shutdown_after_target(Arc::clone(&metrics), Arc::clone(&shutdown), 3);
             run_buffered(source, processor, sink, config, metrics.clone(), shutdown, None)
                 .await
                 .unwrap();
+            stopper.await.unwrap();
 
             assert_eq!(
                 captured_calls.load(Ordering::SeqCst),
@@ -4999,9 +5115,12 @@ mod tests {
             let metrics = Arc::new(PipelineMetrics::new());
             let shutdown = Arc::new(AtomicBool::new(false));
 
+            let stopper =
+                shutdown_after_target(Arc::clone(&metrics), Arc::clone(&shutdown), 15);
             run_buffered(source, processor, sink, config, metrics.clone(), shutdown, None)
                 .await
                 .unwrap();
+            stopper.await.unwrap();
 
             assert_eq!(metrics.events_received.load(Ordering::Relaxed), 15);
         }

@@ -425,6 +425,44 @@ mod tests {
     }
 
     #[test]
+    fn nil_uuids_collapse_tracking_slots() {
+        // B1 regression guard: every source must stamp a unique Event.id.
+        // If a source accidentally reverts to Uuid::nil(), N events would
+        // collide into a single ledger slot, and ack(nil) would silently
+        // cover a batch that was never delivered — breaking EOS accounting.
+        //
+        // This test asserts the collapse actually happens for nil, so the
+        // paired `distinct_uuids_get_distinct_slots` guarantees the fix.
+        let ledger = DeliveryLedger::new(3);
+        let nil = uuid::Uuid::nil();
+        for i in 0..5 {
+            ledger.track(nil, PartitionId::new(0), i as i64);
+        }
+        assert_eq!(
+            ledger.len(),
+            1,
+            "nil UUIDs collapse into one slot — this is why Event.id must be UUIDv7"
+        );
+        assert!(ledger.mark_acked(&nil));
+        assert!(ledger.is_empty());
+    }
+
+    #[test]
+    fn distinct_uuids_get_distinct_slots() {
+        // B1 regression guard (positive case): N distinct UUIDv7 ids
+        // produce N tracking slots, and each must be individually acked.
+        let ledger = DeliveryLedger::new(3);
+        let ids: Vec<uuid::Uuid> = (0..100).map(|_| uid()).collect();
+        for (i, id) in ids.iter().enumerate() {
+            ledger.track(*id, PartitionId::new(0), i as i64);
+        }
+        assert_eq!(ledger.len(), 100);
+        let acked = ledger.mark_batch_acked(&ids);
+        assert_eq!(acked, 100);
+        assert!(ledger.is_empty());
+    }
+
+    #[test]
     fn counters_are_monotonic() {
         let ledger = DeliveryLedger::new(3);
         let id1 = uid();

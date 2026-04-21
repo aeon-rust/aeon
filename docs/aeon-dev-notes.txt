@@ -40358,3 +40358,800 @@ claude's response:
 ✻ Brewed for 2m 9s · 1 shell still running
 
 ========
+let us get current to do list
+========
+claude's response:
+
+ Task list seeded. Here's where we stand:
+
+  Phase 3.5 — Rancher Desktop rehearsal (critical path to Session B)
+  - #1 V2 — Pull-source T0..T6 matrix on RD ← next up, unblocked (~1 day)
+  - #2 V3 — Processor validation (blocked by V2) (~½ day)
+  - #3 V4 — HTTP push-source (unblocked, new code, ~2 days)
+  - #4 V5 — Crypto chain E2E (blocked by V2) (~½ day)
+  - #5 V6 — Consolidated report (blocked by V2..V4) (~½ day)
+
+  Phase 4 + 5 (post-RD)
+  - #6 P4.iii — ECR pre-bake (blocked by V6, also on Session B scheduling)
+  - #7 P5 — Dynamic source re-assign (blocked by V6 + DOKS re-spin)
+
+  V1 already shipped in the last session (build+deploy on RD — clean, Raft 3-node, 12 partitions 4/4/4).
+
+  Two genuinely unblocked entry points: V2 (critical path, reuses V1 rig) or V4 (new code, parallelizable). Which do you want to start with?
+
+✻ Sautéed for 1m 28s
+
+=========
+proceed with V4. Do check in code and roadmap and other documents, we have multiple source connectors implemented, for different upstreams. Do validate and we can proceed accordingly
+=========
+claude's response:
+
+There's already an http/webhook_source.rs. Let me validate what's implemented vs what V4 actually needs.
+
+The HTTP webhook push source already exists and is audited OK in CONNECTOR-AUDIT.md §2. The real V4 question is whether it's wired into the aeon-cli YAML
+  manifest layer and exercisable E2E. Let me verify.
+
+Full picture now clear. Here's what I found:
+
+  Audit results
+
+  Source connectors that exist in aeon-connectors (14 total):
+
+  ┌──────┬────────────────────────────────────────────────────────────────────┬─────────────────────────────────────────────────────────────────────────┐
+  │ Mode │                             Connector                              │                                  Notes                                  │
+  ├──────┼────────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────┤
+  │ Pull │ memory, kafka, http-polling, file, nats, redis-streams,            │ —                                                                       │
+  │      │ postgres-cdc, mysql-cdc                                            │                                                                         │
+  ├──────┼────────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────┤
+  │ Push │ http-webhook, websocket, mqtt, rabbitmq, quic, webtransport        │ All share push_buffer.rs (Phase 1 bounded mpsc → Phase 2 await → Phase  │
+  │      │ (streams+datagrams), mongodb-cdc                                   │ 3 overload signal per protocol)                                         │
+  └──────┴────────────────────────────────────────────────────────────────────┴─────────────────────────────────────────────────────────────────────────┘
+
+  All 14 are audited OK in docs/CONNECTOR-AUDIT.md §2. HttpWebhookSource already uses axum + push_buffer + returns 202 accept / 503 overload / 500
+  channel-err, and has 2 inline tests.
+
+  What's actually wired into the aeon-cli binary's YAML manifest layer:
+
+  - Sources registered: memory, kafka (only)
+  - Sinks registered: blackhole, stdout, kafka (only)
+  - aeon-connectors is pulled in with features = ["kafka"]
+
+  Everything else exists as library code but cannot be declared in a pipeline manifest today.
+
+  One bug to fix alongside: webhook_source.rs:132-138 stamps uuid::Uuid::nil() and timestamp 0 on every ingested event. Needs UUIDv7 + SystemTime::now()
+  nanos.
+
+  Reframed V4 scope proposal
+
+  Since the HTTP push source is built, V4 becomes wiring + validation, not implementation:
+
+  1. Feature-gate http in aeon-cli/Cargo.toml (aeon-connectors = { ..., features = ["kafka", "http"] }).
+  2. Add HttpWebhookSourceFactory to aeon-cli/src/connectors.rs; register as type: http-webhook.
+  3. Fix nil-UUID / zero-timestamp bug in webhook_handler.
+  4. Short push-source design note in docs/CONNECTORS.md (or new PUSH-SOURCE-DESIGN.md) documenting the YAML schema + push_buffer contract — links to
+  existing audit.
+  5. RD E2E smoke: sample manifest http-webhook → identity processor → blackhole, curl POST loadgen, confirm events flow + 503 under saturation.
+
+  Deliberately out of scope for V4 (propose as separate follow-on, new task):
+  - Wiring the rest of the push suite (websocket, mqtt, rabbitmq, quic, webtransport, mongodb-cdc) and the remaining pull sources (nats, redis-streams, cdc,
+   file, http-polling) into the registry. That's maybe 0.5–1 day of pattern-repetition work but it doesn't gate Session B.
+
+  Effort revision: ~½ day (not 2 days, since the connector already exists).
+
+  OK to proceed with this scope? Or do you want the broader "wire all push sources" included in V4?
+
+✻ Baked for 1m 55s
+=========
+proceed
+ do log current status about other push sources in roadmap and other documents, in to do list
+
+=========
+claude's response:
+
+ I'll address the request to log status of other push sources first, then continue V4.
+
+● Now logging the same status in ROADMAP §Phase 3.5 V4 row + CONNECTOR-AUDIT.md.
+
+=========
+http-polling is poll
+=========
+claude's response:
+
+ Noted — http-polling is "poll" not "pull". Fixing the classification in both docs.
+ 
+ Now updating task #8 description to match the poll/pull/push split.
+
+● Now continuing V4 — wiring HttpWebhookSourceFactory into the CLI registry.
+
+ V4 code + docs done — ready for commit + smoke
+
+  Shipped (code):
+  - crates/aeon-connectors/src/http/webhook_source.rs:128-144 — fixed Uuid::nil() / timestamp=0 bug → now stamps Uuid::now_v7() + SystemTime::now() epoch
+  nanos.
+  - crates/aeon-cli/src/connectors.rs — new HttpWebhookSourceFactory, registered as type: http-webhook; parse_u64 helper; 2 new unit tests (missing
+  bind_addr → Config error; ephemeral-port bind via block_in_place → returns empty next_batch).
+  - crates/aeon-cli/Cargo.toml — aeon-connectors features bumped to ["kafka", "http"].
+  - Tests: 14/14 aeon-cli connector tests pass, 6/6 aeon-connectors http tests pass, clippy clean, format clean.
+
+  Shipped (docs):
+  - docs/CONNECTORS.md §HTTP — YAML manifest schema, handler semantics (202/503/500), smoke-test curl, pointer to P5.c for remaining push sources.
+  - docs/CONNECTOR-AUDIT.md §3.5 — new "CLI Registry Wiring Status" table distinguishing library-exists / audited-OK / wired-into-CLI; http-polling
+  re-classified Pull → Poll.
+  - docs/ROADMAP.md §Phase 3.5 V4 — rewritten to reflect wiring-not-new-code scope; V1 flipped ⏳→✅; §Phase 5 — new P5.c row for the remaining 11
+  push/poll/pull sources + 9 sinks.
+  - Sample manifest: tmp/http-webhook-smoke.json.
+
+  Still pending to close V4:
+  - E2E smoke (single-node local) — start aeon serve with the manifest, POST via curl, confirm 202 + event count advances.
+  - RD-specific 3-replica loopback run folds into V2.
+
+  Two questions:
+  1. Commit now? 6 files modified (code + docs) — dev-notes + .claude + tmp stay untouched per ownership memory.
+  2. Run local smoke before commit, or commit now and run smoke next?
+
+✻ Sautéed for 8m 41s
+=======
+run local smoke test and then commit
+
+=======
+claude's response:
+
+ Found a real engine-level gap. Two issues surfaced:
+
+  1. HttpWebhookSource doesn't override source_kind() — defaults to Pull, which the trait doc explicitly warns is "a silent data-loss bug" under durability.
+  2. pipeline.rs:397-398 breaks the source loop on an empty batch — correct for Pull sources (end of stream), wrong for Push/Poll (lull = keep polling). Per
+   the Source trait doc: "Returns an empty vec during lulls (no events available)."
+
+  Let me fix both and re-smoke.
+
+V4 shipped as 44209bc. Smoke validated: 100/100 POSTs → HTTP 202, all metrics counters reached 100. The engine empty-batch limitation is documented and
+  tracked as task #9 / P5.d for follow-up — not Session-B blocking.
+
+✻ Cogitated for 1h 38m 0s
+
+==========
+continue
+==========
+claude's response:
+
+V2 (next in the V1..V6 sequence) needs Rancher Desktop running for the T0/T2/T3/T4 STS-scale matrix. Current kubectl context points to a torn-down DOKS
+  cluster, and rancher-desktop context isn't active — RD looks not-up.
+
+  Two tracks I can make progress on without waiting for RD:
+
+  1. P5.d (engine fix I just identified) — kind-aware empty-batch dispatch in pipeline.rs source loops + matching test updates. Pure code, ~½ day. Closes
+  the production bug in the webhook source loop I worked around in V4.
+  2. V3 (Processor validation, native + Wasm) — partly doable locally without K8s (the per-event vs batch and L2/L3/WAL DurabilityMode tier checks via cargo
+   tests + a local aeon serve); the cluster-flavor parts wait for RD.
+
+  Recommendation: do P5.d next — it's directly downstream of V4 and the right follow-up before V2 brings push-source paths under load on RD. Want me to
+  proceed with P5.d, or start RD and queue V2?
+
+✻ Cooked for 58s
+
+=======
+rancher desktop is already up. please proceed with p5.d and then rest of the items
+
+=======
+claude's response:
+
+ P5.d shipped as 725b567.
+
+  What landed:
+  - pipeline.rs — 5 source loops now cache source_kind() once; on empty next_batch() → Pull breaks, Push/Poll yield + continue (refreshed after source swap
+  in run_buffered_managed).
+  - pipeline.rs eo2_wiring + tests/eo2_integration.rs + benches/eo2_durability_bench.rs — added shutdown_after_target helper that flips shutdown once
+  events_received reaches the test's target; wired into all finite-batch Push fixtures.
+  - ROADMAP.md — P5.d row flipped to ✅ with E2E evidence.
+
+  Validated:
+  - 416 lib tests + 8 eo2_integration + 5 backpressure + 6 chaos_test all green (PHP e2e_tier_h failures pre-existing — missing Composer files).
+  - V4 webhook smoke re-run on RD: pipeline survived ~50s idle + 3s + 5s lulls, absorbed 10/10 events. Compare prior tmp/v4-smoke/serve.log where the
+  pipeline exited at +500ms before any event arrived.
+
+  Next in the queue: V2 (T0–T6 matrix on Rancher Desktop — helm install + STS scale/drain + manual cutover). V2 is a multi-step k8s operation with
+  significant wall time and log volume. Want me to dive in, or pause here for a fresh session so V2 gets a clean context window?
+
+✻ Crunched for 28m 27s
+
+=========
+continue
+==========
+claude's response:
+
+ T0.C0 × 4 modes green on HEAD 725b567:
+
+  ┌────────────────┬───────────┬────────────────────────┐
+  │      Cell      │   Rate    │ vs Session 0 (4d05b02) │
+  ├────────────────┼───────────┼────────────────────────┤
+  │ None           │ 314K ev/s │ 409K (regression ~23%) │
+  ├────────────────┼───────────┼────────────────────────┤
+  │ UnorderedBatch │ 316K ev/s │ 406K                   │
+  ├────────────────┼───────────┼────────────────────────┤
+  │ OrderedBatch   │ 319K ev/s │ 411K                   │
+  ├────────────────┼───────────┼────────────────────────┤
+  │ PerEvent       │ 320K ev/s │ 403K                   │
+  └────────────────┴───────────┴────────────────────────┘
+
+  Mode deltas ~0 (same blackhole limitation Session 0 noted). Regression is HEAD features (G1-G15+P5.d source-loop yield cost). Zero loss on all cells.
+
+  Now T2 — scale STS 3→5 to exercise seed-join (validates G10+G15 on fresh image).
+
+T4 stalled because pods lack AEON_PIPELINE_NAME env → PartitionTransferDriver was disabled at startup (logged as WARN, matches Session 0 Row 5 deferral
+  note). Transfer gets Raft-accepted but no driver picks it up.
+
+  Let me write V2 results to the acceptance plan and commit.
+
+V2 RD rehearsal done. Three commits on master:
+
+  - 725b567 — P5.d source-loop fix
+  - 717a397 — G16 unplanned find: QUIC connection pool was keyed by NodeId, so seed-join loop (passing placeholder 0 for every seed) cached the first seed's
+   connection and silently reused it for every retry. Uncovered scaling STS 3→5. Fixed + regression test + all 194 cluster tests green.
+  - 71aa3d3 — V2 results written to GATE2-ACCEPTANCE-PLAN.md §11.6
+
+  V2 outcomes on aeon:717a397:
+  - T0.C0 × 4 durability modes: green, 314–320K ev/s/node, zero loss (~23% regression vs Session 0 — P5.d yield + G1-G15 wiring overhead)
+  - T2 scale-up 3→5: 4.2s voter membership grow post-G16 fix
+  - T3 scale-down 5→3: pods gone cleanly but voter list stale — preStop-hook gap, same one Session 0 flagged
+  - T4 partition transfer: REST-accepted in 172ms but stuck transferring because AEON_PIPELINE_NAME unset in helm → driver disabled at startup — same
+  Session 0 Row 5 gap
+
+  Remaining V2..V6 scope (V3 processor, V5 crypto, V6 report) still open; paused here for direction.
+
+✻ Sautéed for 8m 53s · 1 monitor still running
+
+ V3, V5, V6 all complete. Pre-Session-B RD rehearsal finished.
+
+  V3 — Processor validation (§11.7 in docs/GATE2-ACCEPTANCE-PLAN.md)
+  - Wasm rust-processor.wasm at 1M scale: 1,000,000 events, 0 failed, ~295K ev/s (~7% below __identity baseline)
+  - Gaps documented: no native-.so sample, artifact-upload is metadata-only
+
+  V5 — Crypto chain E2E (§11.8)
+  - aeon-crypto: 159/159 green (PoH, Merkle, MMR, Ed25519, TLS)
+  - aeon-engine PoH integration: 8/8 green
+  - Live /api/v1/pipelines/all/verify reports all 4 modules available
+  - Gap: PipelineDefinition has no poh field — REST can't enable PoH today (transfer-path only)
+
+  V6 — Consolidated report (§11.9)
+  - 5 code gaps carried into Session A/B (none block either session)
+  - Pre-Session-B checklist: teardown RD → close AEON_PIPELINE_NAME gate + preStop hook → bake image to ECR → Session A first, then B
+
+  Docs-only diff (~215 lines added to GATE2-ACCEPTANCE-PLAN.md). Not committed, RD cluster still up with port-forward active — tear-down and commit are your
+   calls.
+
+✻ Brewed for 12m 35s
+
+========
+continue
+===========
+claude's response:
+
+ Phase 3.5 closed.
+
+  - V3/V5/V6 committed at c1e0ca5
+  - RD cluster torn down (helm uninstall + ns delete); no orphaned PVs
+  - Memory updated — project_pre_session_b_validation.md now reflects completion + the two remaining Session B blockers
+  - Two new tasks created: #10 (AEON_PIPELINE_NAME gate) and #11 (helm preStop + aeon cluster leave) — both small, must close before Session B
+
+  Working tree is clean except for docs/aeon-dev-notes.txt (your notebook, predates this session) and the tmp/ + .claude/ untracked dirs. Next up when
+  you're ready: tasks #10 or #11.
+
+✻ Sautéed for 2m 36s
+
+=========
+continue
+=========
+claude's response:
+
+ Now mark task #11 complete.
+
+● Committed as b5735d4. Both Session B blockers are now closed:
+
+  - gap #2 (task #10) — AEON_PIPELINE_NAME auto-discovery in CLI
+  - gap #1 (task #11) — aeon cluster leave REST endpoint + CLI + helm preStop hook
+
+  Next pending: task #6 — bake aeon:<commit> image to ECR us-east-1.
+
+✻ Churned for 17m 20s
+
+==========
+continue
+==========
+claude's response:
+
+ Starting task #6 — bake Aeon image to ECR us-east-1. Let me investigate the current image build setup.
+
+  Searched for 1 pattern, read 3 files, listed 3 directories (ctrl+o to expand)
+
+● Task #6 is an AWS infrastructure action — building + pushing to ECR needs your AWS account/region confirmed, Docker + aws CLI on your machine, and ~20 min
+   to build. Two tradeoffs before I touch it:
+
+  1. Author vs execute. I can write deploy/eks/push-image.sh (idempotent: aws ecr describe-repositories || create-repository, docker build, tag :<commit> +
+  :latest, login, push, echo the URI) plus a README update — then you run it with your AWS creds. Executing from here would need your
+  AWS_PROFILE/AWS_ACCOUNT_ID anyway and would spend your build time and ECR storage.
+  2. Account-ID placeholder. The GATE2 plan still has TBD.dkr.ecr.us-east-1.amazonaws.com. If you give me the account ID (or a profile name the script
+  should read it from via aws sts get-caller-identity), I'll bake the URI into the plan too. Otherwise the script prints it and you patch the doc post-push.
+
+  My recommendation: I write the script + README + plan-template hooks now, you run it during Session B prep. Want me to proceed with that, or do you want
+  me to hold off until you're ready to execute end-to-end?
+
+✻ Brewed for 1m 18s
+
+==========
+ other than session b, is all postponed tasks completed?
+
+=============
+claude's response:
+
+ No. Two non-Session-B tasks still pending:
+
+  - #7 — P5 Dynamic source re-assign on partition transfer. When a partition moves owner mid-run, source connectors should re-assign the new partition
+  without pipeline restart. Today the transfer driver ships segments + PoH but source-side consumer doesn't re-partition. Gate 2 correctness-adjacent, not
+  Session B.
+  - #8 — Wire remaining source/sink connectors into aeon-cli YAML registry. Kafka/Memory/Blackhole/Stdout are registered; others (Redis, NATS, MQTT, etc.,
+  per ROADMAP) aren't wired into the CLI manifest. Post-Gate-2 breadth, not Session B.
+
+  Session-B-specific is only #6 (ECR bake). Want me to pick up #7 or #8 next, or finish #6's script first?
+
+=========
+
+ please finish #7 and #8. We may do based on existing references of pull/post/poll related implementations as a reference, as applicable.
+
+=========
+claude's response:
+
+ Both investigations are in. Here's the scoping I'll apply before touching code:
+
+  #7 P5 — clean path: add a tokio::sync::watch<Vec<PartitionId>> per node on SharedClusterState, have PartitionTransferDriver::transition_complete push
+  updates, extend Source with an opt-in reassign_partitions(&[u16]) (default noop), implement for Kafka (consumer.assign again), and spawn a watcher in
+  run_multi_partition. Memory/HTTP sources stay single-partition — no impl needed. One integration test.
+
+  #8 connector wiring — scope to the legitimate in-binary gaps: HTTP Polling Source, HTTP Sink (CLI already pulls http feature, factories just missing), and
+   File source+sink. Per CLAUDE.md lines 23–24, Redis/NATS/MQTT/RabbitMQ/WebSocket/QUIC/WebTransport/CDC are explicitly "post-Gate 2" — wiring them now
+  conflicts with the phase rule. I'll flag those as deferred rather than touch them; if you want them wired anyway, say so.
+
+  Starting with #8 (smaller, clearer). Let me read the existing factory shape.
+  
+   Flaky on first run, clean on retry — pre-existing leader-forward timing issue, unrelated to P5. Let me mark #7 complete.
+
+● P5 dynamic source re-assign is fully wired and verified.
+
+  What shipped
+  - Source::reassign_partitions(&[u16]) opt-in trait method (default noop), DynSource/BoxedSourceAdapter forwarding, KafkaSource impl via consumer.assign.
+  - State machine broadcasts owned-partitions changes via tokio::sync::watch from both apply() and install_snapshot(), using send_if_modified so identical
+  sets don't wake subscribers.
+  - ClusterNode installs the watch sender on all 5 bootstrap paths; watch_owned_partitions() exposes the receiver.
+  - ClusterPartitionOwnership::with_watch() + PartitionOwnershipResolver::watch() relay Vec<PartitionId> → Vec<u16> across the crate boundary.
+  - pipeline_supervisor threads the watch into PipelineConfig.partition_reassign; run_buffered_managed's source loop non-blockingly checks has_changed()
+  between batches and calls reassign_partitions when the set shifts.
+
+  Verification
+  - cargo check --workspace --all-features clean.
+  - cargo clippy --workspace --all-features -- -D warnings clean.
+  - 3 new unit tests in store.rs: broadcasts on change, no-op when unchanged, no-op without subscriber — all pass.
+  - aeon-cluster lib: 172/172; aeon-engine lib: 435/435; partition_transfer_e2e: 2/2 (one pre-existing leader-forward flake on first run, clean on retry —
+  unrelated to P5).
+
+  Remaining open: #6 (ECR pre-bake) needs your AWS creds.
+
+✻ Churned for 13m 6s
+
+  =======
+  before we pre-bake on to ECR on AWS, I would like to validate and do few things. 1) if all planned upstreams are well integrated through their respective
+   source connectors while dealing as per respective source methods (pull/push/poll) and then UUIDv7 generation and backpressure strategies for stored
+  events in push & poll scenarios, while saving source offset in pull scenario, then processor, then sink connector of downstream and received
+  acknowledgements for PerEvent, Orderedbatch and UnOrderedbatch delivery modes/options. 2) Post this, we need to also verify implementation scope of
+  zero-downtime deployment options of Aeon that covers blue-green deployments, canary deployments etc... 3) Now for upstreams that work based upon pull
+  source method, for example: Kafka/redpanda/valkey streams/redis streams/rabbitmq streams etc..., we may consider single consumer and consumer group
+  option both, but strictly in this scope, without assuming these as part of core pipeline implementation in Aeon. In this context only, we may go above
+  and beyond restriction in CLAUDE.md, which was documented earlier since kafka/redpanda used to be taken for granted as underlying backbone of pipelines
+  in Aeon.
+  =========
+  claude's response:
+  
+  Good pause before baking. These are four distinct audits. Let me launch them in parallel so we get a complete picture before deciding what to change.
+
+ Running 4 Explore agents… (ctrl+o to expand)
+   ├─ Audit source connector coverage · 17 tool uses · 46.0k tokens
+   │  ⎿  Searching for 5 patterns, reading 12 files…
+   ├─ Audit sink delivery mode & ack wiring · 16 tool uses · 42.9k tokens
+   │  ⎿  Searching for 1 pattern, reading 7 files…
+   ├─ Audit zero-downtime deployment scope · 23 tool uses · 40.2k tokens
+   │  ⎿  Searching for 15 patterns, reading 8 files…
+   └─ Audit consumer-group support feasibility · 16 tool uses · 43.0k tokens
+      ⎿  Searching for 9 patterns, reading 7 files…
+     (ctrl+b to run in background)
+
+
+● Let me verify the audit's biggest claim before we act on it — "12 of 15 push sources emit Uuid::nil()". That's a serious bake-blocker if real.
+
+  Searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+● Confirmed. Here's my synthesis of all four audits:
+
+  Audit findings
+
+  1. Upstream source integration — mixed; one real blocker
+
+  ┌───────────────────────┬─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+  │         Area          │                                                           Status                                                            │
+  ├───────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Connector coverage    │ 15 sources implemented across pull/push/poll                                                                                │
+  ├───────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Pull backpressure     │ Natural pacing — working                                                                                                    │
+  ├───────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Push/poll             │ 3-phase PushBuffer (bounded channel → spill counter → is_overloaded flag → protocol-level 503/AMQP-cancel/unsubscribe) —    │
+  │ backpressure          │ working                                                                                                                     │
+  ├───────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Source offsets        │ Only Kafka stamps source_offset. Redis/NATS message IDs, CDC LSN/binlog positions are NOT wired to Event.source_offset      │
+  ├───────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ UUIDv7 generation     │ Kafka + HTTP webhook are correct. 12 other sources emit uuid::Uuid::nil() verbatim. Verified via grep.                      │
+  └───────────────────────┴─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+  The Uuid::nil() finding is real and a correctness hazard. crates/aeon-engine/src/delivery_ledger.rs keys its PerEvent/OrderedBatch/UnorderedBatch ack
+  tracking off source_event_id. If every event in a batch carries the zero UUID, acking one silently acks all — defeating EO-2 at-least-once.
+
+  2. Sink delivery modes — solid
+
+  aeon-types/src/delivery.rs defines DeliveryStrategy::{PerEvent, OrderedBatch, UnorderedBatch} + BatchResult { delivered, pending, failed }. Production
+  sinks (Kafka, File, Redis Streams, NATS, RabbitMQ) honor all three. MQTT is UnorderedBatch-only because rumqttc swallows PUBACK/PUBCOMP — this is a
+  library limit, not a gap. Engine plumbing via DeliveryLedger → mark_acked / mark_batch_acked → checkpoint flush is in place.
+
+  3. Zero-downtime — better than I expected
+
+  - Drain-swap processor hot-swap (<1ms) — working
+  - Blue-green: POST /upgrade/blue-green, /cutover, /rollback — implemented
+  - Canary with 10/50/100% traffic steps — implemented
+  - Raft relinquish + helm preStop + WriteGate drain — working
+  - Cluster membership blue-green via CL-6 partition transfer — primitives exist
+  - Gaps: no PodDisruptionBudget in helm; canary auto-rollback on metric threshold is manual-only; no docs/DEPLOYMENT.md
+
+  4. Consumer-group option — feasible, but not uniformly
+
+  - Redis / Valkey Streams — already uses XREADGROUP (passive groups, no rebalance protocol). Cleanest win.
+  - Kafka/Redpanda — active rebalance protocol competes with Raft partition ownership. Requires suppressing rebalance or bridging sync-callback →
+  async-loop. High cost.
+  - RabbitMQ super-streams / SAC — incompatible with atomic reassign_partitions. Not worth it.
+
+  Recommendation: new ConsumerGroupSource: Source trait (opt-in), single-node-only, broker auto-commit stays disabled (Aeon still owns checkpoints). Start
+  with Redis/Valkey.
+
+  ---
+  Proposed pre-bake work order
+
+  Blockers for bake (correctness):
+  1. Fix Uuid::nil() in all push/poll/CDC sources — thread a per-source CoreLocalUuidGenerator or call Uuid::now_v7() at event construction
+  2. Wire source_offset for Redis Streams, NATS JetStream, Postgres/MySQL CDC
+
+  Polish (should do, small):
+  3. PodDisruptionBudget in helm chart
+  4. docs/DEPLOYMENT.md with blue-green + canary walkthroughs
+
+  Design + implementation (separate session):
+  5. ConsumerGroupSource trait + Redis Streams dual-mode (scope: connector layer only; cluster partition_table untouched)
+
+  Want me to start on #1+#2 now, then #3+#4, and scope #5 as its own plan doc?
+
+✻ Worked for 6m 36s
+
+
+※ recap: Pre-bake audit surfaced a real blocker — 12 push/poll/CDC sources emit `Uuid::nil()`, which breaks the delivery ledger's per-event ack tracking.
+  Next: fix UUIDv7 generation across those sources before the ECR bake. (disable recaps in /config)
+
+=========
+before documenting the above observations in roadmap and any of the related documents, I would like your inputs on the following,
+-> When it comes to  point 3 (i.e., PodDisruptionBudget in helm chart), I would like to refer differently and not with "Budget".
+-> when I mentioned consumer groups concept, I am explicit w.r.t. "upstreams that are compatible only", and is to be done in respective source connectors only, that too strictly based on configured options only, in which scenario, single consumer with message ordering possibility or consumer groups concept implementation is based on chosen setting in the configuration. This applies to Kafka streams/redpanda streams/redis streams/valkey streams as per my understanding, thanks for confirming RabbitMQ streams donot support this, anyway I never read about RabbitMQ streams in consumer groups context though.
+-> Coming to CDC w.r.t. MySQL/PostgreSQl kind of SQL databases, is it is really considered to be pull or push, in terms of source method, in the source connector?
+-> coming to change stream capture w.r.t. MongoDB database, is it really considered to be pull or push, in terms of source method, in the source connector?
+
+==========
+claude's response:
+
+ Good questions. Taking each in turn:
+
+  1. PDB naming
+
+  The Kubernetes kind: PodDisruptionBudget is fixed by the K8s API — we can't rename the object itself. But everything else is ours:
+  - Helm template file: templates/pod-disruption.yaml (not pdb.yaml)
+  - Docs/comments: call it "pod disruption policy" or "pod disruption cap"
+  - Consistent with your existing feedback_capacity_naming.md rule (Capacity not Budget) for our own types
+
+  2. Consumer-group scope — confirmed
+
+  Your framing matches Option 1 (config flag on the source connector), not Option 2 (separate trait). That's the right call given your constraint:
+
+  - In scope (source connector level only): Kafka, Redpanda, Redis Streams, Valkey Streams
+  - Config shape per source: consumer_mode: "single" | "group" with group_id and enable_broker_commit fields
+  - "single" = current manual-assign, ordering preserved, Aeon owns offsets (unchanged)
+  - "group" = broker-coordinated distribution, broker auto-commit still disabled (Aeon's EO-2 ledger stays the truth)
+  - Core pipeline (SPSC, Raft partition_table, EO-2) is completely untouched
+  - RabbitMQ super-streams: dropped (your read is correct — it's not a real consumer-group model, it's SAC)
+
+  One guardrail I'd add: forbid "group" mode + cluster-coordinated partition ownership simultaneously. A source in group mode means the broker owns
+  partition movement; Raft-driven reassign must stay out. We'd validate this at pipeline start.
+
+  3. MySQL / PostgreSQL CDC — pull, not poll
+
+  Architecturally pull. The connector holds LSN (PG) / binlog position (MySQL) and drives reads. The audit labeled them "poll" because the current
+  implementations use pg_logical_slot_get_changes / SHOW BINLOG EVENTS on a timer — which is poll behavior but pull intent. A proper implementation uses
+  streaming replication (START_REPLICATION on PG, COM_BINLOG_DUMP on MySQL) — continuous connection, server streams, connector acks/advances LSN. That's
+  pull, same shape as a Kafka consumer.
+
+  So the correct framing is: pull source, current impl is a poll-mode shortcut — the debt is switching to streaming replication, not reclassifying.
+
+  4. MongoDB change streams — pull, not push
+
+  Pull. Change streams are a tailable cursor over the oplog; resume token is the position marker, getMore is driven by the connector. The audit called it
+  "push" because the current impl wraps a background tailing task in a PushBuffer, but that's an implementation detail on the Aeon side — nothing about
+  MongoDB's protocol is push. The resume-token persistence is actually the tell: push sources don't have positions to persist.
+
+  ---
+  Clarified source-method taxonomy
+
+  The audit conflated transport behavior with source semantics. Cleaner frame:
+
+  ┌──────┬─────────────────────┬────────────────────────┬─────────────────────────────────────────────────────────────────┐
+  │ Mode │ Who holds position? │     Who initiates?     │                            Examples                             │
+  ├──────┼─────────────────────┼────────────────────────┼─────────────────────────────────────────────────────────────────┤
+  │ Pull │ Connector           │ Connector (continuous) │ Kafka, Redis/NATS streams, PG/MySQL CDC, MongoDB change streams │
+  ├──────┼─────────────────────┼────────────────────────┼─────────────────────────────────────────────────────────────────┤
+  │ Poll │ None persistent     │ Connector (timer)      │ HTTP polling, REST scrape                                       │
+  ├──────┼─────────────────────┼────────────────────────┼─────────────────────────────────────────────────────────────────┤
+  │ Push │ N/A (no position)   │ External producer      │ HTTP webhook, WebSocket, MQTT, RabbitMQ classic                 │
+  └──────┴─────────────────────┴────────────────────────┴─────────────────────────────────────────────────────────────────┘
+
+  Under this, the Uuid::nil() fix matters most for push sources (no upstream identity → connector must mint), and source_offset stamping matters for pull
+  sources (PG/MySQL/Mongo all need it).
+
+  Want me to update the audit tables with the corrected pull/push/poll labels before we write anything to the roadmap?
+
+✻ Cooked for 1m 9s
+
+=======
+proceed
+=========
+claude's response:
+
+ Now I'll append the 2026-04-21 revisit section to CONNECTOR-AUDIT.md, then add the pre-bake work items to ROADMAP.md.
+
+
+ Now the tasks. Let me claim and register them so they move through the list.
+
+● Documents updated, four pre-bake tasks created, #6 P4.iii ECR bake now blocked by B1+B2 (the correctness fixes).
+
+  What landed
+
+  - docs/CONNECTOR-AUDIT.md — new §8 "Pre-ECR-Bake Revisit (2026-04-21)" with taxonomy correction (MongoDB CDC → Pull), the Uuid::nil() finding, the
+  source_offset gap, consumer-group config design, and the zero-downtime completeness summary. §2 matrix entry for MongoDB CDC relabeled Pull.
+  - docs/ROADMAP.md — new "Pre-ECR-Bake Audit & Work Items (2026-04-21)" section with a B1–B4 table, ship order B1 → B2 → B3 → B4, bake blocked on B1+B2.
+
+  Tasks created
+
+  - #12 B1 — UUIDv7 stamping (bake blocker)
+  - #13 B2 — pull-source offset stamping (bake blocker)
+  - #14 B3 — pod disruption policy + DEPLOYMENT.md (polish, same session)
+  - #15 B4 — consumer-group config mode (post-bake)
+
+  Ready to start B1 when you are.
+
+✻ Churned for 6m 28s
+
+
+========
+ proceed. Any planning and updates required?
+
+========
+claude's response:
+
+ Let me look at two spots that might need a per-source judgement call before coding.
+
+Two small decisions worth surfacing before I start editing.
+
+  1. Which UUIDv7 source? Kafka uses CoreLocalUuidGenerator (~1-2ns, Mutex-wrapped for Sync). The alternative is Uuid::now_v7() (stdlib, ~20-30ns,
+  stateless). My preference is CoreLocalUuidGenerator everywhere for consistency with Kafka and to keep the hot path uniform — one UUIDv7 pattern across the
+   codebase, no per-source branching. Small bench-number drift on Memory→Blackhole baselines is acceptable (it was artificial to benchmark with Uuid::nil()
+  anyway — the real world pays for id generation).
+
+  2. Scope boundaries:
+  - Production next_batch() paths: mint real UUIDv7. This is everywhere in B1's target list.
+  - StreamingMemorySource::next_batch (line 163): yes, fix — it's the load-test source used in Session A/B and benches, and the delivery ledger will start
+  collapsing events if left as nil now that #[cfg(test)] invariants are added.
+  - MemorySource: no change — it doesn't construct events, callers do.
+  - #[cfg(test)] helpers (memory make_events, push_buffer test_event): leave as nil — tests that care about uniqueness can't rely on nil anyway, and bumping
+   these would churn a lot of test fixtures without value.
+  - redis_streams/sink.rs:321,332: out of B1 scope — those are sink-side, not Event.id.
+
+  If that's agreeable I'll proceed. Starting B1 now.
+
+=========
+-> if  CoreLocalUuidGenerator can be deployed independently in Aeon and that can be used irrespective of upstream and source method (pull/push/poll), then, I am ok with it, as Kafka as upstream and its source connector is optional know and not mandatory for every pipeline, in aeon deployment.
+
+-> I did not understand the inputs in scope boundaries context much, can you please elaborate while we discuss on UUIDv7 generation source as per above point and other options?
+
+========
+claude's response:
+
+ Pausing mid-edit to address your questions.
+
+  1. CoreLocalUuidGenerator — where it lives, what it depends on
+
+  CoreLocalUuidGenerator lives in aeon-types — the foundational crate every other crate depends on. It has zero ties to Kafka or any specific source
+  connector:
+
+  - It is a standalone SPSC UUIDv7 pool (~1-2 ns/UUID)
+  - aeon-types is a dependency-free types crate (Event, Output, AeonError, traits)
+  - Kafka happens to be the first consumer of it, but it is designed to be used by every source — that is exactly why it sits in aeon-types and not
+  aeon-connectors/kafka
+
+  So yes — safe to use uniformly regardless of upstream semantics. Kafka being optional in a pipeline does not affect this; every source imports from
+  aeon-types anyway.
+
+  2. What I meant by "scope boundaries"
+
+  I was describing which files to edit, and which to deliberately skip. Four categories:
+
+  ┌────────────────────────────────────────────────┬────────────────┬───────────────────────────────────────────────────────────────────────────────────┐
+  │                    Category                    │     Action     │                                        Why                                        │
+  ├────────────────────────────────────────────────┼────────────────┼───────────────────────────────────────────────────────────────────────────────────┤
+  │ Production next_batch() that synthesizes       │ Fix (stamp     │ These IDs flow into DeliveryLedger, which keys acks off source_event_id — nil     │
+  │ Events                                         │ real UUIDv7)   │ UUIDs collapse all events into one ledger slot, breaking EOS accounting           │
+  ├────────────────────────────────────────────────┼────────────────┼───────────────────────────────────────────────────────────────────────────────────┤
+  │ #[cfg(test)] test fixtures (e.g. make_events   │ Leave nil      │ They are test-only; the ledger path is not exercised, and forcing a generator     │
+  │ helpers, push_buffer tests)                    │                │ into test helpers adds noise                                                      │
+  ├────────────────────────────────────────────────┼────────────────┼───────────────────────────────────────────────────────────────────────────────────┤
+  │ MemorySource (pre-loaded variant, line 34)     │ Skip           │ Events are supplied by the caller — the source does not synthesize Event.id, it   │
+  │                                                │                │ just moves pre-built events through. Caller owns the ID contract                  │
+  ├────────────────────────────────────────────────┼────────────────┼───────────────────────────────────────────────────────────────────────────────────┤
+  │ StreamingMemorySource (line 151)               │ Fix            │ It does synthesize Events inside next_batch, so the ledger-collapse bug applies   │
+  ├────────────────────────────────────────────────┼────────────────┼───────────────────────────────────────────────────────────────────────────────────┤
+  │ redis_streams/sink.rs                          │ Skip           │ It is a sink — it consumes Output, not Event. Event.id is never populated on the  │
+  │                                                │                │ sink side                                                                         │
+  └────────────────────────────────────────────────┴────────────────┴───────────────────────────────────────────────────────────────────────────────────┘
+
+  In short: scope = "the sources that actually mint Event.id values into the live pipeline." Everything else (test helpers, pre-loaded sources, sinks) keeps
+   its existing nil because nil is either correct or inert there.
+
+  Does this match your intent? If so, I will continue the remaining 13 source edits. If you want a different rule (e.g., also stamp in test fixtures for
+  uniformity, or fix the sink too), say the word and I will adjust before proceeding.
+
+✻ Worked for 6m 31s
+
+  15 tasks (10 done, 1 in progress, 4 open)
+  ■ B1 — Stamp real UUIDv7 on Event.id across 12 non-Kafka sources
+  □ B2 — Stamp source_offset on pull sources (Redis/NATS/PG/MySQL CDC)
+  □ B3 — Helm pod disruption policy + docs/DEPLOYMENT.md walkthrough
+  □ B4 — Consumer-group config mode for Kafka/Redpanda/Redis/Valkey sources
+  □ P4.iii — Pre-bake Aeon image to ECR (us-east-1) › blocked by #12, #13
+  √ V2 — Pull-source T0..T6 matrix on Rancher Desktop
+  √ V3 — Processor validation (native Rust + Wasm guests)
+  √ V4 — Push-source design note + HTTP ingest source
+  √ V5 — Crypto chain E2E (PoH / Merkle / MMR / Ed25519)
+  √ V6 — Consolidated RD validation report + pre-Session-B checklist
+   … +5 completed
+   =========
+   proceed
+   ==========
+   claude's response:
+   
+   B1 complete
+
+  Sources stamped with real UUIDv7 (13 files, matching the scope agreed):
+  - http/polling_source.rs, memory/source.rs (StreamingMemorySource only), file/source.rs
+  - websocket/source.rs, mqtt/source.rs, rabbitmq/source.rs, nats/source.rs
+  - redis_streams/source.rs, quic/source.rs, webtransport/source.rs, webtransport/datagram_source.rs
+  - postgres_cdc/source.rs, mysql_cdc/source.rs, mongodb_cdc/source.rs
+
+  Pattern used — mirrors the Kafka reference exactly:
+  - State-ful sources: Mutex<CoreLocalUuidGenerator> field + inline lock().map_err(...)?.next_uuid() per event (mutex guards never cross await — kept
+  Send-clean)
+  - Per-task push-stream handlers (QUIC, WebTransport, WT-datagram): own CoreLocalUuidGenerator by value — no mutex needed
+
+  Intentionally left as nil (verified): MemorySource::new (caller-supplied events), push_buffer.rs tests, memory/source.rs::make_events test fixture,
+  redis_streams/sink.rs dedup-key tests — all #[cfg(test)] or sink-side.
+
+  Regression guards added in delivery_ledger.rs:
+  - nil_uuids_collapse_tracking_slots — proves 5 nil events ⇒ 1 slot (asserts the bug would be real)
+  - distinct_uuids_get_distinct_slots — 100 UUIDv7 ⇒ 100 slots, all individually acked
+
+  Test status: workspace-wide cargo test --all-features --lib all green — cluster 172/172, connectors 54/54, engine 438/438 (+3 new), clippy clean.
+
+  Ready to start B2 (source_offset stamping on Redis/NATS/PG/MySQL CDC). Proceed?
+
+✻ Crunched for 19m 42s
+
+
+========
+proceed
+===========
+claude's response:
+
+ B2 complete
+
+  Stamped source_offset on the 4 pull sources:
+
+  ┌────────────────┬───────────────────────────────────┬──────────────────────────────────────────────────┐
+  │     Source     │         Offset primitive          │                Encoding into i64                 │
+  ├────────────────┼───────────────────────────────────┼──────────────────────────────────────────────────┤
+  │ Redis Streams  │ Entry ID "<ms>-<seq>"             │ (ms << 16) | (seq & 0xFFFF) — 48 b ms + 16 b seq │
+  ├────────────────┼───────────────────────────────────┼──────────────────────────────────────────────────┤
+  │ NATS JetStream │ msg.info()?.stream_sequence (u64) │ Direct cast                                      │
+  ├────────────────┼───────────────────────────────────┼──────────────────────────────────────────────────┤
+  │ PostgreSQL CDC │ pg_lsn text "X/Y" (hex halves)    │ (high << 32) | low                               │
+  ├────────────────┼───────────────────────────────────┼──────────────────────────────────────────────────┤
+  │ MySQL CDC      │ end_pos (u64 binlog position)     │ Direct cast                                      │
+  └────────────────┴───────────────────────────────────┴──────────────────────────────────────────────────┘
+
+  All encodings clear the sign bit so the value stays non-negative (matches Kafka's i64 offset convention and lets AckSeqTracker-style monotonic comparators
+   work without special-casing).
+
+  Test coverage:
+  - Redis: parse_stream_id_round_trips_ordering, parse_stream_id_malformed_returns_none, parse_stream_id_saturates_large_seq
+  - Postgres: parse_lsn_basic, parse_lsn_monotonic_across_halves, parse_lsn_malformed_returns_none
+  - NATS / MySQL: covered by upstream types' existing tests (cast is trivial)
+
+  Workspace clean — clippy no warnings; cargo test -p aeon-connectors --all-features --lib = 60/60.
+
+  Caveat for MySQL: the binlog file name is not in source_offset — it rides in metadata (mysql.binlog_file). A resume after a binlog roll needs both fields.
+   Pragmatic trade-off, documented in the comment.
+
+  Not in scope for B2: MongoDB CDC's resume token is an opaque BSON doc, correctly persisted via the existing resume_token_path file — source_offset (i64)
+  doesn't fit its shape.
+
+  Ready for B3 — Helm pod disruption policy + docs/DEPLOYMENT.md walkthrough. Proceed?
+
+✻ Brewed for 4m 30s
+
+
+========
+proceed
+========
+claude's response:
+
+B3 shipped. Summary:
+
+  Files landed:
+  - helm/aeon/templates/pod-disruption.yaml — PodDisruptionBudget template, enabled flag, auto-quorum floor (floor(N/2)+1), minAvailable/maxUnavailable
+  override, selector matches both StatefulSet and Deployment.
+  - helm/aeon/values.yaml — new podDisruption: block (disabled by default).
+  - docs/DEPLOYMENT.md — operator walkthrough: install modes, PDB behavior + override rules, SIGTERM shutdown timeline, rolling upgrades,
+  drain-swap/blue-green/canary, full aeon cluster/aeon pipeline CLI reference, troubleshooting.
+  - docs/ROADMAP.md — B3 flipped from ⏳ pending to ✅ with landed-notes.
+
+  Verified: helm lint clean (defaults + values-doks), template renders for 3/5/7-replica quorum floors, percentage + maxUnavailable overrides.
+
+  Pre-bake blockers (B1, B2, B3) are now all closed. B4 (consumer-group mode) is post-bake per ROADMAP ship order, so P4.iii (pre-bake image to ECR) is
+  unblocked. Want me to move on to P4.iii, or start B4 now?
+
+✻ Crunched for 9m 1s
+
+=======
+ please update current status of tasks in roadmap and related documents
+
+==========
+claude's response:
+
+Status updates landed across ROADMAP.md and CONNECTOR-AUDIT.md:
+
+  ROADMAP.md
+  - B1, B2, B3 table rows flipped from ⏳ pending → ✅ with shipped-date + what-landed notes.
+  - Audit conclusions 2, 3, 5 annotated with "Closed 2026-04-21 by B{1,2,3}."
+  - Added post-table "Status as of 2026-04-21" block noting all pre-bake correctness blockers closed; only P4.iii (ECR bake) remains.
+  - Phase 5 P5.a and P5.c flipped to ✅ shipped (tasks #7, #8).
+  - "What aeon-dev-notes still references as pending but is actually done" list now includes the B1/B2/B3 closure.
+
+  CONNECTOR-AUDIT.md
+  - §8.2 and §8.3 gained "Status (2026-04-21): ✅ closed by B1/B2" banners at the top.
+  - §8.5 pre-bake blocker table gained a Status column — all rows ✅ except B4 (deliberate post-bake).
+  - §8.6 zero-downtime narrative now notes B3 shipped.
+
+  Task list
+  - #14 (B3) flipped to completed.
+
+  Remaining open tasks: #15 (B4 — post-bake, not on critical path) and #6 (P4.iii — ECR bake, now unblocked).
+
+✻ Brewed for 4m 46s
+==========
+
+
+

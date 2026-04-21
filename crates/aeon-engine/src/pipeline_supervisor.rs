@@ -241,6 +241,14 @@ impl PipelineSupervisor {
             pipeline_config.poh_installed_chains =
                 self.poh_installed_chains.get().cloned();
         }
+        // P5: if the installed ownership resolver exposes a change-feed,
+        // subscribe the pipeline so the source loop can `reassign_partitions`
+        // without tearing down the task on a CL-6 transfer commit. Resolvers
+        // without a watch (tests, benches, single-node) leave this `None` and
+        // the loop falls back to the legacy resolve-once-at-start behaviour.
+        if let Some(resolver) = self.ownership.get() {
+            pipeline_config.partition_reassign = resolver.watch();
+        }
 
         let metrics = Arc::new(PipelineMetrics::new());
         let control = PipelineControl::new();

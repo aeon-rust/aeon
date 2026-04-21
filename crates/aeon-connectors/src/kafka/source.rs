@@ -295,6 +295,40 @@ impl Source for KafkaSource {
     async fn resume(&mut self) {
         self.paused = false;
     }
+
+    async fn reassign_partitions(&mut self, partitions: &[u16]) -> Result<(), AeonError> {
+        // Short-circuit if the set is unchanged — avoids needless
+        // `assign()` calls on the consumer which would reset per-partition
+        // fetch state.
+        let mut want: Vec<i32> = partitions.iter().map(|p| *p as i32).collect();
+        want.sort_unstable();
+        let mut have: Vec<i32> = self.config.partitions.clone();
+        have.sort_unstable();
+        if want == have {
+            return Ok(());
+        }
+
+        // rdkafka's `assign()` fully replaces the prior topic-partition
+        // list; partitions kept across the transition resume from the
+        // consumer's in-memory offset state, partitions that move away
+        // stop being fetched on the next poll.
+        let mut tpl = TopicPartitionList::new();
+        for &partition in partitions {
+            tpl.add_partition(&self.config.topic, partition as i32);
+        }
+        self.consumer
+            .assign(&tpl)
+            .map_err(|e| AeonError::connection(format!("kafka partition re-assign failed: {e}")))?;
+
+        self.config.partitions = partitions.iter().map(|p| *p as i32).collect();
+
+        tracing::info!(
+            topic = %self.config.topic,
+            partitions = ?self.config.partitions,
+            "KafkaSource re-assigned partitions on cluster ownership change"
+        );
+        Ok(())
+    }
 }
 
 /// Helper to create a Redpanda-optimized source config.

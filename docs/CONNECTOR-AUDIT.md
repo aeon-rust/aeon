@@ -48,7 +48,7 @@ decoupled (`UnorderedBatch`, flushed at interval).
 |---|---|---|---|---|---|---|
 | Memory | Pull | Bounded (Vec) | — | N/A | No | Test-only, OK |
 | Kafka | Pull | Bounded (offsets) | rdkafka prefetch | Implicit (offsets) | **Yes** | Production-grade |
-| HTTP Polling | Pull | Controlled interval | — | N/A | No | OK |
+| HTTP Polling | Poll | Controlled interval | — | N/A | No | OK |
 | HTTP Webhook | Push | Unbounded | PushBuffer | **HTTP 503** | No | OK — best Phase 3 |
 | WebSocket | Push | Unbounded | PushBuffer | TCP window (blocking send) | No | OK (fixed §4.1) |
 | NATS JetStream | Pull | Bounded (consumer grp) | — | Implicit (ack) | Implicit | OK |
@@ -57,7 +57,7 @@ decoupled (`UnorderedBatch`, flushed at interval).
 | Redis Streams | Pull | Bounded (pending) | — | Implicit (XACK) | Yes | OK |
 | Postgres CDC | Pull | Bounded (LSN) | — | Implicit | Yes | OK (polling, see §4.5) |
 | MySQL CDC | Pull | Bounded (binlog pos) | — | Implicit | Yes | OK (polling, see §4.5) |
-| MongoDB CDC | Push | Unbounded | PushBuffer | Blocking send only | File-based (at-least-once) | OK (fixed §4.3) |
+| MongoDB CDC | Pull | Bounded (resume token) | PushBuffer (internal shaping) | Blocking send only | File-based (at-least-once) | OK (fixed §4.3, reclassified §8.1) |
 | QUIC | Push | Unbounded | PushBuffer | Zero-length frame | No | OK |
 | WebTransport (streams) | Push | Unbounded | PushBuffer | Zero-length frame | No | OK |
 | WebTransport (datagrams) | Push | Lossy | PushBuffer | **intentional drop** | No | OK (opt-in `accept_loss`) |
@@ -90,6 +90,46 @@ three-phase backpressure primitive used by every push source:
 | QUIC | None differentiated | New stream per batch | no-op | Functional, see §4.6 |
 | WebTransport | None differentiated | New stream per batch | no-op | Functional, see §4.6 |
 | WebSocket | None differentiated | Per-output `send` + loop await | `writer.flush()` | Functional |
+
+---
+
+## 3.5 CLI Registry Wiring Status (2026-04-20)
+
+Separate from "is the library code correct?" is "can it be declared in a YAML
+manifest?" Today, `aeon-cli/src/connectors.rs::register_defaults` only registers
+**two sources** and **three sinks**. Everything else in this audit exists as
+library code but is unreachable from a pipeline manifest. Surfaced during V4
+(`docs/ROADMAP.md` §Phase 3.5) on 2026-04-20.
+
+| Connector | Library exists? | Audited OK? | Wired into CLI? |
+|---|---|---|---|
+| memory (source + sink) | ✅ | ✅ | ✅ source only |
+| blackhole sink | ✅ | ✅ | ✅ |
+| stdout sink | ✅ | ✅ | ✅ |
+| kafka (source + sink) | ✅ | ✅ | ✅ |
+| http-webhook source (push) | ✅ | ✅ | ⏳ V4 (this session) |
+| http-polling source (poll) | ✅ | ✅ | ⏳ P5.c (post-V6) |
+| http sink | ✅ | — | ⏳ P5.c |
+| file (source + sink) | ✅ | ✅ | ⏳ P5.c |
+| websocket (source + sink) | ✅ | ✅ | ⏳ P5.c |
+| mqtt (source + sink) | ✅ | ✅ | ⏳ P5.c |
+| rabbitmq (source + sink) | ✅ | ✅ | ⏳ P5.c |
+| nats (source + sink) | ✅ | ✅ | ⏳ P5.c |
+| redis-streams (source + sink) | ✅ | ✅ | ⏳ P5.c |
+| quic (source + sink) | ✅ | ✅ | ⏳ P5.c |
+| webtransport (streams + datagrams + sink) | ✅ | ✅ | ⏳ P5.c |
+| mongodb-cdc source | ✅ | ✅ | ⏳ P5.c |
+| postgres-cdc source | ✅ | ✅ | ⏳ P5.c |
+| mysql-cdc source | ✅ | ✅ | ⏳ P5.c |
+
+**P5.c** (`docs/ROADMAP.md` §Phase 5) is the follow-up that wires the remaining
+11 sources and 9 sinks using the pattern established by V4. Pattern-repetition
+work (~0.5–1 day): feature-gate in `aeon-cli/Cargo.toml`, add `*Factory` stubs
+following the `KafkaSourceFactory` shape, extend `register_defaults`, extend
+the unit tests in `connectors.rs`, and document YAML schema in
+`docs/CONNECTORS.md`. Not a Session B blocker — runs after V6.
+
+---
 
 **Pipeline-level metric bug** (see §4.0): the sink task only credits `outputs_sent`
 from `batch_result.delivered.len()`. For `UnorderedBatch`, sinks return
@@ -603,3 +643,206 @@ regression at the 10K evt/s steady-state baseline (see
 - **Pipeline orchestrator.** The `outputs_sent` metric bug is fixed
   (§4.0). The Scenario-1 hot path has no known correctness gaps. Gate
   1 re-validation confirms zero regression from the §5.3 refactor.
+
+---
+
+## 8. Pre-ECR-Bake Revisit (2026-04-21)
+
+Re-audit in preparation for the AWS ECR pre-bake (`#6 P4.iii`). Surfaced
+findings the 2026-04-09 pass did not cover, plus corrections to two
+source-method labels that were set from the *implementation shape*
+rather than the *source semantics*.
+
+### 8.1 Source-method taxonomy (clarified)
+
+The audit's pull/push/poll labels conflated "how does the impl handle
+data" with "how does the upstream protocol behave". The cleaner frame:
+
+| Mode | Who holds position? | Who initiates reads? | Backpressure shape |
+|------|---------------------|----------------------|--------------------|
+| **Pull** | Connector | Connector (continuous long-lived read) | Natural — connector paces |
+| **Poll** | None persistent | Connector (timer-driven) | Timer interval + backoff on errors |
+| **Push** | N/A — upstream has no position for us | External producer writes to our endpoint | Three-phase `PushBuffer` → protocol-level 503 / TCP-window / AMQP-cancel |
+
+Under this frame:
+
+- **MongoDB CDC is Pull, not Push** (corrected from §2). Change streams
+  are a tailable cursor over the oplog; the resume token is the
+  connector-owned position marker; `stream.next()` is a pull driven by
+  the connector. The current impl wrapping the tail in a `PushBuffer`
+  is an internal rate-shaping detail and does not make it a push
+  source. The tell: push sources have nothing to persist on shutdown.
+  MongoDB CDC persists a resume token.
+- **Postgres/MySQL CDC are Pull, not Poll** (clarified against §2). The
+  intent is streaming replication (`START_REPLICATION` /
+  `COM_BINLOG_DUMP`) with connector-held LSN / binlog position. The
+  current impls use `pg_logical_slot_get_changes` and
+  `SHOW BINLOG EVENTS` on a timer — poll *behaviour* but pull *intent*
+  (§4.5 already captured the streaming-replication upgrade as
+  deferred). Taxonomy stays Pull; §4.5 remains the debt.
+
+Labels updated in §2's matrix as part of this revisit.
+
+### 8.2 `Uuid::nil()` on Event.id across 12 sources — correctness gap
+
+**Status (2026-04-21)**: ✅ closed by ROADMAP B1. All 14 sources stamp
+UUIDv7 via `CoreLocalUuidGenerator`; regression tests in
+`delivery_ledger.rs` (`nil_uuids_collapse_tracking_slots`,
+`distinct_uuids_get_distinct_slots`) lock the invariant.
+
+**Severity**: correctness hazard under EO-2 at-least-once.
+**Scope**: every source except **Kafka** (uses
+`CoreLocalUuidGenerator`, `kafka/source.rs:126,176,208`) and the
+**HTTP webhook** source (uses `Uuid::now_v7()`,
+`http/webhook_source.rs:138`) currently stamps `Event.id =
+uuid::Uuid::nil()` — verified by repo-wide grep
+(`memory/file/websocket/mqtt/rabbitmq/nats/mqtt/redis_streams/quic/
+webtransport[streams+datagrams]/mongodb_cdc/postgres_cdc/mysql_cdc/
+http_polling`).
+
+**Why it matters.** `crates/aeon-engine/src/delivery_ledger.rs` keys
+its PerEvent / OrderedBatch / UnorderedBatch ack tracking off
+`source_event_id`. If every event in a batch carries the zero UUID,
+`mark_acked(id)` and `mark_batch_acked(&ids)` collapse distinct
+events into one ledger slot — acking one silently acks all, defeating
+at-least-once recovery. `IdempotentSink::has_seen(event_id)` is
+likewise useless with a shared zero id.
+
+**Fix (two-line per source)**. The `PushBuffer`-fed sources can either
+share an `Arc<Mutex<CoreLocalUuidGenerator>>` through the config, or
+call `uuid::Uuid::now_v7()` at the event-construction site — whichever
+matches the surrounding hot-path budget. Pull sources (CDC, Redis/NATS
+streams) have the simplest path: stamp `Uuid::now_v7()` at event
+construction in the source loop (same shape as the HTTP webhook).
+
+**Test**. One shared unit test asserting batch-distinct event ids
+across every non-Kafka source, plus the delivery-ledger invariant
+"N sent events → N ledger slots → N acks required to advance the
+checkpoint".
+
+Captured as ROADMAP `B1 — push/poll source UUIDv7 stamping`.
+
+### 8.3 `source_offset` stamping gaps for pull sources
+
+**Status (2026-04-21)**: ✅ closed by ROADMAP B2. Redis Streams /
+NATS JetStream / Postgres / MySQL CDC all stamp `source_offset` at
+event construction via documented packed-i64 helpers (with unit
+tests). MongoDB resume-token sidecar unchanged pending P13 WAL bump.
+
+**Severity**: blocks EO-2 at-least-once on every pull source other
+than Kafka.
+**Scope**: `source_offset` is currently populated only by the Kafka
+source (`kafka/source.rs:219`). Redis Streams (message id), NATS
+JetStream (sequence), MongoDB CDC (resume token — partially, via
+separate file), Postgres CDC (LSN), MySQL CDC (binlog coords) all
+have an upstream-native position but do not stamp it into `Event.
+source_offset`.
+
+**Why it matters.** The EO-2 checkpoint replicator advances recovery
+offsets from `Event.source_offset`; a pull source that does not
+stamp it gives the ledger no recovery point, which means replay
+after crash restarts from "now" (silent data loss) or from start
+(duplicate work), depending on source defaults.
+
+**Shape of the fix**. For each pull source, stamp
+`event.source_offset = Some(upstream_position)` at event
+construction. The MongoDB resume-token sidecar file (§4.3) stays —
+it is a token, not an `i64`, and EO-2 P13 tracks the WAL format bump
+that would unify them. The simpler `i64`-positioned pull sources
+(Redis/NATS/PG/MySQL) can land today.
+
+Captured as ROADMAP `B2 — pull-source offset stamping`.
+
+### 8.4 Consumer-group mode for compatible pull sources (optional, opt-in)
+
+**Scope — strictly connector-local.** Core pipeline (SPSC, Raft-
+coordinated `partition_table`, EO-2 checkpoint) stays unchanged. The
+feature is a config flag per source that selects between today's
+manual-assign mode and a broker-coordinated consumer-group mode.
+
+**Compatible upstreams**:
+
+| Source | Library | Mode surface |
+|--------|---------|--------------|
+| Kafka / Redpanda | `rdkafka` | `consumer.assign` vs `consumer.subscribe` + rebalance callbacks |
+| Redis Streams | `redis` | `XREAD` vs `XREADGROUP` (already uses `XREADGROUP`; exposes the group/consumer as config) |
+| Valkey Streams | same as Redis protocol | identical to Redis |
+
+**Not compatible** — out of scope: RabbitMQ super-streams (SAC is
+not a consumer-group model; rebuilding the consumer on every
+rebalance is incompatible with `reassign_partitions`). Audit
+finding confirmed in the 2026-04-21 revisit, no implementation.
+
+**Config shape (per source)**:
+
+```yaml
+consumer_mode:
+  kind: single        # default; manual-assign, ordering preserved, Aeon owns offsets
+  # OR
+  kind: group         # broker-coordinated, broker auto-commit still disabled
+  group_id: aeon-ingest
+  broker_commit: false  # Aeon's EO-2 ledger remains the truth
+```
+
+**Hard guardrail.** `kind: group` is **mutually exclusive** with
+cluster-coordinated partition ownership. When a source is in group
+mode the broker owns partition movement; Raft-driven
+`reassign_partitions` must stay out. The pipeline start path
+validates this — a source advertising group-mode on a clustered
+deployment fails configuration.
+
+**Design rationale** (against a separate `ConsumerGroupSource`
+trait): the user-facing surface is a configuration decision, not a
+type-system decision. Keeping it in config preserves YAML symmetry
+across sources and means the pipeline supervisor never has to branch
+on trait variants. The trait-level safety (no accidental
+`reassign_partitions` in group mode) is enforced by a single runtime
+assertion at source startup.
+
+Captured as ROADMAP `B4 — consumer-group config mode for pull
+sources (Kafka / Redpanda / Redis / Valkey)`.
+
+### 8.5 Pre-bake correctness blockers and polish
+
+| Item | Severity | Captured as | Status (2026-04-21) |
+|------|----------|-------------|---------------------|
+| 8.2 push/poll UUIDv7 stamping | Bake blocker (EO-2 correctness) | ROADMAP B1 | ✅ shipped |
+| 8.3 pull-source `source_offset` stamping | Bake blocker (EO-2 correctness) | ROADMAP B2 | ✅ shipped |
+| Pod disruption policy in Helm chart | Polish (bake-safe without, but one eviction ⇒ downtime) | ROADMAP B3 | ✅ shipped |
+| `docs/DEPLOYMENT.md` blue-green + canary walkthroughs | Docs polish | ROADMAP B3 | ✅ shipped |
+| 8.4 consumer-group config mode | Post-bake design + impl | ROADMAP B4 | ⏳ pending (deliberate — post-bake) |
+
+All B1 + B2 + B3 items landed in the same session on 2026-04-21.
+Pre-bake bar is clear; the only open ECR-bake-path item is P4.iii
+(task #6, pre-bake image to ECR `us-east-1`).
+
+Helm terminology note: the Kubernetes object `kind: PodDisruptionBudget`
+is a fixed API-server type; we inherit it. Everywhere Aeon-owned
+documents reference it we use **"pod disruption policy"** or **"pod
+disruption cap"** to stay consistent with the project-wide "Capacity
+not Budget" convention for our own types.
+
+### 8.6 Zero-downtime deployment — already largely in place
+
+For completeness, the 2026-04-21 revisit confirmed via grep + REST-
+API review that the pre-bake work order does **not** need to ship
+blue-green or canary — both already exist:
+
+- Drain-swap processor hot-swap (<1ms): `pipeline.rs`
+  `PipelineControl::drain_and_swap` family.
+- Blue-green: `POST /api/v1/pipelines/{name}/upgrade/blue-green`,
+  `/cutover`, `/rollback` → `start_blue_green` /
+  `cutover_blue_green` / `rollback_upgrade`.
+- Canary: `POST /api/v1/pipelines/{name}/upgrade/canary`
+  (configurable traffic steps, default 10/50/100%) → `start_canary`
+  / `set_canary_pct` / `complete_canary`.
+- Raft leadership relinquish + Helm `preStop` + `WriteGate` drain
+  cover graceful pod termination.
+- Cluster membership blue-green via CL-6 partition transfer (primitive
+  complete; orchestration tooling — `aeon cluster drain` — tracked as
+  Pillar 3 G5).
+
+Since 2026-04-21 the pod disruption policy (B3) and the operator-
+facing walkthrough (`docs/DEPLOYMENT.md`) have shipped, closing the
+polish gap. Canary auto-rollback on metric threshold stays manual for
+now — acceptable for v0.1.

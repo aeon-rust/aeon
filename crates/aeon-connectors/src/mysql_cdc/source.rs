@@ -7,10 +7,10 @@
 //! protocol directly. This implementation uses polling of the binlog via
 //! `SHOW BINLOG EVENTS` as a simpler starting point.
 
-use aeon_types::{AeonError, BackoffPolicy, Event, PartitionId, Source};
+use aeon_types::{AeonError, BackoffPolicy, CoreLocalUuidGenerator, Event, PartitionId, Source};
 use bytes::Bytes;
 use mysql_async::prelude::*;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Configuration for `MysqlCdcSource`.
@@ -105,6 +105,7 @@ pub struct MysqlCdcSource {
     /// TR-3 reconnect backoff. Advanced on pool/query errors; reset on
     /// every successful poll (even when no events arrive).
     backoff: aeon_types::Backoff,
+    uuid_gen: Mutex<CoreLocalUuidGenerator>,
 }
 
 impl MysqlCdcSource {
@@ -149,6 +150,7 @@ impl MysqlCdcSource {
             current_file: file,
             current_position: position,
             backoff,
+            uuid_gen: Mutex::new(CoreLocalUuidGenerator::new(0)),
         })
     }
 }
@@ -225,14 +227,25 @@ impl Source for MysqlCdcSource {
 
             let payload_bytes = Bytes::from(serde_json::to_vec(&payload).unwrap_or_default());
 
+            let event_id = self
+                .uuid_gen
+                .lock()
+                .map_err(|_| AeonError::connection("UUID generator mutex poisoned"))?
+                .next_uuid();
             let mut event = Event::new(
-                uuid::Uuid::nil(),
+                event_id,
                 0,
                 Arc::clone(&self.config.source_name),
                 PartitionId::new(0),
                 payload_bytes,
             );
             event = event.with_source_ts(now);
+            // B2: end_pos is the binlog offset after this event, a monotonic
+            // u64 within a single binlog file. Cast to i64 (sign bit cleared)
+            // for checkpoint ordering. The binlog file name is carried in
+            // metadata — callers that need full resume identity should
+            // combine both.
+            event = event.with_source_offset((end_pos & 0x7FFF_FFFF_FFFF_FFFF) as i64);
             event
                 .metadata
                 .push((Arc::from("mysql.binlog_file"), Arc::from(log_name.as_str())));

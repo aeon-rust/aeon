@@ -1,0 +1,38 @@
+{
+  "name": "v4-http-webhook-smoke",
+  "sources": [
+    {
+      "type": "http-webhook",
+      "topic": null,
+      "partitions": [],
+      "config": {
+        "bind_addr": "127.0.0.1:8088",
+        "path": "/webhook",
+        "source_name": "v4-smoke",
+        "channel_capacity": "2048",
+        "batch_size": "256",
+        "poll_timeout_ms": "500"
+      }
+    }
+  ],
+  "processor": {"name": "__identity", "version": "0.0.0"},
+  "sinks": [
+    {
+      "type": "blackhole",
+      "topic": null,
+      "config": {}
+    }
+  ],
+  "upgrade_strategy": "blue-green",
+  "state": "created",
+  "created_at": 0,
+  "updated_at": 0,
+  "assigned_node": null,
+  "transport_codec": "msgpack",
+  "upgrade_state": null,
+  "durability": {
+    "mode": "none",
+    "checkpoint": {"backend": "state_store"},
+    "flush": {}
+  }
+}

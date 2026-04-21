@@ -104,6 +104,25 @@ gracefulShutdown:
   preStopDelaySeconds: 5
   leaderRelinquishMs: 4000
 
+# Pod disruption policy (ROADMAP B3). Caps voluntary disruption (drain,
+# node upgrade, cluster-autoscaler scale-down) so Raft quorum is preserved.
+#
+# The K8s object kind is `PodDisruptionBudget` (fixed by the API); in
+# Aeon-owned surfaces we call it the "pod disruption policy" to match
+# the project's Capacity-not-Budget convention.
+#
+# Default (when enabled and neither minAvailable nor maxUnavailable is
+# set) computes `floor(N/2) + 1` — the Raft quorum floor — from
+# cluster.replicas (cluster mode), autoscaling.minReplicas (HPA mode),
+# or replicaCount. Override either field to pin an absolute cap; set
+# only one of the two (K8s forbids both).
+podDisruption:
+  enabled: false
+  # Absolute number, string ("2"), or percentage ("60%"). Empty = auto.
+  minAvailable: ""
+  # Mutually exclusive with minAvailable. Absolute or percentage.
+  maxUnavailable: ""
+
 # Horizontal Pod Autoscaler
 autoscaling:
   enabled: false

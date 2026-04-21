@@ -4,7 +4,7 @@
 //! becomes an Event. Uses the shared push buffer for three-phase backpressure.
 
 use crate::push_buffer::{PushBufferConfig, PushBufferRx, PushBufferTx, push_buffer};
-use aeon_types::{AeonError, Event, PartitionId, Source};
+use aeon_types::{AeonError, Event, PartitionId, Source, SourceKind};
 use bytes::Bytes;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -129,9 +129,14 @@ async fn webhook_handler(
         return axum::http::StatusCode::SERVICE_UNAVAILABLE;
     }
 
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0);
+
     let event = Event::new(
-        uuid::Uuid::nil(),
-        0,
+        uuid::Uuid::now_v7(),
+        timestamp,
         Arc::clone(&state.source_name),
         PartitionId::new(0),
         body,
@@ -146,6 +151,10 @@ async fn webhook_handler(
 impl Source for HttpWebhookSource {
     async fn next_batch(&mut self) -> Result<Vec<Event>, AeonError> {
         self.rx.next_batch(self.poll_timeout).await
+    }
+
+    fn source_kind(&self) -> SourceKind {
+        SourceKind::Push
     }
 }
 

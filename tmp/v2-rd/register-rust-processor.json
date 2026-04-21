@@ -1,0 +1,14 @@
+{
+  "name": "rust-processor",
+  "description": "V3 — shipped rust-processor.wasm identity example",
+  "version": {
+    "version": "1.0.0",
+    "sha512": "791c27dc012f1c08f54839f69e3d4f79a2af8ee287858a94126631ca045f85fb0f4880963952426c419cc36778c2e566967fe9351cb47bb89c3f5948d94247de",
+    "size_bytes": 2911,
+    "processor_type": "wasm",
+    "platform": "wasm32",
+    "status": "available",
+    "registered_at": 1776701966000,
+    "registered_by": "cli"
+  }
+}
