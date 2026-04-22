@@ -12,7 +12,10 @@
 //! never dropped.
 
 use crate::push_buffer::{PushBufferConfig, PushBufferRx, PushBufferTx, push_buffer};
-use aeon_types::{AeonError, Backoff, BackoffPolicy, Event, PartitionId, Source};
+use aeon_types::{
+    AeonError, Backoff, BackoffPolicy, CoreLocalUuidGenerator, Event, PartitionId, Source,
+    SourceKind, SsrfPolicy, redact_uri,
+};
 use bytes::Bytes;
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,6 +36,10 @@ pub struct WebSocketSourceConfig {
     /// reconnects. Resets on a successful reconnect. Initial `new()` still
     /// fails fast so misconfiguration surfaces on startup.
     pub backoff: BackoffPolicy,
+    /// S7: SSRF guard. Checked at initial connect AND on every reconnect
+    /// so a mid-life DNS change (classic rebinding) can't quietly move
+    /// the source onto an internal endpoint.
+    pub ssrf_policy: SsrfPolicy,
 }
 
 impl WebSocketSourceConfig {
@@ -44,12 +51,19 @@ impl WebSocketSourceConfig {
             buffer_config: PushBufferConfig::default(),
             poll_timeout: Duration::from_secs(1),
             backoff: BackoffPolicy::default(),
+            ssrf_policy: SsrfPolicy::production(),
         }
     }
 
     /// Override the reconnect backoff policy.
     pub fn with_backoff(mut self, backoff: BackoffPolicy) -> Self {
         self.backoff = backoff;
+        self
+    }
+
+    /// Override the SSRF policy.
+    pub fn with_ssrf_policy(mut self, policy: SsrfPolicy) -> Self {
+        self.ssrf_policy = policy;
         self
     }
 
@@ -90,48 +104,74 @@ impl WebSocketSource {
     /// loop — on Close/error it drops the socket, sleeps for the backoff
     /// delay, and reconnects; resets the backoff on successful reconnect.
     pub async fn new(config: WebSocketSourceConfig) -> Result<Self, AeonError> {
+        // S7: pre-flight SSRF check — reject bad URLs synchronously, before
+        // DNS / socket. Re-checked on each reconnect below to defeat
+        // rebinding (the guard re-resolves, so a mid-flight DNS swap onto
+        // 127.0.0.1 or 169.254/16 is caught).
+        config.ssrf_policy.check_url(&config.url)?;
+
         // Initial connect — fail fast on bad URL / unreachable host so the
         // pipeline operator sees misconfiguration immediately rather than
         // watching the backoff loop grind forever.
         let (ws_stream, _) = tokio_tungstenite::connect_async(&config.url)
             .await
             .map_err(|e| {
-                AeonError::connection(format!("websocket connect failed: {}: {e}", config.url))
+                AeonError::connection(format!(
+                    "websocket connect failed: {}: {e}",
+                    redact_uri(&config.url)
+                ))
             })?;
 
-        tracing::info!(url = %config.url, "WebSocketSource connected");
+        tracing::info!(url = %redact_uri(&config.url), "WebSocketSource connected");
 
         let (tx, rx) = push_buffer(config.buffer_config);
         let source_name = config.source_name;
         let url = config.url;
+        // Pre-redacted copy for logging — avoids recomputing at every
+        // reconnect, and keeps the userinfo out of the reader task scope.
+        let url_for_log: String = redact_uri(&url).into_owned();
+        let ssrf_policy = config.ssrf_policy;
         let mut backoff = Backoff::new(config.backoff);
+        let mut uuid_gen = CoreLocalUuidGenerator::new(0);
 
         let handle = tokio::spawn(async move {
             // Drive the initial connection first, then fall into the
             // reconnect loop on drop.
-            if !run_ws_reader(ws_stream, &tx, &source_name).await {
+            if !run_ws_reader(ws_stream, &tx, &source_name, &mut uuid_gen).await {
                 return; // Buffer closed — caller dropped the source.
             }
 
             loop {
                 let delay = backoff.next_delay();
                 tracing::warn!(
-                    %url,
+                    url = %url_for_log,
                     delay_ms = delay.as_millis() as u64,
                     "websocket disconnected, reconnecting after backoff"
                 );
                 tokio::time::sleep(delay).await;
 
+                // Anti-rebinding: re-run the SSRF guard every reconnect so
+                // a DNS record that flipped to a private IP between the
+                // initial connect and now fails closed here.
+                if let Err(e) = ssrf_policy.check_url(&url) {
+                    tracing::error!(
+                        url = %url_for_log,
+                        error = %e,
+                        "websocket reconnect refused by SSRF policy — terminating reader task"
+                    );
+                    return;
+                }
+
                 match tokio_tungstenite::connect_async(&url).await {
                     Ok((stream, _)) => {
-                        tracing::info!(%url, "websocket reconnected");
+                        tracing::info!(url = %url_for_log, "websocket reconnected");
                         backoff.reset();
-                        if !run_ws_reader(stream, &tx, &source_name).await {
+                        if !run_ws_reader(stream, &tx, &source_name, &mut uuid_gen).await {
                             return;
                         }
                     }
                     Err(e) => {
-                        tracing::warn!(%url, error = %e, "websocket reconnect failed");
+                        tracing::warn!(url = %url_for_log, error = %e, "websocket reconnect failed");
                         // Loop back; next iteration picks up the next delay.
                     }
                 }
@@ -155,6 +195,7 @@ async fn run_ws_reader<S>(
     ws_stream: tokio_tungstenite::WebSocketStream<S>,
     tx: &PushBufferTx,
     source_name: &Arc<str>,
+    uuid_gen: &mut CoreLocalUuidGenerator,
 ) -> bool
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -166,7 +207,7 @@ where
         match msg_result {
             Ok(Message::Text(text)) => {
                 let event = Event::new(
-                    uuid::Uuid::nil(),
+                    uuid_gen.next_uuid(),
                     0,
                     Arc::clone(source_name),
                     PartitionId::new(0),
@@ -182,7 +223,7 @@ where
             }
             Ok(Message::Binary(data)) => {
                 let event = Event::new(
-                    uuid::Uuid::nil(),
+                    uuid_gen.next_uuid(),
                     0,
                     Arc::clone(source_name),
                     PartitionId::new(0),
@@ -209,5 +250,9 @@ where
 impl Source for WebSocketSource {
     async fn next_batch(&mut self) -> Result<Vec<Event>, AeonError> {
         self.rx.next_batch(self.poll_timeout).await
+    }
+
+    fn source_kind(&self) -> SourceKind {
+        SourceKind::Push
     }
 }

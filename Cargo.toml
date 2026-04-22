@@ -80,12 +80,15 @@ axum = "0.8"
 tower-http = { version = "0.6", features = ["trace", "cors", "limit", "set-header"] }
 serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+ipnet = { version = "2", features = ["serde"] }
 
 # Crypto (integrity verification)
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 sha2 = "0.10"
+hmac = "0.12"
 hex = "0.4"
 base64 = "0.22"
+zeroize = { version = "1", features = ["derive"] }
 
 # Streaming connectors
 futures-util = "0.3"

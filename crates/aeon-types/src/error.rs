@@ -129,6 +129,29 @@ impl AeonError {
 /// Convenience type alias used throughout Aeon.
 pub type Result<T> = std::result::Result<T, AeonError>;
 
+impl From<crate::ssrf::SsrfError> for AeonError {
+    fn from(err: crate::ssrf::SsrfError) -> Self {
+        use crate::ssrf::SsrfError;
+        match err {
+            // Policy denied the address: operator intervention required
+            // (change SsrfPolicy or use an allowed target). Non-retryable.
+            SsrfError::AddressDenied { .. } | SsrfError::UrlParseFailed { .. } => {
+                AeonError::Config {
+                    message: err.to_string(),
+                }
+            }
+            // DNS hiccup: retryable connection-class failure.
+            SsrfError::ResolutionFailed { .. } | SsrfError::NoAddresses { .. } => {
+                AeonError::Connection {
+                    message: err.to_string(),
+                    source: None,
+                    retryable: true,
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

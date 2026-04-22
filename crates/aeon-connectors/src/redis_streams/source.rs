@@ -3,12 +3,15 @@
 //! Uses consumer groups for reliable delivery with acknowledgment.
 //! Pull-source: `next_batch()` issues XREADGROUP with COUNT and BLOCK.
 
-use aeon_types::{AeonError, Backoff, BackoffPolicy, Event, PartitionId, Source};
+use aeon_types::{
+    AeonError, Backoff, BackoffPolicy, ConsumerMode, CoreLocalUuidGenerator, Event, PartitionId,
+    Source,
+};
 use bytes::Bytes;
 use redis::AsyncCommands;
 use redis::aio::MultiplexedConnection;
 use redis::streams::{StreamReadOptions, StreamReadReply};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Configuration for `RedisSource`.
 pub struct RedisSourceConfig {
@@ -31,6 +34,21 @@ pub struct RedisSourceConfig {
     /// current delay, and returns an empty batch so the pipeline stays alive.
     /// The next `next_batch()` rebuilds the connection and retries.
     pub backoff: BackoffPolicy,
+    /// B4: consumer-group mode selector. Redis Streams always uses
+    /// XREADGROUP under the hood, but `ConsumerMode` governs whether
+    /// Aeon's Raft-coordinated partition_table may drive partition
+    /// ownership on top of the stream.
+    ///
+    /// - `Single` (default): Aeon owns the stream — at most one consumer
+    ///   per group per Aeon deployment; cluster-coordinated partition
+    ///   ownership is allowed.
+    /// - `Group { group_id, .. }`: multiple Aeon instances share the
+    ///   broker-managed group (each with a distinct `consumer` name);
+    ///   the broker distributes pending entries across instances and
+    ///   Raft-driven partition re-assignment is refused at pipeline start.
+    ///
+    /// When `Group`, the mode's `group_id` overrides the `group` field.
+    pub consumer_mode: ConsumerMode,
 }
 
 impl RedisSourceConfig {
@@ -50,6 +68,7 @@ impl RedisSourceConfig {
             block_ms: 1000,
             source_name: Arc::from("redis"),
             backoff: BackoffPolicy::default(),
+            consumer_mode: ConsumerMode::Single,
         }
     }
 
@@ -57,6 +76,22 @@ impl RedisSourceConfig {
     pub fn with_backoff(mut self, backoff: BackoffPolicy) -> Self {
         self.backoff = backoff;
         self
+    }
+
+    /// Set the consumer-group mode (B4). See `ConsumerMode`.
+    pub fn with_consumer_mode(mut self, mode: ConsumerMode) -> Self {
+        self.consumer_mode = mode;
+        self
+    }
+
+    /// Group id that will be passed to `XGROUP CREATE` / `XREADGROUP`:
+    /// the `ConsumerMode::Group` variant's `group_id` when present,
+    /// otherwise the config's `group` field.
+    pub fn effective_group(&self) -> &str {
+        match &self.consumer_mode {
+            ConsumerMode::Single => self.group.as_str(),
+            ConsumerMode::Group { group_id, .. } => group_id.as_str(),
+        }
     }
 
     /// Set batch size.
@@ -91,6 +126,7 @@ pub struct RedisSource {
     config: RedisSourceConfig,
     pending_ack_ids: Vec<String>,
     backoff: Backoff,
+    uuid_gen: Mutex<CoreLocalUuidGenerator>,
 }
 
 impl RedisSource {
@@ -118,6 +154,7 @@ impl RedisSource {
             config,
             pending_ack_ids: Vec::new(),
             backoff,
+            uuid_gen: Mutex::new(CoreLocalUuidGenerator::new(0)),
         })
     }
 
@@ -138,7 +175,7 @@ impl RedisSource {
         let result: redis::RedisResult<String> = redis::cmd("XGROUP")
             .arg("CREATE")
             .arg(&config.stream_key)
-            .arg(&config.group)
+            .arg(config.effective_group())
             .arg("0")
             .arg("MKSTREAM")
             .query_async(&mut conn)
@@ -148,7 +185,7 @@ impl RedisSource {
             Ok(_) => {
                 tracing::info!(
                     stream = %config.stream_key,
-                    group = %config.group,
+                    group = %config.effective_group(),
                     "RedisSource created consumer group"
                 );
             }
@@ -177,7 +214,7 @@ impl RedisSource {
             .ok_or_else(|| AeonError::connection("redis conn not established"))?;
         let ids: Vec<&str> = self.pending_ack_ids.iter().map(|s| s.as_str()).collect();
         let _: u64 = conn
-            .xack(&self.config.stream_key, &self.config.group, &ids)
+            .xack(&self.config.stream_key, self.config.effective_group(), &ids)
             .await
             .map_err(|e| AeonError::connection(format!("redis XACK failed: {e}")))?;
 
@@ -232,7 +269,7 @@ impl Source for RedisSource {
         let opts = StreamReadOptions::default()
             .count(self.config.batch_size)
             .block(self.config.block_ms)
-            .group(&self.config.group, &self.config.consumer);
+            .group(self.config.effective_group(), &self.config.consumer);
 
         let conn = self
             .conn
@@ -280,14 +317,27 @@ impl Source for RedisSource {
                     }
                 };
 
+                let event_id = self
+                    .uuid_gen
+                    .lock()
+                    .map_err(|_| AeonError::connection("UUID generator mutex poisoned"))?
+                    .next_uuid();
                 let mut event = Event::new(
-                    uuid::Uuid::nil(),
+                    event_id,
                     0,
                     Arc::clone(&self.config.source_name),
                     PartitionId::new(0),
                     payload_bytes,
                 );
                 event = event.with_source_ts(now);
+                // B2: encode Redis stream entry ID "<ms>-<seq>" into a
+                // monotonic i64 for checkpoint persistence. High 48 bits
+                // hold the ms timestamp, low 16 bits hold the intra-ms seq.
+                // Actual resume is via consumer-group PEL (XACK); this
+                // offset is for observability and checkpoint ordering.
+                if let Some(offset) = parse_stream_id_to_i64(&entry.id) {
+                    event = event.with_source_offset(offset);
+                }
                 events.push(event);
 
                 self.pending_ack_ids.push(entry.id.clone());
@@ -295,5 +345,74 @@ impl Source for RedisSource {
         }
 
         Ok(events)
+    }
+
+    fn broker_coordinated_partitions(&self) -> bool {
+        self.config.consumer_mode.is_broker_coordinated()
+    }
+}
+
+/// Pack a Redis stream entry ID `"<ms>-<seq>"` into a monotonic `i64`.
+/// Returns `None` if the ID is malformed.
+///
+/// Layout: `[ms: high 48 bits][seq: low 16 bits]`. The bit layout is
+/// internal — consumers should treat the value as an opaque monotonic
+/// ordering key for checkpoint purposes. `seq` saturates at 0xFFFF; in
+/// the pathological case of >65k entries at the same ms the ordering
+/// between late entries is lost but the checkpoint remains monotonic.
+fn parse_stream_id_to_i64(id: &str) -> Option<i64> {
+    let (ms_s, seq_s) = id.split_once('-')?;
+    let ms: u64 = ms_s.parse().ok()?;
+    let seq: u64 = seq_s.parse().ok()?;
+    let packed = (ms << 16) | (seq.min(0xFFFF));
+    // Clear the sign bit to keep the result non-negative as an i64.
+    Some((packed & 0x7FFF_FFFF_FFFF_FFFF) as i64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_stream_id_round_trips_ordering() {
+        let a = parse_stream_id_to_i64("1713456789123-0").unwrap();
+        let b = parse_stream_id_to_i64("1713456789123-1").unwrap();
+        let c = parse_stream_id_to_i64("1713456789124-0").unwrap();
+        assert!(a < b, "seq monotonic within same ms");
+        assert!(b < c, "later ms dominates");
+    }
+
+    #[test]
+    fn parse_stream_id_malformed_returns_none() {
+        assert!(parse_stream_id_to_i64("nope").is_none());
+        assert!(parse_stream_id_to_i64("123").is_none());
+        assert!(parse_stream_id_to_i64("abc-0").is_none());
+    }
+
+    #[test]
+    fn parse_stream_id_saturates_large_seq() {
+        let a = parse_stream_id_to_i64("1-65535").unwrap();
+        let b = parse_stream_id_to_i64("1-99999").unwrap();
+        assert_eq!(a, b, "seq saturates at 0xFFFF");
+    }
+
+    #[test]
+    fn default_consumer_mode_is_single_and_uses_config_group() {
+        let cfg =
+            RedisSourceConfig::new("redis://localhost", "stream", "group-a", "consumer-1");
+        assert_eq!(cfg.consumer_mode, ConsumerMode::Single);
+        assert_eq!(cfg.effective_group(), "group-a");
+    }
+
+    #[test]
+    fn group_mode_overrides_effective_group() {
+        let cfg =
+            RedisSourceConfig::new("redis://localhost", "stream", "group-a", "consumer-1")
+                .with_consumer_mode(ConsumerMode::Group {
+                    group_id: "shared-group".to_string(),
+                    broker_commit: false,
+                });
+        assert!(cfg.consumer_mode.is_broker_coordinated());
+        assert_eq!(cfg.effective_group(), "shared-group");
     }
 }

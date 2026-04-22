@@ -32,7 +32,7 @@
 //! §4.3 notes).
 
 use crate::push_buffer::{PushBufferConfig, PushBufferRx, push_buffer};
-use aeon_types::{AeonError, Event, PartitionId, Source};
+use aeon_types::{AeonError, CoreLocalUuidGenerator, Event, PartitionId, Source};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use mongodb::bson::Document;
@@ -245,6 +245,7 @@ async fn mongodb_reader(
     let mut latest_token: Option<ResumeToken> = None;
     let mut unflushed_since: usize = 0;
     let mut backoff = backoff_policy.iter();
+    let mut id_gen = CoreLocalUuidGenerator::new(0);
 
     while let Some(result) = change_stream.next().await {
         match result {
@@ -283,7 +284,7 @@ async fn mongodb_reader(
 
                 let payload_bytes = doc_to_json_bytes(&doc);
                 let mut event = Event::new(
-                    uuid::Uuid::nil(),
+                    id_gen.next_uuid(),
                     0,
                     Arc::clone(&source_name),
                     PartitionId::new(0),

@@ -1,8 +1,8 @@
 //! In-memory source that serves pre-loaded events.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use aeon_types::{AeonError, Event, PartitionId, Source};
+use aeon_types::{AeonError, CoreLocalUuidGenerator, Event, PartitionId, Source};
 use bytes::Bytes;
 
 /// A source that yields events from a pre-loaded `Vec<Event>`.
@@ -120,6 +120,8 @@ pub struct StreamingMemorySource {
     payload: Bytes,
     source_name: Arc<str>,
     partition: PartitionId,
+    /// Per-source UUIDv7 generator (SPSC pool, ~1-2ns per UUID).
+    uuid_gen: Mutex<CoreLocalUuidGenerator>,
 }
 
 impl StreamingMemorySource {
@@ -137,6 +139,7 @@ impl StreamingMemorySource {
             payload: Bytes::from(vec![0u8; payload_size]),
             source_name: Arc::from("memory"),
             partition: PartitionId::new(0),
+            uuid_gen: Mutex::new(CoreLocalUuidGenerator::new(0)),
         }
     }
 
@@ -158,9 +161,13 @@ impl Source for StreamingMemorySource {
             self.batch_size.min(self.limit - self.emitted)
         };
         let mut batch = Vec::with_capacity(want);
+        let mut id_gen = self
+            .uuid_gen
+            .lock()
+            .map_err(|_| AeonError::connection("UUID generator mutex poisoned"))?;
         for _ in 0..want {
             batch.push(Event::new(
-                uuid::Uuid::nil(),
+                id_gen.next_uuid(),
                 self.emitted as i64,
                 Arc::clone(&self.source_name),
                 self.partition,

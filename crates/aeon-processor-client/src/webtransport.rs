@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use aeon_types::AeonError;
+use aeon_types::{AeonError, redact_uri};
 use wtransport::{ClientConfig, Endpoint};
 
 /// Log the webtransport-insecure warning at most once per process.
@@ -84,7 +84,7 @@ async fn run_webtransport_inner(
         .await
         .map_err(|e| AeonError::state(format!("WebTransport connect: {e}")))?;
 
-    tracing::info!(url = %url, "Connected to Aeon via WebTransport");
+    tracing::info!(url = %redact_uri(&url), "Connected to Aeon via WebTransport");
 
     // Open control stream (bidirectional stream 0).
     let (mut ctrl_send, mut ctrl_recv) = connection

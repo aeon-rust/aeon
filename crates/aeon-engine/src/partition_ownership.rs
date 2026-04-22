@@ -14,6 +14,8 @@ use std::pin::Pin;
 
 use aeon_cluster::store::SharedClusterState;
 use aeon_cluster::types::NodeId;
+use aeon_types::PartitionId;
+use tokio::sync::watch;
 
 use crate::connector_registry::PartitionOwnershipResolver;
 
@@ -24,6 +26,11 @@ use crate::connector_registry::PartitionOwnershipResolver;
 pub struct ClusterPartitionOwnership {
     shared_state: SharedClusterState,
     my_id: NodeId,
+    /// P5: optional receiver for the cluster's per-node owned-partitions
+    /// watch. When present, subscribers (pipeline source loop) observe
+    /// every committed ownership change without polling. Stored as a
+    /// `Receiver` so each `watch()` call hands out a fresh subscription.
+    owned_partitions_rx: Option<watch::Receiver<Vec<PartitionId>>>,
 }
 
 impl ClusterPartitionOwnership {
@@ -31,7 +38,20 @@ impl ClusterPartitionOwnership {
         Self {
             shared_state,
             my_id,
+            owned_partitions_rx: None,
         }
+    }
+
+    /// P5: attach the cluster-side owned-partitions watch receiver. Callers
+    /// typically obtain this from `ClusterNode::watch_owned_partitions()`
+    /// immediately after bootstrap. Chainable so `cmd_serve` can build the
+    /// resolver in one expression.
+    pub fn with_watch(
+        mut self,
+        rx: watch::Receiver<Vec<PartitionId>>,
+    ) -> Self {
+        self.owned_partitions_rx = Some(rx);
+        self
     }
 }
 
@@ -52,6 +72,39 @@ impl PartitionOwnershipResolver for ClusterPartitionOwnership {
             // supervisor can keep the factory's own fallback semantics.
             if owned.is_empty() { None } else { Some(owned) }
         })
+    }
+
+    fn watch(&self) -> Option<watch::Receiver<Vec<u16>>> {
+        // Adapt the cluster-side `Vec<PartitionId>` watch into the
+        // engine-facing `Vec<u16>` watch expected by the pipeline source
+        // loop. Rather than carry a pre-mapped receiver (cluster-side
+        // sender only knows `PartitionId`), spawn a one-shot relay task
+        // the first time we hand out a subscription — the relay stays
+        // alive as long as any subscriber keeps its handle.
+        //
+        // Cheap: relay is a `while watch.changed()` loop — no per-event
+        // allocation beyond the re-shaped `Vec<u16>`. Returning `None`
+        // means the caller should fall back to the polling resolver.
+        let mut upstream = self.owned_partitions_rx.as_ref()?.clone();
+        let initial: Vec<u16> = upstream
+            .borrow()
+            .iter()
+            .map(|p| p.as_u16())
+            .collect();
+        let (tx, rx) = watch::channel(initial);
+        tokio::spawn(async move {
+            while upstream.changed().await.is_ok() {
+                let mapped: Vec<u16> = upstream
+                    .borrow_and_update()
+                    .iter()
+                    .map(|p| p.as_u16())
+                    .collect();
+                if tx.send(mapped).is_err() {
+                    break;
+                }
+            }
+        });
+        Some(rx)
     }
 }
 

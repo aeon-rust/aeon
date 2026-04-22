@@ -212,6 +212,10 @@ impl<S: Source> Source for L2WritingSource<S> {
     ) -> impl std::future::Future<Output = Result<(), AeonError>> + Send {
         self.inner.on_recovery_plan(pull_offsets, replay_from_l2_seq)
     }
+
+    fn broker_coordinated_partitions(&self) -> bool {
+        self.inner.broker_coordinated_partitions()
+    }
 }
 
 // ── MaybeL2Wrapped ──────────────────────────────────────────────────────
@@ -321,6 +325,13 @@ impl<S: Source> Source for MaybeL2Wrapped<S> {
                 Self::Direct(s) => s.on_recovery_plan(pull_offsets, replay_from_l2_seq).await,
                 Self::Wrapped(w) => w.on_recovery_plan(pull_offsets, replay_from_l2_seq).await,
             }
+        }
+    }
+
+    fn broker_coordinated_partitions(&self) -> bool {
+        match self {
+            Self::Direct(s) => s.broker_coordinated_partitions(),
+            Self::Wrapped(w) => w.broker_coordinated_partitions(),
         }
     }
 }

@@ -3,7 +3,7 @@
 //! Connects to a WebTransport server and sends outputs as
 //! length-prefixed messages on bidirectional streams.
 
-use aeon_types::{AeonError, BatchResult, Output, Sink};
+use aeon_types::{AeonError, BatchResult, Output, Sink, SsrfPolicy, redact_uri};
 
 /// Configuration for `WebTransportSink`.
 pub struct WebTransportSinkConfig {
@@ -11,6 +11,8 @@ pub struct WebTransportSinkConfig {
     pub url: String,
     /// wtransport client configuration.
     pub client_config: wtransport::ClientConfig,
+    /// S7: SSRF guard. Checked at connection time.
+    pub ssrf_policy: SsrfPolicy,
 }
 
 impl WebTransportSinkConfig {
@@ -19,7 +21,14 @@ impl WebTransportSinkConfig {
         Self {
             url: url.into(),
             client_config,
+            ssrf_policy: SsrfPolicy::production(),
         }
+    }
+
+    /// Override the SSRF policy.
+    pub fn with_ssrf_policy(mut self, policy: SsrfPolicy) -> Self {
+        self.ssrf_policy = policy;
+        self
     }
 }
 
@@ -33,8 +42,11 @@ pub struct WebTransportSink {
 }
 
 impl WebTransportSink {
-    /// Connect to the WebTransport server.
+    /// Connect to the WebTransport server. The URL is validated against
+    /// the [`SsrfPolicy`] before the QUIC handshake is initiated.
     pub async fn new(config: WebTransportSinkConfig) -> Result<Self, AeonError> {
+        config.ssrf_policy.check_url(&config.url)?;
+
         let endpoint = wtransport::Endpoint::client(config.client_config).map_err(|e| {
             AeonError::connection(format!("webtransport client endpoint failed: {e}"))
         })?;
@@ -42,11 +54,11 @@ impl WebTransportSink {
         let connection = endpoint.connect(&config.url).await.map_err(|e| {
             AeonError::connection(format!(
                 "webtransport connect failed to {}: {e}",
-                config.url
+                redact_uri(&config.url)
             ))
         })?;
 
-        tracing::info!(url = %config.url, "WebTransportSink connected");
+        tracing::info!(url = %redact_uri(&config.url), "WebTransportSink connected");
 
         Ok(Self {
             connection,

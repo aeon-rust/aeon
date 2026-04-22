@@ -74,6 +74,7 @@ fn open_l3_backend(config: &TieredConfig) -> Result<Arc<dyn L3Store>, AeonError>
                 ))
             }
         }
+        #[cfg(feature = "rocksdb")]
         aeon_types::L3Backend::RocksDb => Err(AeonError::state(
             "L3 backend=RocksDb: adapter not yet implemented (FT-7 placeholder)",
         )),
@@ -835,8 +836,11 @@ mod tests {
         assert_eq!(results.len(), 2);
     }
 
-    /// FT-7: rocksdb backend selected but not implemented — surfaces a clear
-    /// error rather than silently falling back.
+    /// FT-7 / S8.3: rocksdb backend selected but not implemented — surfaces a
+    /// clear error rather than silently falling back. Only compiled when the
+    /// `rocksdb` feature is enabled (the variant is otherwise gated out at the
+    /// type level, so YAML configs selecting `rocksdb` fail at parse time).
+    #[cfg(feature = "rocksdb")]
     #[test]
     fn tiered_l3_backend_rocksdb_not_implemented() {
         let config = TieredConfig {

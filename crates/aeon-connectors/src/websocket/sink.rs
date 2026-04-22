@@ -3,19 +3,30 @@
 //! Each output payload is sent as a WebSocket binary message.
 //! The connection is maintained across `write_batch()` calls.
 
-use aeon_types::{AeonError, BatchResult, Output, Sink};
+use aeon_types::{AeonError, BatchResult, Output, Sink, SsrfPolicy, redact_uri};
 use tokio_tungstenite::tungstenite::Message;
 
 /// Configuration for `WebSocketSink`.
 pub struct WebSocketSinkConfig {
     /// WebSocket URL to connect to.
     pub url: String,
+    /// S7: SSRF guard. The URL is checked against this policy before dial.
+    pub ssrf_policy: SsrfPolicy,
 }
 
 impl WebSocketSinkConfig {
     /// Create a config for a WebSocket sink.
     pub fn new(url: impl Into<String>) -> Self {
-        Self { url: url.into() }
+        Self {
+            url: url.into(),
+            ssrf_policy: SsrfPolicy::production(),
+        }
+    }
+
+    /// Override the SSRF policy.
+    pub fn with_ssrf_policy(mut self, policy: SsrfPolicy) -> Self {
+        self.ssrf_policy = policy;
+        self
     }
 }
 
@@ -35,15 +46,22 @@ pub struct WebSocketSink {
 }
 
 impl WebSocketSink {
-    /// Connect to the WebSocket server.
+    /// Connect to the WebSocket server. The URL is validated against the
+    /// [`SsrfPolicy`] before the TCP SYN is sent, so a denied target fails
+    /// at startup.
     pub async fn new(config: WebSocketSinkConfig) -> Result<Self, AeonError> {
+        config.ssrf_policy.check_url(&config.url)?;
+
         let (ws_stream, _) = tokio_tungstenite::connect_async(&config.url)
             .await
             .map_err(|e| {
-                AeonError::connection(format!("websocket connect failed: {}: {e}", config.url))
+                AeonError::connection(format!(
+                    "websocket connect failed: {}: {e}",
+                    redact_uri(&config.url)
+                ))
             })?;
 
-        tracing::info!(url = %config.url, "WebSocketSink connected");
+        tracing::info!(url = %redact_uri(&config.url), "WebSocketSink connected");
 
         use futures_util::StreamExt;
         let (writer, _reader) = ws_stream.split();

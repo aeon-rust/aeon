@@ -3,8 +3,8 @@
 //! Uses JetStream pull-based consumer for durable, at-least-once delivery.
 //! Messages are acknowledged after being returned from `next_batch()`.
 
-use aeon_types::{AeonError, BackoffPolicy, Event, PartitionId, Source};
-use std::sync::Arc;
+use aeon_types::{AeonError, BackoffPolicy, CoreLocalUuidGenerator, Event, PartitionId, Source};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Configuration for `NatsSource`.
@@ -91,6 +91,7 @@ pub struct NatsSource {
     /// TR-3 reconnect backoff. Advanced on message-stream errors; reset on
     /// every successful message delivery.
     backoff: aeon_types::Backoff,
+    uuid_gen: Mutex<CoreLocalUuidGenerator>,
 }
 
 impl NatsSource {
@@ -134,6 +135,7 @@ impl NatsSource {
             config,
             messages: None,
             backoff,
+            uuid_gen: Mutex::new(CoreLocalUuidGenerator::new(0)),
         })
     }
 }
@@ -183,14 +185,23 @@ impl Source for NatsSource {
 
                 // FT-11: async_nats Message.payload is bytes::Bytes — clone is refcount-only.
                 let payload = msg.payload.clone();
+                // B2: stream_sequence is the JetStream-assigned monotonic
+                // per-stream sequence number, the canonical resume anchor.
+                let stream_seq = msg.info().ok().map(|i| i.stream_sequence as i64);
                 let mut event = Event::new(
-                    uuid::Uuid::nil(),
+                    self.uuid_gen
+                        .lock()
+                        .map_err(|_| AeonError::connection("UUID generator mutex poisoned"))?
+                        .next_uuid(),
                     0,
                     Arc::clone(&self.config.source_name),
                     PartitionId::new(0),
                     payload,
                 );
                 event = event.with_source_ts(now);
+                if let Some(seq) = stream_seq {
+                    event = event.with_source_offset(seq);
+                }
 
                 // Propagate NATS headers as metadata
                 if let Some(headers) = &msg.headers {
@@ -230,15 +241,22 @@ impl Source for NatsSource {
             match tokio::time::timeout_at(drain_deadline, messages.next()).await {
                 Ok(Some(Ok(msg))) => {
                     // FT-11: async_nats Message.payload is bytes::Bytes — clone is refcount-only.
-                let payload = msg.payload.clone();
+                    let payload = msg.payload.clone();
+                    let stream_seq = msg.info().ok().map(|i| i.stream_sequence as i64);
                     let mut event = Event::new(
-                        uuid::Uuid::nil(),
+                        self.uuid_gen
+                            .lock()
+                            .map_err(|_| AeonError::connection("UUID generator mutex poisoned"))?
+                            .next_uuid(),
                         0,
                         Arc::clone(&self.config.source_name),
                         PartitionId::new(0),
                         payload,
                     );
                     event = event.with_source_ts(now);
+                    if let Some(seq) = stream_seq {
+                        event = event.with_source_offset(seq);
+                    }
                     events.push(event);
                     let _ = msg.ack().await;
                 }

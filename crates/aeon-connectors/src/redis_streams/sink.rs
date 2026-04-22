@@ -17,7 +17,9 @@
 //!   `BatchResult::all_pending`. `flush()` awaits all stashed tasks and credits
 //!   them. Used by the pipeline sink task at flush intervals.
 
-use aeon_types::{AeonError, BatchResult, DeliveryStrategy, IdempotentSink, Output, Sink};
+use aeon_types::{
+    AeonError, BatchResult, DeliveryStrategy, IdempotentSink, Output, Sink, SinkAckCallback,
+};
 use redis::aio::MultiplexedConnection;
 use std::time::Duration;
 use uuid::Uuid;
@@ -111,6 +113,11 @@ pub struct RedisSink {
     pending_tasks: Vec<tokio::task::JoinHandle<Result<(), AeonError>>>,
     /// Count of outputs enqueued but not yet confirmed (UnorderedBatch).
     pending: u64,
+    /// Engine-installed callback fired when XADD round-trips succeed. Drives
+    /// the `outputs_acked_total` companion metric so the operator can see the
+    /// gap between `outputs_sent` (write_batch calls) and broker-confirmed
+    /// delivery. UnorderedBatch fires on flush, not on enqueue.
+    ack_callback: Option<SinkAckCallback>,
 }
 
 impl RedisSink {
@@ -136,6 +143,7 @@ impl RedisSink {
             delivered: 0,
             pending_tasks: Vec::new(),
             pending: 0,
+            ack_callback: None,
         })
     }
 
@@ -147,6 +155,17 @@ impl RedisSink {
     /// Number of outputs enqueued but not yet confirmed (UnorderedBatch).
     pub fn pending(&self) -> u64 {
         self.pending
+    }
+
+    /// Fire the engine-installed ack callback. Shared by PerEvent/OrderedBatch
+    /// write paths and the UnorderedBatch flush drain.
+    fn fire_ack(&self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        if let Some(cb) = self.ack_callback.as_ref() {
+            cb(n);
+        }
     }
 }
 
@@ -216,6 +235,7 @@ impl Sink for RedisSink {
                         })?;
                     self.delivered += 1;
                 }
+                self.fire_ack(count);
                 Ok(BatchResult::all_delivered(event_ids))
             }
             DeliveryStrategy::OrderedBatch => {
@@ -226,6 +246,7 @@ impl Sink for RedisSink {
                     AeonError::connection(format!("redis XADD pipeline failed: {e}"))
                 })?;
                 self.delivered += count as u64;
+                self.fire_ack(count);
                 Ok(BatchResult::all_delivered(event_ids))
             }
             DeliveryStrategy::UnorderedBatch => {
@@ -260,9 +281,15 @@ impl Sink for RedisSink {
                 AeonError::connection(format!("redis sink task join failed: {e}"))
             })??;
         }
-        self.delivered += self.pending;
+        let newly_acked = self.pending;
+        self.delivered += newly_acked;
         self.pending = 0;
+        self.fire_ack(newly_acked as usize);
         Ok(())
+    }
+
+    fn on_ack_callback(&mut self, cb: SinkAckCallback) {
+        self.ack_callback = Some(cb);
     }
 }
 

@@ -30,12 +30,18 @@ pub enum BatchOp {
 pub type BatchEntry = (BatchOp, Vec<u8>, Option<Vec<u8>>);
 
 /// Configuration for the L3 backend selection.
+///
+/// The `RocksDb` variant is gated behind the `rocksdb` cargo feature. Until the
+/// adapter lands (FT-7), builds without `--features rocksdb` will fail to
+/// deserialize YAML configs that select `rocksdb`, surfacing the gap at
+/// config-parse time rather than hiding it as a runtime error. See S8.3.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum L3Backend {
     /// redb — pure Rust B-tree database (default).
     #[default]
     Redb,
-    /// RocksDB — LSM-tree (future, feature-gated).
+    /// RocksDB — LSM-tree. Feature-gated (`rocksdb`) and not yet implemented.
+    #[cfg(feature = "rocksdb")]
     RocksDb,
 }
 

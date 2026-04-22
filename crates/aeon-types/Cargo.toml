@@ -11,6 +11,14 @@ documentation = "https://docs.rs/aeon-types"
 keywords = ["stream-processing", "event-driven", "pipeline", "kafka", "wasm"]
 categories = ["data-structures", "asynchronous"]
 
+[features]
+default = []
+# S8.3: Compile-time gate for the (not-yet-implemented) RocksDB L3 backend.
+# Enabling this exposes the `L3Backend::RocksDb` variant; without it, YAML
+# configs that set `l3.backend: rocksdb` fail at deserialization time instead
+# of silently falling through to a runtime "not implemented" error.
+rocksdb = []
+
 [dependencies]
 bytes = { workspace = true }
 smallvec = { workspace = true }
@@ -23,11 +31,18 @@ serde_json = { workspace = true }
 rmp-serde = { workspace = true }
 memchr = { workspace = true }
 sha2 = { workspace = true }
+hmac = { workspace = true }
+hex = { workspace = true }
+base64 = { workspace = true }
+ipnet = { workspace = true }
+zeroize = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 bincode = { workspace = true }
+tempfile = { workspace = true }
 
 [[bench]]
 name = "uuid_bench"

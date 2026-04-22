@@ -32,8 +32,11 @@ aes = "0.8"
 ctr = "0.9"
 hmac = "0.12"
 
+# AES-256-GCM for KEK envelope wrap (S1)
+aes-gcm = "0.10"
+
 # Key safety
-zeroize = { version = "1", features = ["derive"] }
+zeroize = { workspace = true }
 
 # TLS/mTLS certificate management
 rustls = { workspace = true }
@@ -44,6 +47,7 @@ hostname = { version = "0.4", optional = true }
 [dev-dependencies]
 criterion = { workspace = true }
 rcgen = { workspace = true }
+serde_json = { workspace = true }
 
 [[bench]]
 name = "crypto_bench"

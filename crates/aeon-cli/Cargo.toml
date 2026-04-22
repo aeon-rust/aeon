@@ -43,6 +43,7 @@ aeon-connectors = { workspace = true, optional = true, features = ["kafka", "htt
 uuid = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
 aeon-cluster = { workspace = true, features = ["auto-tls"], optional = true }
+ipnet = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = "2"

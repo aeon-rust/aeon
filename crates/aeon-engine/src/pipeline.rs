@@ -187,6 +187,14 @@ pub struct PipelineConfig {
     /// partition handover (local/test use), and the gate check compiles to
     /// a single branch.
     pub write_gate: Option<Arc<crate::write_gate::WriteGate>>,
+    /// P5: optional subscription to this node's owned-partitions slice.
+    /// When `Some`, the source loop in `run_buffered_managed` selects over
+    /// `next_batch()` and `changed()`; on every committed ownership change
+    /// it calls `source.reassign_partitions(&new)` so partitioned pulls
+    /// (Kafka) re-issue `consumer.assign()` without tearing down the task.
+    /// `None` keeps the legacy one-shot resolve-at-start behaviour used by
+    /// tests, benches, and the single-node path.
+    pub partition_reassign: Option<tokio::sync::watch::Receiver<Vec<u16>>>,
 }
 
 impl Default for PipelineConfig {
@@ -210,6 +218,7 @@ impl Default for PipelineConfig {
             eo2_shared_ack_tracker: None,
             partition_id: PartitionId::new(0),
             write_gate: None,
+            partition_reassign: None,
         }
     }
 }
@@ -645,6 +654,12 @@ where
     P: Processor + Send + Sync + 'static,
     K: Sink + Send + 'static,
 {
+    // B4: refuse to attach a Raft-driven partition-reassign watcher to a
+    // source whose partition ownership is broker-coordinated. The broker
+    // rebalance protocol and Aeon's `partition_table` would otherwise
+    // fight over the same resource.
+    reject_broker_coord_with_reassign(&source, &config)?;
+
     let core_assignment = config.core_pinning.resolve();
 
     // EO-2: conditionally wrap the source so push/poll events land in L2
@@ -885,6 +900,8 @@ where
     T: aeon_types::traits::ProcessorTransport + Send + Sync + 'static + ?Sized,
     K: Sink + Send + 'static,
 {
+    reject_broker_coord_with_reassign(&source, &config)?;
+
     let core_assignment = config.core_pinning.resolve();
 
     // EO-2 P4: wrap the source in `L2WritingSource` when durability requires
@@ -1057,6 +1074,26 @@ where
     proc_result.map_err(|e| AeonError::processor(format!("processor task panicked: {e}")))??;
     sink_result.map_err(|e| AeonError::processor(format!("sink task panicked: {e}")))??;
 
+    Ok(())
+}
+
+/// B4: refuse to start a pipeline whose source uses broker-coordinated
+/// partition ownership while the caller has also attached a Raft-driven
+/// `partition_reassign` watch. The two partition-ownership models are
+/// mutually exclusive — running both would have the broker and Aeon
+/// fight over the same resource.
+fn reject_broker_coord_with_reassign<S: Source>(
+    source: &S,
+    config: &PipelineConfig,
+) -> Result<(), AeonError> {
+    if config.partition_reassign.is_some() && source.broker_coordinated_partitions() {
+        return Err(AeonError::config(
+            "pipeline start: source uses ConsumerMode::Group (broker-coordinated \
+             partition ownership) but partition_reassign is attached — these are \
+             mutually exclusive. Either set ConsumerMode::Single on the source, or \
+             drop the Raft partition_reassign watcher.",
+        ));
+    }
     Ok(())
 }
 
@@ -1259,6 +1296,10 @@ where
             eo2_shared_ack_tracker: config.pipeline.eo2_shared_ack_tracker.clone(),
             partition_id,
             write_gate,
+            // run_multi_partition owns per-partition sub-tasks that are
+            // each pinned to a single partition id — dynamic re-assign at
+            // the per-task level is not meaningful. Leave disabled.
+            partition_reassign: None,
         };
 
         if let Some(ref assignments) = core_assignments {
@@ -2135,6 +2176,8 @@ where
     S: Source + Send + 'static,
     K: Sink + Send + 'static,
 {
+    reject_broker_coord_with_reassign(&source, &config)?;
+
     let core_assignment = config.core_pinning.resolve();
 
     // Initialize PoH chain if configured
@@ -2151,6 +2194,11 @@ where
     let shutdown_src = Arc::clone(&shutdown);
     let metrics_src = Arc::clone(&metrics);
     let control_src = Arc::clone(&control);
+    // P5: take the caller's owned-partitions watch by value into the source
+    // task. Checked non-blockingly between batches so a CL-6 transfer commit
+    // triggers `source.reassign_partitions(&new)` on the live source instead
+    // of a pipeline restart.
+    let mut reassign_rx = config.partition_reassign.clone();
 
     // Source task: identical to run_buffered, but checks control.paused.
     // When paused, checks for source swap before yielding.
@@ -2161,6 +2209,28 @@ where
         }
         let mut source_kind = source.source_kind();
         while !shutdown_src.load(Ordering::Relaxed) {
+            // P5: re-assign partitions if the cluster watch has advanced
+            // since the last iteration. Non-blocking — returns `Err` if the
+            // sender has dropped (cluster tore down) in which case we keep
+            // running on the last known assignment.
+            if let Some(rx) = reassign_rx.as_mut() {
+                if rx.has_changed().unwrap_or(false) {
+                    let new_partitions: Vec<u16> = rx.borrow_and_update().clone();
+                    if let Err(e) = source.reassign_partitions(&new_partitions).await {
+                        tracing::error!(
+                            error = %e,
+                            partitions = ?new_partitions,
+                            "source reassign_partitions failed; exiting source task"
+                        );
+                        return Err(e);
+                    }
+                    tracing::info!(
+                        partitions = ?new_partitions,
+                        "source re-assigned to new owned-partitions slice"
+                    );
+                }
+            }
+
             // Pause check: check for source swap, then yield
             if control_src.paused.load(Ordering::Acquire) {
                 // Check if a new source has been placed in the swap slot.
@@ -2465,6 +2535,62 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    /// B4: a synthetic source that reports itself as broker-coordinated.
+    /// Used only to drive the pipeline-start guardrail test below.
+    struct BrokerCoordinatedSource;
+    impl aeon_types::Source for BrokerCoordinatedSource {
+        async fn next_batch(&mut self) -> Result<Vec<Event>, AeonError> {
+            Ok(Vec::new())
+        }
+        fn broker_coordinated_partitions(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn run_buffered_rejects_broker_coord_with_partition_reassign() {
+        // Stand up a `partition_reassign` watch so the guard sees both
+        // conditions — broker-coordinated source AND Raft reassign watcher.
+        let (_tx, rx) = tokio::sync::watch::channel::<Vec<u16>>(vec![0]);
+        let config = PipelineConfig {
+            partition_reassign: Some(rx),
+            ..Default::default()
+        };
+
+        let source = BrokerCoordinatedSource;
+        let processor = PassthroughProcessor::new(Arc::from("out"));
+        let sink = MemorySink::new();
+        let metrics = Arc::new(PipelineMetrics::new());
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let err = run_buffered(source, processor, sink, config, metrics, shutdown, None)
+            .await
+            .expect_err("broker-coordinated source + partition_reassign must fail at start");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("ConsumerMode::Group") && msg.contains("mutually exclusive"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_buffered_allows_broker_coord_when_no_partition_reassign() {
+        // No partition_reassign watcher — the guard is silent and the
+        // pipeline starts normally (finishes immediately on the empty
+        // source).
+        let config = PipelineConfig::default();
+
+        let source = BrokerCoordinatedSource;
+        let processor = PassthroughProcessor::new(Arc::from("out"));
+        let sink = MemorySink::new();
+        let metrics = Arc::new(PipelineMetrics::new());
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        run_buffered(source, processor, sink, config, metrics, shutdown, None)
+            .await
+            .expect("single-instance broker-coord source must start without a reassign watch");
     }
 
     #[tokio::test]

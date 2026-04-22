@@ -19,6 +19,11 @@ processor-auth = ["aeon-crypto", "rand", "sha2", "hex", "base64"]
 webtransport-host = ["wtransport", "rustls", "processor-auth"]
 websocket-host = ["processor-auth", "rest-api", "axum/ws"]
 cluster = ["aeon-cluster"]
+# S2: dev-only diagnostic that lets gated trace! sites emit payload bytes.
+# Pairs with a `compile_error!` in `lib.rs` that refuses release builds, so
+# the "payload never in logs, ever" invariant cannot be undermined by a
+# mis-configured production image. No runtime toggle — by design.
+debug-payload-logging = []
 
 [dependencies]
 aeon-types = { workspace = true }

@@ -8,7 +8,9 @@
 //! - **OrderedBatch** (default): JetStream publish all in order, await all acks at batch end.
 //! - **UnorderedBatch**: JetStream publish (enqueue), collect ack futures, await in flush().
 
-use aeon_types::{AeonError, BatchResult, DeliveryStrategy, IdempotentSink, Output, Sink};
+use aeon_types::{
+    AeonError, BatchResult, DeliveryStrategy, IdempotentSink, Output, Sink, SinkAckCallback,
+};
 use async_nats::jetstream::context::Publish;
 use uuid::Uuid;
 
@@ -86,6 +88,12 @@ pub struct NatsSink {
     delivered: u64,
     /// Pending JetStream ack futures (UnorderedBatch mode only).
     pending_acks: Vec<async_nats::jetstream::context::PublishAckFuture>,
+    /// Engine-installed callback fired when downstream-confirmed acks land.
+    /// Drives the `outputs_acked_total` companion metric so operators can see
+    /// the gap between `outputs_sent` and broker-confirmed delivery. Fire-and-
+    /// forget (core NATS) fires on enqueue; JetStream fires after the publish
+    /// ack future resolves.
+    ack_callback: Option<SinkAckCallback>,
 }
 
 impl NatsSink {
@@ -114,12 +122,25 @@ impl NatsSink {
             config,
             delivered: 0,
             pending_acks: Vec::new(),
+            ack_callback: None,
         })
     }
 
     /// Number of outputs delivered.
     pub fn delivered(&self) -> u64 {
         self.delivered
+    }
+
+    /// Fire the engine-installed ack callback if one is present. Called
+    /// whenever `delivered` advances so `outputs_acked_total` tracks real
+    /// broker confirmation rather than enqueue rate.
+    fn fire_ack(&self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        if let Some(cb) = self.ack_callback.as_ref() {
+            cb(n);
+        }
     }
 
     /// Publish one output to JetStream, attaching `Nats-Msg-Id` for dedup
@@ -173,6 +194,7 @@ impl Sink for NatsSink {
                         })?;
                         self.delivered += 1;
                     }
+                    self.fire_ack(outputs.len());
                     Ok(BatchResult::all_delivered(event_ids))
                 }
                 DeliveryStrategy::OrderedBatch => {
@@ -191,6 +213,7 @@ impl Sink for NatsSink {
                         })?;
                         self.delivered += 1;
                     }
+                    self.fire_ack(outputs.len());
                     Ok(BatchResult::all_delivered(event_ids))
                 }
                 DeliveryStrategy::UnorderedBatch => {
@@ -215,6 +238,7 @@ impl Sink for NatsSink {
                     .map_err(|e| AeonError::connection(format!("nats publish failed: {e}")))?;
                 self.delivered += 1;
             }
+            self.fire_ack(outputs.len());
             Ok(BatchResult::all_delivered(event_ids))
         }
     }
@@ -223,18 +247,24 @@ impl Sink for NatsSink {
         // Await all pending JetStream ack futures (UnorderedBatch mode).
         if !self.pending_acks.is_empty() {
             let acks = std::mem::take(&mut self.pending_acks);
+            let newly_acked = acks.len();
             for ack in acks {
                 ack.await.map_err(|e| {
                     AeonError::connection(format!("nats jetstream ack failed: {e}"))
                 })?;
                 self.delivered += 1;
             }
+            self.fire_ack(newly_acked);
         }
 
         self.client
             .flush()
             .await
             .map_err(|e| AeonError::connection(format!("nats flush failed: {e}")))
+    }
+
+    fn on_ack_callback(&mut self, cb: SinkAckCallback) {
+        self.ack_callback = Some(cb);
     }
 }
 

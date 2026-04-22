@@ -13,7 +13,9 @@
 //! WebSocket source relies on.
 
 use crate::push_buffer::{PushBufferConfig, PushBufferRx, push_buffer};
-use aeon_types::{AeonError, BackoffPolicy, Event, PartitionId, Source};
+use aeon_types::{
+    AeonError, BackoffPolicy, CoreLocalUuidGenerator, Event, PartitionId, Source, SourceKind,
+};
 use rumqttc::{AsyncClient, EventLoop, MqttOptions, QoS};
 use std::sync::Arc;
 use std::time::Duration;
@@ -130,7 +132,8 @@ impl MqttSource {
         let (tx, rx) = push_buffer(config.buffer_config);
         let source_name = config.source_name;
 
-        let handle = tokio::spawn(mqtt_reader(eventloop, tx, source_name, config.backoff));
+        let uuid_gen = CoreLocalUuidGenerator::new(0);
+        let handle = tokio::spawn(mqtt_reader(eventloop, tx, source_name, config.backoff, uuid_gen));
 
         Ok(Self {
             rx,
@@ -146,6 +149,7 @@ async fn mqtt_reader(
     tx: crate::push_buffer::PushBufferTx,
     source_name: Arc<str>,
     backoff_policy: BackoffPolicy,
+    mut uuid_gen: CoreLocalUuidGenerator,
 ) {
     let mut backoff = backoff_policy.iter();
     loop {
@@ -158,7 +162,7 @@ async fn mqtt_reader(
                 // FT-11: rumqttc Publish.payload is bytes::Bytes — clone is refcount-only.
                 let payload = publish.payload.clone();
                 let mut event = Event::new(
-                    uuid::Uuid::nil(),
+                    uuid_gen.next_uuid(),
                     0,
                     Arc::clone(&source_name),
                     PartitionId::new(0),
@@ -198,5 +202,9 @@ async fn mqtt_reader(
 impl Source for MqttSource {
     async fn next_batch(&mut self) -> Result<Vec<Event>, AeonError> {
         self.rx.next_batch(self.poll_timeout).await
+    }
+
+    fn source_kind(&self) -> SourceKind {
+        SourceKind::Push
     }
 }

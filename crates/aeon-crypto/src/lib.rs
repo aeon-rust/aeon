@@ -23,6 +23,7 @@ pub mod auth;
 pub mod encryption;
 pub mod fips;
 pub mod hash;
+pub mod kek;
 pub mod keys;
 pub mod merkle;
 pub mod mmr;

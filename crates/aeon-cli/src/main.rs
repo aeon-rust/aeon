@@ -787,7 +787,12 @@ fn cmd_serve(addr: &str, artifact_dir: &str) -> Result<()> {
                             aeon_engine::ClusterPartitionOwnership::new(
                                 node.shared_state(),
                                 node.config().node_id,
-                            ),
+                            )
+                            // P5: attach the cluster-side owned-partitions
+                            // watch so the pipeline source loop can
+                            // reassign_partitions on a CL-6 transfer commit
+                            // without a pipeline restart.
+                            .with_watch(node.watch_owned_partitions()),
                         ))
                         .map_err(|e| {
                             anyhow::anyhow!("install ownership resolver: {e}")
@@ -2344,9 +2349,25 @@ struct ExportManifest {
 /// Maximum YAML manifest size (1 MB) to prevent resource exhaustion (OWASP A04).
 const MAX_MANIFEST_SIZE: u64 = 1024 * 1024;
 
-fn cmd_apply(file: &Path, api: &str, dry_run: bool) -> Result<()> {
+/// Read a YAML manifest and run `${SCHEME:path}` secret interpolation
+/// through the default local registry (Env + DotEnv + Literal providers).
+///
+/// Interpolation is pre-parse: tokens are replaced in the raw YAML text,
+/// then `serde_yaml` parses the resolved string. This keeps every field
+/// value — connector `auth_token`, Kafka SASL user/password, L3 backend
+/// URLs, S3 key references, etc. — eligible for env-var / dotenv / Vault
+/// / AWS Secrets Manager resolution without per-field plumbing.
+///
+/// Vault and AWS providers are registered by downstream callers
+/// (post-S1.2 `aeon-secrets` crate); by default only Env / DotEnv /
+/// Literal are available, so a `${VAULT:...}` token in a manifest
+/// surfaces a clear `scheme not registered` error at load time.
+///
+/// Values containing YAML-reserved characters (colon, newline, quotes)
+/// may break parsing — base64-encode multi-line secrets.
+fn read_and_interpolate_manifest(path: &Path) -> Result<String> {
     let metadata =
-        std::fs::metadata(file).with_context(|| format!("failed to stat {}", file.display()))?;
+        std::fs::metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
     if metadata.len() > MAX_MANIFEST_SIZE {
         bail!(
             "manifest file exceeds maximum size ({} bytes > {} bytes)",
@@ -2354,8 +2375,17 @@ fn cmd_apply(file: &Path, api: &str, dry_run: bool) -> Result<()> {
             MAX_MANIFEST_SIZE
         );
     }
-    let content = std::fs::read_to_string(file)
-        .with_context(|| format!("failed to read {}", file.display()))?;
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let registry = aeon_types::SecretRegistry::default_local();
+    let resolved = registry
+        .interpolate_str(&raw)
+        .context("failed to resolve ${SCHEME:path} secret references in manifest")?;
+    Ok(resolved.into_owned())
+}
+
+fn cmd_apply(file: &Path, api: &str, dry_run: bool) -> Result<()> {
+    let content = read_and_interpolate_manifest(file)?;
     let manifest: Manifest = serde_yaml::from_str(&content).context("invalid YAML manifest")?;
 
     if manifest.pipelines.is_empty() && manifest.identities.is_empty() {
@@ -2563,8 +2593,7 @@ fn cmd_export(file: Option<&Path>, api: &str) -> Result<()> {
 }
 
 fn cmd_diff(file: &Path, api: &str) -> Result<()> {
-    let content = std::fs::read_to_string(file)
-        .with_context(|| format!("failed to read {}", file.display()))?;
+    let content = read_and_interpolate_manifest(file)?;
     let manifest: Manifest = serde_yaml::from_str(&content).context("invalid YAML manifest")?;
 
     let existing: serde_json::Value = ureq::get(&format!("{api}/api/v1/pipelines"))
@@ -3487,5 +3516,65 @@ mod tests {
             let n: u32 = p.parse().expect("numeric");
             assert!(n < 60);
         }
+    }
+
+    // ─── S1.3 secret interpolation on manifest load ────────────────
+
+    fn write_temp_yaml(body: &str) -> tempfile::NamedTempFile {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().expect("temp file");
+        f.write_all(body.as_bytes()).expect("write yaml");
+        f.flush().expect("flush yaml");
+        f
+    }
+
+    #[test]
+    fn manifest_interpolation_replaces_env_refs() {
+        const VAR: &str = "AEON_TEST_MANIFEST_INTERP_VALUE";
+        // SAFETY: test-only env mutation.
+        unsafe { std::env::set_var(VAR, "resolved-secret") };
+        let yaml = "token: ${ENV:AEON_TEST_MANIFEST_INTERP_VALUE}\n";
+        let f = write_temp_yaml(yaml);
+        let out = read_and_interpolate_manifest(f.path()).expect("interp");
+        assert!(out.contains("resolved-secret"));
+        assert!(!out.contains("${ENV:"));
+        unsafe { std::env::remove_var(VAR) };
+    }
+
+    #[test]
+    fn manifest_interpolation_preserves_plain_yaml() {
+        let yaml = "pipelines:\n  - name: foo\n    partitions: 4\n";
+        let f = write_temp_yaml(yaml);
+        let out = read_and_interpolate_manifest(f.path()).expect("plain");
+        assert_eq!(out, yaml);
+    }
+
+    #[test]
+    fn manifest_interpolation_reports_missing_env_var() {
+        let yaml = "token: ${ENV:AEON_TEST_DEFINITELY_UNSET_SECRET_ZZ}\n";
+        let f = write_temp_yaml(yaml);
+        let err = read_and_interpolate_manifest(f.path()).expect_err("missing env");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("not set") || msg.contains("EnvNotSet"),
+            "expected missing-env error, got {msg}");
+    }
+
+    #[test]
+    fn manifest_interpolation_rejects_unregistered_scheme() {
+        let yaml = "token: ${VAULT:secret/aeon/key}\n";
+        let f = write_temp_yaml(yaml);
+        let err = read_and_interpolate_manifest(f.path()).expect_err("unregistered");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("not registered") || msg.contains("Vault"),
+            "expected scheme-not-registered error, got {msg}");
+    }
+
+    #[test]
+    fn manifest_interpolation_rejects_oversize_file() {
+        // 2 MB of content (exceeds MAX_MANIFEST_SIZE = 1 MB).
+        let huge = "a".repeat(2 * 1024 * 1024);
+        let f = write_temp_yaml(&huge);
+        let err = read_and_interpolate_manifest(f.path()).expect_err("oversize");
+        assert!(format!("{err:#}").contains("maximum size"));
     }
 }

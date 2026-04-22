@@ -46,6 +46,13 @@ pub trait DynSource: Send + Sync {
     fn pause_boxed<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
     fn resume_boxed<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+
+    fn reassign_partitions_boxed<'a>(
+        &'a mut self,
+        partitions: &'a [u16],
+    ) -> Pin<Box<dyn Future<Output = Result<(), AeonError>> + Send + 'a>>;
+
+    fn broker_coordinated_partitions(&self) -> bool;
 }
 
 impl<S: Source + 'static> DynSource for S {
@@ -69,6 +76,17 @@ impl<S: Source + 'static> DynSource for S {
 
     fn resume_boxed<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         Box::pin(self.resume())
+    }
+
+    fn reassign_partitions_boxed<'a>(
+        &'a mut self,
+        partitions: &'a [u16],
+    ) -> Pin<Box<dyn Future<Output = Result<(), AeonError>> + Send + 'a>> {
+        Box::pin(self.reassign_partitions(partitions))
+    }
+
+    fn broker_coordinated_partitions(&self) -> bool {
+        Source::broker_coordinated_partitions(self)
     }
 }
 
@@ -134,6 +152,18 @@ impl Source for BoxedSourceAdapter {
     fn resume(&mut self) -> impl Future<Output = ()> + Send {
         self.0.resume_boxed()
     }
+
+    fn reassign_partitions(
+        &mut self,
+        partitions: &[u16],
+    ) -> impl Future<Output = Result<(), AeonError>> + Send {
+        let owned = partitions.to_vec();
+        async move { self.0.reassign_partitions_boxed(&owned).await }
+    }
+
+    fn broker_coordinated_partitions(&self) -> bool {
+        self.0.broker_coordinated_partitions()
+    }
 }
 
 /// Wraps `Box<dyn DynSink>` into a value that implements the original
@@ -190,6 +220,20 @@ pub trait PartitionOwnershipResolver: Send + Sync {
     fn owned_partitions<'a>(
         &'a self,
     ) -> Pin<Box<dyn Future<Output = Option<Vec<u16>>> + Send + 'a>>;
+
+    /// P5: optional change-feed of the owned-partitions slice for this node.
+    ///
+    /// When `Some`, the supervisor clones the receiver into each pipeline's
+    /// `PipelineConfig.partition_reassign` and the source loop re-assigns
+    /// the live source on every committed ownership change — no pipeline
+    /// restart. `None` keeps the legacy "resolve once at start" behaviour
+    /// (single-node tests, pre-cluster benches).
+    ///
+    /// Default: returns `None`. Cluster-backed resolvers that expose a Raft
+    /// watch (see `ClusterPartitionOwnership`) override this.
+    fn watch(&self) -> Option<tokio::sync::watch::Receiver<Vec<u16>>> {
+        None
+    }
 }
 
 // ─── Registry ──────────────────────────────────────────────────────────────

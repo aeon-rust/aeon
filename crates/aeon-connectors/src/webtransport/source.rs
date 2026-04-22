@@ -5,11 +5,14 @@
 //! Push-source with three-phase backpressure.
 
 use crate::push_buffer::{PushBufferConfig, PushBufferRx, push_buffer};
-use aeon_types::{AeonError, Event, PartitionId, Source};
+use aeon_types::{
+    AeonError, AuthContext, CoreLocalUuidGenerator, Event, InboundAuthVerifier, PartitionId,
+    Source, SourceKind,
+};
 use bytes::Bytes;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use wtransport::ServerConfig;
 
 /// Configuration for `WebTransportSource`.
@@ -24,6 +27,10 @@ pub struct WebTransportSourceConfig {
     pub buffer_config: PushBufferConfig,
     /// Timeout waiting for first event in `next_batch()`.
     pub poll_timeout: Duration,
+    /// S9: optional inbound auth verifier. Only `ip_allowlist` mode is
+    /// meaningfully enforceable here; HTTP-style modes need header/body
+    /// plumbing that isn't wired for raw WT streams today.
+    pub auth: Option<Arc<InboundAuthVerifier>>,
 }
 
 impl WebTransportSourceConfig {
@@ -35,6 +42,7 @@ impl WebTransportSourceConfig {
             source_name: Arc::from("webtransport"),
             buffer_config: PushBufferConfig::default(),
             poll_timeout: Duration::from_secs(1),
+            auth: None,
         }
     }
 
@@ -47,6 +55,13 @@ impl WebTransportSourceConfig {
     /// Set the poll timeout.
     pub fn with_poll_timeout(mut self, timeout: Duration) -> Self {
         self.poll_timeout = timeout;
+        self
+    }
+
+    /// Attach an inbound auth verifier (S9). Only `ip_allowlist` mode is
+    /// enforceable on raw WebTransport streams.
+    pub fn with_auth(mut self, verifier: Arc<InboundAuthVerifier>) -> Self {
+        self.auth = Some(verifier);
         self
     }
 }
@@ -76,8 +91,9 @@ impl WebTransportSource {
 
         let (tx, rx) = push_buffer(config.buffer_config);
         let source_name = config.source_name;
+        let auth = config.auth;
 
-        let handle = tokio::spawn(wt_accept_loop(endpoint, tx, source_name));
+        let handle = tokio::spawn(wt_accept_loop(endpoint, tx, source_name, auth));
 
         Ok(Self {
             rx,
@@ -91,9 +107,39 @@ async fn wt_accept_loop(
     endpoint: wtransport::Endpoint<wtransport::endpoint::endpoint_side::Server>,
     tx: crate::push_buffer::PushBufferTx,
     source_name: Arc<str>,
+    auth: Option<Arc<InboundAuthVerifier>>,
 ) {
     loop {
         let incoming = endpoint.accept().await;
+
+        // S9: pre-handshake IP allow-list check. `incoming.remote_address()`
+        // is available before crypto/handshake completes.
+        if let Some(verifier) = &auth {
+            let peer_ip = incoming.remote_address().ip();
+            let now_unix = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let ctx = AuthContext {
+                peer_ip,
+                method: "WT",
+                path: "",
+                body: b"",
+                headers: &[],
+                now_unix,
+                client_cert_subjects: None,
+            };
+            if let Err(rejection) = verifier.verify(&ctx) {
+                tracing::warn!(
+                    source = %source_name,
+                    reason = rejection.reason_tag(),
+                    peer_ip = ?rejection.redacted_peer_ip(),
+                    "webtransport auth rejected"
+                );
+                incoming.refuse();
+                continue;
+            }
+        }
 
         let session_request = match incoming.await {
             Ok(req) => req,
@@ -128,7 +174,9 @@ async fn wt_accept_loop(
                 let source_name = Arc::clone(&source_name);
 
                 tokio::spawn(async move {
-                    if let Err(e) = handle_wt_stream(stream, tx, source_name).await {
+                    // Per-stream UUID generator — each task owns its own.
+                    let id_gen = CoreLocalUuidGenerator::new(0);
+                    if let Err(e) = handle_wt_stream(stream, tx, source_name, id_gen).await {
                         tracing::debug!(error = %e, "webtransport stream error");
                     }
                 });
@@ -141,6 +189,7 @@ async fn handle_wt_stream(
     (mut send, mut recv): (wtransport::SendStream, wtransport::RecvStream),
     tx: crate::push_buffer::PushBufferTx,
     source_name: Arc<str>,
+    mut id_gen: CoreLocalUuidGenerator,
 ) -> Result<(), AeonError> {
     loop {
         // Phase 3: backpressure signal
@@ -168,7 +217,7 @@ async fn handle_wt_stream(
             .map_err(|e| AeonError::connection(format!("webtransport read payload failed: {e}")))?;
 
         let event = Event::new(
-            uuid::Uuid::nil(),
+            id_gen.next_uuid(),
             0,
             Arc::clone(&source_name),
             PartitionId::new(0),
@@ -186,5 +235,9 @@ async fn handle_wt_stream(
 impl Source for WebTransportSource {
     async fn next_batch(&mut self) -> Result<Vec<Event>, AeonError> {
         self.rx.next_batch(self.poll_timeout).await
+    }
+
+    fn source_kind(&self) -> SourceKind {
+        SourceKind::Push
     }
 }

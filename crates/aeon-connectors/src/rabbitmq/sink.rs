@@ -16,7 +16,7 @@
 //!   `BatchResult::all_pending`. `flush()` drains and awaits the stashed
 //!   futures. Used by the pipeline sink task at flush intervals.
 
-use aeon_types::{AeonError, BatchResult, DeliveryStrategy, Output, Sink};
+use aeon_types::{AeonError, BatchResult, DeliveryStrategy, Output, Sink, SinkAckCallback};
 use futures_util::future::join_all;
 use lapin::options::*;
 use lapin::publisher_confirm::{Confirmation, PublisherConfirm};
@@ -110,6 +110,10 @@ pub struct RabbitMqSink {
     /// Count of outputs published but not yet confirmed (UnorderedBatch).
     pending: u64,
     _connection: Connection,
+    /// Engine-installed callback fired when publisher confirms return. Drives
+    /// the `outputs_acked_total` companion metric. UnorderedBatch fires on
+    /// flush, not on enqueue.
+    ack_callback: Option<SinkAckCallback>,
 }
 
 impl RabbitMqSink {
@@ -172,6 +176,7 @@ impl RabbitMqSink {
             pending_confirms: Vec::new(),
             pending: 0,
             _connection: conn,
+            ack_callback: None,
         })
     }
 
@@ -183,6 +188,15 @@ impl RabbitMqSink {
     /// Number of outputs published but not yet confirmed (UnorderedBatch).
     pub fn pending(&self) -> u64 {
         self.pending
+    }
+
+    fn fire_ack(&self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        if let Some(cb) = self.ack_callback.as_ref() {
+            cb(n);
+        }
     }
 }
 
@@ -240,7 +254,10 @@ impl Sink for RabbitMqSink {
         }
 
         match self.config.strategy {
-            DeliveryStrategy::PerEvent => Ok(BatchResult::all_delivered(event_ids)),
+            DeliveryStrategy::PerEvent => {
+                self.fire_ack(count);
+                Ok(BatchResult::all_delivered(event_ids))
+            }
             DeliveryStrategy::OrderedBatch => {
                 // Await all publisher-confirm futures concurrently at the
                 // batch boundary. AMQP delivers publishes on a single channel
@@ -255,6 +272,7 @@ impl Sink for RabbitMqSink {
                     }
                 }
                 self.delivered += count as u64;
+                self.fire_ack(count);
                 Ok(BatchResult::all_delivered(event_ids))
             }
             DeliveryStrategy::UnorderedBatch => {
@@ -278,8 +296,14 @@ impl Sink for RabbitMqSink {
                 }
             }
         }
-        self.delivered += self.pending;
+        let newly_acked = self.pending;
+        self.delivered += newly_acked;
         self.pending = 0;
+        self.fire_ack(newly_acked as usize);
         Ok(())
+    }
+
+    fn on_ack_callback(&mut self, cb: SinkAckCallback) {
+        self.ack_callback = Some(cb);
     }
 }

@@ -15,6 +15,10 @@ categories = ["data-structures", "caching"]
 default = []
 mmap = ["memmap2"]
 redb = ["dep:redb"]
+# S8.3: compile-time gate for the RocksDB L3 backend. Re-exports the
+# `aeon-types/rocksdb` feature so the `L3Backend::RocksDb` variant becomes
+# visible here. The adapter itself is still a placeholder (FT-7).
+rocksdb = ["aeon-types/rocksdb"]
 
 [dependencies]
 aeon-types = { workspace = true }

@@ -6,6 +6,18 @@
 // Test modules and benches are exempt (`cfg(not(test))`).
 #![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::expect_used))]
 
+// S2: `debug-payload-logging` is a dev-only diagnostic feature. Future gated
+// `trace!(?payload, ...)` sites hang off it; a release build that accidentally
+// enables it must fail to compile so the payload-never-in-logs invariant
+// survives the build pipeline. `debug_assertions` is on in debug builds and
+// off in `--release`, so this check fires exactly when it should.
+#[cfg(all(feature = "debug-payload-logging", not(debug_assertions)))]
+compile_error!(
+    "feature `debug-payload-logging` is a dev-only diagnostic and refuses to \
+     compile in release builds (S2: payload never in logs, ever). Drop \
+     `--features debug-payload-logging` or build without `--release`."
+);
+
 pub mod affinity;
 #[cfg(feature = "cluster")]
 pub mod cluster_applier;

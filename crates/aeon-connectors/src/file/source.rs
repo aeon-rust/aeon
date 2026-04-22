@@ -3,10 +3,10 @@
 //! Each line becomes an Event payload. Suitable for log files, JSONL, CSV, etc.
 //! Uses tokio::io::BufReader for async, non-blocking reads.
 
-use aeon_types::{AeonError, Event, PartitionId, Source};
+use aeon_types::{AeonError, CoreLocalUuidGenerator, Event, PartitionId, Source};
 use bytes::Bytes;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 /// Configuration for `FileSource`.
@@ -60,6 +60,7 @@ pub struct FileSource {
     reader: Option<BufReader<tokio::fs::File>>,
     exhausted: bool,
     line_buf: String,
+    uuid_gen: Mutex<CoreLocalUuidGenerator>,
 }
 
 impl FileSource {
@@ -70,6 +71,7 @@ impl FileSource {
             reader: None,
             exhausted: false,
             line_buf: String::with_capacity(4096),
+            uuid_gen: Mutex::new(CoreLocalUuidGenerator::new(0)),
         }
     }
 
@@ -125,9 +127,14 @@ impl Source for FileSource {
                 continue; // Skip empty lines
             }
 
+            let event_id = self
+                .uuid_gen
+                .lock()
+                .map_err(|_| AeonError::connection("UUID generator mutex poisoned"))?
+                .next_uuid();
             let payload = Bytes::copy_from_slice(line.as_bytes());
             let mut event = Event::new(
-                uuid::Uuid::nil(),
+                event_id,
                 0,
                 Arc::clone(&self.config.source_name),
                 self.config.partition,

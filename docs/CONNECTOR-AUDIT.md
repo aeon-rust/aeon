@@ -57,7 +57,7 @@ decoupled (`UnorderedBatch`, flushed at interval).
 | Redis Streams | Pull | Bounded (pending) | — | Implicit (XACK) | Yes | OK |
 | Postgres CDC | Pull | Bounded (LSN) | — | Implicit | Yes | OK (polling, see §4.5) |
 | MySQL CDC | Pull | Bounded (binlog pos) | — | Implicit | Yes | OK (polling, see §4.5) |
-| MongoDB CDC | Push | Unbounded | PushBuffer | Blocking send only | File-based (at-least-once) | OK (fixed §4.3) |
+| MongoDB CDC | Pull | Bounded (resume token) | PushBuffer (internal shaping) | Blocking send only | File-based (at-least-once) | OK (fixed §4.3, reclassified §8.1) |
 | QUIC | Push | Unbounded | PushBuffer | Zero-length frame | No | OK |
 | WebTransport (streams) | Push | Unbounded | PushBuffer | Zero-length frame | No | OK |
 | WebTransport (datagrams) | Push | Lossy | PushBuffer | **intentional drop** | No | OK (opt-in `accept_loss`) |
@@ -643,3 +643,708 @@ regression at the 10K evt/s steady-state baseline (see
 - **Pipeline orchestrator.** The `outputs_sent` metric bug is fixed
   (§4.0). The Scenario-1 hot path has no known correctness gaps. Gate
   1 re-validation confirms zero regression from the §5.3 refactor.
+
+---
+
+## 8. Pre-ECR-Bake Revisit (2026-04-21)
+
+Re-audit in preparation for the AWS ECR pre-bake (`#6 P4.iii`). Surfaced
+findings the 2026-04-09 pass did not cover, plus corrections to two
+source-method labels that were set from the *implementation shape*
+rather than the *source semantics*.
+
+### 8.1 Source-method taxonomy (clarified)
+
+The audit's pull/push/poll labels conflated "how does the impl handle
+data" with "how does the upstream protocol behave". The cleaner frame:
+
+| Mode | Who holds position? | Who initiates reads? | Backpressure shape |
+|------|---------------------|----------------------|--------------------|
+| **Pull** | Connector | Connector (continuous long-lived read) | Natural — connector paces |
+| **Poll** | None persistent | Connector (timer-driven) | Timer interval + backoff on errors |
+| **Push** | N/A — upstream has no position for us | External producer writes to our endpoint | Three-phase `PushBuffer` → protocol-level 503 / TCP-window / AMQP-cancel |
+
+Under this frame:
+
+- **MongoDB CDC is Pull, not Push** (corrected from §2). Change streams
+  are a tailable cursor over the oplog; the resume token is the
+  connector-owned position marker; `stream.next()` is a pull driven by
+  the connector. The current impl wrapping the tail in a `PushBuffer`
+  is an internal rate-shaping detail and does not make it a push
+  source. The tell: push sources have nothing to persist on shutdown.
+  MongoDB CDC persists a resume token.
+- **Postgres/MySQL CDC are Pull, not Poll** (clarified against §2). The
+  intent is streaming replication (`START_REPLICATION` /
+  `COM_BINLOG_DUMP`) with connector-held LSN / binlog position. The
+  current impls use `pg_logical_slot_get_changes` and
+  `SHOW BINLOG EVENTS` on a timer — poll *behaviour* but pull *intent*
+  (§4.5 already captured the streaming-replication upgrade as
+  deferred). Taxonomy stays Pull; §4.5 remains the debt.
+
+Labels updated in §2's matrix as part of this revisit.
+
+### 8.2 `Uuid::nil()` on Event.id across 12 sources — correctness gap
+
+**Status (2026-04-21)**: ✅ closed by ROADMAP B1. All 14 sources stamp
+UUIDv7 via `CoreLocalUuidGenerator`; regression tests in
+`delivery_ledger.rs` (`nil_uuids_collapse_tracking_slots`,
+`distinct_uuids_get_distinct_slots`) lock the invariant.
+
+**Severity**: correctness hazard under EO-2 at-least-once.
+**Scope**: every source except **Kafka** (uses
+`CoreLocalUuidGenerator`, `kafka/source.rs:126,176,208`) and the
+**HTTP webhook** source (uses `Uuid::now_v7()`,
+`http/webhook_source.rs:138`) currently stamps `Event.id =
+uuid::Uuid::nil()` — verified by repo-wide grep
+(`memory/file/websocket/mqtt/rabbitmq/nats/mqtt/redis_streams/quic/
+webtransport[streams+datagrams]/mongodb_cdc/postgres_cdc/mysql_cdc/
+http_polling`).
+
+**Why it matters.** `crates/aeon-engine/src/delivery_ledger.rs` keys
+its PerEvent / OrderedBatch / UnorderedBatch ack tracking off
+`source_event_id`. If every event in a batch carries the zero UUID,
+`mark_acked(id)` and `mark_batch_acked(&ids)` collapse distinct
+events into one ledger slot — acking one silently acks all, defeating
+at-least-once recovery. `IdempotentSink::has_seen(event_id)` is
+likewise useless with a shared zero id.
+
+**Fix (two-line per source)**. The `PushBuffer`-fed sources can either
+share an `Arc<Mutex<CoreLocalUuidGenerator>>` through the config, or
+call `uuid::Uuid::now_v7()` at the event-construction site — whichever
+matches the surrounding hot-path budget. Pull sources (CDC, Redis/NATS
+streams) have the simplest path: stamp `Uuid::now_v7()` at event
+construction in the source loop (same shape as the HTTP webhook).
+
+**Test**. One shared unit test asserting batch-distinct event ids
+across every non-Kafka source, plus the delivery-ledger invariant
+"N sent events → N ledger slots → N acks required to advance the
+checkpoint".
+
+Captured as ROADMAP `B1 — push/poll source UUIDv7 stamping`.
+
+### 8.3 `source_offset` stamping gaps for pull sources
+
+**Status (2026-04-21)**: ✅ closed by ROADMAP B2. Redis Streams /
+NATS JetStream / Postgres / MySQL CDC all stamp `source_offset` at
+event construction via documented packed-i64 helpers (with unit
+tests). MongoDB resume-token sidecar unchanged pending P13 WAL bump.
+
+**Severity**: blocks EO-2 at-least-once on every pull source other
+than Kafka.
+**Scope**: `source_offset` is currently populated only by the Kafka
+source (`kafka/source.rs:219`). Redis Streams (message id), NATS
+JetStream (sequence), MongoDB CDC (resume token — partially, via
+separate file), Postgres CDC (LSN), MySQL CDC (binlog coords) all
+have an upstream-native position but do not stamp it into `Event.
+source_offset`.
+
+**Why it matters.** The EO-2 checkpoint replicator advances recovery
+offsets from `Event.source_offset`; a pull source that does not
+stamp it gives the ledger no recovery point, which means replay
+after crash restarts from "now" (silent data loss) or from start
+(duplicate work), depending on source defaults.
+
+**Shape of the fix**. For each pull source, stamp
+`event.source_offset = Some(upstream_position)` at event
+construction. The MongoDB resume-token sidecar file (§4.3) stays —
+it is a token, not an `i64`, and EO-2 P13 tracks the WAL format bump
+that would unify them. The simpler `i64`-positioned pull sources
+(Redis/NATS/PG/MySQL) can land today.
+
+Captured as ROADMAP `B2 — pull-source offset stamping`.
+
+### 8.4 Consumer-group mode for compatible pull sources (optional, opt-in)
+
+**Status (2026-04-21): ✅ closed by ROADMAP B4.** See §8.5 row for the
+shipped shape; the design below is preserved for historical context.
+
+**Scope — strictly connector-local.** Core pipeline (SPSC, Raft-
+coordinated `partition_table`, EO-2 checkpoint) stays unchanged. The
+feature is a config flag per source that selects between today's
+manual-assign mode and a broker-coordinated consumer-group mode.
+
+**Compatible upstreams**:
+
+| Source | Library | Mode surface |
+|--------|---------|--------------|
+| Kafka / Redpanda | `rdkafka` | `consumer.assign` vs `consumer.subscribe` + rebalance callbacks |
+| Redis Streams | `redis` | `XREAD` vs `XREADGROUP` (already uses `XREADGROUP`; exposes the group/consumer as config) |
+| Valkey Streams | same as Redis protocol | identical to Redis |
+
+**Not compatible** — out of scope: RabbitMQ super-streams (SAC is
+not a consumer-group model; rebuilding the consumer on every
+rebalance is incompatible with `reassign_partitions`). Audit
+finding confirmed in the 2026-04-21 revisit, no implementation.
+
+**Config shape (per source)**:
+
+```yaml
+consumer_mode:
+  kind: single        # default; manual-assign, ordering preserved, Aeon owns offsets
+  # OR
+  kind: group         # broker-coordinated, broker auto-commit still disabled
+  group_id: aeon-ingest
+  broker_commit: false  # Aeon's EO-2 ledger remains the truth
+```
+
+**Hard guardrail.** `kind: group` is **mutually exclusive** with
+cluster-coordinated partition ownership. When a source is in group
+mode the broker owns partition movement; Raft-driven
+`reassign_partitions` must stay out. The pipeline start path
+validates this — a source advertising group-mode on a clustered
+deployment fails configuration.
+
+**Design rationale** (against a separate `ConsumerGroupSource`
+trait): the user-facing surface is a configuration decision, not a
+type-system decision. Keeping it in config preserves YAML symmetry
+across sources and means the pipeline supervisor never has to branch
+on trait variants. The trait-level safety (no accidental
+`reassign_partitions` in group mode) is enforced by a single runtime
+assertion at source startup.
+
+Captured as ROADMAP `B4 — consumer-group config mode for pull
+sources (Kafka / Redpanda / Redis / Valkey)`.
+
+### 8.5 Pre-bake correctness blockers and polish
+
+| Item | Severity | Captured as | Status (2026-04-21) |
+|------|----------|-------------|---------------------|
+| 8.2 push/poll UUIDv7 stamping | Bake blocker (EO-2 correctness) | ROADMAP B1 | ✅ shipped |
+| 8.3 pull-source `source_offset` stamping | Bake blocker (EO-2 correctness) | ROADMAP B2 | ✅ shipped |
+| Pod disruption policy in Helm chart | Polish (bake-safe without, but one eviction ⇒ downtime) | ROADMAP B3 | ✅ shipped |
+| `docs/DEPLOYMENT.md` blue-green + canary walkthroughs | Docs polish | ROADMAP B3 | ✅ shipped |
+| 8.4 consumer-group config mode | Post-bake design + impl | ROADMAP B4 | ✅ shipped |
+
+All B1 + B2 + B3 + B4 items landed in the same session on 2026-04-21.
+Pre-bake bar is clear; the only open ECR-bake-path item is P4.iii
+(task #6, pre-bake image to ECR `us-east-1`). B4 shipped the
+`ConsumerMode::{Single,Group}` enum for Kafka/Redpanda + Redis Streams
+sources with a pipeline-start guardrail rejecting
+`ConsumerMode::Group` + Raft-driven `partition_reassign` together —
+the broker rebalance protocol and Aeon's `partition_table` are
+mutually exclusive by construction.
+
+Helm terminology note: the Kubernetes object `kind: PodDisruptionBudget`
+is a fixed API-server type; we inherit it. Everywhere Aeon-owned
+documents reference it we use **"pod disruption policy"** or **"pod
+disruption cap"** to stay consistent with the project-wide "Capacity
+not Budget" convention for our own types.
+
+### 8.6 Zero-downtime deployment — already largely in place
+
+For completeness, the 2026-04-21 revisit confirmed via grep + REST-
+API review that the pre-bake work order does **not** need to ship
+blue-green or canary — both already exist:
+
+- Drain-swap processor hot-swap (<1ms): `pipeline.rs`
+  `PipelineControl::drain_and_swap` family.
+- Blue-green: `POST /api/v1/pipelines/{name}/upgrade/blue-green`,
+  `/cutover`, `/rollback` → `start_blue_green` /
+  `cutover_blue_green` / `rollback_upgrade`.
+- Canary: `POST /api/v1/pipelines/{name}/upgrade/canary`
+  (configurable traffic steps, default 10/50/100%) → `start_canary`
+  / `set_canary_pct` / `complete_canary`.
+- Raft leadership relinquish + Helm `preStop` + `WriteGate` drain
+  cover graceful pod termination.
+- Cluster membership blue-green via CL-6 partition transfer (primitive
+  complete; orchestration tooling — `aeon cluster drain` — tracked as
+  Pillar 3 G5).
+
+Since 2026-04-21 the pod disruption policy (B3) and the operator-
+facing walkthrough (`docs/DEPLOYMENT.md`) have shipped, closing the
+polish gap. Canary auto-rollback on metric threshold stays manual for
+now — acceptable for v0.1.
+
+## 9. Full-Repo Audit Critical Fixes — S8 (2026-04-21)
+
+A cross-cutting audit (roadmap/stubs/OWASP/12-factor/Flink diff)
+surfaced two critical correctness items on connectors that this
+matrix had not previously flagged, plus one config-surface hygiene
+fix. All three landed together as workstream **S8**.
+
+### 9.1 Push-source `source_kind()` overrides — **Closed 2026-04-21**
+
+`Source::source_kind()` defaults to `SourceKind::Pull` in
+`aeon-types/src/traits.rs`. Push sources that forget to override it
+silently skip L2 body persistence under `durability != none` — a
+data-loss bug invisible until recovery. Fixed by adding explicit
+overrides on every push source connector:
+
+| Connector                                   | New override            |
+| ------------------------------------------- | ----------------------- |
+| `mqtt/source.rs`                            | `SourceKind::Push`      |
+| `rabbitmq/source.rs`                        | `SourceKind::Push`      |
+| `quic/source.rs`                            | `SourceKind::Push`      |
+| `websocket/source.rs`                       | `SourceKind::Push`      |
+| `webtransport/source.rs`                    | `SourceKind::Push`      |
+| `webtransport/datagram_source.rs`           | `SourceKind::Push`      |
+| `http/polling_source.rs`                    | `SourceKind::Poll`      |
+
+`http/polling_source.rs` is not a push source — it's HTTP-style
+poll (no durable replay). Marking it `Poll` keeps EO-2 from
+attempting L2 body writes it can't replay, and matches the
+SourceKind taxonomy defined in §8.1.
+
+### 9.2 Sink `on_ack_callback()` overrides — **Closed 2026-04-21**
+
+`Sink::on_ack_callback()` has a default no-op. Sinks that don't
+override it never drive `outputs_acked_total`, so operators see
+`outputs_sent_total` tick but no broker-confirmed delivery count —
+the batch-async vs sync-ack gap disappears from metrics. Fixed by
+wiring the callback on every non-pass-through sink:
+
+| Connector                   | Fire point                                          |
+| --------------------------- | --------------------------------------------------- |
+| `nats/sink.rs`              | PerEvent/OrderedBatch batch end; UnorderedBatch on `flush` drain |
+| `redis_streams/sink.rs`     | PerEvent after loop; OrderedBatch after pipeline await; UnorderedBatch on `flush` drain |
+| `http/sink.rs`              | Per-success counter; partial on error-exit          |
+| `mqtt/sink.rs`              | On enqueue (rumqttc has no packet-id observability — documented) |
+| `rabbitmq/sink.rs`          | PerEvent/OrderedBatch batch end; UnorderedBatch on `flush` drain |
+
+Kafka was already wired. MQTT's "fire on enqueue" is the honest
+reflection of what the MQTT API lets us observe — §4.4 notes this
+would require PUBACK/PUBCOMP interception, deferred post-Gate 2.
+
+### 9.3 L3 RocksDB compile-time gate — **Closed 2026-04-21**
+
+`aeon_types::L3Backend::RocksDb` was visible in the enum but the
+adapter is a placeholder (FT-7). A YAML config setting
+`l3.backend: rocksdb` deserialized fine and then failed at runtime
+with `AeonError::state(...)` — a silent config footgun. Fixed by
+gating the variant behind a new `rocksdb` cargo feature on
+`aeon-types` (re-exported from `aeon-state`). Without
+`--features rocksdb`:
+
+- The variant is absent from the enum
+- Serde rejects `rocksdb` at config-parse time
+- The tiered-store match arm no longer needs to cover it
+
+With the feature, behaviour is unchanged (still returns the
+"not yet implemented" error) — the test
+`tiered_l3_backend_rocksdb_not_implemented` is now gated to match.
+
+### 9.4 S2 payload-never-in-logs sweep — **Closed 2026-04-21**
+
+Audit finding C4 (Kafka SASL URL logged in
+`AeonError::connection(format!(...))`) generalised to every
+URL-shaped field on every connector. Fixed by shipping a
+shared redaction helper in `aeon-types` and a build-time
+debug-logging gate on `aeon-engine`.
+
+**`aeon_types::redact::redact_uri` helper.** Zero-alloc
+`Cow<'_, str>` wrapper that strips `user[:password]@` from any
+URI-shaped string while preserving scheme / host / port / path /
+query / fragment. Lives in `aeon-types` (not
+`aeon-observability`) so every crate — connectors, engine,
+processor-client, CLI — can reach it without a new dependency.
+10 unit tests cover: empty input, no-scheme, no-userinfo,
+userinfo-with-password, userinfo-without-password, password
+containing literal `@`, nested scheme in query string
+(`?callback=https://...` must not confuse the authority parser),
+fragment, missing path component, and custom schemes
+(`quic+wt://...`).
+
+**Log-site sweep.** Every connector + processor-client site that
+previously emitted a raw connection URL now passes it through
+`redact_uri()`:
+
+| Connector / client                             | Sites patched                                          |
+| ---------------------------------------------- | ------------------------------------------------------ |
+| `http/sink.rs`                                 | `HttpSink created` info + POST-fail / non-success errors |
+| `http/polling_source.rs`                       | `created` info + send-fail / non-success / body-read warns |
+| `websocket/sink.rs`                            | connect-error + `connected` info                       |
+| `websocket/source.rs`                          | connect-error + `connected` info + reconnect warns (pre-redacted once, reused in reader task) |
+| `webtransport/sink.rs`                         | connect-error + `connected` info                       |
+| `aeon-processor-client/src/websocket.rs`       | `Connected to Aeon` info                               |
+| `aeon-processor-client/src/webtransport.rs`    | `Connected to Aeon via WebTransport` info              |
+
+Both `tracing::*!` log sites **and** the `AeonError::connection(format!(...))`
+error chains are redacted — errors bubble up through logs the same
+way, so redacting one without the other leaves the leak in place.
+
+### 9.5 S2 build-time `debug-payload-logging` gate — **Closed 2026-04-21**
+
+Added a `debug-payload-logging` cargo feature on `aeon-engine` as
+an opt-in dev diagnostic. A `compile_error!` guard refuses to
+compile it in release builds:
+
+```rust
+#[cfg(all(feature = "debug-payload-logging", not(debug_assertions)))]
+compile_error!("feature `debug-payload-logging` is a dev-only diagnostic …");
+```
+
+Invariant: shipping payload-logging to production requires
+deleting the gate in source, not forgetting a CLI flag. Verified
+both directions — `cargo check --release --features
+debug-payload-logging` fails with the compile_error; a debug
+build with the same feature succeeds.
+
+### 9.6 S7 SSRF guard — `aeon_types::ssrf` module — **Closed 2026-04-22**
+
+Audit finding C3 (SSRF / external URL hardening) lands as a new
+`aeon_types::ssrf` module so every crate can reach it without new
+deps. `SsrfPolicy` carries four category toggles
+(`allow_loopback` / `allow_private` / `allow_link_local` /
+`allow_cgnat`) plus `extra_deny` / `extra_allow` as
+`Vec<ipnet::IpNet>`. Three presets:
+
+- `production()` — VPC-safe default. Allows RFC1918 (so sidecars
+  and in-VPC HTTP APIs still work), denies loopback, link-local,
+  CGNAT 100.64.0.0/10, ULA fc00::/7, and the always-denied host set.
+- `strict()` — also denies private. For edge deployments that
+  should never dial into their own VPC.
+- `permissive_for_tests()` — allows everything EXCEPT the
+  `ALWAYS_DENIED_HOSTS` set. Layered over every preset so a test
+  config cannot accidentally dial cloud metadata even with
+  `allow_link_local = true`:
+  - AWS IMDS — `169.254.169.254`
+  - Alibaba ECS metadata — `100.100.100.200`
+  - GCP metadata — `169.254.169.253`
+  - Oracle Cloud metadata — `192.0.0.192`
+
+API:
+
+```rust
+policy.check_addr(ip)?;                       // pre-resolved IP
+policy.check_host("api.example.com", 443)?;   // DNS resolve + filter
+policy.check_url("https://foo.example/v1")?;  // scheme-aware parse
+```
+
+`check_host` / `check_url` run the full `ToSocketAddrs` resolve and
+return every address that passed so the caller can dial them
+directly — no rebinding gap. `From<SsrfError> for AeonError` so
+call-sites just use `?` (AddressDenied → `AeonError::Config`,
+ResolutionFailed / NoAddresses → `AeonError::Connection { retryable:
+true }`). Twenty unit tests cover the preset matrix, IMDS layering
+on every preset, loopback/link-local/CGNAT/ULA on both v4 and v6,
+unspecified/multicast/broadcast, `extra_deny` + `extra_allow`
+precedence, the invariant that `extra_allow` **cannot** override
+`ALWAYS_DENIED_HOSTS`, host/port parsing edge cases
+(userinfo-with-`@`-in-password, IPv6-literal brackets, default-port
+inference per scheme), and JSON serde roundtrip defaults.
+
+### 9.7 S7 connector wiring — **Closed 2026-04-22**
+
+Every URL-based connector's `::new()` now runs the SSRF guard before
+any socket opens:
+
+- HTTP sink (`crates/aeon-connectors/src/http/sink.rs`)
+- HTTP polling source (`crates/aeon-connectors/src/http/polling_source.rs`)
+- WebSocket sink (`crates/aeon-connectors/src/websocket/sink.rs`)
+- WebSocket source (`crates/aeon-connectors/src/websocket/source.rs`)
+- WebTransport sink (`crates/aeon-connectors/src/webtransport/sink.rs`)
+
+Each gains a `ssrf_policy: SsrfPolicy` field (defaults to
+`SsrfPolicy::production()`) plus a `with_ssrf_policy()` builder.
+`::new()` calls `config.ssrf_policy.check_url(&config.url)?` — fails
+fast with `AeonError::Config` before any DNS query in the connector's
+main loop.
+
+**Anti-rebinding**: WebSocket source re-runs the guard inside its
+reconnect loop, so a DNS record that flipped to a private IP between
+the initial connect and a later reconnect fails closed. (HTTP
+clients typically rebuild their connection pool per request, so the
+`::new()`-time check plus the underlying resolver cache TTL is
+sufficient; long-lived WebSocket sessions re-check on every
+reconnect.)
+
+Broker connectors (Kafka, NATS, MQTT, Redis, RabbitMQ, QUIC transport)
+deliberately do **not** go through this guard — they're designed for
+in-VPC use and their client libraries do their own connection pooling
+and endpoint validation. The audit finding C3 is specifically about
+attacker-controlled URLs reaching the HTTP / WebSocket / WebTransport
+families.
+
+Engine test fixtures in `crates/aeon-engine/tests/e2e_tier_e.rs`
+(3 sites: HttpPollingSource, HttpSink, WebTransportSink) and
+`e2e_tier_f.rs` (2 sites: WebSocketSource, WebSocketSink) migrated to
+`aeon_types::SsrfPolicy::permissive_for_tests()` so loopback 127.0.0.1
+still works but IMDS stays blocked even in tests. Three new
+connector-level SSRF rejection tests (HTTP sink IMDS, HTTP polling
+IMDS, WebSocket sink loopback-denied) written with
+`let Err(err) = ... else { panic!(...) }` because these builders don't
+impl `Debug` on the success variant.
+
+### 9.8 S7 CLI YAML surface — **Closed 2026-04-22**
+
+`aeon-cli/src/connectors.rs` gains `parse_ssrf_policy()` and
+`parse_cidr_list()` helpers that translate six YAML keys into an
+`SsrfPolicy`:
+
+| Key                       | Type        | Default (production)                       |
+| ------------------------- | ----------- | ------------------------------------------ |
+| `ssrf_allow_loopback`     | bool        | `false`                                    |
+| `ssrf_allow_private`      | bool        | `true` (in-VPC)                            |
+| `ssrf_allow_link_local`   | bool        | `false`                                    |
+| `ssrf_allow_cgnat`        | bool        | `false`                                    |
+| `ssrf_extra_deny`         | CIDR list   | empty                                      |
+| `ssrf_extra_allow`        | CIDR list   | empty                                      |
+
+CIDR lists are comma-separated, e.g.
+`"10.0.0.0/8,192.168.0.0/16,2001:db8::/32"`. Invalid CIDRs fail
+deserialisation — misconfiguration cannot silently widen the guard.
+Wired into `HttpPollingSourceFactory` and `HttpSinkFactory` with
+updated docstrings listing the new keys. Three parser tests cover
+defaults, explicit toggle round-trip, and CIDR-list parsing.
+
+### 9.9 S3–S6, S10 workstreams — in progress / pending
+
+S8 closed the **critical** audit items (silent data-loss + silent
+config failure); S2 closed **payload-never-in-logs**; S7 closed
+**SSRF / external URL hardening**; S1 closed **secret provider + KEK
+envelope encryption + rotation** (see §9.10–§9.12); S9 closed
+**inbound connector auth** (see §9.13–§9.15); S10 primitives + HTTP
+surface closed (see §9.16–§9.18). Remaining security/compliance
+workstreams are tracked in `ROADMAP.md`:
+
+- **S10 remaining** — WebSocket source/sink header injection,
+  WebTransport sink identity, and broker-native wiring for Kafka /
+  Redis / NATS / Postgres CDC / MySQL CDC / MongoDB CDC (plumb
+  `signer.broker_native()` values into the underlying SDK auth
+  path; mTLS identity on the TCP/TLS transports that support it).
+- **S4** — Compliance mode manifest (PCI-DSS / HIPAA / GDPR)
+- **S3** — L2 + L3 at-rest encryption + perf re-bench
+- **S5** — Configurable retention (L2 body / L3 ack windows)
+- **S6** — GDPR subject-id + erasure API + right-to-export
+
+All S1–S10 config is **env-var-first** — every YAML value resolves
+via `${ENV:VAR}`, `${VAULT:path/key}`, `${AWS_SM:name}`,
+`${AWS_KMS:key}`, `${DOTENV:VAR}` through the S1 secret-provider
+trait. Helm / CI-CD tooling injects env vars; secrets live in Vault
+(self-hosted or managed) as primary, `.env` outside the deployed
+artifact as last resort. Literal values warn at load.
+
+Sequence approved 2026-04-22: S8 → S2 → S7 → S1 → S9 → **S10** →
+S4 → S3 → S5 → S6 (S8, S2, S7, S1, S9 closed; S10 primitives + HTTP
+closed, broker-native wiring in progress).
+
+### 9.10 S1.1 Secret provider — `aeon_types::secrets` module — **Closed 2026-04-22**
+
+Zero-heavy-dep module in `aeon-types` so every crate can reach it.
+`SecretScheme` enum (`Env` / `DotEnv` / `Vault` / `AwsSm` / `AwsKms`
+/ `Literal`), `SecretRef::parse(&str)` returning `Ok(None)` for
+plain strings and `Err` for malformed `${SCHEME:path}` tokens.
+`SecretBytes([u8; _])` — `zeroize` on drop, no `Debug`, no `Clone`;
+exposes `expose_bytes()` / `expose_str()`. `SecretProvider` trait
+with three local implementations: `EnvProvider` (`std::env::var`),
+`DotEnvProvider` (reads `.env` at `AEON_DOTENV_PATH`, **no
+auto-discovery**), `LiteralProvider` (warn-once per run so operators
+see they've inlined a secret). `SecretRegistry::default_local()`
+registers Env + DotEnv + Literal; Vault / AWS SM / AWS KMS providers
+are deliberately **not** in `aeon-types` — they'll land in a future
+`aeon-secrets` crate and register via `SecretRegistry::register()`.
+`interpolate_str<'a>(&self, s: &'a str) -> Result<Cow<'a, str>, _>`
+returns `Cow::Borrowed` on no-`$` (zero-alloc fast path), handles
+`${...}` escape, errors on unknown scheme / unregistered provider /
+malformed token. `From<SecretError> for AeonError` routes to
+`AeonError::Config` (non-retryable). 34 unit tests.
+
+### 9.11 S1.2 Dual-domain KEK + envelope encryption — `aeon_crypto::kek` module — **Closed 2026-04-22**
+
+`KekDomain::{LogContext, DataContext}` — strictly non-fungible
+(log keys and payload keys never cross, even under misconfiguration).
+`WrappedDek { kek_domain, kek_id, nonce, ciphertext }` — serde-
+serializable, wire-stable. `DekBytes([u8; 32])` — zeroize-on-drop,
+no `Debug`, no `Clone`. `KekHandle` carries `domain`, `active_id +
+active_ref`, optional `previous_id + previous_ref`, and `Arc<SecretRegistry>`.
+`wrap_new_dek()` generates + wraps; `unwrap_dek()` dispatches on
+`wrapped.kek_id` (active vs previous) for **hot-key rotation**,
+rejects domain mismatch and unknown kek_id. AES-256-GCM (12-byte
+random nonce, 128-bit tag) via `aes-gcm` 0.10 — same primitive
+planned for S3 at-rest encryption. 10 unit tests cover
+active-roundtrip, rotation (previous-key roundtrip), domain-
+mismatch rejection, unknown-kek_id rejection, tamper detection via
+GCM tag, wrong-length KEK rejection, debug redaction, DEK non-zero,
+`KekDomain` string-stability, `WrappedDek` JSON serde roundtrip.
+
+### 9.12 S1.3 CLI pre-parse YAML interpolation — `aeon-cli/src/main.rs` — **Closed 2026-04-22**
+
+`read_and_interpolate_manifest(&Path) -> Result<String>` helper
+reads the manifest, enforces existing `MAX_MANIFEST_SIZE`, and runs
+`SecretRegistry::default_local().interpolate_str(&raw)` before
+`serde_yaml::from_str`. Wired into `cmd_apply` and `cmd_diff`.
+`cmd_check` deliberately left on raw-read — it's a syntax-only
+validator that should run offline without env vars set. Pre-parse
+interpolation means **no per-field plumbing** is needed: one edit
+covers every connector and config field. Documented limitation:
+interpolated values containing YAML-reserved characters may break
+parsing (base64-encode multi-line secrets). 5 new tests:
+env-ref replacement, plain-YAML passthrough, missing-env-var error,
+unregistered-scheme error, oversize-file rejection. Also fixed 2
+pre-existing SSRF test gaps in `connectors.rs` that were using
+`127.0.0.1` against `SsrfPolicy::production()` defaults
+(`http_polling_source_requires_url`,
+`http_sink_factory_requires_url_and_posts`) — added
+`ssrf_allow_loopback: true` to both configs. Full CLI suite back
+to 34/34 green.
+
+### 9.13 S9.1 Inbound auth primitives — `aeon_types::auth` module — **Closed 2026-04-22**
+
+Protocol-agnostic verifier so HTTP / WebTransport / QUIC all funnel
+through one type. `auth::hmac_sig` exposes `sign_request` /
+`verify_request` over the canonical
+`method || "\n" || path || "\n" || ts || "\n" || body` preimage;
+`HmacAlgorithm::{HmacSha256, HmacSha512}` with serde kebab-case;
+constant-time tag compare via `hmac::Mac::verify_slice`; candidate
+list for `[active, previous]` rotation. `auth::inbound` defines
+`InboundAuthMode` (4 modes, `serde(snake_case)`), per-block config
+structs (`IpAllowlistConfig` / `ApiKeyConfig` / `HmacConfig` /
+`MtlsConfig`), and `InboundAuthConfig` as the top-level document.
+`InboundAuthVerifier::build()` compiles the config, moves secrets
+into `SecretBytes`, and validates non-empty mode blocks up-front.
+`verify(&AuthContext)` runs modes in declaration order —
+cheap-reject-first ordering is the operator's responsibility. Custom
+redacted `Debug` surfaces mode list + count-per-block but never
+key bytes. `AuthRejection::reason_tag()` returns bounded-cardinality
+labels for metrics; `redacted_peer_ip()` applies the S2 rule
+(v4 last octet / v6 lower 32 bits). 15 hmac_sig tests + 33 inbound
+tests = 48 new aeon-types tests (276 total crate-wide, clippy clean).
+
+### 9.14 S9.2 Connector wiring — **Closed 2026-04-22**
+
+`HttpWebhookSource` receives the full four-mode surface:
+`ConnectInfo<SocketAddr>` extractor provides the peer IP,
+`HeaderMap` is materialised into a flat `&[(&str, &[u8])]` slice
+(aeon-types stays protocol-agnostic), auth runs **before** the
+push-buffer overload check, `status_for(rejection)` maps to HTTP
+401 (API-key / HMAC) vs 403 (IP / mTLS), and rejection emits a
+`tracing::warn` with `reason_tag` + redacted peer IP. Raw
+push-endpoint sources — `QuicSource`, `WebTransportSource`,
+`WebTransportDatagramSource` — get an IP allow-list hook at
+pre-handshake acceptance: `incoming.remote_address().ip()` is
+resolved without paying the TLS cost and the session is refused
+(`quinn::Incoming::refuse()` / `wtransport::IncomingSession::refuse()`)
+on rejection. API-key / HMAC / mTLS for QUIC+WT require header/
+cert-subject plumbing that's deferred to a follow-up. 8 new webhook
+auth tests (baseline + all 4 modes with real reqwest round-trips),
+existing QUIC/WT tests regression-checked — 40/40 connector tests
+green under `http,quic,webtransport` features.
+
+### 9.15 S9.3 CLI YAML surface — `aeon-cli/src/connectors.rs` — **Closed 2026-04-22**
+
+`parse_inbound_auth_config(&BTreeMap<String, String>)` reads a
+flat-key convention that fits the existing factory config shape:
+`auth_modes` (comma-separated), `auth_ip_cidrs`, `auth_api_keys`,
+`auth_hmac_secrets`, `auth_hmac_algorithm`, `auth_hmac_skew_seconds`,
+`auth_mtls_subjects`, plus optional header-name overrides. Absent
+`auth_modes` returns `Ok(None)` — no verifier is installed, source
+stays open. Secret-valued fields (`auth_api_keys`, `auth_hmac_secrets`)
+carry plaintext by the time the factory runs — S1.3 pre-parse
+interpolation has already resolved `${VAULT:...}` / `${ENV:...}`
+tokens. `build_inbound_auth_verifier` wraps in `Arc` and plugs into
+`HttpWebhookSourceFactory::build()`. Five parser tests (absent-key,
+single-mode, all-four-modes incl. sha512 + custom skew, unknown
+mode rejected, unknown algorithm rejected) — full CLI suite 29/29
+green under `rest-api`. Wiring for QUIC + WT YAML factories is
+separate work under the P5.c connector-catalog track.
+
+### 9.16 S10.1 Outbound auth primitives in `aeon_types::auth::outbound` — **Closed 2026-04-22**
+
+Matches the S9 shape but inverts direction: Aeon is the client, the
+remote is the server. `OutboundAuthMode` enum exposes seven modes
+(`None`, `Bearer`, `Basic`, `ApiKey`, `HmacSign`, `Mtls`,
+`BrokerNative`) with a `tag()` helper for bounded-cardinality
+metric labels. `OutboundAuthConfig` carries the mode + per-mode
+blocks (`BearerConfig`, `BasicConfig`, `OutboundApiKeyConfig`,
+`HmacSignConfig`, `OutboundMtlsConfig`, `BrokerNativeConfig`).
+
+**Single-mode discipline.** Unlike S9 (which *stacks* IP allow-list
+/ API-key / HMAC / mTLS as defence-in-depth), S10 allows exactly
+one `auth.mode` per connector. The design note in the module
+header explains why: outbound is a single handshake, and composing
+modes (Bearer + HMAC? which credential caused the 401? which do we
+rotate?) breaks retry semantics. Stackable auth is the inbound
+world's job.
+
+`OutboundAuthSigner::build()` moves every secret into `SecretBytes`
+(zeroize-on-drop); it rejects mode/block mismatches (`Bearer`
+selected but `bearer:` absent → `ModeConfigMissing`) and empty
+credential values (`BearerEmpty`, `BasicUsernameEmpty`, `ApiKeyEmpty`,
+`HmacSecretEmpty`, `MtlsEmpty`) up-front so misconfiguration fails
+loud at pipeline start. Internal state is a typed `CompiledSigner`
+enum variant per mode — every accessor pattern-matches rather than
+unwrapping options, so there are no `.unwrap()` / `.expect()` on
+the hot path (FT-10 compliant without any `#[allow(...)]` escapes).
+
+`http_headers(&OutboundSignContext)` returns per-request headers
+for HTTP-applicable modes: `Authorization: Bearer …` for Bearer,
+`Authorization: Basic <b64(user:pass)>` for Basic, configurable
+header for ApiKey, and `(X-Aeon-Timestamp, X-Aeon-Signature)` for
+HmacSign (signed over the canonical `method\npath\nts\nbody`
+preimage — same shape as S9 verifier). Returns empty `Vec` for
+`None` / `Mtls` / `BrokerNative`; `mtls_cert_pem()` /
+`mtls_key_pem()` / `broker_native()` surface the non-HTTP
+material for connectors that install it on the transport. Custom
+`Debug` impl redacts secret bytes — surfaces mode + `has_bearer:
+true` / `api_key_header: …` / `broker_native_keys: […]` but never
+the key material itself.
+
+20 unit tests cover: every mode emits the right header set or
+surfaces the right material; empty-credential variants all return
+the right build error; HMAC timestamp varies between calls (so the
+signature varies), base64 matches the exact expected string, Debug
+redacts, mode tags are bounded-cardinality, serde is snake_case,
+and build errors convert cleanly to `AeonError`. 296 aeon-types
+tests total; clippy clean with `-D warnings`.
+
+### 9.17 S10.2 HTTP connector wiring — **Closed 2026-04-22**
+
+`HttpSinkConfig::with_auth(Arc<OutboundAuthSigner>)` and the
+matching builder on `HttpPollingSourceConfig`. Per-request header
+merge is unconditional — `signer.http_headers(OutboundSignContext)`
+handles the `None` / `Mtls` / `BrokerNative` no-ops internally so
+the call site stays uniform. Context is built per-request
+(`method`, `path` pre-parsed from the URL at construction time,
+`body` = output payload for sink / empty for GET source, `now_unix`
+from `SystemTime`).
+
+`Mtls` mode is handled specially: PEM cert + key are concatenated
+and installed on the `reqwest::Client` via `Identity::from_pem()`
+at construction time (rustls-tls feature). `BrokerNative` is
+logged-and-ignored for HTTP with a `tracing::warn!` so operators
+see the misconfiguration without killing the pipeline.
+
+Tests exercise Bearer, HmacSign, ApiKey, and None modes end-to-end
+against an axum test server — verifying `Authorization`,
+`X-Aeon-Signature` (hex-only), `X-Aeon-Timestamp` (parseable i64),
+and custom-header injection on both sink and polling source. All
+8/8 HTTP sink tests and 5/5 HTTP polling tests pass; full
+`cargo test -p aeon-connectors --features http http::` suite 23/23
+green. Clippy clean with `-D warnings`.
+
+### 9.18 S10.3 CLI YAML surface — **Closed 2026-04-22**
+
+`parse_outbound_auth_config(&BTreeMap<String, String>)` in
+`aeon-cli::connectors` reads a flat-key convention parallel to the
+S9 inbound parser:
+
+- `auth_mode` — required to trigger parsing; absent ⇒ `Ok(None)`.
+  Values: `none` | `bearer` | `basic` | `api_key` | `hmac_sign` |
+  `mtls` | `broker_native`.
+- `auth_bearer_token` — for `bearer`.
+- `auth_basic_username` / `auth_basic_password` — for `basic`.
+- `auth_api_key_header` (default `X-Aeon-Api-Key`) /
+  `auth_api_key` — for `api_key`.
+- `auth_hmac_sign_signature_header` (default `X-Aeon-Signature`) /
+  `auth_hmac_sign_timestamp_header` (default `X-Aeon-Timestamp`) /
+  `auth_hmac_sign_secret` / `auth_hmac_sign_algorithm`
+  (`hmac-sha256` | `hmac-sha512`) — for `hmac_sign`.
+- `auth_mtls_cert_pem` / `auth_mtls_key_pem` — for `mtls`.
+- `auth_broker_native.<key>` — each such pair lands in the
+  `BrokerNativeConfig.values` map verbatim, so SDK-specific keys
+  (`sasl_mechanism`, `username`, `password`, `oauth_token`,
+  `creds_path`, …) pass through unchanged.
+
+`build_outbound_auth_signer` wraps in `Arc` and plugs into
+`HttpSinkFactory::build()` + `HttpPollingSourceFactory::build()`.
+Secret-valued fields are plaintext by the time the factory runs —
+S1.3 pre-parse interpolation has already resolved `${VAULT:...}` /
+`${ENV:...}` tokens. Unknown mode / unknown algorithm rejections
+match the S9 shape so YAML misconfiguration fails loud at pipeline
+start.
+
+13 parser tests (absent-key, every mode, custom headers, sha512
+algorithm, broker-native map round-trip, unknown-mode rejection,
+unknown-algorithm rejection, empty-credential build rejection) —
+full `cargo test -p aeon-cli --features rest-api connectors::`
+suite 42/42 green.

@@ -10,8 +10,10 @@
 // Test modules and benches are exempt (`cfg(not(test))`).
 #![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod auth;
 pub mod awpp;
 pub mod backoff;
+pub mod consumer_mode;
 pub mod delivery;
 pub mod durability;
 pub mod error;
@@ -24,15 +26,26 @@ pub mod oauth;
 pub mod partition;
 pub mod processor_identity;
 pub mod processor_transport;
+pub mod redact;
 pub mod registry;
 pub mod scanner;
+pub mod secrets;
+pub mod ssrf;
 pub mod state;
 pub mod traits;
 pub mod transport_codec;
 pub mod uuid;
 
 // Re-export primary types at crate root for convenience.
+pub use auth::{
+    ApiKeyConfig, AuthContext, AuthRejection, BasicConfig, BearerConfig, BrokerNativeConfig,
+    HmacAlgorithm, HmacConfig, HmacSignConfig, HmacSignError, HmacVerifyError, InboundAuthConfig,
+    InboundAuthMode, InboundAuthVerifier, IpAllowlistConfig, MtlsConfig, OutboundApiKeyConfig,
+    OutboundAuthBuildError, OutboundAuthConfig, OutboundAuthMode, OutboundAuthSigner,
+    OutboundMtlsConfig, OutboundSignContext, OutboundSignError,
+};
 pub use backoff::{Backoff, BackoffPolicy};
+pub use consumer_mode::ConsumerMode;
 pub use delivery::{BatchFailurePolicy, BatchResult, DeliverySemantics, DeliveryStrategy};
 pub use durability::DurabilityMode;
 pub use error::{AeonError, Result};
@@ -54,6 +67,7 @@ pub use processor_identity::{PipelineScope, ProcessorIdentity};
 pub use processor_transport::{
     ProcessorBinding, ProcessorConnectionConfig, ProcessorHealth, ProcessorInfo, ProcessorTier,
 };
+pub use redact::redact_uri;
 pub use registry::{
     BlueGreenActive, BlueGreenState, CanaryState, CanaryThresholds, PipelineAction,
     PipelineDefinition, PipelineHistoryEntry, PipelineState, ProcessorRecord, ProcessorRef,
@@ -63,6 +77,11 @@ pub use registry::{
 pub use scanner::{
     BytesFinder, contains_byte, contains_bytes, find_byte, find_bytes, json_field_value,
 };
+pub use secrets::{
+    DotEnvProvider, EnvProvider, LiteralProvider, SecretBytes, SecretError, SecretProvider,
+    SecretRef, SecretRegistry, SecretScheme,
+};
+pub use ssrf::{SsrfError, SsrfPolicy, parse_host_port};
 pub use state::{BatchEntry, BatchOp, KvPairs, L3Backend, L3Store};
 pub use traits::{
     CheckpointReplicator, IdempotentSink, Processor, ProcessorTransport, Seekable, Sink,
