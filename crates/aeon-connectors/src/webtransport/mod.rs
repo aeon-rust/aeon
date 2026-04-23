@@ -11,9 +11,11 @@
 //!   Datagrams may be dropped, reordered, or duplicated.
 
 mod datagram_source;
+mod mtls;
 mod sink;
 mod source;
 
 pub use datagram_source::{WebTransportDatagramSource, WebTransportDatagramSourceConfig};
+pub use mtls::mtls_client_config_from_signer;
 pub use sink::{WebTransportSink, WebTransportSinkConfig};
 pub use source::{WebTransportSource, WebTransportSourceConfig};

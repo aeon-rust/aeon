@@ -21,10 +21,10 @@ pub struct WebTransportSinkConfig {
     pub ssrf_policy: SsrfPolicy,
     /// S10: outbound auth signer. HTTP-style modes (Bearer / Basic /
     /// ApiKey / HmacSign) inject headers on the HTTP/3 CONNECT request
-    /// that opens the WebTransport session. `Mtls` is logged-and-ignored
-    /// here — the client certificate must be baked into `client_config`
-    /// via `wtransport::ClientConfigBuilder::with_custom_tls` at build
-    /// time; `client_config` is opaque to this sink after construction.
+    /// that opens the WebTransport session. `Mtls` mode requires the
+    /// client certificate be baked into `client_config` — use
+    /// [`crate::webtransport::mtls_client_config_from_signer`] to build
+    /// one from the signer, then pass it to [`WebTransportSinkConfig::new`].
     /// `BrokerNative` does not apply to WebTransport and is warned-and-ignored.
     pub auth: Option<Arc<OutboundAuthSigner>>,
 }
@@ -71,10 +71,10 @@ impl WebTransportSink {
         // S10: warn-once on modes that don't translate to CONNECT headers.
         if let Some(signer) = &config.auth {
             match signer.mode() {
-                OutboundAuthMode::Mtls => tracing::warn!(
-                    "WebTransportSink: mTLS auth must be baked into client_config via \
-                     ClientConfigBuilder::with_custom_tls; signer cert/key ignored at \
-                     this layer (follow-up to expose a builder helper)"
+                OutboundAuthMode::Mtls => tracing::info!(
+                    "WebTransportSink: mTLS signer present — client_config must have been \
+                     built via webtransport::mtls_client_config_from_signer for the cert \
+                     to be presented; signer cert/key are advisory at this layer"
                 ),
                 OutboundAuthMode::BrokerNative => tracing::warn!(
                     "WebTransportSink: broker_native auth mode is not applicable to WebTransport; ignored"

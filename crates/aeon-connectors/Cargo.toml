@@ -98,7 +98,14 @@ nats = ["dep:async-nats", "dep:futures-util", "dep:tokio"]
 mqtt = ["dep:rumqttc", "dep:tokio"]
 rabbitmq = ["dep:lapin", "dep:futures-util", "dep:tokio"]
 quic = ["dep:quinn", "dep:rustls", "dep:rcgen", "dep:tokio", "dep:futures-util"]
-webtransport = ["dep:wtransport", "dep:tokio", "dep:futures-util"]
+webtransport = [
+    "dep:wtransport",
+    "dep:tokio",
+    "dep:futures-util",
+    "dep:rustls",
+    "dep:rustls-pemfile",
+    "dep:webpki-roots",
+]
 postgres-cdc = ["dep:tokio-postgres", "dep:tokio", "dep:serde", "dep:serde_json"]
 mysql-cdc = ["dep:mysql_async", "dep:tokio", "dep:serde", "dep:serde_json"]
 mongodb-cdc = ["dep:mongodb", "dep:tokio", "dep:futures-util", "dep:serde", "dep:serde_json"]
