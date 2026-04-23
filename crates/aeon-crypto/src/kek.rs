@@ -33,7 +33,7 @@ use aeon_types::{AeonError, SecretBytes, SecretRef, SecretRegistry};
 /// Logical domain a KEK belongs to. Domains are strictly non-fungible:
 /// a wrapped DEK tagged `DataContext` must not be unwrappable by a
 /// `LogContext` handle even if the underlying KEK bytes happened to match.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum KekDomain {
     LogContext,

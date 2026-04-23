@@ -49,6 +49,7 @@ hostname = { version = "0.4", optional = true }
 criterion = { workspace = true }
 rcgen = { workspace = true }
 serde_json = { workspace = true }
+tokio = { workspace = true }
 
 [[bench]]
 name = "crypto_bench"

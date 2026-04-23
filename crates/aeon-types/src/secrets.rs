@@ -380,6 +380,15 @@ pub struct SecretRegistry {
     providers: HashMap<SecretScheme, Arc<dyn SecretProvider>>,
 }
 
+impl std::fmt::Debug for SecretRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let schemes: Vec<_> = self.providers.keys().collect();
+        f.debug_struct("SecretRegistry")
+            .field("schemes", &schemes)
+            .finish()
+    }
+}
+
 impl SecretRegistry {
     pub fn empty() -> Self {
         Self {

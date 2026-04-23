@@ -1,0 +1,44 @@
+[package]
+name = "aeon-secrets"
+description = "Adapter crate for Aeon secret and KEK provider backends (Vault, OpenBao, AWS KMS, AWS Secrets Manager, GCP KMS, Azure Key Vault)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/aeon-secrets"
+keywords = ["secrets", "vault", "kms", "secret-manager", "aeon"]
+categories = ["cryptography"]
+
+[features]
+default = []
+
+# HashiCorp Vault KV-v2 + Transit engines. OpenBao is API-compatible and
+# ships under the same feature — one adapter serves both.
+vault = ["dep:reqwest", "dep:tokio", "dep:serde_json"]
+
+# Backend features reserved for follow-up implementations. They exist in
+# the public config enum today so YAML schemas stabilize early, but
+# compiling with any of them currently produces a build error — wiring
+# is in follow-up tasks (see aeon-secrets/src/builder.rs for the gate).
+aws-sm = []
+aws-kms = []
+gcp-kms = []
+azure-kv = []
+
+[dependencies]
+aeon-types = { workspace = true }
+aeon-crypto = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+
+# Feature-gated
+reqwest = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+serde_yaml = "0.9"
+tokio = { workspace = true }

@@ -11,6 +11,10 @@
 //! - [`at_rest`] — S3 AES-256-GCM payload sealing for L2 segments + L3 values
 //! - [`keys`] — Key management (KeyProvider trait, env/file providers)
 //! - [`kek`] — S1.2 dual-domain KEK + envelope-encrypted DEKs
+//! - [`kek_provider`] — async [`kek_provider::KekProvider`] trait for
+//!   adapter-pattern KMS backends (Vault Transit, AWS KMS, GCP KMS,
+//!   Azure Key Vault, PKCS#11); local AES-GCM [`kek::KekHandle`]
+//!   implements it too.
 //! - [`hsm`] — S1.4 HSM / PKCS#11 provider trait stub
 //! - [`fips`] — FIPS 140-3 mode guard
 //! - [`tls`] — TLS/mTLS certificate management
@@ -29,6 +33,7 @@ pub mod fips;
 pub mod hash;
 pub mod hsm;
 pub mod kek;
+pub mod kek_provider;
 pub mod keys;
 pub mod merkle;
 pub mod mmr;
