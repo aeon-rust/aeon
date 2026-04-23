@@ -197,7 +197,7 @@ This wedge is defensible because retrofitting any one piece (crypto chain, compl
 | **Production deployments outside of dev/test** | Whenever first user lands | No case study yet |
 | **Documentation / tutorials / cookbook** | Medium | Scale-out docs exist; SDK docs are strong; lacks "write your first processor" funnel |
 | **HSM / PKCS#11 implementation** | Medium | Trait stub landed in S1.4 (2026-04-23); real backend (SoftHSM / CloudHSM) still required for FIPS-track claims |
-| **SECURITY.md / COMPLIANCE.md user-facing docs** | Small | Audit landings are captured in ROADMAP §Security; dedicated top-level docs still pending |
+| **WebSocket / WebTransport mTLS TLS-layer** | Small | S10 auth-mode matrix is complete; TLS-connector integration for WS/WT mTLS is a follow-up (warn-and-ignore today) |
 
 **Gaps closed by the 2026-04-23 audit landing (no longer on this list):**
 - Secrets-in-config-files risk — closed by S1 (provider abstraction + envelope encryption)
@@ -224,4 +224,4 @@ This wedge is defensible because retrofitting any one piece (crypto chain, compl
 
 ---
 
-*See also:* [`ARCHITECTURE.md`](ARCHITECTURE.md) · [`ROADMAP.md`](ROADMAP.md) · [`GATE2-ACCEPTANCE-PLAN.md`](GATE2-ACCEPTANCE-PLAN.md) · [`EO-2-DURABILITY-DESIGN.md`](EO-2-DURABILITY-DESIGN.md) · [`WINDOWING-WATERMARKS-DESIGN.md`](WINDOWING-WATERMARKS-DESIGN.md)
+*See also:* [`ARCHITECTURE.md`](ARCHITECTURE.md) · [`ROADMAP.md`](ROADMAP.md) · [`GATE2-ACCEPTANCE-PLAN.md`](GATE2-ACCEPTANCE-PLAN.md) · [`EO-2-DURABILITY-DESIGN.md`](EO-2-DURABILITY-DESIGN.md) · [`WINDOWING-WATERMARKS-DESIGN.md`](WINDOWING-WATERMARKS-DESIGN.md) · [`SECURITY.md`](SECURITY.md) · [`COMPLIANCE.md`](COMPLIANCE.md)

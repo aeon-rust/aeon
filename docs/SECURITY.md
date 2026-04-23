@@ -21,7 +21,8 @@ REST API surface to the Wasm sandbox boundary.
 8. [Container Security](#8-container-security)
 9. [Network Security](#9-network-security)
 10. [Wasm Sandboxing](#10-wasm-sandboxing)
-11. [Production Hardening Checklist](#11-production-hardening-checklist)
+11. [Pipeline Data-Plane Security (S1–S10 Audit Landings)](#11-pipeline-data-plane-security-s1s10-audit-landings)
+12. [Production Hardening Checklist](#12-production-hardening-checklist)
 
 ---
 
@@ -33,12 +34,14 @@ OWASP Top 10 (2021) categories:
 
 | OWASP Category | Aeon Mitigation |
 |---|---|
-| A01 — Broken Access Control | Bearer token authentication on all management endpoints |
-| A03 — Injection | Resource name validation, path traversal prevention |
-| A04 — Insecure Design | Request body size limits (10 MB), batch size bounds |
-| A05 — Security Misconfiguration | Security headers on all responses, dev-mode warnings |
-| A08 — Software and Data Integrity | SHA-256 hash verification for native processor artifacts |
-| A09 — Security Logging and Monitoring | Full request logging via tower-http TraceLayer |
+| A01 — Broken Access Control | Bearer token on the REST management plane; per-source inbound auth (IP allow-list / API-key / HMAC / mTLS — §11.9); per-sink outbound auth (Bearer / Basic / API-key / HMAC-sign / mTLS / broker-native — §11.10) |
+| A02 — Cryptographic Failures | At-rest encryption of L2 body + L3 checkpoints (AES-256-GCM per-segment DEK — §11.3); dual-KEK envelope encryption with rotation (§11.1); secret provider abstraction (Vault / KMS / SM) keeps plaintext credentials off disk |
+| A03 — Injection | Resource name validation, path traversal prevention; SSRF hardening on every external-URL resolver (§11.8) |
+| A04 — Insecure Design | Request body size limits (10 MB), batch size bounds; compliance-regime precondition validator refuses to start pipelines missing required encryption / retention / erasure (§11.5) |
+| A05 — Security Misconfiguration | Security headers on all responses, dev-mode warnings; dev-mode secret providers emit a warn log so they cannot silently reach prod |
+| A08 — Software and Data Integrity | SHA-256 hash verification for native processor artifacts; PoH + Merkle + MMR + Ed25519 hot-path chain for event-level integrity |
+| A09 — Security Logging and Monitoring | Full request logging via tower-http TraceLayer; tracing-layer payload redaction (§11.6); separated audit log channel (§11.7) |
+| A10 — Server-Side Request Forgery | SSRF policy: allow/deny-list, private-IP rejection, URL redaction on error paths (§11.8) |
 
 Key design principles:
 
@@ -361,15 +364,23 @@ In production, configure network policies to:
   `AEON_API_TOKEN` and optionally a reverse proxy with TLS termination.
 - **4472:** Allow only from monitoring infrastructure (Prometheus, Grafana).
 
-### mTLS Path (Planned)
+### TLS / mTLS Status
 
 Aeon's key decisions lock in `rustls` + `aws-lc-rs` for TLS, providing a path
-to FIPS 140-3 compliance. The planned security progression:
+to FIPS 140-3 compliance. Current status by surface:
 
-1. **Current:** Bearer token over HTTP (suitable for internal networks).
-2. **Next:** TLS termination via reverse proxy (nginx, Traefik, Envoy).
-3. **Future:** Native mTLS on all ports using rustls, with certificate-based
-   mutual authentication between cluster nodes (QUIC via quinn).
+| Surface | TLS / mTLS status |
+|---|---|
+| QUIC cluster (port 4470) | TLS via rustls + auto-generated or configured certificates (always on) |
+| REST API (port 4471) | Bearer token; TLS via reverse proxy recommended |
+| Inbound push sources (HTTP webhook, WebSocket, WebTransport) | mTLS supported as an S9 auth mode alongside IP allow-list / API-key / HMAC |
+| Outbound HTTP sink | mTLS supported — S10 mode `mtls`, client cert/key from secret provider |
+| Outbound Kafka / Redpanda sink | mTLS via broker-native (rdkafka SASL/TLS) — S10 mode `broker_native` |
+| Outbound WebSocket / WebTransport sink | mTLS at auth-mode level accepted; TLS-layer integration pending (see follow-up task #34 — warn-and-ignore today) |
+| Inbound REST on port 4471 | Native TLS termination via rustls is future work; reverse proxy recommended |
+
+Roadmap reference: FIPS-track claims require landing the S1.4 HSM/PKCS#11
+backend (currently trait stub only — see follow-up task #33).
 
 ### Kafka/Redpanda Security
 
@@ -437,7 +448,217 @@ This prevents shared-state race conditions at the Wasm layer.
 
 ---
 
-## 11. Production Hardening Checklist
+## 11. Pipeline Data-Plane Security (S1–S10 Audit Landings)
+
+Sections 2–10 cover the Aeon control plane (REST API, CLI, processor loading,
+Wasm sandbox, container, ports). This section covers the pipeline data plane
+— how events, checkpoints, and connector credentials are protected as data
+flows through Aeon. All items below landed between 2026-04-19 and 2026-04-23
+as the S1–S10 audit close-out. For regime-specific guidance (PCI-DSS / HIPAA /
+GDPR), see [`COMPLIANCE.md`](COMPLIANCE.md).
+
+### 11.1 Secret Management (S1)
+
+Secrets (KEKs, DEKs, HMAC keys, connector passwords, API tokens, TLS private
+keys) are resolved through a provider abstraction. No plaintext credentials
+touch disk outside the dev-mode fallbacks.
+
+Providers, in priority order:
+
+| Provider | Use case |
+|---|---|
+| HashiCorp Vault | Primary production provider. KV-v2 + Transit engine both supported. |
+| AWS KMS | Envelope encryption; `GenerateDataKey` for DEK, `Decrypt` for KEK unwrap. |
+| AWS Secrets Manager | Password/token-style secrets. |
+| GCP Secret Manager | GCP-native equivalent of AWS SM. |
+| Environment variables | For CI / Helm / K8s-injected values (second-last resort). |
+| Literal YAML | Dev-only. Engine logs a startup warning if any literal secret is observed. |
+
+Envelope encryption model:
+
+- DEK = per-segment 256-bit AES key, generated by the provider or Aeon.
+- KEK = key-encryption-key held by the provider; wraps the DEK.
+- Dual KEK supported: primary + next. During rotation, new segments use the
+  next KEK while old segments continue to unwrap under the primary.
+
+KEK rotation runbook:
+
+1. Add the new KEK to the provider with a new key-id.
+2. Configure Aeon with `security.kek.next = <new-key-id>`.
+3. New L2 segment DEKs are wrapped under `next`; existing segments are
+   unaffected.
+4. Once all old segments age out (per S5 retention), promote `next` to
+   `primary` and remove the old KEK.
+
+Config-via-env-var-first: all provider endpoints, role-ids, and key-ids come
+from env vars (see [`CONFIGURATION.md`](CONFIGURATION.md) for the canonical
+list). Literal YAML values are dev-only.
+
+### 11.2 HSM / PKCS#11 (S1.4)
+
+The `aeon-crypto::hsm` trait defines the surface for hardware-backed KEK
+custody. A trait stub is present; a real backend (SoftHSM for CI, CloudHSM
+for production) is a follow-up required for FIPS-track claims. See
+tracking task #33.
+
+### 11.3 At-Rest Encryption (S3)
+
+Both durability tiers are encrypted at rest:
+
+| Tier | Encryption |
+|---|---|
+| L2 body (segment files) | AES-256-GCM with a per-segment DEK. DEK is wrapped with the KEK and stored alongside the segment. |
+| L3 checkpoints (redb / RocksDB) | AES-256-GCM wrapping at the store boundary; DEK wrapped with the KEK. |
+
+GCM provides integrity out of the box — any tampering produces a decryption
+failure rather than silent corruption.
+
+Performance: encryption is applied in the hot path. Gate 1 throughput was
+re-benched after S3 landed; no regression versus the pre-encryption baseline.
+
+### 11.4 Retention (S5)
+
+Per-tier, per-pipeline retention is configurable:
+
+- L2 body: `state.l2.retention = <duration>` (default 7d)
+- L3 ack: `state.l3.ack_retention = <duration>` (default 24h)
+
+Retention is a precondition of several compliance regimes (HIPAA retention
+floors, GDPR storage limitation). The compliance validator (§11.5) reads
+these values at pipeline start and refuses to start if they don't meet the
+declared regime's floor.
+
+### 11.5 Compliance-Regime Enforcement (S4.2)
+
+The `compliance_validator::validate_compliance` function runs at pipeline
+start (before the first event is accepted) and gates startup on regime-driven
+preconditions.
+
+Supported regimes (declared per-pipeline in YAML):
+
+| Regime | Minimum preconditions checked |
+|---|---|
+| PCI-DSS | At-rest encryption (§11.3) on; tracing redaction (§11.6) on; audit channel (§11.7) on; KEK rotation configured. |
+| HIPAA | At-rest encryption on; retention floor configured; erasure API (§11.8) available for patient-data-tagged pipelines. |
+| GDPR | At-rest encryption on; subject-id extractor configured; retention ceiling configured; erasure + right-to-export available. |
+
+Failed preconditions produce a startup error with the specific missing control
+named. Operators see the error in engine logs and the pipeline stays in
+`Failed` state until the config is corrected.
+
+See [`COMPLIANCE.md`](COMPLIANCE.md) for per-regime operator guidance.
+
+### 11.6 Tracing Redaction (S2)
+
+Data-path tracing uses a redaction layer that strips event payload bytes
+before emission. Only structural metadata (event id, source, partition,
+timestamps, headers with opted-in keys) reaches the log sink. The redaction
+is applied in the tracing-subscriber layer, so any log line anywhere in the
+codebase is subject to it — not just opt-in call sites.
+
+External URLs written to log fields are passed through `redact_uri()` to
+strip userinfo (`user:pass@…`) and query strings.
+
+### 11.7 Audit Log Channel (S2.5)
+
+Audit-relevant events (pipeline start/stop, config changes, erasure
+operations, KEK rotation, authentication failures) emit to a separate audit
+channel rather than the data-path tracing channel. The audit channel is
+defined in `aeon-types::audit` and emitted via `aeon-observability::audit`.
+
+Separation matters because:
+- The data-path channel is high-volume and redacted — audit events must not
+  get lost in the noise.
+- Audit events are append-only and routed to a different sink (commonly an
+  immutable store) so ops can investigate incidents without trusting the
+  same store that an attacker might tamper with.
+
+Call-site wiring is ongoing (see ROADMAP §Security follow-ups).
+
+### 11.8 SSRF Hardening (S7)
+
+Every connector that dials an external URL runs the target through an
+`SsrfPolicy` check first. Defaults (production profile):
+
+- Scheme allow-list: `http`, `https`, `ws`, `wss` (plus protocol-specific
+  extensions like `kafka`, `nats`).
+- Host deny-list: loopback (127.0.0.0/8, ::1), link-local (169.254.0.0/16,
+  fe80::/10), broadcast, multicast, RFC1918 private ranges (configurable).
+- DNS resolution happens *before* the TCP SYN — a hostname that resolves to
+  a private IP is rejected.
+- URLs in error paths are passed through `redact_uri()`.
+
+Dev profiles can relax the deny-list (e.g., to allow `127.0.0.1` for local
+integration tests). Production profile is on by default.
+
+Connectors using the guard: HTTP source/sink, webhook source, WebSocket
+source/sink, WebTransport source/sink, any processor making an egress call.
+
+### 11.9 GDPR Subject-ID / Erasure / Export (S6)
+
+Three primitives:
+
+- **Subject-ID extractor** — per-pipeline config that extracts a stable
+  subject identifier from each event (JSON path, header, or custom
+  extractor). Events are indexed by subject ID in the L3 tier.
+- **Erasure API** — `POST /api/v1/pipelines/{name}/erase` takes a subject ID
+  and writes a tombstone to the deny-list store. Subsequent reads of events
+  for that subject are suppressed; future writes for that subject are
+  rejected at ingest (deny-list enforcement).
+- **Right-to-export** — `GET /api/v1/pipelines/{name}/export?subject=...`
+  returns all events for a given subject ID across the retention window.
+  Includes a cryptographic null-receipt when the subject has been erased
+  (the PoH/Merkle chain still verifies; the payload is proven absent).
+
+The erasure policy type (`ErasurePolicy`) declares the retention window and
+the tombstone TTL. See [`COMPLIANCE.md`](COMPLIANCE.md) for the GDPR
+operator workflow.
+
+### 11.10 Inbound Connector Auth (S9)
+
+Per-push-source authentication, configured under `auth.mode` on the source
+YAML. Available modes:
+
+| Mode | Description |
+|---|---|
+| `none` | No auth (dev only — allowed sources log a warn if used outside `127.0.0.1`). |
+| `ip_allow_list` | CIDR-based peer-IP allow-list checked at accept. |
+| `api_key` | Header-based API key; constant-time compare against secret-provider value. |
+| `hmac` | Signature + timestamp header; HMAC-SHA256 / SHA512; replay window enforced. |
+| `mtls` | Peer certificate required; trust store configurable. |
+
+The modes compose: the source can require `mtls` AND `hmac` simultaneously.
+Credentials resolve through the S1 secret provider.
+
+Applies to: HTTP webhook source, WebSocket source, WebTransport source.
+
+### 11.11 Outbound Connector Auth (S10)
+
+Per-sink outbound authentication, configured under `auth.mode` on the sink
+YAML. Available modes:
+
+| Mode | Description |
+|---|---|
+| `none` | Legitimate default for trusted-VPC pulls (Kafka, CDC) where upstream whitelists Aeon's egress IPs. |
+| `bearer` | `Authorization: Bearer <token>` header. |
+| `basic` | `Authorization: Basic <user:pass>` header. |
+| `api_key` | Custom header name + key value (e.g. `X-Api-Key: <value>`). |
+| `hmac_sign` | Request body + path signed with HMAC-SHA256 / SHA512; timestamp + signature headers. |
+| `mtls` | Client cert + key presented on the TLS handshake. |
+| `broker_native` | Protocol-native auth (e.g. Kafka SASL/SCRAM, NATS credentials, Redis ACL). |
+
+All credentials resolve through the S1 secret provider. One mode per sink —
+no interlocking.
+
+Applies to: HTTP sink, Kafka/Redpanda sink (broker-native), NATS sink,
+Redis Streams sink, WebSocket sink, WebTransport sink.
+
+For WebSocket and WebTransport sinks, the `mtls` mode is accepted at the
+auth-mode layer but TLS-layer plumbing is pending — see tracking task #34.
+
+---
+
+## 12. Production Hardening Checklist
 
 Follow this checklist before deploying Aeon to production.
 
@@ -506,6 +727,37 @@ Follow this checklist before deploying Aeon to production.
 - [ ] Set `max_memory_bytes` appropriate to your workload (default 64 MiB).
 - [ ] Use distinct namespaces for each processor to ensure state isolation.
 - [ ] Audit Wasm modules before deploying to production.
+
+### Data-Plane Security (S1–S10)
+
+- [ ] Configure a production-grade **secret provider** (Vault / AWS KMS /
+      Secrets Manager / GCP SM). Do not use literal YAML secrets or bare
+      env vars beyond CI/Helm injection (see §11.1).
+- [ ] Configure both **primary and next KEK** so rotation can be performed
+      without downtime (see §11.1).
+- [ ] Verify **at-rest encryption is on** for both L2 body and L3
+      checkpoints (`state.l2.encryption=on`, `state.l3.encryption=on`) —
+      §11.3.
+- [ ] Set **retention** on both tiers to match your regulatory floor /
+      ceiling — §11.4.
+- [ ] Declare the **compliance regime** on each regulated pipeline
+      (`compliance.regime: pci_dss | hipaa | gdpr`) so the validator (§11.5)
+      enforces preconditions at start.
+- [ ] Verify **payload-never-in-logs** by spot-checking structured log
+      output on a sample pipeline (§11.6).
+- [ ] Route the **audit channel** to an immutable or write-protected sink
+      separate from data-path tracing (§11.7).
+- [ ] Review **SSRF policy** for every source / sink that dials external
+      URLs. Leave the production profile on unless you have a specific
+      reason to relax it (§11.8).
+- [ ] Configure **inbound auth** on every push source — never deploy
+      `auth.mode: none` outside a trusted-VPC where upstream peer-auth is
+      already enforced (§11.10).
+- [ ] Configure **outbound auth** on every sink — prefer `mtls` or
+      `broker_native` over `bearer` where the protocol supports it
+      (§11.11).
+- [ ] For pipelines handling EU personal data, test the **erasure API** and
+      **right-to-export** paths (§11.9) as part of pre-prod acceptance.
 
 ### General
 
