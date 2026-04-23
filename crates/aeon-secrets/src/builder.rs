@@ -15,6 +15,7 @@ use aeon_types::{
 
 use crate::config::{
     KekProviderConfig, LocalKekConfig, SecretProviderConfig, VaultProviderConfig,
+    VaultTransitConfig,
 };
 use crate::error::SecretsAdapterError;
 use crate::kek_registry::KekRegistry;
@@ -176,7 +177,11 @@ impl KekRegistryBuilder {
         self
     }
 
-    pub fn build(self) -> Result<KekRegistry, SecretsAdapterError> {
+    /// Async because the KEK backends (Vault Transit today, cloud KMS
+    /// later) speak async HTTP and perform eager login at registration
+    /// so config errors surface at startup. `KekProvider` itself is
+    /// async, so the builder is naturally called from an async context.
+    pub async fn build(self) -> Result<KekRegistry, SecretsAdapterError> {
         let mut reg = KekRegistry::empty();
         for cfg in self.configs {
             match cfg {
@@ -193,8 +198,9 @@ impl KekRegistryBuilder {
                 KekProviderConfig::AzureKv(_) => {
                     return Err(feature_disabled("azure_key_vault_crypto", "azure-kv"));
                 }
-                KekProviderConfig::VaultTransit(_) => {
-                    return Err(feature_disabled("vault_transit", "vault"));
+                KekProviderConfig::VaultTransit(v) => {
+                    let provider = build_vault_transit(&v, &self.secrets).await?;
+                    reg.register(provider)?;
                 }
                 KekProviderConfig::Pkcs11(_) => {
                     return Err(SecretsAdapterError::BackendNotImplemented {
@@ -205,6 +211,24 @@ impl KekRegistryBuilder {
         }
         Ok(reg)
     }
+}
+
+#[cfg(feature = "vault")]
+async fn build_vault_transit(
+    cfg: &VaultTransitConfig,
+    bootstrap: &SecretRegistry,
+) -> Result<Arc<dyn aeon_crypto::kek_provider::KekProvider>, SecretsAdapterError> {
+    let provider =
+        crate::backends::vault::VaultTransitKekProvider::from_config(cfg, bootstrap).await?;
+    Ok(Arc::new(provider))
+}
+
+#[cfg(not(feature = "vault"))]
+async fn build_vault_transit(
+    _cfg: &VaultTransitConfig,
+    _bootstrap: &SecretRegistry,
+) -> Result<Arc<dyn aeon_crypto::kek_provider::KekProvider>, SecretsAdapterError> {
+    Err(feature_disabled("vault_transit", "vault"))
 }
 
 // ─── helpers ───────────────────────────────────────────────────────
@@ -396,7 +420,11 @@ mod tests {
             previous_id: None,
             previous_ref: None,
         });
-        let reg = KekRegistryBuilder::new(secrets).with_config(cfg).build().unwrap();
+        let reg = KekRegistryBuilder::new(secrets)
+            .with_config(cfg)
+            .build()
+            .await
+            .unwrap();
         assert!(reg.has_domain(KekDomain::DataContext));
 
         let (dek, wrapped) = reg.wrap_new_dek(KekDomain::DataContext).await.unwrap();
@@ -406,8 +434,8 @@ mod tests {
         unsafe { std::env::remove_var(VAR) };
     }
 
-    #[test]
-    fn kek_registry_builder_aws_kms_returns_feature_disabled() {
+    #[tokio::test]
+    async fn kek_registry_builder_aws_kms_returns_feature_disabled() {
         let secrets = Arc::new(aeon_types::SecretRegistry::empty());
         let cfg = KekProviderConfig::AwsKms(AwsKmsConfig {
             domain: "data_context".to_string(),
@@ -419,6 +447,7 @@ mod tests {
         let err = KekRegistryBuilder::new(secrets)
             .with_config(cfg)
             .build()
+            .await
             .unwrap_err();
         assert!(matches!(
             err,
@@ -429,8 +458,9 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn kek_registry_builder_vault_transit_returns_feature_disabled() {
+    #[cfg(not(feature = "vault"))]
+    #[tokio::test]
+    async fn kek_registry_builder_vault_transit_returns_feature_disabled() {
         let secrets = Arc::new(aeon_types::SecretRegistry::empty());
         let cfg = KekProviderConfig::VaultTransit(VaultTransitConfig {
             domain: "data_context".to_string(),
@@ -446,6 +476,7 @@ mod tests {
         let err = KekRegistryBuilder::new(secrets)
             .with_config(cfg)
             .build()
+            .await
             .unwrap_err();
         assert!(matches!(
             err,
@@ -454,6 +485,51 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// With the `vault` feature compiled, the Transit registration
+    /// path runs the real construction. Use a mockito server so the
+    /// AppRole-less Token path succeeds without a live Vault.
+    #[cfg(feature = "vault")]
+    #[tokio::test]
+    async fn kek_registry_builder_vault_transit_registers_via_real_provider() {
+        use base64::Engine;
+        use base64::engine::general_purpose::STANDARD as BASE64;
+
+        let mut server = mockito::Server::new_async().await;
+        let dek_b64 = BASE64.encode([0x77u8; 32]);
+        let _m = server
+            .mock("POST", "/v1/transit/datakey/plaintext/aeon-dek")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(
+                r#"{{"data":{{"plaintext":"{dek_b64}","ciphertext":"vault:v1:builder-test"}}}}"#
+            ))
+            .create_async()
+            .await;
+
+        let secrets = Arc::new(aeon_types::SecretRegistry::default_local());
+        let cfg = KekProviderConfig::VaultTransit(VaultTransitConfig {
+            domain: "data_context".to_string(),
+            endpoint: server.url(),
+            mount: "transit".to_string(),
+            key_name: "aeon-dek".to_string(),
+            auth: VaultAuthConfig::Token {
+                token_ref: "literal-token".to_string(),
+            },
+            namespace: None,
+            tls_verify: false,
+        });
+        let reg = KekRegistryBuilder::new(secrets)
+            .with_config(cfg)
+            .build()
+            .await
+            .unwrap();
+        assert!(reg.has_domain(KekDomain::DataContext));
+
+        // Smoke-check the registered provider actually serves wraps.
+        let (dek, _wrapped) = reg.wrap_new_dek(KekDomain::DataContext).await.unwrap();
+        assert_eq!(dek.expose_bytes(), &[0x77u8; 32]);
     }
 
     #[test]

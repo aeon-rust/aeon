@@ -1,255 +1,91 @@
-//! HashiCorp Vault / OpenBao KV-v2 [`SecretProvider`] backend.
-//!
-//! OpenBao is API-compatible with Vault — one adapter covers both,
-//! selected by pointing `endpoint` at whichever server you run.
+//! Vault / OpenBao KV-v2 read-side [`SecretProvider`].
 //!
 //! ## Sync vs async
 //!
 //! [`SecretProvider::resolve`] is a sync trait method. KV-v2 reads
 //! happen at pipeline-start time (resolving auth tokens, KEK refs,
 //! TLS keys), never on the hot event path, so this adapter uses
-//! [`reqwest::blocking`] rather than dragging async into the resolve
+//! `reqwest::blocking` rather than dragging async into the resolve
 //! signature.
-//!
-//! ## Auth methods
-//!
-//! - `Token` — static `client_token`, supplied via a secret ref
-//!   (`${ENV:VAULT_TOKEN}` is the typical shape).
-//! - `AppRole` — `role_id` + `secret_id` via secret refs; the adapter
-//!   performs the initial `POST /v1/auth/approle/login` eagerly at
-//!   construction so misconfiguration surfaces at startup, then caches
-//!   the resulting `client_token` and re-logs-in on a `403` response.
-//! - `Kubernetes` — declared in the config enum but not implemented in
-//!   this commit; surfaces [`SecretsAdapterError::BackendNotImplemented`].
 //!
 //! ## Path syntax
 //!
-//! `resolve(path)` reads `GET /v1/{mount}/data/{path}`. KV-v2 returns a
-//! map of fields — the adapter picks the field named after a `#`
+//! `resolve(path)` reads `GET /v1/{mount}/data/{path}`. KV-v2 returns
+//! a map of fields — the adapter picks the field named after a `#`
 //! suffix on the path (`secret/aeon/db#password`), or `value` by
 //! default.
 
-use std::sync::Mutex;
-
 use aeon_types::{
-    AeonError, SecretBytes, SecretError, SecretProvider, SecretRef, SecretRegistry,
-    SecretScheme,
+    SecretBytes, SecretError, SecretProvider, SecretRegistry, SecretScheme,
 };
 use reqwest::StatusCode;
-use reqwest::blocking::{Client, Response};
-use serde::{Deserialize, Serialize};
+use reqwest::blocking::Response;
+use serde::Deserialize;
 
-use crate::config::{VaultAuthConfig, VaultProviderConfig};
+use crate::backends::vault::auth::{VaultAuthClient, config_err};
+use crate::config::VaultProviderConfig;
 use crate::error::SecretsAdapterError;
 
-/// Vault / OpenBao KV-v2 [`SecretProvider`].
+/// Vault / OpenBao KV-v2 read-side provider.
 pub struct VaultKvProvider {
-    http: Client,
-    endpoint: String,
+    auth: VaultAuthClient,
     mount: String,
-    namespace: Option<String>,
-    auth: VaultAuth,
-}
-
-enum VaultAuth {
-    Token(String),
-    AppRole {
-        role_id: String,
-        secret_id: String,
-        current_token: Mutex<Option<String>>,
-    },
 }
 
 impl std::fmt::Debug for VaultKvProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let method = match &self.auth {
-            VaultAuth::Token(_) => "token",
-            VaultAuth::AppRole { .. } => "app_role",
-        };
         f.debug_struct("VaultKvProvider")
-            .field("endpoint", &self.endpoint)
             .field("mount", &self.mount)
-            .field("namespace", &self.namespace)
-            .field("auth_method", &method)
+            .field("auth", &self.auth)
             .finish()
     }
 }
 
 impl VaultKvProvider {
-    /// Construct a provider from config, resolving every `${...}` ref
-    /// in the auth block via `bootstrap`. For AppRole, performs an
-    /// eager login so config errors surface here, not at first read.
     pub fn from_config(
         cfg: &VaultProviderConfig,
         bootstrap: &SecretRegistry,
     ) -> Result<Self, SecretsAdapterError> {
-        let http = Client::builder()
-            .danger_accept_invalid_certs(!cfg.tls_verify)
-            .build()
-            .map_err(|e| http_err("build client", e))?;
-
-        let endpoint = cfg.endpoint.trim_end_matches('/').to_string();
         let mount = cfg.mount.trim_matches('/').to_string();
         if mount.is_empty() {
             return Err(config_err("vault mount must not be empty".into()));
         }
 
-        let auth = match &cfg.auth {
-            VaultAuthConfig::Token { token_ref } => {
-                let bytes = resolve_ref(bootstrap, token_ref)?;
-                let token = bytes_to_string(&bytes, "token_ref")?;
-                VaultAuth::Token(token)
-            }
-            VaultAuthConfig::AppRole {
-                role_id_ref,
-                secret_id_ref,
-            } => {
-                let role_bytes = resolve_ref(bootstrap, role_id_ref)?;
-                let secret_bytes = resolve_ref(bootstrap, secret_id_ref)?;
-                let role_id = bytes_to_string(&role_bytes, "role_id_ref")?;
-                let secret_id = bytes_to_string(&secret_bytes, "secret_id_ref")?;
-                VaultAuth::AppRole {
-                    role_id,
-                    secret_id,
-                    current_token: Mutex::new(None),
-                }
-            }
-            VaultAuthConfig::Kubernetes { .. } => {
-                return Err(SecretsAdapterError::BackendNotImplemented {
-                    backend: "vault_kubernetes_auth",
-                });
-            }
-        };
+        let auth = VaultAuthClient::new(
+            &cfg.endpoint,
+            cfg.namespace.as_deref(),
+            cfg.tls_verify,
+            &cfg.auth,
+            bootstrap,
+        )?;
 
-        let provider = Self {
-            http,
-            endpoint,
-            mount,
-            namespace: cfg.namespace.clone(),
-            auth,
-        };
-
-        if matches!(provider.auth, VaultAuth::AppRole { .. }) {
-            provider.login_approle()?;
-        }
-
-        Ok(provider)
-    }
-
-    fn current_token(&self) -> Result<String, SecretsAdapterError> {
-        match &self.auth {
-            VaultAuth::Token(t) => Ok(t.clone()),
-            VaultAuth::AppRole { current_token, .. } => {
-                {
-                    let guard = current_token.lock().map_err(|_| poisoned())?;
-                    if let Some(t) = guard.as_ref() {
-                        return Ok(t.clone());
-                    }
-                }
-                self.login_approle()?;
-                let guard = current_token.lock().map_err(|_| poisoned())?;
-                guard
-                    .as_ref()
-                    .cloned()
-                    .ok_or_else(|| config_err("AppRole login produced no token".into()))
-            }
-        }
-    }
-
-    fn login_approle(&self) -> Result<(), SecretsAdapterError> {
-        let (role_id, secret_id, slot) = match &self.auth {
-            VaultAuth::AppRole {
-                role_id,
-                secret_id,
-                current_token,
-            } => (role_id.as_str(), secret_id.as_str(), current_token),
-            _ => {
-                return Err(config_err(
-                    "internal: login_approle on non-AppRole auth".into(),
-                ));
-            }
-        };
-
-        #[derive(Serialize)]
-        struct Body<'a> {
-            role_id: &'a str,
-            secret_id: &'a str,
-        }
-        #[derive(Deserialize)]
-        struct AuthResp {
-            auth: AuthInner,
-        }
-        #[derive(Deserialize)]
-        struct AuthInner {
-            client_token: String,
-        }
-
-        let url = format!("{}/v1/auth/approle/login", self.endpoint);
-        let mut req = self.http.post(&url).json(&Body { role_id, secret_id });
-        if let Some(ns) = &self.namespace {
-            req = req.header("X-Vault-Namespace", ns);
-        }
-        let resp = req
-            .send()
-            .map_err(|e| http_err("approle login send", e))?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().unwrap_or_default();
-            return Err(config_err(format!(
-                "Vault AppRole login failed: HTTP {status} — {body}"
-            )));
-        }
-        let parsed: AuthResp = resp
-            .json()
-            .map_err(|e| http_err("approle login parse", e))?;
-        let mut guard = slot.lock().map_err(|_| poisoned())?;
-        *guard = Some(parsed.auth.client_token);
-        Ok(())
-    }
-
-    fn invalidate_token(&self) {
-        if let VaultAuth::AppRole { current_token, .. } = &self.auth {
-            if let Ok(mut guard) = current_token.lock() {
-                *guard = None;
-            }
-        }
-    }
-
-    fn build_get(&self, url: &str, token: &str) -> reqwest::blocking::RequestBuilder {
-        let mut req = self.http.get(url).header("X-Vault-Token", token);
-        if let Some(ns) = &self.namespace {
-            req = req.header("X-Vault-Namespace", ns);
-        }
-        req
+        Ok(Self { auth, mount })
     }
 
     fn fetch_kv(&self, path: &str, field: &str) -> Result<SecretBytes, SecretError> {
-        let url = format!(
-            "{}/v1/{}/data/{}",
-            self.endpoint,
+        let url_path = format!(
+            "/v1/{}/data/{}",
             self.mount,
             path.trim_start_matches('/'),
         );
 
-        let token = self
-            .current_token()
+        let req = self
+            .auth
+            .get(&url_path)
             .map_err(|e| provider_err(e.to_string()))?;
-        let resp = self
-            .build_get(&url, &token)
+        let resp = req
             .send()
-            .map_err(|e| provider_err(format!("vault GET {url} send: {e}")))?;
+            .map_err(|e| provider_err(format!("vault GET {url_path} send: {e}")))?;
 
-        if resp.status() == StatusCode::FORBIDDEN
-            && matches!(self.auth, VaultAuth::AppRole { .. })
-        {
-            self.invalidate_token();
-            let token = self
-                .current_token()
+        if resp.status() == StatusCode::FORBIDDEN && self.auth.is_approle() {
+            self.auth.invalidate_token();
+            let req = self
+                .auth
+                .get(&url_path)
                 .map_err(|e| provider_err(e.to_string()))?;
-            let resp = self
-                .build_get(&url, &token)
+            let resp = req
                 .send()
-                .map_err(|e| provider_err(format!("vault GET retry {url} send: {e}")))?;
+                .map_err(|e| provider_err(format!("vault GET retry {url_path}: {e}")))?;
             return decode_response(resp, field);
         }
 
@@ -302,44 +138,11 @@ impl SecretProvider for VaultKvProvider {
     }
 }
 
-// ─── helpers ───────────────────────────────────────────────────────
-
-fn resolve_ref(bootstrap: &SecretRegistry, raw: &str) -> Result<SecretBytes, SecretsAdapterError> {
-    let parsed = SecretRef::parse(raw).map_err(|e| config_err(e.to_string()))?;
-    let r = parsed.unwrap_or_else(|| SecretRef::literal(raw));
-    bootstrap
-        .resolve(&r)
-        .map_err(|e| config_err(format!("resolve '{raw}': {e}")))
-}
-
-fn bytes_to_string(b: &SecretBytes, what: &str) -> Result<String, SecretsAdapterError> {
-    let s = b
-        .expose_str()
-        .map_err(|_| config_err(format!("{what} resolved to non-UTF-8 bytes")))?;
-    Ok(s.trim().to_string())
-}
-
-fn http_err(what: &'static str, e: reqwest::Error) -> SecretsAdapterError {
-    SecretsAdapterError::Backend(AeonError::Config {
-        message: format!("vault HTTP {what}: {e}"),
-    })
-}
-
-fn config_err(message: String) -> SecretsAdapterError {
-    SecretsAdapterError::Backend(AeonError::Config { message })
-}
-
 fn provider_err(message: String) -> SecretError {
     SecretError::Provider {
         scheme: SecretScheme::Vault,
         message,
     }
-}
-
-fn poisoned() -> SecretsAdapterError {
-    SecretsAdapterError::Backend(AeonError::Config {
-        message: "vault provider mutex poisoned".to_string(),
-    })
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────
@@ -390,16 +193,16 @@ mod tests {
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(
-                json!({
-                    "data": { "data": { "value": "shh-it-is-a-secret" } }
-                })
-                .to_string(),
+                json!({ "data": { "data": { "value": "shh-it-is-a-secret" } } })
+                    .to_string(),
             )
             .create();
 
-        let provider =
-            VaultKvProvider::from_config(&token_cfg(&server.url(), "secret", "literal-token"), &bootstrap())
-                .unwrap();
+        let provider = VaultKvProvider::from_config(
+            &token_cfg(&server.url(), "secret", "literal-token"),
+            &bootstrap(),
+        )
+        .unwrap();
 
         let bytes = provider.resolve("aeon/db").unwrap();
         assert_eq!(bytes.expose_str().unwrap(), "shh-it-is-a-secret");
@@ -424,7 +227,6 @@ mod tests {
         let provider =
             VaultKvProvider::from_config(&token_cfg(&server.url(), "secret", "t"), &bootstrap())
                 .unwrap();
-
         let bytes = provider.resolve("aeon/db#password").unwrap();
         assert_eq!(bytes.expose_str().unwrap(), "hunter2");
         m.assert();
@@ -457,9 +259,11 @@ mod tests {
             .with_body(json!({ "data": { "data": { "value": "k1" } } }).to_string())
             .create();
 
-        let provider =
-            VaultKvProvider::from_config(&token_cfg(&server.url(), "kv-prod", "t"), &bootstrap())
-                .unwrap();
+        let provider = VaultKvProvider::from_config(
+            &token_cfg(&server.url(), "kv-prod", "t"),
+            &bootstrap(),
+        )
+        .unwrap();
         provider.resolve("api/keys").unwrap();
         m.assert();
     }
@@ -505,10 +309,8 @@ mod tests {
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(
-                json!({
-                    "auth": { "client_token": "approle-issued-token" }
-                })
-                .to_string(),
+                json!({ "auth": { "client_token": "approle-issued-token" } })
+                    .to_string(),
             )
             .create();
         let read = server
@@ -524,7 +326,7 @@ mod tests {
             &bootstrap(),
         )
         .unwrap();
-        login.assert(); // eager login at construction
+        login.assert();
 
         let bytes = provider.resolve("x").unwrap();
         assert_eq!(bytes.expose_str().unwrap(), "ok");
@@ -551,7 +353,6 @@ mod tests {
     #[test]
     fn approle_re_authenticates_on_403() {
         let mut server = mockito::Server::new();
-        // Two logins expected: one eager at construction, one after 403.
         let login = server
             .mock("POST", "/v1/auth/approle/login")
             .with_status(200)
@@ -561,7 +362,6 @@ mod tests {
             )
             .expect(2)
             .create();
-
         let _denied = server
             .mock("GET", "/v1/secret/data/x")
             .with_status(403)
