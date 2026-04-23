@@ -42,12 +42,15 @@ use aeon_crypto::kek_provider::{KekFuture, KekProvider};
 use aeon_types::{AeonError, SecretRegistry};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use reqwest::{Client, RequestBuilder, Response, StatusCode};
+use reqwest::{Client, RequestBuilder, Response};
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 
 use crate::backends::vault::auth::{ResolvedAuth, config_err, resolve_auth};
-use crate::config::VaultTransitConfig;
+use crate::backends::vault::retry::{
+    Classification, RetryPolicyExt, classify_status, is_transient_network_error,
+};
+use crate::config::{RetryPolicy, VaultTransitConfig};
 use crate::error::SecretsAdapterError;
 
 /// Vault / OpenBao Transit-engine KEK provider.
@@ -59,6 +62,7 @@ pub struct VaultTransitKekProvider {
     key_name: String,
     domain: KekDomain,
     auth: AsyncAuth,
+    retry: RetryPolicy,
 }
 
 enum AsyncAuth {
@@ -132,6 +136,7 @@ impl VaultTransitKekProvider {
             key_name: cfg.key_name.clone(),
             domain,
             auth,
+            retry: cfg.retry,
         };
 
         if provider.auth.is_approle() {
@@ -256,21 +261,45 @@ impl VaultTransitKekProvider {
         path: &str,
         body: &B,
     ) -> Result<Response, AeonError> {
-        let req = self.build_post(path, body).await.map_err(secrets_to_aeon)?;
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| crypto_err(format!("vault transit POST {path} send: {e}")))?;
+        let mut attempt: u32 = 0;
+        let mut auth_retried = false;
+        let mut backoff = self.retry.backoff.iter();
 
-        if resp.status() == StatusCode::FORBIDDEN && self.auth.is_approle() {
-            self.invalidate_token();
+        loop {
             let req = self.build_post(path, body).await.map_err(secrets_to_aeon)?;
-            return req
-                .send()
-                .await
-                .map_err(|e| crypto_err(format!("vault transit POST retry {path}: {e}")));
+            let send_result = req.send().await;
+            let resp = match send_result {
+                Ok(r) => r,
+                Err(e) => {
+                    if is_transient_network_error(&e) && self.retry.can_retry(attempt) {
+                        tokio::time::sleep(backoff.next_delay()).await;
+                        attempt += 1;
+                        continue;
+                    }
+                    return Err(crypto_err(format!(
+                        "vault transit POST {path} send: {e}"
+                    )));
+                }
+            };
+
+            match classify_status(resp.status()) {
+                Classification::Success | Classification::Permanent => return Ok(resp),
+                Classification::Auth if self.auth.is_approle() && !auth_retried => {
+                    self.invalidate_token();
+                    auth_retried = true;
+                    continue;
+                }
+                Classification::Auth => return Ok(resp),
+                Classification::Transient => {
+                    if self.retry.can_retry(attempt) {
+                        tokio::time::sleep(backoff.next_delay()).await;
+                        attempt += 1;
+                        continue;
+                    }
+                    return Ok(resp);
+                }
+            }
         }
-        Ok(resp)
     }
 
     async fn wrap_new_dek_async(&self) -> Result<(DekBytes, WrappedDek), AeonError> {
@@ -498,6 +527,21 @@ mod tests {
             },
             namespace: None,
             tls_verify: false,
+            retry: fast_retry(),
+        }
+    }
+
+    /// Tight backoff so retry tests finish in milliseconds without
+    /// hiding the policy under `thread::sleep`.
+    fn fast_retry() -> crate::config::RetryPolicy {
+        crate::config::RetryPolicy {
+            max_attempts: 3,
+            backoff: aeon_types::backoff::BackoffPolicy {
+                initial_ms: 1,
+                max_ms: 5,
+                multiplier: 2.0,
+                jitter_pct: 0.0,
+            },
         }
     }
 
@@ -677,6 +721,7 @@ mod tests {
             },
             namespace: None,
             tls_verify: false,
+            retry: fast_retry(),
         };
         let provider = VaultTransitKekProvider::from_config(&cfg, &bootstrap())
             .await
@@ -763,6 +808,50 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, SecretsAdapterError::Backend(_)));
+    }
+
+    #[tokio::test]
+    async fn retry_succeeds_on_transient_503_then_200_on_wrap() {
+        let mut server = mockito::Server::new_async().await;
+        let dek_b64 = BASE64.encode([0x77u8; 32]);
+        let fail = server
+            .mock("POST", "/v1/transit/datakey/plaintext/aeon-dek")
+            .with_status(503)
+            .with_body(r#"{"errors":["sealed"]}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let ok = server
+            .mock("POST", "/v1/transit/datakey/plaintext/aeon-dek")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                json!({
+                    "data": {
+                        "plaintext": dek_b64,
+                        "ciphertext": "vault:v1:after-retry"
+                    }
+                })
+                .to_string(),
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        let provider = VaultTransitKekProvider::from_config(
+            &token_cfg(&server.url(), "transit", "aeon-dek", "data_context", "tok"),
+            &bootstrap(),
+        )
+        .await
+        .unwrap();
+        let (dek, wrapped) = provider.wrap_new_dek().await.unwrap();
+        assert_eq!(dek.expose_bytes(), &[0x77u8; 32]);
+        assert_eq!(
+            std::str::from_utf8(&wrapped.ciphertext).unwrap(),
+            "vault:v1:after-retry"
+        );
+        fail.assert_async().await;
+        ok.assert_async().await;
     }
 
     #[tokio::test]

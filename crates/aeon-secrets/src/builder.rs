@@ -341,6 +341,8 @@ mod tests {
             namespace: None,
             tls_verify: true,
             ca_cert_ref: None,
+            retry: Default::default(),
+            cache_ttl_secs: 0,
         });
         let err = SecretRegistryBuilder::new().with_config(cfg).build().unwrap_err();
         assert!(matches!(
@@ -378,6 +380,8 @@ mod tests {
             namespace: None,
             tls_verify: false,
             ca_cert_ref: None,
+            retry: Default::default(),
+            cache_ttl_secs: 0,
         });
         let reg = SecretRegistryBuilder::new().with_config(cfg).build().unwrap();
         assert!(reg.has_scheme(aeon_types::SecretScheme::Vault));
@@ -472,6 +476,7 @@ mod tests {
             },
             namespace: None,
             tls_verify: true,
+            retry: Default::default(),
         });
         let err = KekRegistryBuilder::new(secrets)
             .with_config(cfg)
@@ -519,6 +524,7 @@ mod tests {
             },
             namespace: None,
             tls_verify: false,
+            retry: Default::default(),
         });
         let reg = KekRegistryBuilder::new(secrets)
             .with_config(cfg)

@@ -13,6 +13,7 @@
 
 use std::path::PathBuf;
 
+use aeon_types::backoff::BackoffPolicy;
 use serde::{Deserialize, Serialize};
 
 // ─── SecretProvider configs ────────────────────────────────────────
@@ -21,7 +22,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Discriminated by the `kind:` field. Each variant carries only the
 /// backend-specific fields — endpoint URLs, auth blocks, etc.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SecretProviderConfig {
     /// Read from `std::env`. Always available.
@@ -53,7 +54,7 @@ pub enum SecretProviderConfig {
 }
 
 /// Vault / OpenBao KV-v2 config. Both servers speak the same HTTP API.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct VaultProviderConfig {
     /// Base URL, e.g. `https://vault.example.com:8200`. For OpenBao,
     /// point at the OpenBao server — same path layout.
@@ -81,6 +82,18 @@ pub struct VaultProviderConfig {
     /// uses a private CA.
     #[serde(default)]
     pub ca_cert_ref: Option<String>,
+
+    /// Retry policy applied to transient failures (429, 5xx, connect
+    /// timeouts). Default is 4 attempts with 100ms → 30s jittered
+    /// exponential backoff.
+    #[serde(default)]
+    pub retry: RetryPolicy,
+
+    /// TTL for the in-memory resolve cache, in seconds. Defaults to
+    /// 300 (5 min). Set to 0 to disable caching — every resolve hits
+    /// Vault unconditionally.
+    #[serde(default = "default_cache_ttl_secs")]
+    pub cache_ttl_secs: u64,
 }
 
 fn default_kv_mount() -> String {
@@ -89,6 +102,35 @@ fn default_kv_mount() -> String {
 
 fn default_tls_verify() -> bool {
     true
+}
+
+fn default_cache_ttl_secs() -> u64 {
+    300
+}
+
+/// Operator-tunable cap on attempts + backoff policy. `max_attempts`
+/// of 1 disables retry entirely; default is 4 (1 initial + 3 retries).
+/// Backoff delegates to [`aeon_types::backoff::BackoffPolicy`] so
+/// every retryable Aeon call-site uses one set of defaults.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct RetryPolicy {
+    #[serde(default = "default_max_attempts")]
+    pub max_attempts: u32,
+    #[serde(default)]
+    pub backoff: BackoffPolicy,
+}
+
+fn default_max_attempts() -> u32 {
+    4
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: default_max_attempts(),
+            backoff: BackoffPolicy::default(),
+        }
+    }
 }
 
 /// Auth methods supported by the Vault / OpenBao adapter.
@@ -153,7 +195,7 @@ pub struct AzureKvProviderConfig {
 /// Local AES-GCM and remote KMS backends are first-class siblings
 /// under one enum — operators pick by `kind:` without touching the
 /// rest of the pipeline manifest.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum KekProviderConfig {
     /// In-process AES-256-GCM, KEK bytes fetched via
@@ -228,7 +270,7 @@ pub struct AzureKvKmsConfig {
     pub previous_key_version: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct VaultTransitConfig {
     pub domain: String,
     /// Same Vault/OpenBao server the KV-v2 side points at, typically.
@@ -242,6 +284,11 @@ pub struct VaultTransitConfig {
     pub namespace: Option<String>,
     #[serde(default = "default_tls_verify")]
     pub tls_verify: bool,
+
+    /// Retry policy for transient wrap/unwrap failures. Unlike KV-v2
+    /// there is no cache here — every call has a unique ciphertext.
+    #[serde(default)]
+    pub retry: RetryPolicy,
 }
 
 fn default_transit_mount() -> String {

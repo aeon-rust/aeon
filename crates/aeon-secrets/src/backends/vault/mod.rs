@@ -11,8 +11,11 @@
 //! adapters stay focused on their respective request shapes.
 
 pub mod auth;
+pub mod cache;
 pub mod kv;
+pub mod retry;
 pub mod transit;
 
 pub use kv::VaultKvProvider;
+pub use retry::RetryPolicy;
 pub use transit::VaultTransitKekProvider;

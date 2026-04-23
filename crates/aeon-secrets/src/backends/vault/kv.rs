@@ -18,18 +18,24 @@
 use aeon_types::{
     SecretBytes, SecretError, SecretProvider, SecretRegistry, SecretScheme,
 };
-use reqwest::StatusCode;
 use reqwest::blocking::Response;
 use serde::Deserialize;
+use std::time::Duration;
 
 use crate::backends::vault::auth::{VaultAuthClient, config_err};
-use crate::config::VaultProviderConfig;
+use crate::backends::vault::cache::SecretCache;
+use crate::backends::vault::retry::{
+    Classification, RetryPolicyExt, classify_status, is_transient_network_error,
+};
+use crate::config::{RetryPolicy, VaultProviderConfig};
 use crate::error::SecretsAdapterError;
 
 /// Vault / OpenBao KV-v2 read-side provider.
 pub struct VaultKvProvider {
     auth: VaultAuthClient,
     mount: String,
+    retry: RetryPolicy,
+    cache: SecretCache,
 }
 
 impl std::fmt::Debug for VaultKvProvider {
@@ -37,6 +43,8 @@ impl std::fmt::Debug for VaultKvProvider {
         f.debug_struct("VaultKvProvider")
             .field("mount", &self.mount)
             .field("auth", &self.auth)
+            .field("retry_attempts", &self.retry.max_attempts)
+            .field("cache", &self.cache)
             .finish()
     }
 }
@@ -59,7 +67,12 @@ impl VaultKvProvider {
             bootstrap,
         )?;
 
-        Ok(Self { auth, mount })
+        Ok(Self {
+            auth,
+            mount,
+            retry: cfg.retry,
+            cache: SecretCache::new(Duration::from_secs(cfg.cache_ttl_secs)),
+        })
     }
 
     fn fetch_kv(&self, path: &str, field: &str) -> Result<SecretBytes, SecretError> {
@@ -69,27 +82,54 @@ impl VaultKvProvider {
             path.trim_start_matches('/'),
         );
 
-        let req = self
-            .auth
-            .get(&url_path)
-            .map_err(|e| provider_err(e.to_string()))?;
-        let resp = req
-            .send()
-            .map_err(|e| provider_err(format!("vault GET {url_path} send: {e}")))?;
+        let mut attempt: u32 = 0;
+        let mut auth_retried = false;
+        let mut backoff = self.retry.backoff.iter();
 
-        if resp.status() == StatusCode::FORBIDDEN && self.auth.is_approle() {
-            self.auth.invalidate_token();
+        loop {
             let req = self
                 .auth
                 .get(&url_path)
                 .map_err(|e| provider_err(e.to_string()))?;
-            let resp = req
-                .send()
-                .map_err(|e| provider_err(format!("vault GET retry {url_path}: {e}")))?;
-            return decode_response(resp, field);
-        }
+            let send_result = req.send();
+            let resp = match send_result {
+                Ok(r) => r,
+                Err(e) => {
+                    if is_transient_network_error(&e) && self.retry.can_retry(attempt) {
+                        std::thread::sleep(backoff.next_delay());
+                        attempt += 1;
+                        continue;
+                    }
+                    return Err(provider_err(format!(
+                        "vault GET {url_path} send: {e}"
+                    )));
+                }
+            };
 
-        decode_response(resp, field)
+            match classify_status(resp.status()) {
+                Classification::Success | Classification::Permanent => {
+                    return decode_response(resp, field);
+                }
+                Classification::Auth if self.auth.is_approle() && !auth_retried => {
+                    self.auth.invalidate_token();
+                    auth_retried = true;
+                    continue;
+                }
+                Classification::Auth => {
+                    // Static-token 403 or already retried — surface the
+                    // error response through the normal decode path.
+                    return decode_response(resp, field);
+                }
+                Classification::Transient => {
+                    if self.retry.can_retry(attempt) {
+                        std::thread::sleep(backoff.next_delay());
+                        attempt += 1;
+                        continue;
+                    }
+                    return decode_response(resp, field);
+                }
+            }
+        }
     }
 }
 
@@ -130,11 +170,22 @@ impl SecretProvider for VaultKvProvider {
     }
 
     fn resolve(&self, path: &str) -> Result<SecretBytes, SecretError> {
+        if let Some(cached) = self.cache.get(path) {
+            return Ok(cached);
+        }
         let (kv_path, field) = match path.rsplit_once('#') {
             Some((p, f)) => (p, f),
             None => (path, "value"),
         };
-        self.fetch_kv(kv_path, field)
+        let bytes = self.fetch_kv(kv_path, field)?;
+        // Store a fresh copy under the original key so the next resolve
+        // short-circuits. SecretBytes is !Clone on purpose, so we re-
+        // allocate rather than share — acceptable on the startup path.
+        self.cache.put(
+            path.to_string(),
+            SecretBytes::new(bytes.expose_bytes().to_vec()),
+        );
+        Ok(bytes)
     }
 }
 
@@ -167,6 +218,8 @@ mod tests {
             namespace: None,
             tls_verify: false,
             ca_cert_ref: None,
+            retry: fast_retry(),
+            cache_ttl_secs: 0, // disable cache by default in tests
         }
     }
 
@@ -181,6 +234,22 @@ mod tests {
             namespace: None,
             tls_verify: false,
             ca_cert_ref: None,
+            retry: fast_retry(),
+            cache_ttl_secs: 0,
+        }
+    }
+
+    /// Tight backoff so the retry tests finish in milliseconds without
+    /// papering over the policy logic.
+    fn fast_retry() -> crate::config::RetryPolicy {
+        crate::config::RetryPolicy {
+            max_attempts: 3,
+            backoff: aeon_types::backoff::BackoffPolicy {
+                initial_ms: 1,
+                max_ms: 5,
+                multiplier: 2.0,
+                jitter_pct: 0.0,
+            },
         }
     }
 
@@ -398,6 +467,8 @@ mod tests {
             namespace: None,
             tls_verify: true,
             ca_cert_ref: None,
+            retry: fast_retry(),
+            cache_ttl_secs: 0,
         };
         let err = VaultKvProvider::from_config(&cfg, &bootstrap()).unwrap_err();
         assert!(matches!(
@@ -413,6 +484,74 @@ mod tests {
         let cfg = token_cfg("https://v.example.com", "/", "t");
         let err = VaultKvProvider::from_config(&cfg, &bootstrap()).unwrap_err();
         assert!(matches!(err, SecretsAdapterError::Backend(_)));
+    }
+
+    #[test]
+    fn cache_hit_short_circuits_network_call() {
+        let mut server = mockito::Server::new();
+        // .expect(1) — a second network hit would fail the assertion.
+        let m = server
+            .mock("GET", "/v1/secret/data/aeon/db")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(json!({ "data": { "data": { "value": "cached-v" } } }).to_string())
+            .expect(1)
+            .create();
+
+        let mut cfg = token_cfg(&server.url(), "secret", "t");
+        cfg.cache_ttl_secs = 60;
+        let provider = VaultKvProvider::from_config(&cfg, &bootstrap()).unwrap();
+
+        let first = provider.resolve("aeon/db").unwrap();
+        let second = provider.resolve("aeon/db").unwrap();
+        assert_eq!(first.expose_str().unwrap(), "cached-v");
+        assert_eq!(second.expose_str().unwrap(), "cached-v");
+        m.assert();
+    }
+
+    #[test]
+    fn retry_succeeds_on_transient_503_then_200() {
+        let mut server = mockito::Server::new();
+        let fail = server
+            .mock("GET", "/v1/secret/data/aeon/db")
+            .with_status(503)
+            .with_body("{}")
+            .expect(1)
+            .create();
+        let ok = server
+            .mock("GET", "/v1/secret/data/aeon/db")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(json!({ "data": { "data": { "value": "after-retry" } } }).to_string())
+            .expect(1)
+            .create();
+
+        let provider =
+            VaultKvProvider::from_config(&token_cfg(&server.url(), "secret", "t"), &bootstrap())
+                .unwrap();
+        let bytes = provider.resolve("aeon/db").unwrap();
+        assert_eq!(bytes.expose_str().unwrap(), "after-retry");
+        fail.assert();
+        ok.assert();
+    }
+
+    #[test]
+    fn retry_exhausted_surfaces_last_error() {
+        let mut server = mockito::Server::new();
+        // fast_retry() sets max_attempts=3 → one initial + two retries.
+        let m = server
+            .mock("GET", "/v1/secret/data/x")
+            .with_status(503)
+            .with_body("{}")
+            .expect(3)
+            .create();
+
+        let provider =
+            VaultKvProvider::from_config(&token_cfg(&server.url(), "secret", "t"), &bootstrap())
+                .unwrap();
+        let err = provider.resolve("x").unwrap_err();
+        assert!(matches!(err, SecretError::Provider { .. }));
+        m.assert();
     }
 
     #[test]

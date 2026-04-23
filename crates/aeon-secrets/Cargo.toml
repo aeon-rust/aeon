@@ -16,7 +16,7 @@ default = []
 
 # HashiCorp Vault KV-v2 + Transit engines. OpenBao is API-compatible and
 # ships under the same feature — one adapter serves both.
-vault = ["dep:reqwest", "dep:serde_json", "dep:base64"]
+vault = ["dep:reqwest", "dep:serde_json", "dep:base64", "dep:tokio"]
 
 # Backend features reserved for follow-up implementations. They exist in
 # the public config enum today so YAML schemas stabilize early, but
@@ -42,6 +42,10 @@ serde_json = { workspace = true, optional = true }
 # Vault Transit ships plaintext DEKs base64-encoded; base64-encodes the
 # wire-side ciphertext too. Used only by the Transit adapter.
 base64 = { workspace = true, optional = true }
+# Transit runs on an async tokio runtime (KekProvider is async); we need
+# `tokio::time::sleep` for the retry backoff. KV-v2 is sync and uses
+# `std::thread::sleep`, no runtime required.
+tokio = { workspace = true, optional = true, features = ["time"] }
 
 [dev-dependencies]
 serde_json = { workspace = true }
