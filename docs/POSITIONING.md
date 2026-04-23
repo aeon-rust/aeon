@@ -196,8 +196,10 @@ This wedge is defensible because retrofitting any one piece (crypto chain, compl
 | **Benchmarks vs competitors on identical hardware** | Medium | Same infrastructure, same workload, verifiable numbers |
 | **Production deployments outside of dev/test** | Whenever first user lands | No case study yet |
 | **Documentation / tutorials / cookbook** | Medium | Scale-out docs exist; SDK docs are strong; lacks "write your first processor" funnel |
-| **HSM / PKCS#11 implementation** | Medium | Trait stub landed in S1.4 (2026-04-23); real backend (SoftHSM / CloudHSM) still required for FIPS-track claims |
-| **WebSocket / WebTransport mTLS TLS-layer** | Small | S10 auth-mode matrix is complete; TLS-connector integration for WS/WT mTLS is a follow-up (warn-and-ignore today) |
+| **Direct PKCS#11 / HSM integration** | Deferred | FIPS-track claims are already satisfied via cloud KMS (AWS/GCP/Azure all FIPS 140-3 L3) and Vault/OpenBao-with-HSM-seal. Direct PKCS#11 only needed for air-gapped shops where Vault/OpenBao is not an option — trait stub (S1.4) is in place; real backend deferred until a customer asks. |
+| **OpenBao first-class provider** | Small | Vault provider should work unmodified; needs integration test + docs to promote to first-class alongside Vault (task #35) |
+| **Secret-provider production hardening** | Medium | Rotation runbook, error taxonomy, rate-limit handling across Vault / OpenBao / AWS KMS / AWS SM / GCP KMS (task #36) |
+| **WebSocket / WebTransport mTLS TLS-layer** | Small | S10 auth-mode matrix is complete; TLS-connector integration for WS/WT mTLS is a follow-up (warn-and-ignore today, task #34) |
 
 **Gaps closed by the 2026-04-23 audit landing (no longer on this list):**
 - Secrets-in-config-files risk — closed by S1 (provider abstraction + envelope encryption)

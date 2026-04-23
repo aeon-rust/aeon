@@ -442,9 +442,12 @@ workflows Aeon supports natively.
   the post-Gate-2 roadmap, not in current code.
 - **Protobuf payload support** — intentionally out of scope; transcode at
   the edge.
-- **FIPS 140-3 compliance claim** — requires the S1.4 HSM / PKCS#11 real
-  backend (tracked as follow-up task #33). The trait stub is in place; the
-  cryptoki integration and CloudHSM-compatible backend are pending.
+- **FIPS 140-3 compliance claim** — available today via cloud KMS (AWS
+  KMS, GCP Cloud KMS, Azure Key Vault are themselves FIPS 140-3 L3) and
+  via Vault / OpenBao with an HSM seal. Direct PKCS#11 integration inside
+  Aeon (task #33) is deferred; the S1.4 trait stub is the extension point
+  for the air-gapped case where Vault / OpenBao is not an option. See
+  [`SECURITY.md`](SECURITY.md) §11.2 for the FIPS path table.
 - **Audit channel call-site wiring** — the channel itself is in place
   (S2.5). Call sites for KEK rotation, config changes, authentication
   failures are ongoing; some paths still log to the data-path tracing

@@ -379,8 +379,9 @@ to FIPS 140-3 compliance. Current status by surface:
 | Outbound WebSocket / WebTransport sink | mTLS at auth-mode level accepted; TLS-layer integration pending (see follow-up task #34 — warn-and-ignore today) |
 | Inbound REST on port 4471 | Native TLS termination via rustls is future work; reverse proxy recommended |
 
-Roadmap reference: FIPS-track claims require landing the S1.4 HSM/PKCS#11
-backend (currently trait stub only — see follow-up task #33).
+Roadmap reference: FIPS-track claims are already available via the
+cloud-KMS and Vault/OpenBao-with-HSM-seal paths (§11.2). Direct PKCS#11
+integration (task #33) is deferred until a specific customer surfaces it.
 
 ### Kafka/Redpanda Security
 
@@ -468,7 +469,10 @@ Providers, in priority order:
 | Provider | Use case |
 |---|---|
 | HashiCorp Vault | Primary production provider. KV-v2 + Transit engine both supported. |
-| AWS KMS | Envelope encryption; `GenerateDataKey` for DEK, `Decrypt` for KEK unwrap. |
+| OpenBao | Open-source fork of Vault (post Vault's BSL move). API-compatible with the Vault provider — same config path, same secret layout. First-class. |
+| AWS KMS | Envelope encryption; `GenerateDataKey` for DEK, `Decrypt` for KEK unwrap. Itself FIPS 140-3 L3 validated. |
+| GCP Cloud KMS | Envelope encryption via GCP. Itself FIPS 140-3 L3 validated. |
+| Azure Key Vault | Envelope encryption via Azure. Itself FIPS 140-3 L3 validated. |
 | AWS Secrets Manager | Password/token-style secrets. |
 | GCP Secret Manager | GCP-native equivalent of AWS SM. |
 | Environment variables | For CI / Helm / K8s-injected values (second-last resort). |
@@ -494,12 +498,31 @@ Config-via-env-var-first: all provider endpoints, role-ids, and key-ids come
 from env vars (see [`CONFIGURATION.md`](CONFIGURATION.md) for the canonical
 list). Literal YAML values are dev-only.
 
-### 11.2 HSM / PKCS#11 (S1.4)
+### 11.2 HSM Custody (via Vault / OpenBao, not PKCS#11)
 
-The `aeon-crypto::hsm` trait defines the surface for hardware-backed KEK
-custody. A trait stub is present; a real backend (SoftHSM for CI, CloudHSM
-for production) is a follow-up required for FIPS-track claims. See
-tracking task #33.
+Aeon's primary FIPS-track path is **indirect**: Aeon talks to Vault or
+OpenBao as its secret provider (§11.1), and Vault / OpenBao can themselves
+be sealed with an HSM backend (Thales / Entrust / Utimaco / CloudHSM) when
+direct hardware key custody is required. This keeps Aeon out of the
+PKCS#11 driver business and lets the operator choose the HSM on Vault's
+schedule, not ours.
+
+For deployments that cannot run Vault / OpenBao at all and need Aeon to
+speak PKCS#11 directly to an HSM, the `aeon-crypto::hsm` trait exists as
+an extension point (S1.4 landed 2026-04-23). A real PKCS#11 backend
+(cryptoki + SoftHSM CI + CloudHSM / on-prem HSM) is deferred until a
+specific customer surfaces the requirement (tracked as task #33). The
+90%-of-shops path is "Aeon → OpenBao / Vault → optional HSM seal" and
+that is what SECURITY.md and COMPLIANCE.md recommend.
+
+FIPS 140-3 claim paths, in decreasing order of operator effort:
+
+| Path | FIPS posture | Notes |
+|---|---|---|
+| Aeon → AWS KMS / GCP KMS / Azure KV | FIPS 140-3 L3 for KEK | Cloud provider HSMs are FIPS-validated. Default for cloud deployments. |
+| Aeon → Vault / OpenBao (software seal) | FIPS module only | Software seal is not itself FIPS-validated; use when FIPS is not a hard requirement. |
+| Aeon → Vault / OpenBao (HSM seal) | FIPS 140-3 L3 for KEK | Vault Enterprise HSM seal or OpenBao + PKCS#11 seal. Primary on-prem FIPS path. |
+| Aeon → PKCS#11 (direct, via S1.4) | FIPS 140-3 L3 for KEK | Deferred. Only needed when Vault / OpenBao is not an option. |
 
 ### 11.3 At-Rest Encryption (S3)
 
