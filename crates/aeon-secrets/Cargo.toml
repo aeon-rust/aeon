@@ -16,7 +16,7 @@ default = []
 
 # HashiCorp Vault KV-v2 + Transit engines. OpenBao is API-compatible and
 # ships under the same feature — one adapter serves both.
-vault = ["dep:reqwest", "dep:tokio", "dep:serde_json"]
+vault = ["dep:reqwest", "dep:serde_json"]
 
 # Backend features reserved for follow-up implementations. They exist in
 # the public config enum today so YAML schemas stabilize early, but
@@ -33,12 +33,15 @@ aeon-crypto = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 
-# Feature-gated
-reqwest = { workspace = true, optional = true }
-tokio = { workspace = true, optional = true }
+# Feature-gated. `blocking` + `json` get unioned with the workspace
+# dep's `rustls-tls` feature — KV-v2 reads are startup-only (never on
+# the hot path), so a synchronous HTTP client keeps SecretProvider's
+# sync trait contract intact.
+reqwest = { workspace = true, optional = true, features = ["blocking", "json"] }
 serde_json = { workspace = true, optional = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
 serde_yaml = "0.9"
 tokio = { workspace = true }
+mockito = "1"

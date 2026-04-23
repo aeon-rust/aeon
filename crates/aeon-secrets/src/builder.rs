@@ -10,11 +10,11 @@ use std::sync::Arc;
 
 use aeon_crypto::kek::{KekDomain, KekHandle};
 use aeon_types::{
-    DotEnvProvider, EnvProvider, LiteralProvider, SecretRef, SecretRegistry,
+    DotEnvProvider, EnvProvider, LiteralProvider, SecretProvider, SecretRef, SecretRegistry,
 };
 
 use crate::config::{
-    KekProviderConfig, LocalKekConfig, SecretProviderConfig,
+    KekProviderConfig, LocalKekConfig, SecretProviderConfig, VaultProviderConfig,
 };
 use crate::error::SecretsAdapterError;
 use crate::kek_registry::KekRegistry;
@@ -57,6 +57,14 @@ impl SecretRegistryBuilder {
         self
     }
 
+    /// Two-pass build:
+    ///
+    /// 1. Defaults + simple schemes (`Env` / `DotEnv` / `Literal`) register
+    ///    first, populating a bootstrap registry that knows how to resolve
+    ///    `${ENV:...}` / `${DOTENV:...}` references.
+    /// 2. Backend providers that need to resolve their auth blocks via
+    ///    secret refs (Vault, AWS SM, …) register second, with the
+    ///    pass-1 registry passed in as their bootstrap.
     pub fn build(self) -> Result<SecretRegistry, SecretsAdapterError> {
         let mut reg = SecretRegistry::empty();
 
@@ -66,6 +74,7 @@ impl SecretRegistryBuilder {
             reg.register(Arc::new(LiteralProvider::new()));
         }
 
+        let mut deferred = Vec::new();
         for cfg in self.configs {
             match cfg {
                 SecretProviderConfig::Env => {
@@ -81,8 +90,15 @@ impl SecretRegistryBuilder {
                 SecretProviderConfig::Literal => {
                     reg.register(Arc::new(LiteralProvider::new()));
                 }
-                SecretProviderConfig::Vault(_) => {
-                    return Err(feature_disabled("vault", "vault"));
+                other => deferred.push(other),
+            }
+        }
+
+        for cfg in deferred {
+            match cfg {
+                SecretProviderConfig::Vault(v) => {
+                    let provider = build_vault(&v, &reg)?;
+                    reg.register(provider);
                 }
                 SecretProviderConfig::AwsSm(_) => {
                     return Err(feature_disabled("aws_secrets_manager", "aws-sm"));
@@ -93,11 +109,35 @@ impl SecretRegistryBuilder {
                 SecretProviderConfig::AzureKv(_) => {
                     return Err(feature_disabled("azure_key_vault", "azure-kv"));
                 }
+                SecretProviderConfig::Env
+                | SecretProviderConfig::DotEnv { .. }
+                | SecretProviderConfig::Literal => {
+                    // Already handled in pass 1; deferred only collects
+                    // backends that need bootstrap resolution.
+                    unreachable!()
+                }
             }
         }
 
         Ok(reg)
     }
+}
+
+#[cfg(feature = "vault")]
+fn build_vault(
+    cfg: &VaultProviderConfig,
+    bootstrap: &SecretRegistry,
+) -> Result<Arc<dyn SecretProvider>, SecretsAdapterError> {
+    let provider = crate::backends::vault::VaultKvProvider::from_config(cfg, bootstrap)?;
+    Ok(Arc::new(provider))
+}
+
+#[cfg(not(feature = "vault"))]
+fn build_vault(
+    _cfg: &VaultProviderConfig,
+    _bootstrap: &SecretRegistry,
+) -> Result<Arc<dyn SecretProvider>, SecretsAdapterError> {
+    Err(feature_disabled("vault", "vault"))
 }
 
 impl Default for SecretRegistryBuilder {
@@ -265,6 +305,7 @@ mod tests {
         assert!(!reg.has_scheme(aeon_types::SecretScheme::DotEnv));
     }
 
+    #[cfg(not(feature = "vault"))]
     #[test]
     fn secret_registry_builder_vault_returns_feature_disabled() {
         let cfg = SecretProviderConfig::Vault(VaultProviderConfig {
@@ -285,6 +326,40 @@ mod tests {
                 feature: "vault"
             }
         ));
+    }
+
+    /// With the `vault` feature compiled, the builder must actually try
+    /// to construct the provider against the configured endpoint. We
+    /// can't bring up a real Vault here, but the construction path
+    /// itself should be exercised — the auth-token resolution + the
+    /// AppRole eager login are what matters. Use a known-good mockito
+    /// server so we test the happy registration path end-to-end.
+    #[cfg(feature = "vault")]
+    #[test]
+    fn secret_registry_builder_vault_registers_via_real_provider() {
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("GET", "/v1/secret/data/probe")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"data":{"data":{"value":"ok"}}}"#)
+            .create();
+
+        let cfg = SecretProviderConfig::Vault(VaultProviderConfig {
+            endpoint: server.url(),
+            mount: "secret".to_string(),
+            auth: VaultAuthConfig::Token {
+                token_ref: "literal-token".to_string(),
+            },
+            namespace: None,
+            tls_verify: false,
+            ca_cert_ref: None,
+        });
+        let reg = SecretRegistryBuilder::new().with_config(cfg).build().unwrap();
+        assert!(reg.has_scheme(aeon_types::SecretScheme::Vault));
+
+        let bytes = reg.resolve(&SecretRef::vault("probe")).unwrap();
+        assert_eq!(bytes.expose_str().unwrap(), "ok");
     }
 
     #[test]
