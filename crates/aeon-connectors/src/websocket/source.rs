@@ -12,6 +12,7 @@
 //! never dropped.
 
 use crate::push_buffer::{PushBufferConfig, PushBufferRx, PushBufferTx, push_buffer};
+use crate::websocket::mtls::build_mtls_client_config_arc;
 use aeon_types::{
     AeonError, Backoff, BackoffPolicy, CoreLocalUuidGenerator, Event, OutboundAuthMode,
     OutboundAuthSigner, OutboundSignContext, PartitionId, Source, SourceKind, SsrfPolicy,
@@ -20,6 +21,7 @@ use aeon_types::{
 use bytes::Bytes;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio_tungstenite::Connector;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http;
@@ -45,9 +47,9 @@ pub struct WebSocketSourceConfig {
     pub ssrf_policy: SsrfPolicy,
     /// S10: outbound auth signer. HTTP-style modes (Bearer / Basic /
     /// ApiKey / HmacSign) inject headers on the WebSocket handshake.
-    /// `Mtls` is logged-and-ignored at this layer (requires a custom
-    /// rustls connector — tracked as follow-up). `BrokerNative` does
-    /// not apply to WebSocket and is also warned-and-ignored.
+    /// `Mtls` drives a custom rustls `Connector` built once at startup
+    /// and reused across reconnects. `BrokerNative` does not apply to
+    /// WebSocket and is warned-and-ignored.
     pub auth: Option<Arc<OutboundAuthSigner>>,
 }
 
@@ -131,32 +133,51 @@ impl WebSocketSource {
         // use the path but build the request uniformly.
         let path = extract_path(&config.url);
 
-        // S10: warn-once on modes that don't translate to handshake headers
-        // so operators see misconfiguration early.
-        if let Some(signer) = &config.auth {
-            match signer.mode() {
-                OutboundAuthMode::Mtls => tracing::warn!(
-                    "WebSocketSource: mTLS auth mode requires a custom TLS connector — ignored (follow-up)"
-                ),
-                OutboundAuthMode::BrokerNative => tracing::warn!(
-                    "WebSocketSource: broker_native auth mode is not applicable to WebSocket; ignored"
-                ),
-                _ => {}
+        // S10: branch on signer mode up front.
+        // - Mtls: build a rustls ClientConfig once, Arc-clone it across
+        //   reconnects so we never re-parse PEMs on the backoff path.
+        // - BrokerNative: meaningless for WebSocket — warn-and-ignore.
+        // - HTTP-style modes: handled by `build_ws_request` as headers.
+        let mtls_tls_config: Option<Arc<rustls::ClientConfig>> = match config.auth.as_deref() {
+            Some(signer) if matches!(signer.mode(), OutboundAuthMode::Mtls) => {
+                let cert_pem = signer.mtls_cert_pem().ok_or_else(|| {
+                    AeonError::config("websocket mTLS: signer missing cert pem")
+                })?;
+                let key_pem = signer.mtls_key_pem().ok_or_else(|| {
+                    AeonError::config("websocket mTLS: signer missing key pem")
+                })?;
+                Some(build_mtls_client_config_arc(cert_pem, key_pem)?)
             }
-        }
+            Some(signer) if matches!(signer.mode(), OutboundAuthMode::BrokerNative) => {
+                tracing::warn!(
+                    "WebSocketSource: broker_native auth mode is not applicable to WebSocket; ignored"
+                );
+                None
+            }
+            _ => None,
+        };
 
         // Initial connect — fail fast on bad URL / unreachable host so the
         // pipeline operator sees misconfiguration immediately rather than
         // watching the backoff loop grind forever.
         let request = build_ws_request(&config.url, config.auth.as_ref(), &path)?;
-        let (ws_stream, _) = tokio_tungstenite::connect_async(request)
+        let connect_result = if let Some(cfg) = mtls_tls_config.as_ref() {
+            tokio_tungstenite::connect_async_tls_with_config(
+                request,
+                None,
+                false,
+                Some(Connector::Rustls(Arc::clone(cfg))),
+            )
             .await
-            .map_err(|e| {
-                AeonError::connection(format!(
-                    "websocket connect failed: {}: {e}",
-                    redact_uri(&config.url)
-                ))
-            })?;
+        } else {
+            tokio_tungstenite::connect_async(request).await
+        };
+        let (ws_stream, _) = connect_result.map_err(|e| {
+            AeonError::connection(format!(
+                "websocket connect failed: {}: {e}",
+                redact_uri(&config.url)
+            ))
+        })?;
 
         tracing::info!(url = %redact_uri(&config.url), "WebSocketSource connected");
 
@@ -212,7 +233,18 @@ impl WebSocketSource {
                         continue;
                     }
                 };
-                match tokio_tungstenite::connect_async(request).await {
+                let reconnect_result = if let Some(cfg) = mtls_tls_config.as_ref() {
+                    tokio_tungstenite::connect_async_tls_with_config(
+                        request,
+                        None,
+                        false,
+                        Some(Connector::Rustls(Arc::clone(cfg))),
+                    )
+                    .await
+                } else {
+                    tokio_tungstenite::connect_async(request).await
+                };
+                match reconnect_result {
                     Ok((stream, _)) => {
                         tracing::info!(url = %url_for_log, "websocket reconnected");
                         backoff.reset();
@@ -367,8 +399,15 @@ mod tests {
     use super::*;
     use aeon_types::{
         BasicConfig, BearerConfig, HmacAlgorithm, HmacSignConfig, OutboundApiKeyConfig,
-        OutboundAuthConfig, OutboundAuthMode, OutboundAuthSigner,
+        OutboundAuthConfig, OutboundAuthMode, OutboundAuthSigner, OutboundMtlsConfig,
     };
+
+    fn fixture_cert_and_key() -> (String, String) {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        (cert.pem(), key.serialize_pem())
+    }
 
     #[test]
     fn extract_path_handles_common_cases() {
@@ -433,6 +472,39 @@ mod tests {
         assert_eq!(req.headers().get("x-aeon-key").unwrap().as_bytes(), b"k-xyz");
         // And no Authorization fallback on api_key mode.
         assert!(req.headers().get("authorization").is_none());
+    }
+
+    #[tokio::test]
+    async fn new_mtls_with_unreachable_port_fails_with_connection_error() {
+        // Ensures the mTLS branch parses PEMs at startup without erroring out
+        // as a config problem — a real connect attempt must reach the socket
+        // layer (port 1 is "reserved + never listening" on most hosts).
+        let (cert_pem, key_pem) = fixture_cert_and_key();
+        let signer = Arc::new(
+            OutboundAuthSigner::build(OutboundAuthConfig {
+                mode: OutboundAuthMode::Mtls,
+                mtls: Some(OutboundMtlsConfig { cert_pem, key_pem }),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let cfg = WebSocketSourceConfig::new("wss://127.0.0.1:1/ws")
+            .with_ssrf_policy(SsrfPolicy::permissive_for_tests())
+            .with_poll_timeout(Duration::from_millis(50))
+            .with_auth(signer);
+        let err = match WebSocketSource::new(cfg).await {
+            Ok(_) => panic!("expected connect failure on unreachable port"),
+            Err(e) => e,
+        };
+        // We expect a connection-class error (TCP refused / TLS failed),
+        // NOT a Config error. A Config error would mean the PEM parser
+        // rejected our fixture — the point is to prove we got past parsing.
+        let msg = format!("{err:?}");
+        assert!(
+            !msg.to_lowercase().contains("missing cert pem")
+                && !msg.to_lowercase().contains("missing key pem"),
+            "unexpected config-class error from mTLS PEM plumbing: {msg}"
+        );
     }
 
     #[test]

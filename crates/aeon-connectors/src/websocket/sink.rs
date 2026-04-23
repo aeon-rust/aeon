@@ -3,13 +3,13 @@
 //! Each output payload is sent as a WebSocket binary message.
 //! The connection is maintained across `write_batch()` calls.
 
+use crate::websocket::mtls::build_mtls_connector;
 use aeon_types::{
     AeonError, BatchResult, OutboundAuthMode, OutboundAuthSigner, OutboundSignContext, Output,
     Sink, SsrfPolicy, redact_uri,
 };
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio_tungstenite::Connector;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http;
@@ -87,8 +87,7 @@ impl WebSocketSink {
                 let key_pem = signer.mtls_key_pem().ok_or_else(|| {
                     AeonError::config("websocket mTLS: signer missing key pem")
                 })?;
-                let client_config = build_mtls_client_config(cert_pem, key_pem)?;
-                Some(Connector::Rustls(Arc::new(client_config)))
+                Some(build_mtls_connector(cert_pem, key_pem)?)
             }
             Some(signer) if matches!(signer.mode(), OutboundAuthMode::BrokerNative) => {
                 tracing::warn!(
@@ -170,42 +169,6 @@ impl Sink for WebSocketSink {
     }
 }
 
-/// Build a `rustls::ClientConfig` that presents the signer's mTLS
-/// identity and verifies the remote server against the public
-/// `webpki-roots` trust store. Returns a config error if the PEMs
-/// don't parse — we keep this at startup, never on the hot path.
-fn build_mtls_client_config(
-    cert_pem: &[u8],
-    key_pem: &[u8],
-) -> Result<rustls::ClientConfig, AeonError> {
-    let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
-        rustls_pemfile::certs(&mut std::io::Cursor::new(cert_pem))
-            .collect::<Result<_, _>>()
-            .map_err(|e| AeonError::config(format!("websocket mTLS cert parse: {e}")))?;
-    if certs.is_empty() {
-        return Err(AeonError::config(
-            "websocket mTLS: no certificate in pem".to_string(),
-        ));
-    }
-
-    let key = rustls_pemfile::private_key(&mut std::io::Cursor::new(key_pem))
-        .map_err(|e| AeonError::config(format!("websocket mTLS key parse: {e}")))?
-        .ok_or_else(|| {
-            AeonError::config("websocket mTLS: no private key in pem".to_string())
-        })?;
-
-    let mut root_store = rustls::RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
-    rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_client_auth_cert(certs, key)
-        .map_err(|e| AeonError::Crypto {
-            message: format!("websocket mTLS config build: {e}"),
-            source: None,
-        })
-}
-
 /// Extract the path (including query) from a ws/wss URL for HMAC canonicalization.
 fn extract_path(url: &str) -> String {
     let after_scheme = match url.find("://") {
@@ -265,13 +228,6 @@ mod tests {
         Arc::new(OutboundAuthSigner::build(config).unwrap())
     }
 
-    fn fixture_cert_and_key() -> (String, String) {
-        let key = rcgen::KeyPair::generate().unwrap();
-        let params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
-        let cert = params.self_signed(&key).unwrap();
-        (cert.pem(), key.serialize_pem())
-    }
-
     #[test]
     fn extract_path_handles_common_cases() {
         assert_eq!(extract_path("ws://host:8080/sink"), "/sink");
@@ -298,45 +254,6 @@ mod tests {
         assert_eq!(
             req.headers().get("authorization").unwrap().as_bytes(),
             b"Bearer tkn-sink"
-        );
-    }
-
-    #[test]
-    fn build_mtls_client_config_from_valid_pem_ok() {
-        let (cert_pem, key_pem) = fixture_cert_and_key();
-        let cfg = build_mtls_client_config(cert_pem.as_bytes(), key_pem.as_bytes());
-        assert!(cfg.is_ok(), "expected rustls client config, got {cfg:?}");
-    }
-
-    #[test]
-    fn build_mtls_client_config_rejects_empty_cert() {
-        let (_cert_pem, key_pem) = fixture_cert_and_key();
-        let err = build_mtls_client_config(b"", key_pem.as_bytes()).unwrap_err();
-        let msg = format!("{err:?}");
-        assert!(
-            msg.to_lowercase().contains("certificate") || msg.to_lowercase().contains("pem"),
-            "unexpected error: {msg}"
-        );
-    }
-
-    #[test]
-    fn build_mtls_client_config_rejects_malformed_cert() {
-        let (_cert_pem, key_pem) = fixture_cert_and_key();
-        let err =
-            build_mtls_client_config(b"-----BEGIN CERTIFICATE-----\nnot b64\n-----END CERTIFICATE-----\n", key_pem.as_bytes())
-                .unwrap_err();
-        let msg = format!("{err:?}");
-        assert!(msg.to_lowercase().contains("cert"), "unexpected error: {msg}");
-    }
-
-    #[test]
-    fn build_mtls_client_config_rejects_missing_key() {
-        let (cert_pem, _key_pem) = fixture_cert_and_key();
-        let err = build_mtls_client_config(cert_pem.as_bytes(), b"").unwrap_err();
-        let msg = format!("{err:?}");
-        assert!(
-            msg.to_lowercase().contains("key") || msg.to_lowercase().contains("private"),
-            "unexpected error: {msg}"
         );
     }
 

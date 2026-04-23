@@ -5,6 +5,7 @@
 //!
 //! `WebSocketSink`: Connects to a WebSocket server and sends outputs as messages.
 
+mod mtls;
 mod sink;
 mod source;
 
