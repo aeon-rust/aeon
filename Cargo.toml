@@ -94,6 +94,9 @@ zeroize = { version = "1", features = ["derive"] }
 # Streaming connectors
 futures-util = "0.3"
 tokio-tungstenite = "0.26"
+# For custom rustls ClientConfig passed via `Connector::Rustls`.
+# Only aeon-connectors (websocket feature) pulls this.
+webpki-roots = "1.0"
 redis = { version = "0.27", features = ["tokio-comp", "streams"] }
 async-nats = "0.38"
 rumqttc = "0.24"

@@ -86,6 +86,7 @@ dependencies = [
 name = "aeon-connectors"
 version = "0.1.0"
 dependencies = [
+ "aeon-crypto",
  "aeon-types",
  "async-nats",
  "axum 0.8.8",
@@ -101,6 +102,7 @@ dependencies = [
  "reqwest",
  "rumqttc",
  "rustls 0.23.37",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "smallvec",
@@ -110,6 +112,7 @@ dependencies = [
  "tokio-tungstenite 0.26.2",
  "tracing",
  "uuid",
+ "webpki-roots 1.0.6",
  "wtransport",
 ]
 
@@ -6371,8 +6374,12 @@ checksum = "7a9daff607c6d2bf6c16fd681ccb7eecc83e4e2cdc1ca067ffaadfca5de7f084"
 dependencies = [
  "futures-util",
  "log",
+ "rustls 0.23.37",
+ "rustls-pki-types",
  "tokio",
+ "tokio-rustls 0.26.4",
  "tungstenite 0.26.2",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]
@@ -6733,6 +6740,8 @@ dependencies = [
  "httparse",
  "log",
  "rand 0.9.2",
+ "rustls 0.23.37",
+ "rustls-pki-types",
  "sha1",
  "thiserror 2.0.18",
  "utf-8",
