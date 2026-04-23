@@ -376,7 +376,7 @@ to FIPS 140-3 compliance. Current status by surface:
 | Inbound push sources (HTTP webhook, WebSocket, WebTransport) | mTLS supported as an S9 auth mode alongside IP allow-list / API-key / HMAC |
 | Outbound HTTP sink | mTLS supported — S10 mode `mtls`, client cert/key from secret provider |
 | Outbound Kafka / Redpanda sink | mTLS via broker-native (rdkafka SASL/TLS) — S10 mode `broker_native` |
-| Outbound WebSocket / WebTransport sink | mTLS at auth-mode level accepted; TLS-layer integration pending (see follow-up task #34 — warn-and-ignore today) |
+| Outbound WebSocket / WebTransport sink | mTLS supported — S10 mode `mtls`; WS wires the signer cert/key into the rustls `Connector`, WT exposes `webtransport::mtls_client_config_from_signer` to bake the identity into `wtransport::ClientConfig` before construction. Inbound WT source extracts peer-cert CN + SAN post-handshake for S9 `mtls` subject matching. |
 | Inbound REST on port 4471 | Native TLS termination via rustls is future work; reverse proxy recommended |
 
 Roadmap reference: FIPS-track claims are already available via the
@@ -701,8 +701,14 @@ no interlocking.
 Applies to: HTTP sink, Kafka/Redpanda sink (broker-native), NATS sink,
 Redis Streams sink, WebSocket sink, WebTransport sink.
 
-For WebSocket and WebTransport sinks, the `mtls` mode is accepted at the
-auth-mode layer but TLS-layer plumbing is pending — see tracking task #34.
+For WebSocket sinks and sources, `mtls` mode plumbs the signer cert/key
+into a rustls `Connector` and `tokio_tungstenite::connect_async_tls_with_config`.
+For WebTransport, callers build the TLS-wired `ClientConfig` via
+`aeon_connectors::webtransport::mtls_client_config_from_signer(&signer)`
+and pass it to `WebTransportSinkConfig::new(url, client_config)`.
+Inbound WT sources extract peer-cert CN + SAN after the QUIC handshake
+via `aeon_crypto::tls::CertificateStore::parse_cert_subjects` and feed
+them into `InboundAuthVerifier`'s `mtls` subject check.
 
 ---
 

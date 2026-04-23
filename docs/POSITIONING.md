@@ -199,7 +199,6 @@ This wedge is defensible because retrofitting any one piece (crypto chain, compl
 | **Direct PKCS#11 / HSM integration** | Deferred | FIPS-track claims are already satisfied via cloud KMS (AWS/GCP/Azure all FIPS 140-3 L3) and Vault/OpenBao-with-HSM-seal. Direct PKCS#11 only needed for air-gapped shops where Vault/OpenBao is not an option — trait stub (S1.4) is in place; real backend deferred until a customer asks. |
 | **`aeon-secrets` adapter crate (Vault / OpenBao / KMS / SM backends)** | Medium | `SecretProvider` trait + Env / DotEnv / Literal providers ship today; production backends are trait slots. Task #35 delivers the adapter crate with Vault + OpenBao (API-compatible) as reference; AWS / GCP / Azure KMS + SM backends follow behind their own feature flags. |
 | **Secret-provider production hardening** | Medium | Rotation runbook, error taxonomy, rate-limit handling across Vault / OpenBao / AWS KMS / AWS SM / GCP KMS (task #36) |
-| **WebSocket / WebTransport mTLS TLS-layer** | Small | S10 auth-mode matrix is complete; TLS-connector integration for WS/WT mTLS is a follow-up (warn-and-ignore today, task #34) |
 
 **Gaps closed by the 2026-04-23 audit landing (no longer on this list):**
 - Secrets-in-config-files risk — closed by S1 (provider abstraction + envelope encryption)
@@ -209,6 +208,7 @@ This wedge is defensible because retrofitting any one piece (crypto chain, compl
 - Audit findings S8 (source_kind / on_ack_callback / RocksDB gate) — closed
 - Inbound push-source auth — closed by S9 (IP allow-list + API-key + HMAC + mTLS)
 - Outbound sink auth — closed by S10 (Bearer / Basic / API-key / HMAC-sign / mTLS) — aeon-cli factory wiring continuation in flight
+- WebSocket / WebTransport mTLS TLS-layer — closed by task #34 (WS rustls `Connector`, WT `mtls_client_config_from_signer` helper, WT source post-handshake subject extraction)
 - Configurable retention for L2 body + L3 ack — closed by S5
 - GDPR subject-id + erasure + export — closed by S6
 - Compliance regime precondition validator — closed by S4.2

@@ -1087,30 +1087,40 @@ Wired into `HttpPollingSourceFactory` and `HttpSinkFactory` with
 updated docstrings listing the new keys. Three parser tests cover
 defaults, explicit toggle round-trip, and CIDR-list parsing.
 
-### 9.9 S3–S6, S10 workstreams — in progress / pending
+### 9.9 S3–S6, S10 workstreams — status
 
 S8 closed the **critical** audit items (silent data-loss + silent
 config failure); S2 closed **payload-never-in-logs**; S7 closed
 **SSRF / external URL hardening**; S1 closed **secret provider + KEK
 envelope encryption + rotation** (see §9.10–§9.12); S9 closed
-**inbound connector auth** (see §9.13–§9.15); S10 primitives + HTTP
-surface + WebSocket handshake wiring + Kafka + Redis + NATS +
-Postgres-CDC + MySQL-CDC + Mongo-CDC broker-native + WebTransport
-sink HTTP/3 CONNECT header auth closed (see §9.16–§9.24). Remaining
-security/compliance workstreams are tracked in `ROADMAP.md`:
+**inbound connector auth** (see §9.13–§9.15); **S10 closed 2026-04-23**
+— primitives + HTTP surface + WebSocket handshake wiring + Kafka +
+Redis + NATS + Postgres-CDC + MySQL-CDC + Mongo-CDC broker-native +
+WebTransport sink HTTP/3 CONNECT header auth (2026-04-22) plus WS/WT
+mTLS TLS-layer integration (task #34, 2026-04-23): WS sink+source
+route mTLS through `Connector::Rustls(Arc<ClientConfig>)`; WT sink
+exposes `webtransport::mtls_client_config_from_signer` to bake the
+identity into `wtransport::ClientConfig`; WT source extracts peer-cert
+CN + SAN post-handshake via
+`aeon_crypto::tls::CertificateStore::parse_cert_subjects` for S9
+subject matching. **S3, S4.2, S5, S6, S1.4, S2.5 all closed
+2026-04-22/23** — see ROADMAP §"Security & Compliance Index" for the
+landing map. Remaining security/compliance work:
 
-- **S10 remaining** — WebTransport sink mTLS builder helper;
-  SDK-level mTLS follow-ups (WebSocket custom rustls connector,
-  Redis `tls-rustls` feature, NATS in-memory PEM, Postgres
+- **S10 remaining** — SDK-level mTLS follow-ups on legacy connector
+  stacks (Redis `tls-rustls` feature, NATS in-memory PEM, Postgres
   `tokio-postgres-rustls`, MySQL `native-tls-tls`/`rustls-tls`
   feature, MongoDB tempfile-or-patch for
   `TlsOptions::cert_key_file_path`); aeon-cli factory registration
   for WebSocket / Redis / NATS / PG-CDC / MySQL-CDC / Mongo-CDC
   source/sink (P5.c).
-- **S4** — Compliance mode manifest (PCI-DSS / HIPAA / GDPR)
-- **S3** — L2 + L3 at-rest encryption + perf re-bench
-- **S5** — Configurable retention (L2 body / L3 ack windows)
-- **S6** — GDPR subject-id + erasure API + right-to-export
+- **S4.3 / S4.4** — Compliance CLI YAML surface + COMPLIANCE.md
+  expansion (S4.1 primitives + S4.2 validator closed).
+- **S1.4 driver impl** — HSM / PKCS#11 trait landed; concrete
+  backend deferred (task #33).
+- **S2.5 call-site wiring** — audit channel shipped; remaining
+  emissions (auth rejections, KEK rotation, erasure requests,
+  compliance refusals) tracked as in-code TODOs.
 
 All S1–S10 config is **env-var-first** — every YAML value resolves
 via `${ENV:VAR}`, `${VAULT:path/key}`, `${AWS_SM:name}`,
@@ -1120,11 +1130,13 @@ trait. Helm / CI-CD tooling injects env vars; secrets live in Vault
 artifact as last resort. Literal values warn at load.
 
 Sequence approved 2026-04-22: S8 → S2 → S7 → S1 → S9 → **S10** →
-S4 → S3 → S5 → S6 (S8, S2, S7, S1, S9 closed; S10 primitives +
-HTTP + WebSocket + Kafka + Redis + NATS + Postgres-CDC + MySQL-CDC
-+ Mongo-CDC broker-native + WebTransport sink HTTP/3 header auth
-closed; SDK-level mTLS follow-ups and aeon-cli factory wiring
-pending at P5.c).
+S4 → S3 → S5 → S6 — all closed by 2026-04-23. S10 landed in two
+waves: primitives + HTTP + WebSocket + Kafka + Redis + NATS +
+Postgres-CDC + MySQL-CDC + Mongo-CDC broker-native + WebTransport
+sink HTTP/3 header auth (2026-04-22), then WS/WT mTLS TLS-layer via
+task #34 (2026-04-23). SDK-level mTLS follow-ups on legacy stacks
+(Redis / NATS / PG-CDC / MySQL-CDC / Mongo-CDC) and aeon-cli
+factory wiring for the unregistered connectors remain at P5.c.
 
 ### 9.10 S1.1 Secret provider — `aeon_types::secrets` module — **Closed 2026-04-22**
 

@@ -3800,7 +3800,7 @@ wiring tracked as TODO in each S-workstream.
 | **S7**  | SSRF hardening: CIDR deny-list (RFC1918, IMDS 169.254.169.254, CGNAT, fc00::/7), DNS re-resolve anti-rebinding | **Closed 2026-04-22** |
 | **S1**  | Secret provider (Vault / AWS KMS+SM / env / .env-outside-deploy-dir), dual KEK domains (log-context vs data-context), envelope encryption, hot+cold rotation | **Closed 2026-04-22** |
 | **S9**  | Inbound connector auth — IP allow-list + API-key + HMAC-signed-request + mTLS on HTTP ingest / WebTransport / QUIC sources (JWT deferred to S9.2) | **Closed 2026-04-22** |
-| **S10** | Outbound connector auth — Bearer / Basic / API-key / HMAC-sign / mTLS credential injection on every client-side dial site | **In progress** — primitives + HTTP + WebSocket + Kafka + Redis + NATS + Postgres-CDC + MySQL-CDC + Mongo-CDC broker-native + WebTransport sink HTTP/3 CONNECT header auth closed 2026-04-22; aeon-cli factory wiring + SDK-level mTLS follow-ups remain |
+| **S10** | Outbound connector auth — Bearer / Basic / API-key / HMAC-sign / mTLS credential injection on every client-side dial site | **Closed 2026-04-23** — primitives + HTTP + WebSocket + Kafka + Redis + NATS + Postgres-CDC + MySQL-CDC + Mongo-CDC broker-native + WebTransport sink HTTP/3 CONNECT header auth closed 2026-04-22; **WS/WT mTLS TLS-layer landed 2026-04-23** (task #34): WS sink+source route `Mtls` signer cert/key through a rustls `Connector` and `connect_async_tls_with_config`; shared `build_mtls_client_config` lives in `crates/aeon-connectors/src/websocket/mtls.rs`; WT sink exposes public helper `webtransport::mtls_client_config_from_signer(&signer) -> wtransport::ClientConfig` that bakes the identity via `ClientConfigBuilder::with_custom_tls`; WT source splits accept loop into pre-/post-handshake paths via `classify_auth_modes`, extracts peer-cert CN + SAN post-handshake via `aeon_crypto::tls::CertificateStore::parse_cert_subjects`, and feeds them to the S9 verifier for subject matching. aeon-cli factory wiring for WS / Redis / NATS / PG-CDC / MySQL-CDC / Mongo-CDC source/sink tracked under P5.c. |
 | S4      | Compliance mode manifest + enforcement (PCI-DSS, HIPAA, GDPR, generic)          | **In progress** — S4.1 primitives landed 2026-04-22; **S4.2 precondition validator closed 2026-04-23** (`aeon-engine::compliance_validator::validate_compliance` gates `PipelineSupervisor::start` on regime-driven encryption/retention/erasure preconditions); S4.3 CLI YAML surface + S4.4 docs remain |
 | S3      | L2 + L3 at-rest encryption (AES-256-GCM, per-segment DEK) + perf re-bench       | **Closed 2026-04-22** — S3.1 `EncryptionBlock` on manifest, S3.2 `AtRestCipher` primitive in `aeon-crypto::at_rest`, S3.3 L2 body sealed per-segment with `.l2b.meta` sidecar, S3.4 `EncryptedL3Store<S: L3Store>` wrapper in `aeon-state::l3_encrypted`, S3.5 pipeline-start probe (`aeon-engine::encryption_probe`), S3.6 re-bench group `eo2_l2_append_encrypted` (64B +1.09 µs / 256B +2.51 µs / 1024B +1.94 µs / 4096B +10.15 µs), S3.7 probe wired into `PipelineSupervisor::start` via `encryption` field on `PipelineDefinition` + `PipelineConfig.encryption_plan` + `set_data_context_kek` — `at_rest=required` without node KEK hard-refuses pipeline start |
 | S5      | Configurable retention — L2 body window + L3 ack window                         | **Closed 2026-04-23** — S5.1 `RetentionBlock` on manifest (`l2_body.hold_after_ack` string + `l3_ack.max_records` u32, both inert by default, nested under `DurabilityBlock`), S5.2 `L2BodyConfig.gc_min_hold` + `PipelineL2Registry::with_gc_min_hold` — `L2BodyStore::gc_up_to` stamps first-seen-eligible `Instant` per segment and defers `remove_file` until the hold elapses (`gc_up_to_at` test seam accepts explicit `now`), S5.3 `L3CheckpointStore::with_max_records` — `append` purges ids below `next - max` via `BatchOp::Delete` after every write, S5.4 pipeline-start probe (`aeon-engine::retention_probe`) parses `"300s"/"5m"/"1h"/"250ms"` with a clear `config(...)` refusal on malformed input; wired into `PipelineSupervisor::start` via `PipelineConfig.retention_plan` — `L3CheckpointStore` receives the cap at construction time, S5.5 5+3+4+11+3 tests across retention/L2/L3/probe/supervisor all green |
@@ -4036,12 +4036,14 @@ driven off `AuthRejection::reason_tag()` (bounded-cardinality
 labels). All reasons logged at `warn` with redacted peer IP per
 S2 rules.
 
-**S10 — in progress**, outbound credential injection on every
+**S10 — closed 2026-04-23**, outbound credential injection on every
 client-side dial site. **Primitives + HTTP closed 2026-04-22**;
-WebSocket and broker-native unification pending. Scope covers HTTP
-polling source, HTTP sink, WebSocket source/sink, WebTransport sink,
-Kafka SASL unified, Redis AUTH unified, NATS creds unified,
-Postgres/MySQL CDC. **Exactly one `auth.mode` per connector, no
+WebSocket + broker-native unification + WebTransport CONNECT-header
+auth closed 2026-04-22; **WS/WT mTLS TLS-layer closed 2026-04-23
+(task #34)**. Scope covers HTTP polling source, HTTP sink, WebSocket
+source/sink, WebTransport source/sink, Kafka SASL unified, Redis AUTH
+unified, NATS creds unified, Postgres/MySQL CDC. **Exactly one
+`auth.mode` per connector, no
 interlocking** — outbound is a single handshake; composing modes
 breaks retry semantics. Modes:
 
@@ -4210,24 +4212,47 @@ YAML**. Shared HMAC helper + header-parse primitives come from S9.
   that opens the WebTransport session via
   `wtransport::endpoint::ConnectOptions::builder(url).add_header`.
   HMAC canonicalizes as `method="CONNECT" | path | ts | body=""`.
-  `Mtls` is logged-and-ignored at the sink layer — the client cert
-  must be baked into `client_config` via
-  `ClientConfigBuilder::with_custom_tls(rustls::ClientConfig)` at
-  build time; `client_config` is opaque to the sink after
-  construction (follow-up: expose a builder helper that bakes the
-  signer cert/key into the rustls config). `BrokerNative` warned
-  and ignored (N/A for WT). 9 unit tests on `build_connect_options`
-  + 1 path-extractor test (no live server dep).
-- **Remaining S10 work:** WebTransport sink mTLS builder helper
-  (bake signer cert/key into `rustls::ClientConfig` then
-  `with_custom_tls`); custom rustls connector for WebSocket mTLS;
-  Redis `tls-rustls` feature + `redis::TlsCertificates` wiring
-  for mTLS; NATS mTLS via in-memory PEM or secure ramfs; Postgres
-  mTLS via `tokio-postgres-rustls`; MySQL mTLS via
-  `native-tls-tls`/`rustls-tls` feature toggle; MongoDB mTLS via
-  tempfile or driver patch; aeon-cli YAML factory wiring for
-  WebSocket / Redis / NATS / PG-CDC / MySQL-CDC / Mongo-CDC
-  source/sink (tracked under P5.c — not-yet-registered connectors).
+  `BrokerNative` warned and ignored (N/A for WT). 9 unit tests on
+  `build_connect_options` + 1 path-extractor test (no live server
+  dep).
+- **S10.10 WS/WT mTLS TLS-layer closed (2026-04-23, task #34)** — five
+  increments on top of the X.509 subject extractor
+  (`aeon_crypto::tls::CertificateStore::parse_cert_subjects`, CN + SAN):
+  (1) WS sink routes `Mtls` mode signer PEMs through
+  `tokio_tungstenite::Connector::Rustls(Arc<rustls::ClientConfig>)` via
+  `connect_async_tls_with_config`; (2) WS source stores
+  `Option<Arc<rustls::ClientConfig>>` at task scope so the reconnect
+  loop reuses the parsed config without re-parsing PEMs; shared helper
+  module `crates/aeon-connectors/src/websocket/mtls.rs` hosts
+  `build_mtls_client_config` / `build_mtls_client_config_arc` /
+  `build_mtls_connector` (4 unit tests); (3) WT sink public helper
+  `webtransport::mtls_client_config_from_signer(&Arc<OutboundAuthSigner>)
+  -> wtransport::ClientConfig` bakes the signer cert/key into the
+  rustls config via `ClientConfigBuilder::with_custom_tls` — the sink
+  remains opaque to the TLS identity (3 unit tests incl. doctest);
+  (4) WT source splits the accept loop into pre-/post-handshake
+  verification via `classify_auth_modes(verifier) -> (only_ip_allowlist,
+  needs_post_handshake)` — IP allow-list stays a pre-handshake
+  fast-reject when it's the sole mode; `Mtls` (alone or mixed) defers
+  everything until `session.peer_identity()` is available, at which
+  point the leaf cert is run through `parse_cert_subjects` and the
+  resulting subjects feed `AuthContext::client_cert_subjects` for the
+  S9 verifier; rejected sessions close with
+  `VarInt::from_u32(0x100)` + traced rejection; (5) `webtransport`
+  feature in `crates/aeon-connectors/Cargo.toml` gains `dep:rustls`,
+  `dep:rustls-pemfile`, `dep:webpki-roots`, `dep:aeon-crypto`; same
+  four deps added to the `websocket` feature earlier in the series.
+  Commits: `e2e7a18` (subject extractor) · `d4c2f2e` (WS sink) ·
+  `17badf9` (WS source + shared mtls helper) · `f553d9e` (WT sink
+  builder helper) · `53258a5` (WT source post-handshake subjects).
+- **Remaining S10 work:** Redis `tls-rustls` feature +
+  `redis::TlsCertificates` wiring for mTLS; NATS mTLS via in-memory
+  PEM or secure ramfs; Postgres mTLS via `tokio-postgres-rustls`;
+  MySQL mTLS via `native-tls-tls`/`rustls-tls` feature toggle;
+  MongoDB mTLS via tempfile or driver patch; aeon-cli YAML factory
+  wiring for WebSocket / Redis / NATS / PG-CDC / MySQL-CDC /
+  Mongo-CDC source/sink (tracked under P5.c — not-yet-registered
+  connectors).
 
 **S4 — in progress**, per-pipeline compliance declaration + enforcement
 (PCI-DSS, HIPAA, GDPR, mixed). YAML surface:
