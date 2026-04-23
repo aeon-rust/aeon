@@ -3778,6 +3778,21 @@ workstreams (S1–S8). Full detail in memory
 S8 → S2 → S7 → S1 → S4 → S3 → S5 → S6 → S1.4 + S2.5 → CL-6c.4 → SECURITY.md /
 COMPLIANCE.md / ROADMAP pass → POSITIONING.md Flink-diff refresh.
 
+**Landing commits** (grep for full diff):
+
+- `4586677 feat(security): S8/S2/S7/S1/S9/S10 security & compliance landings`
+  — S8 + S2 + S7 + S1 + S9 + S10 primitives/HTTP surface (2026-04-21/22).
+- `e11cbe0 feat(cluster+engine+security): CL-6c.4 + S3/S4.2/S5/S6/S1.4/S2.5 + S10 continuation`
+  — CL-6c.4 engine-side providers, S3 at-rest encryption, S4.2 compliance
+  validator, S5 retention plumbing, S6 GDPR subject-id + erasure +
+  right-to-export, S1.4 HSM trait stub, S2.5 audit channel, S10
+  broker-native wiring across Kafka/Redis/NATS/Postgres-CDC/MySQL-CDC/
+  Mongo-CDC/WebSocket/WebTransport (2026-04-23).
+
+Open rows below: S4.3 (CLI YAML surface) + S4.4 (docs), S10 aeon-cli
+factory wiring + SDK-level mTLS follow-ups, audit-emission call-site
+wiring tracked as TODO in each S-workstream.
+
 | ID      | Workstream                                                                       | Status             |
 | ------- | -------------------------------------------------------------------------------- | ------------------ |
 | **S8**  | Critical audit fixes: push-source `source_kind`, sink `on_ack_callback`, L3 RocksDB compile-time gate | **Closed 2026-04-21** |
@@ -3786,12 +3801,12 @@ COMPLIANCE.md / ROADMAP pass → POSITIONING.md Flink-diff refresh.
 | **S1**  | Secret provider (Vault / AWS KMS+SM / env / .env-outside-deploy-dir), dual KEK domains (log-context vs data-context), envelope encryption, hot+cold rotation | **Closed 2026-04-22** |
 | **S9**  | Inbound connector auth — IP allow-list + API-key + HMAC-signed-request + mTLS on HTTP ingest / WebTransport / QUIC sources (JWT deferred to S9.2) | **Closed 2026-04-22** |
 | **S10** | Outbound connector auth — Bearer / Basic / API-key / HMAC-sign / mTLS credential injection on every client-side dial site | **In progress** — primitives + HTTP + WebSocket + Kafka + Redis + NATS + Postgres-CDC + MySQL-CDC + Mongo-CDC broker-native + WebTransport sink HTTP/3 CONNECT header auth closed 2026-04-22; aeon-cli factory wiring + SDK-level mTLS follow-ups remain |
-| S4      | Compliance mode manifest + enforcement (PCI-DSS, HIPAA, GDPR, generic)          | **In progress** — S4.1 primitives (`ComplianceBlock` + regime/enforcement enums + PII/PHI selectors) landed in `aeon-types` 2026-04-22; precondition validator (S4.2) + CLI YAML surface (S4.3) + docs remain |
+| S4      | Compliance mode manifest + enforcement (PCI-DSS, HIPAA, GDPR, generic)          | **In progress** — S4.1 primitives landed 2026-04-22; **S4.2 precondition validator closed 2026-04-23** (`aeon-engine::compliance_validator::validate_compliance` gates `PipelineSupervisor::start` on regime-driven encryption/retention/erasure preconditions); S4.3 CLI YAML surface + S4.4 docs remain |
 | S3      | L2 + L3 at-rest encryption (AES-256-GCM, per-segment DEK) + perf re-bench       | **Closed 2026-04-22** — S3.1 `EncryptionBlock` on manifest, S3.2 `AtRestCipher` primitive in `aeon-crypto::at_rest`, S3.3 L2 body sealed per-segment with `.l2b.meta` sidecar, S3.4 `EncryptedL3Store<S: L3Store>` wrapper in `aeon-state::l3_encrypted`, S3.5 pipeline-start probe (`aeon-engine::encryption_probe`), S3.6 re-bench group `eo2_l2_append_encrypted` (64B +1.09 µs / 256B +2.51 µs / 1024B +1.94 µs / 4096B +10.15 µs), S3.7 probe wired into `PipelineSupervisor::start` via `encryption` field on `PipelineDefinition` + `PipelineConfig.encryption_plan` + `set_data_context_kek` — `at_rest=required` without node KEK hard-refuses pipeline start |
 | S5      | Configurable retention — L2 body window + L3 ack window                         | **Closed 2026-04-23** — S5.1 `RetentionBlock` on manifest (`l2_body.hold_after_ack` string + `l3_ack.max_records` u32, both inert by default, nested under `DurabilityBlock`), S5.2 `L2BodyConfig.gc_min_hold` + `PipelineL2Registry::with_gc_min_hold` — `L2BodyStore::gc_up_to` stamps first-seen-eligible `Instant` per segment and defers `remove_file` until the hold elapses (`gc_up_to_at` test seam accepts explicit `now`), S5.3 `L3CheckpointStore::with_max_records` — `append` purges ids below `next - max` via `BatchOp::Delete` after every write, S5.4 pipeline-start probe (`aeon-engine::retention_probe`) parses `"300s"/"5m"/"1h"/"250ms"` with a clear `config(...)` refusal on malformed input; wired into `PipelineSupervisor::start` via `PipelineConfig.retention_plan` — `L3CheckpointStore` receives the cap at construction time, S5.5 5+3+4+11+3 tests across retention/L2/L3/probe/supervisor all green |
-| S6      | GDPR subject-id (metadata `aeon.subject_id`, multi-value `ns/id`) + erasure API + PoH null-receipt + right-to-export | **Closed 2026-04-23** |
-| S1.4    | HSM / PKCS#11 trait stub (trait-now-driver-later)                                | **Closed 2026-04-23** |
-| S2.5    | Audit log channel separate from data-path tracing                                | **Closed 2026-04-23** |
+| S6      | GDPR subject-id (metadata `aeon.subject_id`, multi-value `ns/id`) + erasure API + PoH null-receipt + right-to-export | **Closed 2026-04-23** — S6.1 `aeon-types::subject_id` (`SubjectId`, `MAX_COMPONENT_LEN`, `METADATA_KEY_SUBJECT_ID`, `collect_subject_ids` / `try_collect_subject_ids` / `validate_namespace_for_wildcard`), S6.2 erasure API (`aeon-types::erasure::{ErasureRequest, ErasureSelector, ErasureTombstone, TombstoneState}`), S6.3 tombstone store (`aeon-engine::erasure_store`), S6.4 right-to-export (`aeon-engine::subject_export` scans across L2 segments), S6.5 subject-id deny-list enforced via `aeon-types::redact::METADATA_REDACT_DENYLIST` + `is_redacted_metadata_key` + `redact_metadata_value`, S6.6 extractor config via `SubjectExtractConfig` on manifest, S6.7 `ErasurePolicy` in `aeon-engine::erasure_policy`, S6.8 PoH null-receipt primitive (`aeon-crypto::null_receipt`), S6.9 pipeline-start probe (`aeon-engine::erasure_probe`) wired into `PipelineSupervisor::start` |
+| S1.4    | HSM / PKCS#11 trait stub (trait-now-driver-later)                                | **Closed 2026-04-23** — `aeon-crypto::hsm::HsmClient` trait stub landed; driver impls deferred until a concrete HSM backend is selected |
+| S2.5    | Audit log channel separate from data-path tracing                                | **Closed 2026-04-23** — `aeon-types::audit::{AuditEvent, AuditCategory, AuditOutcome, AuditSink}` + `aeon-observability::audit` channel carry audit emissions on a subscriber separate from the `tracing` data-path spans. Call-site emission wiring (auth rejections, KEK rotation, erasure requests, compliance refusals) remains a follow-up — captured inline in each S-workstream's code as TODO |
 | CL-6c.4 | Engine-side write-freeze + buffer-and-replay integration                         | **Closed 2026-04-23** — `crates/aeon-engine/src/engine_providers.rs` ships the production provider trio: `L2SegmentTransferProvider` (impls `aeon_cluster::PartitionTransferProvider` via `PipelineL2Registry::partition_dir` + `SegmentReader`) and `PohChainExportProvider` (impls `aeon_cluster::PohChainProvider` via `LivePohChainRegistry::get` → `tokio::sync::Mutex<PohChain>::lock().await.export_state()`). `LivePohChainRegistry` added to `partition_install.rs`; `create_poh_state` registers the live chain on both fresh-genesis and G11.c resume paths. `PipelineSupervisor` owns the registry and hands its Arc to every pipeline via `PipelineConfig.poh_live_chains`; `stop()` removes the pipeline's entries. `PohChainProvider::export_state` lifted sync→async so impls can await a tokio mutex. `aeon-cli`'s `install_partition_transfer_driver` now installs all three providers (segment + PoH + `EngineCutoverCoordinator`) into `ClusterNode::source_provider_slots` after bootstrap. 5 new `engine_providers` unit tests + 4 new `LivePohChainRegistry` unit tests + existing 3-node partition-transfer / full-handover integration tests all green. G2 leader-side transfer driver is now wired end-to-end (target pulls L2 + PoH, source freezes via coordinator). |
 
 **S8 — closed 2026-04-21**, three sub-items:
@@ -4239,28 +4254,32 @@ compliance module itself. **Protobuf is intentionally out of scope**
 for selector payload formats; schema-registry integration is a
 separate future initiative.
 
-**S4 landing status (2026-04-22):**
+**S4 landing status (2026-04-23):**
 
-- **S4.1 primitives closed** —
+- **S4.1 primitives closed (2026-04-22)** —
   `aeon-types::compliance::{ComplianceRegime, EnforcementLevel,
   DataClass, PayloadFormat, PiiSelector, ComplianceBlock}` plus
   `compliance` field on `PipelineManifest` (defaults inert,
   `skip_serializing_if` keeps default blocks out of serialised
   YAML/JSON). `ComplianceRegime::requires_encryption/retention/
   erasure` helpers pre-compute which S-series preconditions a regime
-  contributes to — consumed by the S4.2 validator. 13 unit tests
-  (regime serde, enforcement flags, block round-trip, selector
-  format default, is_active gating). 309 aeon-types tests total.
-- **S4.2 precondition validator pending** — a
-  `validate_compliance(manifest, env)` function in aeon-types or
-  aeon-engine that collects findings (each with a `reason_tag`
-  analogous to `AuthRejection`) and returns Ok / warn / abort based
-  on `enforcement`. Probes S1 secret-provider identity, S3
-  encryption toggle, S5 retention config, S6 subject-id plumbing.
+  contributes to. 13 unit tests (regime serde, enforcement flags,
+  block round-trip, selector format default, is_active gating).
+- **S4.2 precondition validator closed (2026-04-23)** —
+  `aeon-engine::compliance_validator::validate_compliance(manifest,
+  env)` collects findings (each carries a `reason_tag` analogous to
+  `AuthRejection`) and returns Ok / warn / abort based on
+  `enforcement`. Probes: S1 secret-provider identity, S3 at-rest
+  encryption toggle + data-context KEK presence, S5 retention config,
+  S6 subject-id plumbing + erasure API wiring. Wired into
+  `PipelineSupervisor::start` before any task spawns — `strict` hard-
+  refuses pipeline start with a structured finding list.
 - **S4.3 CLI YAML surface pending** — aeon-cli reader for the
-  `compliance:` block (struct already serde-wired; just needs CLI
-  integration tests + docs).
-- **S4.4 docs** — COMPLIANCE.md landing in the S26 docs pass.
+  `compliance:` block (struct already serde-wired; needs CLI
+  integration tests covering the regime × enforcement × probes
+  matrix + doc examples).
+- **S4.4 docs** — COMPLIANCE.md deferred; absorbed into the consolidated
+  ROADMAP reference section above (light-pass decision, 2026-04-23).
 
 All S1–S10 configuration follows the env-var-first rule: every YAML
 field accepts `${ENV:VAR}`, `${VAULT:path/key}`, `${AWS_SM:name}`,
