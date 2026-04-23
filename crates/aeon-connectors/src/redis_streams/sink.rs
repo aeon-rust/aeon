@@ -18,9 +18,11 @@
 //!   them. Used by the pipeline sink task at flush intervals.
 
 use aeon_types::{
-    AeonError, BatchResult, DeliveryStrategy, IdempotentSink, Output, Sink, SinkAckCallback,
+    AeonError, BatchResult, DeliveryStrategy, IdempotentSink, OutboundAuthSigner, Output, Sink,
+    SinkAckCallback,
 };
 use redis::aio::MultiplexedConnection;
+use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -49,6 +51,8 @@ pub struct RedisSinkConfig {
     /// Key prefix for dedup records. Full key is `{prefix}{stream_key}:{event_id}`.
     /// Defaults to `"aeon:dedup:"`. Only used when `dedup_ttl` is set.
     pub dedup_key_prefix: String,
+    /// S10 outbound auth. See `RedisSourceConfig::auth`.
+    pub auth: Option<Arc<OutboundAuthSigner>>,
 }
 
 impl RedisSinkConfig {
@@ -61,7 +65,14 @@ impl RedisSinkConfig {
             strategy: DeliveryStrategy::default(),
             dedup_ttl: None,
             dedup_key_prefix: "aeon:dedup:".to_string(),
+            auth: None,
         }
+    }
+
+    /// S10: attach an outbound-auth signer.
+    pub fn with_auth(mut self, signer: Arc<OutboundAuthSigner>) -> Self {
+        self.auth = Some(signer);
+        self
     }
 
     /// Set approximate maximum stream length (trimming with MAXLEN ~).
@@ -123,7 +134,8 @@ pub struct RedisSink {
 impl RedisSink {
     /// Connect to Redis.
     pub async fn new(config: RedisSinkConfig) -> Result<Self, AeonError> {
-        let client = redis::Client::open(config.url.as_str())
+        let conn_info = super::auth::resolve_connection_info(&config.url, config.auth.as_ref())?;
+        let client = redis::Client::open(conn_info)
             .map_err(|e| AeonError::connection(format!("redis client create failed: {e}")))?;
 
         let conn = client

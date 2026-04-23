@@ -9,9 +9,11 @@
 //! - **UnorderedBatch**: JetStream publish (enqueue), collect ack futures, await in flush().
 
 use aeon_types::{
-    AeonError, BatchResult, DeliveryStrategy, IdempotentSink, Output, Sink, SinkAckCallback,
+    AeonError, BatchResult, DeliveryStrategy, IdempotentSink, OutboundAuthSigner, Output, Sink,
+    SinkAckCallback,
 };
 use async_nats::jetstream::context::Publish;
+use std::sync::Arc;
 use uuid::Uuid;
 
 /// Configuration for `NatsSink`.
@@ -36,6 +38,8 @@ pub struct NatsSinkConfig {
     ///
     /// Off by default; opt in via `with_dedup()`.
     pub dedup: bool,
+    /// S10 outbound auth. See `NatsSourceConfig::auth`.
+    pub auth: Option<Arc<OutboundAuthSigner>>,
 }
 
 impl NatsSinkConfig {
@@ -47,7 +51,14 @@ impl NatsSinkConfig {
             jetstream: true,
             strategy: DeliveryStrategy::default(),
             dedup: false,
+            auth: None,
         }
+    }
+
+    /// S10: attach an outbound-auth signer.
+    pub fn with_auth(mut self, signer: Arc<OutboundAuthSigner>) -> Self {
+        self.auth = Some(signer);
+        self
     }
 
     /// Use core NATS publish (no persistence guarantees).
@@ -99,9 +110,7 @@ pub struct NatsSink {
 impl NatsSink {
     /// Connect to NATS.
     pub async fn new(config: NatsSinkConfig) -> Result<Self, AeonError> {
-        let client = async_nats::connect(&config.url)
-            .await
-            .map_err(|e| AeonError::connection(format!("nats connect failed: {e}")))?;
+        let client = super::auth::connect_with_auth(&config.url, config.auth.as_ref()).await?;
 
         let jetstream = if config.jetstream {
             Some(async_nats::jetstream::new(client.clone()))

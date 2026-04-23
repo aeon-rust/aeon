@@ -6,6 +6,7 @@
 //! `RedisSink`: Writes to a Redis Stream using XADD.
 //!   Each output becomes a stream entry with the payload as the field value.
 
+mod auth;
 mod sink;
 mod source;
 

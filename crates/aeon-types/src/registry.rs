@@ -264,6 +264,22 @@ pub struct PipelineDefinition {
     /// compatibility with pre-EO-2 serialized forms.
     #[serde(default)]
     pub durability: crate::manifest::DurabilityBlock,
+    /// S3 at-rest encryption posture. Defaults to an inert block
+    /// (`at_rest=off`) so pipelines pay zero cost unless they opt in.
+    /// The supervisor runs `resolve_encryption_plan` against this block
+    /// at start time; `Required` without a resolvable data-context KEK
+    /// is a hard refusal to start.
+    #[serde(default)]
+    pub encryption: crate::encryption::EncryptionBlock,
+    /// S4/S6 compliance declaration. Defaults to an inert block
+    /// (`regime=None`, `enforcement=Off`) so pre-S6 serialized forms
+    /// deserialize cleanly and pipelines pay zero cost unless they
+    /// opt in. `PipelineSupervisor::start` runs `resolve_erasure_plan`
+    /// against this block so a GDPR/Mixed pipeline declared under
+    /// strict enforcement refuses to start when the structural
+    /// erasure preconditions (at-rest encryption) are missing.
+    #[serde(default)]
+    pub compliance: crate::compliance::ComplianceBlock,
 }
 
 impl PipelineDefinition {
@@ -288,6 +304,8 @@ impl PipelineDefinition {
             transport_codec: crate::transport_codec::TransportCodec::default(),
             upgrade_state: None,
             durability: crate::manifest::DurabilityBlock::default(),
+            encryption: crate::encryption::EncryptionBlock::default(),
+            compliance: crate::compliance::ComplianceBlock::default(),
         }
     }
 }

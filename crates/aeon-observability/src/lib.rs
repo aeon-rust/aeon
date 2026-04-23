@@ -60,12 +60,17 @@
 // Test modules and benches are exempt (`cfg(not(test))`).
 #![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod audit;
 pub mod histogram;
 pub mod logging;
 pub mod metrics;
 pub mod otel;
 pub mod tracing_spans;
 
+pub use audit::{
+    AUDIT_STDERR_PREFIX, NullAuditSink, StderrAuditSink, audit_sink, emit_audit,
+    set_audit_sink,
+};
 pub use histogram::LatencyHistogram;
 pub use logging::{LogConfig, init_logging, mask_email, mask_pii};
 pub use metrics::PipelineObservability;

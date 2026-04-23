@@ -173,6 +173,8 @@ fn l2_append_throughput(c: &mut Criterion) {
                             dir,
                             aeon_engine::l2_body::L2BodyConfig {
                                 segment_bytes: 256 * 1024 * 1024,
+                                kek: None,
+                                gc_min_hold: std::time::Duration::ZERO,
                             },
                         )
                         .unwrap();
@@ -187,6 +189,88 @@ fn l2_append_throughput(c: &mut Criterion) {
                 );
             },
         );
+    }
+
+    group.finish();
+}
+
+// ── Benchmark 2b: L2 body-store append throughput, encrypted ──────────
+//
+// Mirrors benchmark 2 but seals each event with the S3 at-rest cipher
+// (AES-256-GCM, per-segment DEK wrapped by a data-context KEK). The
+// delta between this group and `eo2_l2_append` is the per-event
+// encryption tax; S3 design budget says a few hundred ns at 256 B.
+
+fn l2_append_throughput_encrypted(c: &mut Criterion) {
+    use aeon_crypto::kek::{KekDomain, KekHandle};
+    use aeon_types::{
+        SecretBytes, SecretError, SecretProvider, SecretRef, SecretRegistry, SecretScheme,
+    };
+
+    struct HexEnv;
+    impl SecretProvider for HexEnv {
+        fn scheme(&self) -> SecretScheme {
+            SecretScheme::Env
+        }
+        fn resolve(&self, path: &str) -> Result<SecretBytes, SecretError> {
+            let v = std::env::var(path).map_err(|_| SecretError::EnvNotSet(path.to_string()))?;
+            let bytes: Vec<u8> = (0..v.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&v[i..i + 2], 16).unwrap_or(0))
+                .collect();
+            Ok(SecretBytes::new(bytes))
+        }
+    }
+
+    // One stable KEK reused across bench samples — each segment still
+    // gets a fresh DEK, so this does not cheat on nonce uniqueness.
+    unsafe {
+        std::env::set_var(
+            "AEON_BENCH_L2_KEK",
+            "4242424242424242424242424242424242424242424242424242424242424242",
+        );
+    }
+    let mut reg = SecretRegistry::empty();
+    reg.register(Arc::new(HexEnv));
+    let kek = Arc::new(KekHandle::new(
+        KekDomain::DataContext,
+        "bench-l2-kek",
+        SecretRef::env("AEON_BENCH_L2_KEK"),
+        Arc::new(reg),
+    ));
+
+    let mut group = c.benchmark_group("eo2_l2_append_encrypted");
+
+    for &payload_size in &[64usize, 256, 1024, 4096] {
+        let event_count = 10_000usize;
+        group.throughput(Throughput::Elements(event_count as u64));
+
+        group.bench_function(BenchmarkId::new("payload_bytes", payload_size), |b| {
+            b.iter_batched(
+                || {
+                    let events = make_events(event_count, payload_size);
+                    let tmp = tempfile::tempdir().unwrap();
+                    let dir = tmp.path().join("l2-bench-enc");
+                    std::fs::create_dir_all(&dir).unwrap();
+                    let store = L2BodyStore::open(
+                        dir,
+                        aeon_engine::l2_body::L2BodyConfig {
+                            segment_bytes: 256 * 1024 * 1024,
+                            kek: Some(Arc::clone(&kek)),
+                            gc_min_hold: std::time::Duration::ZERO,
+                        },
+                    )
+                    .unwrap();
+                    (events, store, tmp)
+                },
+                |(events, mut store, _tmp)| {
+                    for event in &events {
+                        store.append(event).unwrap();
+                    }
+                },
+                BatchSize::LargeInput,
+            );
+        });
     }
 
     group.finish();
@@ -426,6 +510,7 @@ criterion_group!(
     benches,
     durability_mode_overhead,
     l2_append_throughput,
+    l2_append_throughput_encrypted,
     checkpoint_cadence,
     capacity_tracking_overhead,
     content_hash_dedup,

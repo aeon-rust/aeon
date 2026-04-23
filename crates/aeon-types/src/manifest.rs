@@ -18,7 +18,9 @@
 //!   to advertise `Source::supports_broker_event_time() == true`; otherwise
 //!   the pipeline fails to start (no silent `AeonIngest` fallback).
 
+use crate::compliance::ComplianceBlock;
 use crate::durability::DurabilityMode;
+use crate::encryption::EncryptionBlock;
 use crate::error::AeonError;
 use crate::event_time::EventTime;
 use crate::traits::{SinkEosTier, SourceKind};
@@ -38,6 +40,16 @@ pub struct PipelineManifest {
     #[serde(default)]
     pub durability: DurabilityBlock,
 
+    /// S4 compliance declaration. Defaults to an inert block
+    /// (`regime=None`, `enforcement=Off`) so pipelines opt in explicitly.
+    #[serde(default, skip_serializing_if = "compliance_is_default")]
+    pub compliance: ComplianceBlock,
+
+    /// S3 at-rest encryption declaration. Defaults to an inert block
+    /// (`at_rest=Off`) so dev pipelines pay zero cost.
+    #[serde(default, skip_serializing_if = "encryption_is_default")]
+    pub encryption: EncryptionBlock,
+
     pub sources: Vec<SourceManifest>,
 
     pub processor: ProcessorManifest,
@@ -46,6 +58,14 @@ pub struct PipelineManifest {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upgrade_strategy: Option<String>,
+}
+
+fn compliance_is_default(b: &ComplianceBlock) -> bool {
+    b == &ComplianceBlock::default()
+}
+
+fn encryption_is_default(b: &EncryptionBlock) -> bool {
+    b == &EncryptionBlock::default()
 }
 
 // ── Durability block ─────────────────────────────────────────────────────
@@ -67,6 +87,12 @@ pub struct DurabilityBlock {
 
     #[serde(default)]
     pub flush: FlushBlock,
+
+    /// S5: optional per-tier retention overrides. Defaults to inert
+    /// (ack-driven GC only, keep-all checkpoint history) so existing
+    /// manifests behave identically.
+    #[serde(default, skip_serializing_if = "crate::retention::RetentionBlock::is_default")]
+    pub retention: crate::retention::RetentionBlock,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,10 +161,97 @@ pub struct SourceManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backpressure: Option<BackpressureConfig>,
 
+    /// S6.7 — optional GDPR subject-id extraction rule. When present,
+    /// the source populates `Event.metadata["aeon.subject_id"]`
+    /// before the event enters the pipeline. See
+    /// [`SubjectExtractConfig`]. `None` means the source emits
+    /// events without a subject id (acceptable for pipelines that do
+    /// not declare `compliance.regime = gdpr|mixed`, or for sources
+    /// where the upstream producer sets the metadata itself).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_extract: Option<SubjectExtractConfig>,
+
     /// Connector-specific free-form config. Validated by the connector
     /// during `open()`, not here.
     #[serde(default, flatten)]
     pub config: BTreeMap<String, serde_json::Value>,
+}
+
+/// S6.7 — how a source connector derives the `aeon.subject_id`
+/// metadata entry for each event. Three extraction kinds, matching
+/// the design decision at `docs/aeon-dev-notes.txt` §6.1.d
+/// (source-side extraction is the default; processor-side is also
+/// supported by simply not configuring a source-side rule).
+///
+/// The extraction itself runs inside the connector; this enum is the
+/// **schema only** — validation lives here, the extraction logic
+/// lives in `aeon-connectors` and is wired in a separate sub-atom.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SubjectExtractConfig {
+    /// Read a field from the payload using a JSON pointer / path
+    /// expression (e.g. `$.user.id`). The extracted string is
+    /// combined with `namespace` to form the canonical
+    /// `namespace/id` subject id.
+    JsonPath {
+        /// Namespace component of the emitted subject id. Must match
+        /// the same character rules as [`crate::SubjectId`]
+        /// namespaces.
+        namespace: String,
+        /// JSON path expression. Dialect supported by the connector
+        /// (JSONPath-plus or RFC 6901 pointer, connector-specific).
+        path: String,
+    },
+    /// Read the subject id from a wire-protocol header / metadata
+    /// key set by the upstream producer (e.g. an HTTP request
+    /// header, a Kafka record header). The value is treated as the
+    /// id component — `namespace` is provided by config.
+    Header {
+        /// Namespace component of the emitted subject id.
+        namespace: String,
+        /// Name of the header / metadata key to read.
+        name: String,
+    },
+    /// The upstream producer already attaches a well-formed
+    /// `aeon.subject_id` metadata entry with canonical
+    /// `namespace/id` form. The source copies it through unchanged.
+    /// No connector-side parsing is required; this variant is a
+    /// declaration that the pipeline trusts its upstream to emit
+    /// subject-ids correctly.
+    MetadataLiteral,
+}
+
+impl SubjectExtractConfig {
+    /// Validate config components. Namespace validation reuses the
+    /// subject-id rules so `$extract` → `SubjectId` cannot fail at
+    /// runtime if the config passed here; similarly, `path` and
+    /// `name` must be non-empty.
+    pub fn validate(&self) -> Result<(), crate::AeonError> {
+        use crate::subject_id::validate_namespace_for_wildcard;
+        match self {
+            Self::JsonPath { namespace, path } => {
+                validate_namespace_for_wildcard(namespace)?;
+                if path.trim().is_empty() {
+                    return Err(crate::AeonError::config(
+                        "subject_extract.json_path: path must not be empty"
+                            .to_string(),
+                    ));
+                }
+                Ok(())
+            }
+            Self::Header { namespace, name } => {
+                validate_namespace_for_wildcard(namespace)?;
+                if name.trim().is_empty() {
+                    return Err(crate::AeonError::config(
+                        "subject_extract.header: name must not be empty"
+                            .to_string(),
+                    ));
+                }
+                Ok(())
+            }
+            Self::MetadataLiteral => Ok(()),
+        }
+    }
 }
 
 /// Identity derivation mode — see EO-2 §4.
@@ -430,6 +543,8 @@ impl PipelineManifest {
             transport_codec: crate::transport_codec::TransportCodec::default(),
             upgrade_state: None,
             durability: self.durability.clone(),
+            encryption: self.encryption.clone(),
+            compliance: self.compliance.clone(),
         }
     }
 }
@@ -446,6 +561,7 @@ mod tests {
             identity: IdentityConfig::Native,
             event_time: EventTime::Broker,
             backpressure: None,
+            subject_extract: None,
             config: BTreeMap::new(),
         }
     }
@@ -464,6 +580,8 @@ mod tests {
             name: "orders".into(),
             partitions: 8,
             durability: DurabilityBlock::default(),
+            compliance: ComplianceBlock::default(),
+            encryption: EncryptionBlock::default(),
             sources: vec![sample_source()],
             processor: ProcessorManifest {
                 name: "p".into(),
@@ -683,6 +801,55 @@ mod tests {
     }
 
     #[test]
+    fn compliance_defaults_to_inert_and_is_omitted_from_json() {
+        let m = sample_manifest();
+        assert_eq!(m.compliance, ComplianceBlock::default());
+        let j = serde_json::to_string(&m).unwrap();
+        assert!(
+            !j.contains("compliance"),
+            "inert compliance block should be skipped, got: {j}"
+        );
+    }
+
+    #[test]
+    fn encryption_defaults_to_inert_and_is_omitted_from_json() {
+        let m = sample_manifest();
+        assert_eq!(m.encryption, EncryptionBlock::default());
+        let j = serde_json::to_string(&m).unwrap();
+        assert!(
+            !j.contains("encryption"),
+            "inert encryption block should be skipped, got: {j}"
+        );
+    }
+
+    #[test]
+    fn encryption_roundtrip_when_required() {
+        use crate::encryption::AtRestEncryption;
+        let mut m = sample_manifest();
+        m.encryption.at_rest = AtRestEncryption::Required;
+        let j = serde_json::to_string(&m).unwrap();
+        assert!(j.contains(r#""encryption""#));
+        assert!(j.contains(r#""required""#));
+        let back: PipelineManifest = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.encryption.at_rest, AtRestEncryption::Required);
+    }
+
+    #[test]
+    fn compliance_roundtrip_when_set() {
+        use crate::compliance::{ComplianceRegime, EnforcementLevel};
+        let mut m = sample_manifest();
+        m.compliance.regime = ComplianceRegime::Pci;
+        m.compliance.enforcement = EnforcementLevel::Strict;
+        let j = serde_json::to_string(&m).unwrap();
+        assert!(j.contains(r#""compliance""#));
+        assert!(j.contains(r#""pci""#));
+        assert!(j.contains(r#""strict""#));
+        let back: PipelineManifest = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.compliance.regime, ComplianceRegime::Pci);
+        assert_eq!(back.compliance.enforcement, EnforcementLevel::Strict);
+    }
+
+    #[test]
     fn durability_block_defaults_to_none_mode() {
         let d = DurabilityBlock::default();
         assert_eq!(d.mode, DurabilityMode::None);
@@ -714,5 +881,118 @@ mod tests {
         let m = sample_manifest();
         let def = m.to_pipeline_definition();
         assert!(def.sinks[0].config.get("eos_tier").unwrap().contains("T2"));
+    }
+
+    // ── S6.7 SubjectExtractConfig ──────────────────────────────────────
+
+    #[test]
+    fn subject_extract_json_path_roundtrips() {
+        let cfg = SubjectExtractConfig::JsonPath {
+            namespace: "tenant-acme".into(),
+            path: "$.user.id".into(),
+        };
+        let j = serde_json::to_string(&cfg).unwrap();
+        // Verify the externally-tagged form with `kind: json_path`.
+        assert!(j.contains("\"kind\":\"json_path\""));
+        assert!(j.contains("\"namespace\":\"tenant-acme\""));
+        assert!(j.contains("\"path\":\"$.user.id\""));
+        let back: SubjectExtractConfig = serde_json::from_str(&j).unwrap();
+        assert_eq!(back, cfg);
+    }
+
+    #[test]
+    fn subject_extract_header_roundtrips() {
+        let cfg = SubjectExtractConfig::Header {
+            namespace: "tenant-acme".into(),
+            name: "X-User-Id".into(),
+        };
+        let j = serde_json::to_string(&cfg).unwrap();
+        assert!(j.contains("\"kind\":\"header\""));
+        let back: SubjectExtractConfig = serde_json::from_str(&j).unwrap();
+        assert_eq!(back, cfg);
+    }
+
+    #[test]
+    fn subject_extract_metadata_literal_roundtrips() {
+        let cfg = SubjectExtractConfig::MetadataLiteral;
+        let j = serde_json::to_string(&cfg).unwrap();
+        assert!(j.contains("\"kind\":\"metadata_literal\""));
+        let back: SubjectExtractConfig = serde_json::from_str(&j).unwrap();
+        assert_eq!(back, cfg);
+    }
+
+    #[test]
+    fn subject_extract_validate_accepts_good_config() {
+        SubjectExtractConfig::JsonPath {
+            namespace: "tenant-acme".into(),
+            path: "$.user.id".into(),
+        }
+        .validate()
+        .unwrap();
+        SubjectExtractConfig::Header {
+            namespace: "tenant-acme".into(),
+            name: "X-User-Id".into(),
+        }
+        .validate()
+        .unwrap();
+        SubjectExtractConfig::MetadataLiteral.validate().unwrap();
+    }
+
+    #[test]
+    fn subject_extract_validate_rejects_bad_namespace() {
+        let cfg = SubjectExtractConfig::JsonPath {
+            namespace: "has whitespace".into(),
+            path: "$.x".into(),
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn subject_extract_validate_rejects_empty_path() {
+        let cfg = SubjectExtractConfig::JsonPath {
+            namespace: "tenant-a".into(),
+            path: "  ".into(),
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn subject_extract_validate_rejects_empty_header_name() {
+        let cfg = SubjectExtractConfig::Header {
+            namespace: "tenant-a".into(),
+            name: "".into(),
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn source_manifest_defaults_subject_extract_to_none() {
+        // Back-compat: a manifest without `subject_extract` must still
+        // parse, leaving the field as None (schema-level Default).
+        let j = r#"{"name":"orders-kafka","type":"kafka","kind":"pull"}"#;
+        let m: SourceManifest = serde_json::from_str(j).unwrap();
+        assert!(m.subject_extract.is_none());
+    }
+
+    #[test]
+    fn source_manifest_parses_subject_extract() {
+        let j = r#"{
+            "name": "orders-kafka",
+            "type": "kafka",
+            "kind": "pull",
+            "subject_extract": {
+                "kind": "header",
+                "namespace": "tenant-acme",
+                "name": "X-User-Id"
+            }
+        }"#;
+        let m: SourceManifest = serde_json::from_str(j).unwrap();
+        match m.subject_extract.unwrap() {
+            SubjectExtractConfig::Header { namespace, name } => {
+                assert_eq!(namespace, "tenant-acme");
+                assert_eq!(name, "X-User-Id");
+            }
+            other => panic!("expected Header, got {other:?}"),
+        }
     }
 }

@@ -8,7 +8,10 @@
 //! - [`poh`] — Per-partition Proof of History chains
 //! - [`signing`] — Ed25519 digital signatures
 //! - [`encryption`] — EtM symmetric encryption (AES-256-CTR + HMAC-SHA-512)
+//! - [`at_rest`] — S3 AES-256-GCM payload sealing for L2 segments + L3 values
 //! - [`keys`] — Key management (KeyProvider trait, env/file providers)
+//! - [`kek`] — S1.2 dual-domain KEK + envelope-encrypted DEKs
+//! - [`hsm`] — S1.4 HSM / PKCS#11 provider trait stub
 //! - [`fips`] — FIPS 140-3 mode guard
 //! - [`tls`] — TLS/mTLS certificate management
 //! - [`auth`] — REST API authentication (api-key, mTLS)
@@ -19,14 +22,17 @@
 // Test modules and benches are exempt (`cfg(not(test))`).
 #![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod at_rest;
 pub mod auth;
 pub mod encryption;
 pub mod fips;
 pub mod hash;
+pub mod hsm;
 pub mod kek;
 pub mod keys;
 pub mod merkle;
 pub mod mmr;
+pub mod null_receipt;
 pub mod poh;
 pub mod signing;
 pub mod tls;

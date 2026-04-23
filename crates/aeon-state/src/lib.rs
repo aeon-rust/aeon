@@ -16,6 +16,7 @@ pub mod l1;
 #[cfg(feature = "mmap")]
 pub mod l2;
 pub mod l3;
+pub mod l3_encrypted;
 pub mod tiered;
 pub mod typed;
 pub mod window;
@@ -24,6 +25,7 @@ pub use l1::L1Store;
 #[cfg(feature = "mmap")]
 pub use l2::L2Store;
 pub use l3::{BatchEntry, BatchOp, KvPairs, L3Backend, L3Store};
+pub use l3_encrypted::EncryptedL3Store;
 #[cfg(feature = "redb")]
 pub use l3::{RedbConfig, RedbStore};
 pub use tiered::{TieredConfig, TieredStore};

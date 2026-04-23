@@ -9,13 +9,14 @@
 //!   pending deliveries. Higher throughput, downstream sorts by UUIDv7.
 
 use aeon_types::{
-    AeonError, BatchResult, DeliveryStrategy, IdempotentSink, Output, Sink, SinkAckCallback,
-    SinkEosTier, TransactionalSink,
+    AeonError, BatchResult, DeliveryStrategy, IdempotentSink, OutboundAuthSigner, Output, Sink,
+    SinkAckCallback, SinkEosTier, TransactionalSink,
 };
 use futures_util::future::join_all;
 use rdkafka::config::ClientConfig;
 use rdkafka::message::OwnedHeaders;
 use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
+use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -49,6 +50,11 @@ pub struct KafkaSinkConfig {
     /// is provided producer-side (idempotent sequence numbers + transactional
     /// fencing), not via per-event-id lookups.
     pub transactional_id: Option<String>,
+    /// S10: outbound auth signer. `BrokerNative` passes SASL/SSL knobs
+    /// directly to rdkafka; `Mtls` sets `security.protocol=ssl` +
+    /// `ssl.{certificate,key}.pem`. HTTP-style modes are warned-and-
+    /// ignored (not meaningful for the Kafka protocol).
+    pub auth: Option<Arc<OutboundAuthSigner>>,
 }
 
 impl KafkaSinkConfig {
@@ -62,7 +68,15 @@ impl KafkaSinkConfig {
             config_overrides: Vec::new(),
             strategy: DeliveryStrategy::default(),
             transactional_id: None,
+            auth: None,
         }
+    }
+
+    /// Attach an outbound auth signer (S10). See [`crate::kafka::auth`]
+    /// for the per-mode translation onto rdkafka config knobs.
+    pub fn with_auth(mut self, signer: Arc<OutboundAuthSigner>) -> Self {
+        self.auth = Some(signer);
+        self
     }
 
     /// Enable Kafka transactions (EOS) with a stable, unique `transactional.id`.
@@ -158,6 +172,10 @@ impl KafkaSink {
         if let Some(ref tid) = config.transactional_id {
             client_config.set("transactional.id", tid);
         }
+
+        // S10: outbound auth (BrokerNative / Mtls) before user overrides so
+        // the user escape-hatch (`config_overrides`) always wins for debugging.
+        super::auth::apply_outbound_auth(&mut client_config, config.auth.as_ref());
 
         // Apply user overrides
         for (k, v) in &config.config_overrides {

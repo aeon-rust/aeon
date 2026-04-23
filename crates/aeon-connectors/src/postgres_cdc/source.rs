@@ -7,7 +7,10 @@
 //! For streaming replication protocol, a future version will use
 //! START_REPLICATION with a walsender connection.
 
-use aeon_types::{AeonError, BackoffPolicy, CoreLocalUuidGenerator, Event, PartitionId, Source};
+use aeon_types::{
+    AeonError, BackoffPolicy, CoreLocalUuidGenerator, Event, OutboundAuthSigner, PartitionId,
+    Source,
+};
 use bytes::Bytes;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -33,6 +36,9 @@ pub struct PostgresCdcSourceConfig {
     /// `pg_logical_slot_get_changes()` query fails. Exponential + jitter
     /// prevents reconnect storms against a flaky Postgres primary.
     pub backoff: BackoffPolicy,
+    /// S10 outbound auth. When `Some`, the signer's mode drives how the
+    /// `tokio_postgres::Config` is built from `connection_string`.
+    pub auth: Option<Arc<OutboundAuthSigner>>,
 }
 
 impl PostgresCdcSourceConfig {
@@ -51,7 +57,14 @@ impl PostgresCdcSourceConfig {
             poll_interval: Duration::from_millis(100),
             source_name: Arc::from("postgres-cdc"),
             backoff: BackoffPolicy::default(),
+            auth: None,
         }
+    }
+
+    /// S10: attach an outbound-auth signer.
+    pub fn with_auth(mut self, signer: Arc<OutboundAuthSigner>) -> Self {
+        self.auth = Some(signer);
+        self
     }
 
     /// Override the reconnect backoff policy.
@@ -127,7 +140,9 @@ impl PostgresCdcSource {
 async fn establish(
     config: &PostgresCdcSourceConfig,
 ) -> Result<(Client, tokio::task::JoinHandle<()>), AeonError> {
-    let (client, connection) = tokio_postgres::connect(&config.connection_string, NoTls)
+    let pg_config = super::auth::resolve_config(&config.connection_string, config.auth.as_ref())?;
+    let (client, connection) = pg_config
+        .connect(NoTls)
         .await
         .map_err(|e| AeonError::connection(format!("postgres connect failed: {e}")))?;
 

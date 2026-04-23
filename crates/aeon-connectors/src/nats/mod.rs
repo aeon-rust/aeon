@@ -6,6 +6,7 @@
 //! `NatsSink`: Publishes outputs to a NATS subject (optionally via JetStream
 //!   for persistence guarantees).
 
+mod auth;
 mod sink;
 mod source;
 

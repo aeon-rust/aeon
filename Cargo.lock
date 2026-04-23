@@ -134,6 +134,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.18",
+ "uuid",
  "zeroize",
 ]
 
@@ -235,6 +236,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "serde_json",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
@@ -279,6 +281,7 @@ dependencies = [
 name = "aeon-state"
 version = "0.1.0"
 dependencies = [
+ "aeon-crypto",
  "aeon-types",
  "bincode",
  "bytes",
@@ -287,6 +290,7 @@ dependencies = [
  "memmap2",
  "redb",
  "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",

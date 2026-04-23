@@ -45,3 +45,7 @@ pub use partition_driver::{
 };
 #[cfg(feature = "cluster")]
 pub use store::SharedClusterState;
+#[cfg(feature = "cluster")]
+pub use transport::{
+    CutoverCoordinator, PartitionTransferProvider, PohChainProvider, SourceProviderSlots,
+};

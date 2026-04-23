@@ -3,7 +3,9 @@
 //! Uses `StreamConsumer` for async integration with tokio.
 //! Manual `assign()` instead of `subscribe()` — Aeon manages partition ownership.
 
-use aeon_types::{AeonError, ConsumerMode, CoreLocalUuidGenerator, Event, PartitionId, Source};
+use aeon_types::{
+    AeonError, ConsumerMode, CoreLocalUuidGenerator, Event, OutboundAuthSigner, PartitionId, Source,
+};
 use bytes::Bytes;
 use rdkafka::TopicPartitionList;
 use rdkafka::config::ClientConfig;
@@ -46,6 +48,11 @@ pub struct KafkaSourceConfig {
     /// ownership (validated at pipeline start). The `group_id` on
     /// `ConsumerMode::Group` overrides the `group_id` field above.
     pub consumer_mode: ConsumerMode,
+    /// S10: outbound auth signer. `BrokerNative` passes SASL/SSL knobs
+    /// directly to rdkafka; `Mtls` sets `security.protocol=ssl` +
+    /// `ssl.{certificate,key}.pem`. HTTP-style modes are warned-and-
+    /// ignored (not meaningful for the Kafka protocol).
+    pub auth: Option<Arc<OutboundAuthSigner>>,
 }
 
 impl KafkaSourceConfig {
@@ -63,12 +70,20 @@ impl KafkaSourceConfig {
             max_empty_polls: 10,
             config_overrides: Vec::new(),
             consumer_mode: ConsumerMode::Single,
+            auth: None,
         }
     }
 
     /// Set the consumer-group mode (B4). See `ConsumerMode`.
     pub fn with_consumer_mode(mut self, mode: ConsumerMode) -> Self {
         self.consumer_mode = mode;
+        self
+    }
+
+    /// Attach an outbound auth signer (S10). See [`crate::kafka::auth`]
+    /// for the per-mode translation onto rdkafka config knobs.
+    pub fn with_auth(mut self, signer: Arc<OutboundAuthSigner>) -> Self {
+        self.auth = Some(signer);
         self
     }
 
@@ -173,6 +188,10 @@ impl KafkaSource {
             .set("fetch.wait.max.ms", "100")
             .set("queued.min.messages", "100000") // Pre-fetch aggressively
             .set("queued.max.messages.kbytes", "65536"); // 64MB pre-fetch buffer
+
+        // S10: outbound auth (BrokerNative / Mtls) before user overrides so
+        // the user escape-hatch (`config_overrides`) always wins for debugging.
+        super::auth::apply_outbound_auth(&mut client_config, config.auth.as_ref());
 
         // Apply user overrides
         for (k, v) in &config.config_overrides {

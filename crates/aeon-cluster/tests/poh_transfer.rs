@@ -31,18 +31,22 @@ struct LivePohProvider {
 }
 
 impl PohChainProvider for LivePohProvider {
-    fn export_state(
-        &self,
-        _req: &PohChainTransferRequest,
-    ) -> Result<Vec<u8>, AeonError> {
-        let chain = self
-            .chain
-            .lock()
-            .map_err(|e| AeonError::state(format!("poh chain mutex poisoned: {e}")))?;
-        let state = chain.export_state();
-        state.to_bytes().map_err(|e| AeonError::Serialization {
-            message: format!("PohChainState::to_bytes: {e}"),
-            source: None,
+    fn export_state<'a>(
+        &'a self,
+        _req: &'a PohChainTransferRequest,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<u8>, AeonError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let chain = self
+                .chain
+                .lock()
+                .map_err(|e| AeonError::state(format!("poh chain mutex poisoned: {e}")))?;
+            let state = chain.export_state();
+            state.to_bytes().map_err(|e| AeonError::Serialization {
+                message: format!("PohChainState::to_bytes: {e}"),
+                source: None,
+            })
         })
     }
 }
@@ -177,6 +181,7 @@ async fn poh_chain_transfers_over_real_quic_and_preserves_head() {
     let mut source_clone = {
         let state_bytes = provider
             .export_state(&req)
+            .await
             .expect("re-export must succeed");
         let state = PohChainState::from_bytes(&state_bytes).unwrap();
         PohChain::from_state(state, MAX_RECENT)

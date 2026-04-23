@@ -31,6 +31,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use aeon_crypto::kek::KekHandle;
 use aeon_types::durability::DurabilityMode;
 use aeon_types::error::AeonError;
 use aeon_types::registry::PipelineDefinition;
@@ -39,6 +40,10 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
 use crate::connector_registry::{ConnectorRegistry, PartitionOwnershipResolver};
+use crate::compliance_validator::validate_compliance;
+use crate::encryption_probe::resolve_encryption_plan;
+use crate::erasure_probe::resolve_erasure_plan;
+use crate::retention_probe::resolve_retention_plan;
 use crate::pipeline::{
     PipelineConfig, PipelineControl, PipelineMetrics, run_buffered_managed,
 };
@@ -98,6 +103,25 @@ pub struct PipelineSupervisor {
     #[cfg(all(feature = "processor-auth", feature = "cluster"))]
     poh_installed_chains:
         OnceLock<Arc<crate::partition_install::InstalledPohChainRegistry>>,
+    /// CL-6c.4: shared `LivePohChainRegistry`. Constructed once at
+    /// supervisor creation so `start()` can stamp the same Arc onto
+    /// every pipeline's `PipelineConfig.poh_live_chains` and the
+    /// source-side `PohChainExportProvider` reads from the same
+    /// instance. Unlike `poh_installed_chains` this is always-on (not
+    /// `OnceLock`): no external bootstrap step is required, and
+    /// pipelines with `poh = None` simply never register anything.
+    /// Available even without the cluster feature so the API is
+    /// uniform — the cluster crate is the only consumer that reads it.
+    #[cfg(all(feature = "processor-auth", feature = "cluster"))]
+    poh_live_chains: Arc<crate::partition_install::LivePohChainRegistry>,
+    /// S3: node-wide data-context KEK handle. Installed once by
+    /// `cmd_serve` after the secret provider and KEK bootstrap finish;
+    /// consumed by `start()` via `resolve_encryption_plan` to decide
+    /// whether to accept a pipeline whose manifest declares
+    /// `encryption.at_rest = required`. Absent handle + `required`
+    /// manifest = hard refusal to start. Tests / benches / single-node
+    /// callers that don't care about at-rest leave this unset.
+    data_context_kek: OnceLock<Arc<KekHandle>>,
 }
 
 impl PipelineSupervisor {
@@ -109,7 +133,34 @@ impl PipelineSupervisor {
             ownership: OnceLock::new(),
             #[cfg(all(feature = "processor-auth", feature = "cluster"))]
             poh_installed_chains: OnceLock::new(),
+            #[cfg(all(feature = "processor-auth", feature = "cluster"))]
+            poh_live_chains: Arc::new(
+                crate::partition_install::LivePohChainRegistry::new(),
+            ),
+            data_context_kek: OnceLock::new(),
         }
+    }
+
+    /// S3: install the node-wide data-context KEK used to wrap per-
+    /// segment / per-value DEKs. Intended to be called once by
+    /// `cmd_serve` after the secret registry is configured; the Arc is
+    /// shared across all pipelines on this node. Returns `Err` if a
+    /// KEK is already installed — startup ordering bug.
+    ///
+    /// If this is never called, pipelines with
+    /// `encryption.at_rest = required` will fail to start (by design);
+    /// pipelines with `off` / `optional` still start, running plaintext.
+    pub fn set_data_context_kek(&self, kek: Arc<KekHandle>) -> Result<(), AeonError> {
+        self.data_context_kek.set(kek).map_err(|_| {
+            AeonError::state("PipelineSupervisor: data-context KEK already installed")
+        })
+    }
+
+    /// Currently-installed data-context KEK, if any. Returns a clone
+    /// of the shared `Arc` so callers can hold it past the supervisor's
+    /// borrow.
+    pub fn data_context_kek(&self) -> Option<Arc<KekHandle>> {
+        self.data_context_kek.get().cloned()
     }
 
     /// G11.c: install the shared `InstalledPohChainRegistry`. Called once
@@ -138,6 +189,19 @@ impl PipelineSupervisor {
     /// this to look up `(pipeline, partition)` gates during handover.
     pub fn gate_registry(&self) -> Arc<WriteGateRegistry> {
         Arc::clone(&self.gate_registry)
+    }
+
+    /// CL-6c.4: shared registry of *live* `Arc<Mutex<PohChain>>`
+    /// handles. Cluster-side `PohChainExportProvider` reads from this
+    /// when a peer asks for the partition's PoH state during a CL-6
+    /// handover. The supervisor stamps the same Arc onto every
+    /// pipeline's `PipelineConfig.poh_live_chains` so `create_poh_state`
+    /// can register the chain it produces.
+    #[cfg(all(feature = "processor-auth", feature = "cluster"))]
+    pub fn poh_live_chains(
+        &self,
+    ) -> Arc<crate::partition_install::LivePohChainRegistry> {
+        Arc::clone(&self.poh_live_chains)
     }
 
     /// Install the cluster-ownership resolver. Intended to be called once
@@ -214,6 +278,69 @@ impl PipelineSupervisor {
             source_cfg
         };
 
+        // S3: resolve the pipeline's declared at-rest encryption posture
+        // against the node-wide data-context KEK *before* any connector /
+        // processor is built. `at_rest = required` without a KEK returns
+        // an error here, so a mis-configured pipeline never opens a
+        // socket or a Kafka consumer. The resolved plan rides on
+        // `PipelineConfig.encryption_plan` so the EO-2 L2 registry /
+        // L3 wrapper can install the KEK when it constructs them.
+        let encryption_plan = resolve_encryption_plan(
+            &def.encryption,
+            self.data_context_kek.get().cloned(),
+        )
+        .map_err(|e| {
+            AeonError::config(format!(
+                "pipeline '{name}' refused to start: {e}"
+            ))
+        })?;
+
+        // S6.9: resolve the declared compliance block against the
+        // just-resolved encryption plan. A GDPR/Mixed pipeline under
+        // strict enforcement refuses to start when at-rest encryption
+        // is not active — tombstones cannot credibly honour Art. 17
+        // when segments remain plaintext on disk and in backups. Warn
+        // enforcement logs but starts. Other regimes (PCI / HIPAA /
+        // None) and Off enforcement short-circuit to a no-op plan.
+        let erasure_plan = resolve_erasure_plan(&def.compliance, &encryption_plan)
+            .map_err(|e| {
+                AeonError::config(format!(
+                    "pipeline '{name}' refused to start: {e}"
+                ))
+            })?;
+
+        // S5: resolve the declared retention posture. A malformed
+        // `hold_after_ack` string is a hard refusal to start — a
+        // pipeline that would silently wait 0 seconds (or crash on
+        // first GC sweep) is worse than a clear error at boot.
+        let retention_plan = resolve_retention_plan(&def.durability.retention)
+            .map_err(|e| {
+                AeonError::config(format!(
+                    "pipeline '{name}' refused to start: {e}"
+                ))
+            })?;
+
+        // S4.2: cross-cut the three resolved plans against the
+        // declared compliance regime. PCI / HIPAA require
+        // encryption + retention; GDPR / Mixed additionally require
+        // an erasure surface. Strict enforcement aborts start on any
+        // unmet precondition; warn logs each finding and boots
+        // anyway; off and `regime=None` short-circuit to a no-op.
+        // The individual probes (S3/S5/S6.9) have already caught
+        // their own local errors — this is the single authoritative
+        // check that a PCI-strict pipeline isn't running plaintext.
+        validate_compliance(
+            &def.compliance,
+            &encryption_plan,
+            &retention_plan,
+            &erasure_plan,
+        )
+        .map_err(|e| {
+            AeonError::config(format!(
+                "pipeline '{name}' refused to start: {e}"
+            ))
+        })?;
+
         let source = self.connectors.build_source(source_cfg_ref)?;
         let mut sink = self.connectors.build_sink(sink_cfg)?;
 
@@ -233,6 +360,8 @@ impl PipelineSupervisor {
         let mut pipeline_config = pipeline_config_for(def);
         pipeline_config.partition_id = partition_id;
         pipeline_config.write_gate = Some(gate);
+        pipeline_config.encryption_plan = Some(encryption_plan);
+        pipeline_config.retention_plan = Some(retention_plan);
         // G11.c: share the process-wide PoH-chain install registry so
         // `create_poh_state` can resume a chain a recent partition-transfer
         // installed on this node instead of genesising fresh.
@@ -240,6 +369,12 @@ impl PipelineSupervisor {
         {
             pipeline_config.poh_installed_chains =
                 self.poh_installed_chains.get().cloned();
+            // CL-6c.4: stamp the shared live-chain registry so
+            // `create_poh_state` can register the chain it produces and
+            // the source-side `PohChainExportProvider` can find it on
+            // the next outbound transfer.
+            pipeline_config.poh_live_chains =
+                Some(Arc::clone(&self.poh_live_chains));
         }
         // P5: if the installed ownership resolver exposes a change-feed,
         // subscribe the pipeline so the source loop can `reassign_partitions`
@@ -344,6 +479,12 @@ impl PipelineSupervisor {
         // the DrainGuard drop inside the source task; the `Frozen` state
         // dies with the Arc once every holder releases.
         self.gate_registry.remove_pipeline(name);
+
+        // CL-6c.4: drop live PoH chain handles for this pipeline so a
+        // subsequent re-`start()` doesn't see stale references that
+        // outlive the underlying processor task.
+        #[cfg(all(feature = "processor-auth", feature = "cluster"))]
+        self.poh_live_chains.remove_pipeline(name);
 
         tracing::info!(pipeline = %name, "supervisor stopped pipeline");
         Ok(())
@@ -837,6 +978,247 @@ mod tests {
             .expect("first install ok");
         let err = sup
             .set_ownership_resolver(Arc::new(StubOwnershipResolver(Some(vec![1]))))
+            .expect_err("second install must fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("already installed"),
+            "error must explain the reason, got: {msg}"
+        );
+    }
+
+    // ─── S3: at-rest encryption probe wired into pipeline start ───
+
+    /// Build a real data-context `KekHandle` for tests. Mirrors the
+    /// pattern in `encryption_probe::tests` / `l2_body::tests` — unique
+    /// env var per call, hex-encoded 32-byte key, registered HexEnv
+    /// provider.
+    fn test_data_context_kek() -> Arc<aeon_crypto::kek::KekHandle> {
+        use aeon_types::{
+            SecretBytes, SecretError, SecretProvider, SecretRef, SecretRegistry,
+            SecretScheme,
+        };
+        use std::sync::atomic::AtomicU64;
+
+        struct HexEnv;
+        impl SecretProvider for HexEnv {
+            fn scheme(&self) -> SecretScheme {
+                SecretScheme::Env
+            }
+            fn resolve(&self, path: &str) -> Result<SecretBytes, SecretError> {
+                let v = std::env::var(path)
+                    .map_err(|_| SecretError::EnvNotSet(path.to_string()))?;
+                let bytes: Vec<u8> = (0..v.len())
+                    .step_by(2)
+                    .map(|i| u8::from_str_radix(&v[i..i + 2], 16).unwrap_or(0))
+                    .collect();
+                Ok(SecretBytes::new(bytes))
+            }
+        }
+
+        static N: AtomicU64 = AtomicU64::new(0);
+        let var = format!(
+            "AEON_SUP_TEST_KEK_{}",
+            N.fetch_add(1, Ordering::Relaxed)
+        );
+        let hex: String = (0..32).map(|_| "42".to_string()).collect();
+        // SAFETY: test-only env mutation, unique var per call.
+        unsafe { std::env::set_var(&var, &hex) };
+        let mut reg = SecretRegistry::empty();
+        reg.register(Arc::new(HexEnv));
+        Arc::new(aeon_crypto::kek::KekHandle::new(
+            aeon_crypto::kek::KekDomain::DataContext,
+            "test-sup-kek",
+            SecretRef::env(&var),
+            Arc::new(reg),
+        ))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_refuses_when_at_rest_required_but_no_kek_installed() {
+        let mut reg = ConnectorRegistry::new();
+        reg.register_source("count", Arc::new(CountingSourceFactory(10)));
+        let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        reg.register_sink("capture", Arc::new(CapturingSinkFactory(counter)));
+
+        let sup = PipelineSupervisor::new(Arc::new(reg));
+        let mut def = def_for("p-req-no-kek");
+        def.encryption.at_rest = aeon_types::AtRestEncryption::Required;
+
+        // No `set_data_context_kek` call — the probe must refuse.
+        let msg = match sup.start(&def).await {
+            Err(e) => format!("{e}"),
+            Ok(_) => panic!("required + no KEK must refuse to start"),
+        };
+        assert!(
+            msg.contains("refused to start")
+                && msg.contains("no data-context KEK"),
+            "error must cite the missing KEK, got: {msg}"
+        );
+        assert!(
+            !sup.is_running("p-req-no-kek").await,
+            "refused pipeline must not show as running"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_succeeds_when_at_rest_required_and_kek_installed() {
+        let mut reg = ConnectorRegistry::new();
+        reg.register_source("count", Arc::new(CountingSourceFactory(50)));
+        let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        reg.register_sink(
+            "capture",
+            Arc::new(CapturingSinkFactory(Arc::clone(&counter))),
+        );
+
+        let sup = PipelineSupervisor::new(Arc::new(reg));
+        sup.set_data_context_kek(test_data_context_kek())
+            .expect("install kek");
+
+        let mut def = def_for("p-req-kek");
+        def.encryption.at_rest = aeon_types::AtRestEncryption::Required;
+
+        let (_ctrl, _metrics) =
+            sup.start(&def).await.expect("required + KEK must start");
+
+        let ok = wait_until(|| counter.load(Ordering::Relaxed) >= 50, 500).await;
+        assert!(
+            ok,
+            "expected 50 outputs under encrypted pipeline, got {}",
+            counter.load(Ordering::Relaxed)
+        );
+        sup.stop("p-req-kek").await.expect("stop");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_succeeds_with_at_rest_off_regardless_of_kek() {
+        // The historical default path — manifest leaves `encryption`
+        // inert (at_rest=off), no KEK installed — must continue to work
+        // after the probe wiring. This is the S3 backward-compat gate.
+        let mut reg = ConnectorRegistry::new();
+        reg.register_source("count", Arc::new(CountingSourceFactory(20)));
+        let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        reg.register_sink(
+            "capture",
+            Arc::new(CapturingSinkFactory(Arc::clone(&counter))),
+        );
+
+        let sup = PipelineSupervisor::new(Arc::new(reg));
+        // Explicitly no KEK installed.
+
+        let def = def_for("p-off"); // encryption defaults to Off
+        let (_ctrl, _metrics) =
+            sup.start(&def).await.expect("off + no KEK must still start");
+
+        let ok = wait_until(|| counter.load(Ordering::Relaxed) >= 20, 500).await;
+        assert!(ok, "expected 20 outputs on plaintext pipeline");
+        sup.stop("p-off").await.expect("stop");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_succeeds_with_at_rest_optional_and_no_kek() {
+        // `Optional` = use-KEK-if-available, plaintext otherwise. Must
+        // not refuse to start; must run to completion even without a
+        // KEK installed.
+        let mut reg = ConnectorRegistry::new();
+        reg.register_source("count", Arc::new(CountingSourceFactory(15)));
+        let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        reg.register_sink(
+            "capture",
+            Arc::new(CapturingSinkFactory(Arc::clone(&counter))),
+        );
+
+        let sup = PipelineSupervisor::new(Arc::new(reg));
+        let mut def = def_for("p-opt-no-kek");
+        def.encryption.at_rest = aeon_types::AtRestEncryption::Optional;
+
+        let (_ctrl, _metrics) =
+            sup.start(&def).await.expect("optional + no KEK must start");
+        let ok = wait_until(|| counter.load(Ordering::Relaxed) >= 15, 500).await;
+        assert!(ok, "expected 15 outputs on optional-but-plaintext pipeline");
+        sup.stop("p-opt-no-kek").await.expect("stop");
+    }
+
+    // ─── S5: retention probe wired into pipeline start ───
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_refuses_on_malformed_hold_after_ack() {
+        let mut reg = ConnectorRegistry::new();
+        reg.register_source("count", Arc::new(CountingSourceFactory(5)));
+        let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        reg.register_sink("capture", Arc::new(CapturingSinkFactory(counter)));
+
+        let sup = PipelineSupervisor::new(Arc::new(reg));
+        let mut def = def_for("p-bad-hold");
+        def.durability.retention.l2_body.hold_after_ack =
+            Some("notaduration".into());
+
+        let msg = match sup.start(&def).await {
+            Err(e) => format!("{e}"),
+            Ok(_) => panic!("malformed hold_after_ack must refuse to start"),
+        };
+        assert!(
+            msg.contains("refused to start") && msg.contains("retention"),
+            "error must cite retention parse failure, got: {msg}"
+        );
+        assert!(
+            !sup.is_running("p-bad-hold").await,
+            "refused pipeline must not show as running"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_succeeds_with_valid_retention_fields() {
+        let mut reg = ConnectorRegistry::new();
+        reg.register_source("count", Arc::new(CountingSourceFactory(10)));
+        let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        reg.register_sink(
+            "capture",
+            Arc::new(CapturingSinkFactory(Arc::clone(&counter))),
+        );
+
+        let sup = PipelineSupervisor::new(Arc::new(reg));
+        let mut def = def_for("p-ret-ok");
+        def.durability.retention.l2_body.hold_after_ack = Some("30s".into());
+        def.durability.retention.l3_ack.max_records = Some(5_000);
+
+        let (_ctrl, _metrics) = sup
+            .start(&def)
+            .await
+            .expect("valid retention must start");
+        let ok = wait_until(|| counter.load(Ordering::Relaxed) >= 10, 500).await;
+        assert!(ok, "expected 10 outputs under retention-configured pipeline");
+        sup.stop("p-ret-ok").await.expect("stop");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_succeeds_with_inert_retention() {
+        // Default manifest — no retention knobs set — must run as before.
+        let mut reg = ConnectorRegistry::new();
+        reg.register_source("count", Arc::new(CountingSourceFactory(7)));
+        let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        reg.register_sink(
+            "capture",
+            Arc::new(CapturingSinkFactory(Arc::clone(&counter))),
+        );
+
+        let sup = PipelineSupervisor::new(Arc::new(reg));
+        let def = def_for("p-ret-inert");
+        assert!(def.durability.retention.is_default());
+
+        let (_ctrl, _metrics) =
+            sup.start(&def).await.expect("inert retention must start");
+        let ok = wait_until(|| counter.load(Ordering::Relaxed) >= 7, 500).await;
+        assert!(ok, "inert retention must not change behaviour");
+        sup.stop("p-ret-inert").await.expect("stop");
+    }
+
+    #[tokio::test]
+    async fn data_context_kek_install_is_once_only() {
+        let sup = PipelineSupervisor::new(Arc::new(ConnectorRegistry::new()));
+        sup.set_data_context_kek(test_data_context_kek())
+            .expect("first install ok");
+        let err = sup
+            .set_data_context_kek(test_data_context_kek())
             .expect_err("second install must fail");
         let msg = format!("{err}");
         assert!(

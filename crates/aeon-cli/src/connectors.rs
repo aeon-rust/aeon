@@ -158,6 +158,12 @@ impl SourceFactory for KafkaSourceFactory {
             kcfg = kcfg.with_max_empty_polls(parse_u32(Some(m), 10)?);
         }
 
+        // S10: outbound auth (BrokerNative / Mtls translated to rdkafka knobs;
+        // HTTP-style modes warned-and-ignored at the kafka::auth layer).
+        if let Some(signer) = build_outbound_auth_signer(&cfg.config)? {
+            kcfg = kcfg.with_auth(signer);
+        }
+
         Ok(Box::new(KafkaSource::new(kcfg)?))
     }
 }
@@ -197,6 +203,12 @@ impl SinkFactory for KafkaSinkFactory {
             // manifest works across every pod without hand-editing.
             let resolved = substitute_env_placeholders(tid)?;
             kcfg = kcfg.with_transactional_id(resolved);
+        }
+
+        // S10: outbound auth (BrokerNative / Mtls translated to rdkafka knobs;
+        // HTTP-style modes warned-and-ignored at the kafka::auth layer).
+        if let Some(signer) = build_outbound_auth_signer(&cfg.config)? {
+            kcfg = kcfg.with_auth(signer);
         }
 
         Ok(Box::new(KafkaSink::new(kcfg)?))

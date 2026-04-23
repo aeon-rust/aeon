@@ -15,7 +15,7 @@ categories = ["concurrency", "asynchronous"]
 default = ["native-loader", "rest-api", "processor-auth", "websocket-host"]
 native-loader = ["libloading", "aeon-native-sdk", "sha2", "hex"]
 rest-api = ["axum", "tower-http", "sha2", "hex", "aeon-wasm"]
-processor-auth = ["aeon-crypto", "rand", "sha2", "hex", "base64"]
+processor-auth = ["rand", "sha2", "hex", "base64"]
 webtransport-host = ["wtransport", "rustls", "processor-auth"]
 websocket-host = ["processor-auth", "rest-api", "axum/ws"]
 cluster = ["aeon-cluster"]
@@ -52,8 +52,11 @@ aeon-native-sdk = { workspace = true, optional = true }
 # Cluster state for REST API status endpoint (feature-gated)
 aeon-cluster = { workspace = true, optional = true, features = ["cluster"] }
 
+# S1/S3 crypto primitives (dual KEK + at-rest AES-256-GCM sealing) —
+# core durability surface, not feature-gated.
+aeon-crypto = { workspace = true }
+
 # Processor identity / challenge-response auth (feature-gated)
-aeon-crypto = { workspace = true, optional = true }
 rand = { version = "0.8", optional = true }
 
 # REST API (feature-gated)

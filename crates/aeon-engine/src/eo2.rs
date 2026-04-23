@@ -6,6 +6,7 @@
 
 use crate::delivery::L2BodyStoreConfig;
 use crate::l2_body::{L2BodyConfig, L2BodyStore};
+use aeon_crypto::kek::KekHandle;
 use aeon_types::{AeonError, DurabilityMode, Event, PartitionId, Source, SourceKind};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -25,6 +26,13 @@ pub struct PipelineL2Registry {
     inner: Arc<Mutex<L2RegistryMap>>,
     root: Option<PathBuf>,
     segment_bytes: u64,
+    /// Data-context KEK for per-segment at-rest encryption. `None`
+    /// means segments are written plaintext (S3 `at_rest=off`).
+    kek: Option<Arc<KekHandle>>,
+    /// S5: retention hold applied to acked segments before `gc_up_to`
+    /// physically deletes them. `ZERO` is the pre-S5 ack-immediate
+    /// behaviour.
+    gc_min_hold: std::time::Duration,
 }
 
 impl PipelineL2Registry {
@@ -38,7 +46,25 @@ impl PipelineL2Registry {
             inner: Arc::default(),
             root,
             segment_bytes: config.segment_bytes,
+            kek: None,
+            gc_min_hold: std::time::Duration::ZERO,
         }
+    }
+
+    /// Install the data-context KEK used to wrap per-segment DEKs. Must
+    /// be called before any partition store is opened; stores already
+    /// resolved through the registry retain their original cipher state.
+    pub fn with_kek(mut self, kek: Arc<KekHandle>) -> Self {
+        self.kek = Some(kek);
+        self
+    }
+
+    /// S5: install the minimum hold applied before `gc_up_to` physically
+    /// deletes a segment that has become eligible for reclaim. Must be
+    /// called before any partition store is opened.
+    pub fn with_gc_min_hold(mut self, hold: std::time::Duration) -> Self {
+        self.gc_min_hold = hold;
+        self
     }
 
     /// Get-or-create the `L2BodyStore` for `(pipeline, partition)`.
@@ -68,6 +94,8 @@ impl PipelineL2Registry {
             dir,
             L2BodyConfig {
                 segment_bytes: self.segment_bytes,
+                kek: self.kek.clone(),
+                gc_min_hold: self.gc_min_hold,
             },
         )?;
         let handle = Arc::new(Mutex::new(store));
@@ -81,6 +109,22 @@ impl PipelineL2Registry {
             .lock()
             .map(|g| g.keys().cloned().collect())
             .unwrap_or_default()
+    }
+
+    /// Directory the `L2BodyStore` for `(pipeline, partition)` lives in.
+    /// Returns `None` only when the registry was constructed without a
+    /// root (an uninitialised default). The path is computed
+    /// deterministically — it does not require the store to be opened.
+    /// Used by CL-6c.4's `L2SegmentTransferProvider` to walk segments
+    /// even when the partition is currently quiesced.
+    pub fn partition_dir(
+        &self,
+        pipeline: &str,
+        partition: PartitionId,
+    ) -> Option<PathBuf> {
+        self.root
+            .as_ref()
+            .map(|r| r.join(pipeline).join(format!("p{:05}", partition.as_u16())))
     }
 }
 

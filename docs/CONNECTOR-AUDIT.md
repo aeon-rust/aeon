@@ -1094,14 +1094,19 @@ config failure); S2 closed **payload-never-in-logs**; S7 closed
 **SSRF / external URL hardening**; S1 closed **secret provider + KEK
 envelope encryption + rotation** (see §9.10–§9.12); S9 closed
 **inbound connector auth** (see §9.13–§9.15); S10 primitives + HTTP
-surface closed (see §9.16–§9.18). Remaining security/compliance
-workstreams are tracked in `ROADMAP.md`:
+surface + WebSocket handshake wiring + Kafka + Redis + NATS +
+Postgres-CDC + MySQL-CDC + Mongo-CDC broker-native + WebTransport
+sink HTTP/3 CONNECT header auth closed (see §9.16–§9.24). Remaining
+security/compliance workstreams are tracked in `ROADMAP.md`:
 
-- **S10 remaining** — WebSocket source/sink header injection,
-  WebTransport sink identity, and broker-native wiring for Kafka /
-  Redis / NATS / Postgres CDC / MySQL CDC / MongoDB CDC (plumb
-  `signer.broker_native()` values into the underlying SDK auth
-  path; mTLS identity on the TCP/TLS transports that support it).
+- **S10 remaining** — WebTransport sink mTLS builder helper;
+  SDK-level mTLS follow-ups (WebSocket custom rustls connector,
+  Redis `tls-rustls` feature, NATS in-memory PEM, Postgres
+  `tokio-postgres-rustls`, MySQL `native-tls-tls`/`rustls-tls`
+  feature, MongoDB tempfile-or-patch for
+  `TlsOptions::cert_key_file_path`); aeon-cli factory registration
+  for WebSocket / Redis / NATS / PG-CDC / MySQL-CDC / Mongo-CDC
+  source/sink (P5.c).
 - **S4** — Compliance mode manifest (PCI-DSS / HIPAA / GDPR)
 - **S3** — L2 + L3 at-rest encryption + perf re-bench
 - **S5** — Configurable retention (L2 body / L3 ack windows)
@@ -1115,8 +1120,11 @@ trait. Helm / CI-CD tooling injects env vars; secrets live in Vault
 artifact as last resort. Literal values warn at load.
 
 Sequence approved 2026-04-22: S8 → S2 → S7 → S1 → S9 → **S10** →
-S4 → S3 → S5 → S6 (S8, S2, S7, S1, S9 closed; S10 primitives + HTTP
-closed, broker-native wiring in progress).
+S4 → S3 → S5 → S6 (S8, S2, S7, S1, S9 closed; S10 primitives +
+HTTP + WebSocket + Kafka + Redis + NATS + Postgres-CDC + MySQL-CDC
++ Mongo-CDC broker-native + WebTransport sink HTTP/3 header auth
+closed; SDK-level mTLS follow-ups and aeon-cli factory wiring
+pending at P5.c).
 
 ### 9.10 S1.1 Secret provider — `aeon_types::secrets` module — **Closed 2026-04-22**
 
@@ -1348,3 +1356,336 @@ algorithm, broker-native map round-trip, unknown-mode rejection,
 unknown-algorithm rejection, empty-credential build rejection) —
 full `cargo test -p aeon-cli --features rest-api connectors::`
 suite 42/42 green.
+
+### 9.19 S10.4 WebSocket source/sink wiring — **Closed 2026-04-22**
+
+Both `WebSocketSourceConfig` and `WebSocketSinkConfig` gained an
+`auth: Option<Arc<OutboundAuthSigner>>` field and a
+`with_auth(signer)` builder. Auth headers are injected on the
+WebSocket **upgrade handshake** — the only point where the
+tungstenite stack accepts custom headers — by building an
+`http::Request<()>` via
+`tokio_tungstenite::tungstenite::client::IntoClientRequest` and
+inserting the headers returned from
+`signer.http_headers(OutboundSignContext{ method: "GET", path,
+body: b"", now_unix })` before calling
+`tokio_tungstenite::connect_async(request)`.
+
+Per-mode behaviour:
+
+- **Bearer / Basic / ApiKey / HmacSign** — headers flow onto the
+  handshake exactly as for HTTP. HMAC canonicalizes over the
+  handshake request line with an empty body, so server-side
+  verification can reuse the HTTP HMAC verifier with the same
+  rules.
+- **None** — unmodified handshake, no Authorization header
+  appears.
+- **Mtls** — logged-and-ignored at this layer. Tungstenite's
+  built-in TLS path doesn't accept a client identity; a custom
+  rustls connector is required. Tracked as follow-up S10 work.
+- **BrokerNative** — warned-and-ignored (not applicable to
+  WebSocket).
+
+The source-side reconnect loop re-builds the request on every
+reconnect so HMAC timestamps stay fresh (no stale `X-Aeon-Ts`
+replays past the server skew window), and continues to re-run
+the S7 SSRF guard before each dial — a sign-step failure is
+warned and retried on the next backoff tick rather than
+terminating the reader task. The sink side is a single
+handshake (no internal reconnect loop).
+
+Path canonicalization is a 10-line pure helper (`extract_path`)
+that strips scheme + authority and returns `/` for malformed
+URLs — the downstream `connect_async` is the actual URL
+validator, so the helper never panics on user input.
+
+10 unit tests in `src/websocket/{source,sink}.rs`:
+`build_ws_request` for Bearer / Basic / ApiKey / HmacSign header
+injection, `None` absence check, `extract_path` common cases.
+No live-server dependency; factories are not yet registered in
+`aeon-cli` (tracked under P5.c), so YAML parser wiring for
+WebSocket is deferred.
+
+### 9.20 S10.5 Kafka broker-native wiring — **Closed 2026-04-22**
+
+`KafkaSourceConfig` and `KafkaSinkConfig` gained
+`auth: Option<Arc<OutboundAuthSigner>>` + `with_auth(signer)`
+builder. A new `aeon-connectors/src/kafka/auth.rs` module
+provides `apply_outbound_auth(&mut ClientConfig, Option<&Arc<...>>)`
+which is called from both `KafkaSource::new` and `KafkaSink::new`
+**after** the base rdkafka defaults but **before** the user
+`config_overrides` loop — the existing debug escape hatch still
+wins.
+
+Per-mode translation onto rdkafka's `ClientConfig`:
+
+- **`BrokerNative`** — iterate `signer.broker_native().values`
+  (a `BTreeMap<String, String>`) and call `client_config.set(k, v)`
+  for each pair. The operator supplies rdkafka keys directly —
+  typical surface is `security.protocol`, `sasl.mechanism`
+  (`PLAIN` | `SCRAM-SHA-256` | `SCRAM-SHA-512` | `OAUTHBEARER`),
+  `sasl.username`, `sasl.password`, `sasl.oauthbearer.config`,
+  `ssl.ca.location`. Aeon deliberately does NOT enforce a
+  whitelist — the rdkafka knob namespace is the source of truth,
+  and refusing unknown keys would break forward-compat with new
+  librdkafka versions.
+- **`Mtls`** — set `security.protocol=ssl` plus the inline-PEM
+  knobs `ssl.certificate.pem` and `ssl.key.pem` (librdkafka ≥ 1.5).
+  PEM bytes are validated as UTF-8 before setting; invalid bytes
+  silently skip (rdkafka will produce a clear error on connect).
+  Operators needing SASL + TLS combine modes via the `config_overrides`
+  escape hatch: `security.protocol: sasl_ssl` + `sasl.*` keys, with
+  `auth.mode: broker_native` carrying both SASL and TLS settings.
+- **`None`** — explicit no-op (network-layer auth on the broker).
+- **`Bearer` | `Basic` | `ApiKey` | `HmacSign`** — warned and
+  skipped. These are HTTP-layer modes and mean nothing to the
+  Kafka wire protocol; logging rather than rejecting follows the
+  S9 "loud but non-fatal" pattern so a shared outbound-auth YAML
+  block across mixed connectors doesn't hard-fail a Kafka sink.
+
+Wired into `KafkaSourceFactory::build()` and
+`KafkaSinkFactory::build()` via the same
+`build_outbound_auth_signer` helper used for HTTP — no new parser
+surface, no new tests required on the aeon-cli side. 5 new unit
+tests in `kafka/auth.rs` cover every mode plus the absent-signer
+case; full `cargo test -p aeon-connectors --features kafka
+--lib kafka::` suite passes 11/11 green.
+
+### 9.21 S10.6 Redis broker-native wiring — **Closed 2026-04-22**
+
+`RedisSourceConfig` and `RedisSinkConfig` gained
+`auth: Option<Arc<OutboundAuthSigner>>` + `with_auth(signer)`
+builder. A new `aeon-connectors/src/redis_streams/auth.rs` module
+provides `resolve_connection_info(url, signer)` which returns the
+`redis::ConnectionInfo` handed to `redis::Client::open` — called
+by both `RedisSource::new` and `RedisSink::new` in place of the
+previous raw-URL open path.
+
+Per-mode translation onto `redis::ConnectionInfo`:
+
+- **`BrokerNative`** — parse the URL via `IntoConnectionInfo`
+  first, then overlay `signer.broker_native().values` keys onto
+  `info.redis`: `username` → `info.redis.username`, `password` →
+  `info.redis.password`, `db` → `info.redis.db` (parsed as i64;
+  non-integer values return a config error, never panic). If the
+  URL already carried `user:pass@host` userinfo and the signer
+  also supplied credentials, the signer wins and a warn line is
+  emitted so the conflict is visible in logs. This matches the
+  `AUTH` / Redis 6 ACL (user+pass) surface — no dedicated flat
+  key in the URL, so the override path is the `ConnectionInfo`
+  struct, not URL mutation.
+- **`Mtls`** — warn-and-skip. The workspace pins
+  `redis = "0.27"` without the `tls-rustls` feature flag, so
+  `redis::TlsCertificates` cannot be wired and client certs can't
+  be attached. Operators needing server-auth TLS can still use
+  `rediss://` URLs via `BrokerNative`; client-auth mTLS is a
+  follow-up that needs a Cargo feature toggle on the redis dep.
+- **`None`** — pass-through (the parsed `ConnectionInfo` is
+  returned unmodified).
+- **`Bearer` | `Basic` | `ApiKey` | `HmacSign`** — warned and
+  skipped. These are HTTP-layer modes and mean nothing to RESP;
+  logging rather than rejecting follows the same "loud but
+  non-fatal" pattern as the Kafka translator.
+
+7 unit tests in `redis_streams/auth.rs`: no-signer pass-through,
+`BrokerNative` overrides URL userinfo (username + password + db),
+password-only signer, non-integer-`db` rejection, `None` mode
+pass-through, `Bearer` warn-and-skip, bad-URL rejection. Full
+`cargo test -p aeon-connectors --features redis-streams --lib
+redis_streams::` suite passes 16/16 green (7 new + 9 existing).
+aeon-cli YAML factory wiring for the Redis source/sink is
+deferred to P5.c (same "not-yet-registered connectors" bucket as
+WebSocket).
+
+### 9.22 S10.7 NATS broker-native wiring — **Closed 2026-04-22**
+
+`NatsSourceConfig` and `NatsSinkConfig` gained
+`auth: Option<Arc<OutboundAuthSigner>>` + `with_auth(signer)`
+builder. A new `aeon-connectors/src/nats/auth.rs` module exposes
+`connect_with_auth(url, signer)` which builds an
+`async_nats::ConnectOptions` then calls `.connect(url)` — replaces
+the previous `async_nats::connect(&url)` call in both
+`NatsSource::new` and `NatsSink::new`.
+
+Per-mode translation onto `ConnectOptions` (async-nats 0.38):
+
+- **`BrokerNative`** — the NATS credential surface has four
+  distinct shapes that the translator picks in this order of
+  precedence:
+    1. `credentials` — inline contents of a `.creds` file
+       (JWT + NKey pair, the canonical NATS decentralized-auth
+       format produced by `nsc`). Routed to
+       `ConnectOptions::credentials(&str)`; malformed input surfaces
+       as `AeonError::config`, never panics.
+    2. `nkey_seed` — raw NKey seed string. Routed to
+       `ConnectOptions::nkey(String)`. Parser runs lazily during
+       connect, so any non-empty string passes translation.
+    3. `token` — bearer-style NATS token. Routed to
+       `ConnectOptions::token(String)`.
+  Independently of the first three, `username` + `password` together
+  are routed to `ConnectOptions::user_and_password`. Providing one
+  without the other is a config error — misconfiguration is loud,
+  never silently under-authenticated.
+- **`Mtls`** — warn-and-skip. async-nats 0.38's
+  `ConnectOptions::add_client_certificate` takes `PathBuf` not inline
+  PEM. Aeon's `OutboundAuthSigner` holds cert/key bytes in
+  `SecretBytes` (zeroize-on-drop) and writing them to disk — even
+  under `/tmp` — would violate the S1 "no secrets on disk outside
+  the deploy dir" posture. Tracked as follow-up: either patch
+  async-nats for in-memory PEM, use a ramfs-backed path, or
+  pre-provision cert files out-of-band with paths supplied via
+  `BrokerNative` free-form keys.
+- **`None`** — returns a default `ConnectOptions` (no auth).
+- **`Bearer` | `Basic` | `ApiKey` | `HmacSign`** — warned and
+  skipped. Same "loud but non-fatal" pattern as Kafka / Redis so
+  shared outbound-auth YAML blocks across mixed connectors don't
+  hard-fail a NATS client.
+
+10 unit tests in `nats/auth.rs` cover every mode branch plus
+the username-without-password / password-without-username config
+errors and the malformed-credentials error path. Tests drive
+`build_connect_options` (the translator) directly so no live NATS
+server is required. Full `cargo test -p aeon-connectors --features
+nats --lib nats::` suite passes 12/12 green (10 new auth + 2
+existing sink dedup). aeon-cli YAML factory wiring for the NATS
+source/sink is deferred to P5.c (same "not-yet-registered
+connectors" bucket as WebSocket / Redis).
+
+### 9.23 S10.8 CDC broker-native wiring (Postgres / MySQL / MongoDB) — **Closed 2026-04-22**
+
+The three CDC source connectors closed broker-native in one sweep.
+All three follow the same pattern: a new `auth.rs` sibling module,
+`auth: Option<Arc<OutboundAuthSigner>>` + `with_auth(signer)` on
+the `*SourceConfig`, and the client-construction call inside
+`*Source::new` replaced with a call through the translator.
+
+**Postgres CDC (`postgres_cdc/auth.rs`)** — translator
+`resolve_config(conn_string, signer)` parses the Postgres keyword /
+URL connection string into `tokio_postgres::Config` via
+`Config::from_str`, then for `BrokerNative` overlays `user` /
+`password` / `dbname` / `application_name` from
+`broker_native().values` using `Config::user()` / `.password()` /
+`.dbname()` / `.application_name()`. When the connection string
+already embedded `user`/`password` and the signer also supplies
+credentials, a warn line records the conflict (signer wins). `Mtls`
+is warn-and-skip — the workspace does not depend on
+`tokio-postgres-rustls`; wiring requires adding that crate and
+plumbing `rustls::ClientConfig` through `Config::connect(tls_ctor)`.
+HTTP modes warn-and-skip. 8 unit tests cover no-signer,
+override-user/password, application_name, password-only (preserves
+URL user), `None` mode, mTLS warn-skip, Bearer warn-skip, and
+malformed-connection-string error.
+
+**MySQL CDC (`mysql_cdc/auth.rs`)** — translator `resolve_opts(url,
+signer)` parses the URL into `mysql_async::Opts` via
+`Opts::from_url`, then for `BrokerNative` rebuilds via
+`OptsBuilder::from_opts(opts)` and applies `user` / `password` /
+`db_name` through the builder's `Some`-wrapped setters. The `Opts`
+→ `OptsBuilder` → `Opts` round trip is the only way to mutate
+parsed Opts (no direct setters). Conflict-warn on URL userinfo +
+signer creds; signer wins. `Mtls` is warn-and-skip — mysql_async's
+`SslOpts` requires the `native-tls-tls` or `rustls-tls` cargo
+feature on the workspace dep, neither is enabled. HTTP modes
+warn-and-skip. 7 unit tests cover no-signer, full override,
+password-only (preserves URL user), `None` mode, mTLS warn-skip,
+Bearer warn-skip, and malformed-URL rejection.
+
+**MongoDB CDC (`mongodb_cdc/auth.rs`)** — translator
+`resolve_options(uri, signer)` is **async** because
+`mongodb::options::ClientOptions::parse` is async (it resolves
+`mongodb+srv://` DNS records on the `dns-resolver` feature). For
+`BrokerNative` the translator takes
+`options.credential.unwrap_or_default()`, overlays
+`Credential.username` / `.password` / `.source` from
+`broker_native().values.{username, password, auth_source}`, and
+writes it back into `options.credential`. A companion
+`resolve_client(uri, signer)` wraps the options helper and calls
+`mongodb::Client::with_options`. `Mtls` is warn-and-skip — MongoDB's
+`TlsOptions::cert_key_file_path` takes a `PathBuf`, and inline PEM
+from `SecretBytes` can't be written to `/tmp` without violating
+S1's "no secrets outside deploy dir" posture (same follow-up
+shape as NATS). HTTP modes warn-and-skip. 8 tests (all
+`#[tokio::test]`) cover no-signer, URI-userinfo override,
+credentials-on-URI-without-userinfo, password-only preserves URI
+username, `None` mode, mTLS warn-skip, Bearer warn-skip, and
+malformed-URI rejection.
+
+Cross-cutting properties of the sweep:
+
+- **All three** carry `Arc<OutboundAuthSigner>` (not a raw pointer)
+  so the zeroize-on-drop `SecretBytes` inside the signer clones
+  cheaply into pipelines and tests alike.
+- **All three** apply the established "signer wins over URI /
+  connection-string userinfo, warn on conflict" rule — operators
+  trust the signer path to be the authoritative credential source.
+- **All three** warn-and-skip on HTTP-style modes (Bearer / Basic /
+  ApiKey / HmacSign) rather than hard-failing, so a shared
+  outbound-auth YAML block across a mixed-protocol pipeline never
+  takes down a CDC source.
+- **Three distinct mTLS follow-ups** are queued because the three
+  SDKs expose radically different TLS surfaces. None is blocking
+  for the Gate 2 auth story — broker-native covers the common
+  "username/password over TLS" deployment; operator-managed mTLS
+  is the edge case.
+
+Tests: `cargo test -p aeon-connectors --features postgres-cdc --lib
+postgres_cdc::` 11/11 green (8 new auth + 3 existing); `--features
+mysql-cdc --lib mysql_cdc::` 7/7 green (all new); `--features
+mongodb-cdc --lib mongodb_cdc::` 14/14 green (8 new auth + 6
+existing resume-token). aeon-cli factory wiring for the three CDC
+sources is deferred to P5.c (same "not-yet-registered connectors"
+bucket).
+
+### 9.24 S10.9 WebTransport sink HTTP/3 CONNECT header auth — **Closed 2026-04-22**
+
+`WebTransportSinkConfig` gained `auth: Option<Arc<OutboundAuthSigner>>`
++ `with_auth(signer)`. The sink's `new()` now builds a
+`wtransport::endpoint::ConnectOptions` via a new
+`build_connect_options(url, signer)` helper and hands it to
+`endpoint.connect(options)` instead of the previous raw `&url`
+call.
+
+Per-mode translation onto the HTTP/3 CONNECT request:
+
+- **`Bearer` / `Basic` / `ApiKey` / `HmacSign`** — the signer's
+  `http_headers(&OutboundSignContext { method: "CONNECT", path,
+  body: b"", now_unix })` produces the header list, each injected
+  via `ConnectRequestBuilder::add_header(k, v)`. The CONNECT
+  request carries them to the server as application-layer auth on
+  the HTTP/3 session-initiation handshake, before any WebTransport
+  stream is opened. HMAC canonicalizes over `"CONNECT" | path | ts
+  | ""` — path is extracted from the `https://` URL by the same
+  `extract_path` shape used in the WebSocket sink so operators can
+  generate verifying HMACs with a single algorithm regardless of
+  transport.
+- **`Mtls`** — logged-and-ignored at the sink layer. The client
+  certificate must be baked into the `wtransport::ClientConfig`
+  that the operator already supplies to `WebTransportSinkConfig::new`,
+  via `ClientConfigBuilder::with_custom_tls(rustls::ClientConfig)`
+  at build time. The sink can't overlay client auth onto the config
+  after the fact because `ClientConfig` is opaque post-build —
+  rebuilding it from the signer's PEM material requires a parallel
+  builder helper. Tracked as follow-up: expose a
+  `WebTransportSinkConfig::new_with_mtls(url, signer)` helper that
+  constructs the `rustls::ClientConfig` with `with_client_auth_cert`
+  from the signer's `mtls_cert_pem()`/`mtls_key_pem()` directly,
+  then chains `.with_custom_tls()`.
+- **`BrokerNative`** — warn-and-skip. There is no "broker-native"
+  concept for WebTransport — HTTP/3 sessions are the wire format.
+- **`None`** — no headers added; builder call chain equivalent to
+  the previous direct `endpoint.connect(&url)` path.
+
+9 unit tests on `build_connect_options` cover every mode branch
+plus a no-signer baseline, a path-extractor test for common URL
+shapes, and assertions that the HTTP modes populate the
+`additional_headers` HashMap while the mTLS / BrokerNative / None
+modes leave it empty. Tests drive the helper directly so no live
+WebTransport server is required. Full `cargo test -p aeon-connectors
+--features webtransport --lib webtransport::` suite passes 10/10
+green (9 new auth + 1 pre-existing datagram-source test).
+
+This closes the **HTTP-style** half of S10 WebTransport. The mTLS
+half is queued as a follow-up. aeon-cli YAML factory wiring for
+the WT sink already exists at `aeon-cli/src/connectors.rs` —
+adding the auth keys is a drop-in that pairs with the follow-up
+builder helper for mTLS.

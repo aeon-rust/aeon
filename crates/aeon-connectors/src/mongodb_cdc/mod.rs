@@ -11,6 +11,7 @@
 //! - Full document lookup on update events
 //! - Schema change handling (new fields are captured automatically)
 
+mod auth;
 mod source;
 
 pub use source::{MongoDbCdcSource, MongoDbCdcSourceConfig};

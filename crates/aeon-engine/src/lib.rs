@@ -27,10 +27,13 @@ pub mod engine_cutover;
 pub mod partition_ownership;
 #[cfg(all(feature = "cluster", feature = "processor-auth"))]
 pub mod partition_install;
+#[cfg(all(feature = "cluster", feature = "processor-auth"))]
+pub mod engine_providers;
 pub mod batch_tuner;
 pub mod batch_wire;
 pub mod checkpoint;
 pub mod circuit_breaker;
+pub mod compliance_validator;
 pub mod connector_registry;
 pub mod dag;
 pub mod delivery;
@@ -40,11 +43,17 @@ pub mod eo2;
 pub mod eo2_backpressure;
 pub mod eo2_content_hash;
 pub mod eo2_metrics;
+pub mod encryption_probe;
 pub mod eo2_recovery;
+pub mod erasure_policy;
+pub mod erasure_probe;
+pub mod erasure_store;
+pub mod retention_probe;
 pub mod health;
 pub mod identity_store;
 pub mod l2_body;
 pub mod l2_transfer;
+pub mod subject_export;
 pub mod metrics_server;
 pub mod pipeline;
 pub mod pipeline_manager;
@@ -124,8 +133,11 @@ pub use partition_ownership::ClusterPartitionOwnership;
 
 #[cfg(all(feature = "cluster", feature = "processor-auth"))]
 pub use partition_install::{
-    InstalledPohChainRegistry, L2SegmentInstaller, PohChainInstallerImpl,
+    InstalledPohChainRegistry, L2SegmentInstaller, LivePohChainRegistry, PohChainInstallerImpl,
 };
+
+#[cfg(all(feature = "cluster", feature = "processor-auth"))]
+pub use engine_providers::{L2SegmentTransferProvider, PohChainExportProvider};
 
 #[cfg(feature = "rest-api")]
 pub use rest_api::{AppState, api_router, serve};

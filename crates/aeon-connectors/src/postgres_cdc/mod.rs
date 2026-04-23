@@ -10,6 +10,7 @@
 //! - Schema change tracking (new columns, type changes)
 //! - LSN-based resume for exactly-once semantics
 
+mod auth;
 mod source;
 
 pub use source::{PostgresCdcSource, PostgresCdcSourceConfig};

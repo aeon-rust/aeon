@@ -21,6 +21,7 @@ aeon-types = { workspace = true }
 serde = { workspace = true }
 bincode = { workspace = true }
 thiserror = { workspace = true }
+uuid = { workspace = true }
 
 # Cryptographic primitives
 sha2 = "0.10"

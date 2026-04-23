@@ -21,8 +21,17 @@ use crate::types::{PohChainTransferRequest, PohChainTransferResponse};
 ///
 /// Returning `Err` surfaces as a failure response to the client with the
 /// error message — the server doesn't drop the stream silently.
+///
+/// The method is async because production providers (e.g. the engine's
+/// `PohChainExportProvider`) need to await a `tokio::sync::Mutex` on the
+/// live `PohChain` handle. Sync stubs return `Box::pin(async move { ... })`.
 pub trait PohChainProvider: Send + Sync {
-    fn export_state(&self, req: &PohChainTransferRequest) -> Result<Vec<u8>, AeonError>;
+    fn export_state<'a>(
+        &'a self,
+        req: &'a PohChainTransferRequest,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<u8>, AeonError>> + Send + 'a>,
+    >;
 }
 
 /// Client side — request the PoH chain state for a partition and return
@@ -114,7 +123,7 @@ pub async fn serve_poh_chain_transfer_with_request<P>(
 where
     P: PohChainProvider + ?Sized,
 {
-    let resp = match provider.export_state(req) {
+    let resp = match provider.export_state(req).await {
         Ok(state_bytes) => PohChainTransferResponse {
             success: true,
             state_bytes,
@@ -173,21 +182,26 @@ mod tests {
     }
 
     impl PohChainProvider for StubProvider {
-        fn export_state(
-            &self,
-            _req: &PohChainTransferRequest,
-        ) -> Result<Vec<u8>, AeonError> {
-            Ok(self.payload.clone())
+        fn export_state<'a>(
+            &'a self,
+            _req: &'a PohChainTransferRequest,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Vec<u8>, AeonError>> + Send + 'a>,
+        > {
+            let payload = self.payload.clone();
+            Box::pin(async move { Ok(payload) })
         }
     }
 
     struct FailingProvider;
     impl PohChainProvider for FailingProvider {
-        fn export_state(
-            &self,
-            _req: &PohChainTransferRequest,
-        ) -> Result<Vec<u8>, AeonError> {
-            Err(AeonError::state("stub: intentional poh failure"))
+        fn export_state<'a>(
+            &'a self,
+            _req: &'a PohChainTransferRequest,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Vec<u8>, AeonError>> + Send + 'a>,
+        > {
+            Box::pin(async move { Err(AeonError::state("stub: intentional poh failure")) })
         }
     }
 

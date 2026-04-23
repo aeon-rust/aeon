@@ -9,6 +9,7 @@
 //! - Schema change detection (DDL events)
 //! - Configurable server ID to avoid conflicts
 
+mod auth;
 mod source;
 
 pub use source::{MysqlCdcSource, MysqlCdcSourceConfig};

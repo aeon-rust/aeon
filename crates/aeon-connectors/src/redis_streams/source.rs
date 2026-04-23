@@ -4,8 +4,8 @@
 //! Pull-source: `next_batch()` issues XREADGROUP with COUNT and BLOCK.
 
 use aeon_types::{
-    AeonError, Backoff, BackoffPolicy, ConsumerMode, CoreLocalUuidGenerator, Event, PartitionId,
-    Source,
+    AeonError, Backoff, BackoffPolicy, ConsumerMode, CoreLocalUuidGenerator, Event,
+    OutboundAuthSigner, PartitionId, Source,
 };
 use bytes::Bytes;
 use redis::AsyncCommands;
@@ -49,6 +49,10 @@ pub struct RedisSourceConfig {
     ///
     /// When `Group`, the mode's `group_id` overrides the `group` field.
     pub consumer_mode: ConsumerMode,
+    /// S10 outbound auth. When `Some`, the signer's mode drives how the
+    /// `ConnectionInfo` passed to `redis::Client::open` is built — see
+    /// `redis_streams::auth::resolve_connection_info`.
+    pub auth: Option<Arc<OutboundAuthSigner>>,
 }
 
 impl RedisSourceConfig {
@@ -69,7 +73,14 @@ impl RedisSourceConfig {
             source_name: Arc::from("redis"),
             backoff: BackoffPolicy::default(),
             consumer_mode: ConsumerMode::Single,
+            auth: None,
         }
+    }
+
+    /// S10: attach an outbound-auth signer.
+    pub fn with_auth(mut self, signer: Arc<OutboundAuthSigner>) -> Self {
+        self.auth = Some(signer);
+        self
     }
 
     /// Override the reconnect backoff policy.
@@ -132,7 +143,8 @@ pub struct RedisSource {
 impl RedisSource {
     /// Connect to Redis and ensure the consumer group exists.
     pub async fn new(config: RedisSourceConfig) -> Result<Self, AeonError> {
-        let client = redis::Client::open(config.url.as_str())
+        let conn_info = super::auth::resolve_connection_info(&config.url, config.auth.as_ref())?;
+        let client = redis::Client::open(conn_info)
             .map_err(|e| AeonError::connection(format!("redis client create failed: {e}")))?;
 
         // Initial connect is validated synchronously so misconfiguration

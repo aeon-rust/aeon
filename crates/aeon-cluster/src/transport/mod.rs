@@ -32,6 +32,7 @@ pub use cutover::{
     CutoverCoordinator, CutoverOffsets, drive_partition_cutover, request_partition_cutover,
     serve_partition_cutover_stream, serve_partition_cutover_with_request,
 };
+pub use server::SourceProviderSlots;
 pub use throttle::TransferThrottle;
 pub use tls::{build_client_config, build_server_config, quic_configs_for_cluster};
 pub use transfer_metrics::{PartitionTransferMetrics, TransferRole};

@@ -30,10 +30,34 @@
 //! are caller-side concerns — the policy here is narrow on purpose so it
 //! never accidentally mangles a non-URI value that happened to land in a
 //! logged field.
+//!
+//! ## S6.6 — metadata-key deny-list
+//!
+//! In addition to URI redaction, this module owns the **metadata-key**
+//! deny-list: a list of `Event.metadata` / `Output.headers` keys whose
+//! *values* must never appear in log output. The current list:
+//!
+//! | Key                | Reason                                  |
+//! | ------------------ | --------------------------------------- |
+//! | `aeon.subject_id`  | GDPR Art. 4(5) pseudonymous PII (S6.6)  |
+//!
+//! Callers that log metadata or headers must either skip denied keys or
+//! replace the value with `***`. The policy lives here (and not in the
+//! observability crate) so leaf crates that have no `tracing` dependency
+//! can still consult it from their own log hooks.
 
 use std::borrow::Cow;
 
 const REDACTED: &str = "***";
+
+/// Metadata keys whose values must be redacted at every log site that
+/// prints `Event.metadata` or `Output.headers`. See [`is_redacted_metadata_key`].
+pub const METADATA_REDACT_DENYLIST: &[&str] = &[
+    // S6.6 — GDPR subject-id is pseudonymous PII under Art. 4(5). Metrics
+    // use a salted hash (see `aeon_crypto::null_receipt::salted_subject_hash`);
+    // logs drop the value entirely.
+    "aeon.subject_id",
+];
 
 /// Replace `user[:password]@` in any URI with `***@`. Returns `Cow::Borrowed`
 /// when the input has no userinfo (the hot path), or `Cow::Owned` when a
@@ -63,6 +87,32 @@ pub fn redact_uri(s: &str) -> Cow<'_, str> {
     out.push_str(&authority[at..]); // includes the '@' separator
     out.push_str(&rest[authority_end..]);
     Cow::Owned(out)
+}
+
+/// Is this metadata key on the redaction deny-list? Log sites that
+/// iterate `Event.metadata` / `Output.headers` must call this per key
+/// and drop the value (or replace with `***`) when it returns `true`.
+///
+/// Match is case-sensitive — the canonical key casing is the source
+/// of truth; Aeon code never emits the same key with a different
+/// case. An inbound connector that forwards mixed-case headers must
+/// normalise before looking up, or use the generic `redact_*` helpers
+/// the call site already reaches for.
+#[inline]
+pub fn is_redacted_metadata_key(k: &str) -> bool {
+    METADATA_REDACT_DENYLIST.iter().any(|denied| *denied == k)
+}
+
+/// Return the log-safe value for a `(key, value)` pair. If the key is
+/// on the deny-list, returns `"***"`; otherwise returns the original
+/// value borrowed. Zero-allocation on the clean path.
+#[inline]
+pub fn redact_metadata_value<'v>(k: &str, v: &'v str) -> Cow<'v, str> {
+    if is_redacted_metadata_key(k) {
+        Cow::Borrowed(REDACTED)
+    } else {
+        Cow::Borrowed(v)
+    }
 }
 
 #[cfg(test)]
@@ -170,5 +220,52 @@ mod tests {
             redact_uri("quic+wt://u:p@node.example:4472/pipe"),
             "quic+wt://***@node.example:4472/pipe"
         );
+    }
+
+    // ── S6.6 metadata-key deny-list ─────────────────────────────────────
+
+    #[test]
+    fn subject_id_is_denied() {
+        assert!(is_redacted_metadata_key("aeon.subject_id"));
+    }
+
+    #[test]
+    fn unrelated_keys_are_not_denied() {
+        for k in [
+            "content-type",
+            "x-request-id",
+            "trace-id",
+            "aeon.subjectId",   // wrong casing
+            "aeon_subject_id",  // wrong separator
+            "subject_id",       // missing namespace prefix
+            "",
+        ] {
+            assert!(
+                !is_redacted_metadata_key(k),
+                "should NOT be denied: {k:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn redact_metadata_value_masks_subject_id() {
+        let v = redact_metadata_value("aeon.subject_id", "tenant-a/user-1");
+        assert_eq!(v, "***");
+    }
+
+    #[test]
+    fn redact_metadata_value_passes_through_safe_keys() {
+        let v = redact_metadata_value("content-type", "application/json");
+        assert_eq!(v, "application/json");
+        // Clean-path guarantee: returned Cow must be borrowed (no alloc).
+        assert!(matches!(v, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn denylist_is_nonempty_and_contains_subject_id() {
+        // Defensive: a refactor that accidentally empties the denylist
+        // must be caught at test time, not in production.
+        assert!(!METADATA_REDACT_DENYLIST.is_empty());
+        assert!(METADATA_REDACT_DENYLIST.contains(&"aeon.subject_id"));
     }
 }

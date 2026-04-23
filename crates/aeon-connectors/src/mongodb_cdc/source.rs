@@ -32,7 +32,9 @@
 //! §4.3 notes).
 
 use crate::push_buffer::{PushBufferConfig, PushBufferRx, push_buffer};
-use aeon_types::{AeonError, CoreLocalUuidGenerator, Event, PartitionId, Source};
+use aeon_types::{
+    AeonError, CoreLocalUuidGenerator, Event, OutboundAuthSigner, PartitionId, Source,
+};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use mongodb::bson::Document;
@@ -72,6 +74,9 @@ pub struct MongoDbCdcSourceConfig {
     /// error. Exponential + jitter prevents reconnect storms against a flaky
     /// MongoDB replica set (TR-3).
     pub backoff: aeon_types::BackoffPolicy,
+    /// S10 outbound auth. When `Some`, the signer's mode drives
+    /// `mongodb::options::ClientOptions` construction from `uri`.
+    pub auth: Option<Arc<OutboundAuthSigner>>,
 }
 
 impl MongoDbCdcSourceConfig {
@@ -89,12 +94,19 @@ impl MongoDbCdcSourceConfig {
             resume_token_path: None,
             resume_token_flush_every_n: 100,
             backoff: aeon_types::BackoffPolicy::default(),
+            auth: None,
         }
     }
 
     /// Override the reconnect backoff policy.
     pub fn with_backoff(mut self, backoff: aeon_types::BackoffPolicy) -> Self {
         self.backoff = backoff;
+        self
+    }
+
+    /// S10: attach an outbound-auth signer.
+    pub fn with_auth(mut self, signer: Arc<OutboundAuthSigner>) -> Self {
+        self.auth = Some(signer);
         self
     }
 
@@ -149,9 +161,7 @@ pub struct MongoDbCdcSource {
 impl MongoDbCdcSource {
     /// Connect to MongoDB and open a change stream.
     pub async fn new(config: MongoDbCdcSourceConfig) -> Result<Self, AeonError> {
-        let client = mongodb::Client::with_uri_str(&config.uri)
-            .await
-            .map_err(|e| AeonError::connection(format!("mongodb connect failed: {e}")))?;
+        let client = super::auth::resolve_client(&config.uri, config.auth.as_ref()).await?;
 
         let db = client.database(&config.database);
 

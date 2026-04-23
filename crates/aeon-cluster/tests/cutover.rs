@@ -73,21 +73,25 @@ struct LivePohProvider {
 }
 
 impl PohChainProvider for LivePohProvider {
-    fn export_state(
-        &self,
-        _req: &PohChainTransferRequest,
-    ) -> Result<Vec<u8>, AeonError> {
-        let chain = self
-            .chain
-            .lock()
-            .map_err(|e| AeonError::state(format!("poh chain mutex poisoned: {e}")))?;
-        chain
-            .export_state()
-            .to_bytes()
-            .map_err(|e| AeonError::Serialization {
-                message: format!("PohChainState::to_bytes: {e}"),
-                source: None,
-            })
+    fn export_state<'a>(
+        &'a self,
+        _req: &'a PohChainTransferRequest,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<u8>, AeonError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let chain = self
+                .chain
+                .lock()
+                .map_err(|e| AeonError::state(format!("poh chain mutex poisoned: {e}")))?;
+            chain
+                .export_state()
+                .to_bytes()
+                .map_err(|e| AeonError::Serialization {
+                    message: format!("PohChainState::to_bytes: {e}"),
+                    source: None,
+                })
+        })
     }
 }
 

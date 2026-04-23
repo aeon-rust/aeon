@@ -131,6 +131,17 @@ pub struct PipelineConfig {
     /// all non-cluster callers.
     #[cfg(all(feature = "processor-auth", feature = "cluster"))]
     pub poh_installed_chains: Option<Arc<crate::partition_install::InstalledPohChainRegistry>>,
+    /// CL-6c.4: shared registry of *live* `Arc<Mutex<PohChain>>` handles
+    /// the source-side `PohChainExportProvider` reads from when a peer
+    /// asks for this partition's PoH state during a CL-6 handover.
+    /// `create_poh_state` registers the chain it produces (whether
+    /// genesised fresh or resumed from `poh_installed_chains`) so a
+    /// subsequent transfer out of this node carries the up-to-date
+    /// state, preserving G11.c (chain continuity) across multiple hops.
+    /// `None` disables — same default as `poh_installed_chains`, safe
+    /// for all non-cluster callers.
+    #[cfg(all(feature = "processor-auth", feature = "cluster"))]
+    pub poh_live_chains: Option<Arc<crate::partition_install::LivePohChainRegistry>>,
     /// FT-3: Optional L3 backend for `CheckpointBackend::StateStore`.
     /// When `delivery.checkpoint.backend == StateStore`, the sink task
     /// persists checkpoint records into this store under the `checkpoint/`
@@ -195,6 +206,22 @@ pub struct PipelineConfig {
     /// `None` keeps the legacy one-shot resolve-at-start behaviour used by
     /// tests, benches, and the single-node path.
     pub partition_reassign: Option<tokio::sync::watch::Receiver<Vec<u16>>>,
+    /// S3: at-rest encryption plan resolved from `manifest.encryption` at
+    /// pipeline start. When the EO-2 follow-up constructs
+    /// `PipelineL2Registry` inside the supervisor, it installs
+    /// `plan.kek` via `.with_kek(...)` so L2 segments and (future) L3
+    /// stores seal payloads under the same data-context KEK. `None`
+    /// means the probe was not run (legacy tests / benches) — equivalent
+    /// to `at_rest=off`. Callers never mutate this after bootstrap.
+    pub encryption_plan: Option<crate::encryption_probe::EncryptionPlan>,
+    /// S5: retention plan resolved from `manifest.durability.retention`
+    /// at pipeline start. `l2_hold_after_ack` is stamped on
+    /// `PipelineL2Registry` via `.with_gc_min_hold(..)`;
+    /// `l3_max_records` is stamped on `L3CheckpointStore` via
+    /// `.with_max_records(..)`. `None` means the probe was not run
+    /// (legacy tests / benches) — equivalent to inert retention (ack-
+    /// immediate GC, keep-all checkpoint history).
+    pub retention_plan: Option<crate::retention_probe::RetentionPlan>,
 }
 
 impl Default for PipelineConfig {
@@ -209,6 +236,8 @@ impl Default for PipelineConfig {
             poh: None,
             #[cfg(all(feature = "processor-auth", feature = "cluster"))]
             poh_installed_chains: None,
+            #[cfg(all(feature = "processor-auth", feature = "cluster"))]
+            poh_live_chains: None,
             l3_checkpoint_store: None,
             pipeline_name: String::new(),
             l2_registry: None,
@@ -219,6 +248,8 @@ impl Default for PipelineConfig {
             partition_id: PartitionId::new(0),
             write_gate: None,
             partition_reassign: None,
+            encryption_plan: None,
+            retention_plan: None,
         }
     }
 }
@@ -292,18 +323,52 @@ pub fn create_poh_state(config: &PipelineConfig) -> Option<PohState> {
     let poh_config = config.poh.as_ref()?;
 
     #[cfg(feature = "cluster")]
-    if let Some(registry) = config.poh_installed_chains.as_ref() {
-        if let Some(chain) = registry.take(&config.pipeline_name, config.partition_id) {
-            tracing::info!(
+    let state: PohState = if let Some(chain) = config
+        .poh_installed_chains
+        .as_ref()
+        .and_then(|registry| registry.take(&config.pipeline_name, config.partition_id))
+    {
+        tracing::info!(
+            pipeline = %config.pipeline_name,
+            partition = config.partition_id.as_u16(),
+            sequence = chain.sequence(),
+            "G11.c: resuming PoH chain from transfer-driver installed snapshot"
+        );
+        Arc::new(Mutex::new(chain))
+    } else {
+        Arc::new(Mutex::new(aeon_crypto::poh::PohChain::new(
+            poh_config.partition,
+            poh_config.max_recent_entries,
+        )))
+    };
+
+    // CL-6c.4: register the live chain so the source-side
+    // `PohChainExportProvider` can hand its state to a peer when this
+    // partition migrates again. `None` registry → single-node / test
+    // path, no-op.
+    #[cfg(feature = "cluster")]
+    if let Some(live) = config.poh_live_chains.as_ref() {
+        if let Err(e) = live.register(
+            &config.pipeline_name,
+            config.partition_id,
+            Arc::clone(&state),
+        ) {
+            tracing::warn!(
                 pipeline = %config.pipeline_name,
                 partition = config.partition_id.as_u16(),
-                sequence = chain.sequence(),
-                "G11.c: resuming PoH chain from transfer-driver installed snapshot"
+                error = %e,
+                "CL-6c.4: failed to register live PoH chain — outgoing \
+                 transfers from this node will see no PoH state"
             );
-            return Some(Arc::new(Mutex::new(chain)));
         }
     }
 
+    #[cfg(feature = "cluster")]
+    {
+        return Some(state);
+    }
+
+    #[cfg(not(feature = "cluster"))]
     Some(Arc::new(Mutex::new(aeon_crypto::poh::PohChain::new(
         poh_config.partition,
         poh_config.max_recent_entries,
@@ -1133,6 +1198,12 @@ fn build_sink_task_ctx(config: &PipelineConfig, core: Option<usize>) -> SinkTask
         CheckpointBackend::StateStore => match &config.l3_checkpoint_store {
             Some(l3) => match L3CheckpointStore::open(Arc::clone(l3)) {
                 Ok(store) => {
+                    // S5: apply the resolved `l3_max_records` cap if the
+                    // manifest set `durability.retention.l3_ack.max_records`.
+                    let store = match config.retention_plan.as_ref() {
+                        Some(plan) => store.with_max_records(plan.l3_max_records),
+                        None => store,
+                    };
                     tracing::info!("Checkpoint L3 store initialized");
                     Some(Box::new(store) as Box<dyn CheckpointPersist>)
                 }
@@ -1287,6 +1358,8 @@ where
             poh: config.pipeline.poh.clone(),
             #[cfg(all(feature = "processor-auth", feature = "cluster"))]
             poh_installed_chains: config.pipeline.poh_installed_chains.clone(),
+            #[cfg(all(feature = "processor-auth", feature = "cluster"))]
+            poh_live_chains: config.pipeline.poh_live_chains.clone(),
             l3_checkpoint_store: config.pipeline.l3_checkpoint_store.clone(),
             pipeline_name: config.pipeline.pipeline_name.clone(),
             l2_registry: config.pipeline.l2_registry.clone(),
@@ -1300,6 +1373,8 @@ where
             // each pinned to a single partition id — dynamic re-assign at
             // the per-task level is not meaningful. Leave disabled.
             partition_reassign: None,
+            encryption_plan: config.pipeline.encryption_plan.clone(),
+            retention_plan: config.pipeline.retention_plan.clone(),
         };
 
         if let Some(ref assignments) = core_assignments {

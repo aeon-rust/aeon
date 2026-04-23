@@ -587,6 +587,42 @@ async fn install_partition_transfer_driver(
 
     node.install_transfer_driver(Arc::clone(&driver)).await;
 
+    // CL-6c.4 — wire the source-side half of CL-6: install the QUIC
+    // provider trio (L2 segment export, PoH state export, cutover
+    // coordinator) into `ClusterNode::source_provider_slots`. Without
+    // this the source-side QUIC accept loop has no providers to route
+    // to and incoming PartitionTransferRequest / PohChainTransferRequest /
+    // PartitionCutoverRequest frames return immediate failures.
+    {
+        let l2_registry_for_export = aeon_engine::eo2::PipelineL2Registry::new(
+            aeon_engine::delivery::L2BodyStoreConfig {
+                root: Some(std::path::PathBuf::from(&l2_root)),
+                segment_bytes: aeon_engine::delivery::L2BodyStoreConfig::default()
+                    .segment_bytes,
+            },
+        );
+        let segment_provider: Arc<
+            dyn aeon_cluster::transport::partition_transfer::PartitionTransferProvider,
+        > = Arc::new(aeon_engine::L2SegmentTransferProvider::new(
+            l2_registry_for_export,
+        ));
+        node.install_segment_provider(segment_provider).await;
+
+        let poh_provider: Arc<
+            dyn aeon_cluster::transport::poh_transfer::PohChainProvider,
+        > = Arc::new(aeon_engine::PohChainExportProvider::new(
+            supervisor.poh_live_chains(),
+        ));
+        node.install_poh_provider(poh_provider).await;
+
+        let cutover_coord: Arc<
+            dyn aeon_cluster::transport::cutover::CutoverCoordinator,
+        > = Arc::new(aeon_engine::EngineCutoverCoordinator::new(
+            supervisor.gate_registry(),
+        ));
+        node.install_cutover_coordinator(cutover_coord).await;
+    }
+
     let driver_shutdown = node.shutdown_flag();
     let driver_for_loop = Arc::clone(&driver);
     tokio::spawn(async move {
@@ -596,7 +632,7 @@ async fn install_partition_transfer_driver(
     tracing::info!(
         pipeline = %pipeline_name,
         l2_root = %l2_root,
-        "PartitionTransferDriver spawned — transfers will drive automatically"
+        "PartitionTransferDriver + source-side providers (L2 / PoH / cutover) installed"
     );
     Ok(())
 }
