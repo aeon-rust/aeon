@@ -461,22 +461,42 @@ GDPR), see [`COMPLIANCE.md`](COMPLIANCE.md).
 ### 11.1 Secret Management (S1)
 
 Secrets (KEKs, DEKs, HMAC keys, connector passwords, API tokens, TLS private
-keys) are resolved through a provider abstraction. No plaintext credentials
-touch disk outside the dev-mode fallbacks.
+keys) are resolved through a two-trait provider abstraction:
 
-Providers, in priority order:
+- **`SecretProvider`** — fetch-shape. `resolve(path) -> SecretBytes`. Fits
+  env vars, `.env` files, Vault / OpenBao KV-v2, AWS Secrets Manager, GCP
+  Secret Manager, Azure Key Vault reads.
+- **`KekProvider`** — remote-op shape. `async wrap(dek)` /
+  `async unwrap(wrapped)` without exposing KEK bytes to the Aeon process.
+  Fits AWS KMS, GCP KMS, Azure KV crypto, Vault Transit, OpenBao Transit,
+  and PKCS#11. The existing in-process AES-GCM path (reads KEK bytes via
+  `SecretProvider`) is the `LocalKekProvider` and remains the default.
 
-| Provider | Use case |
-|---|---|
-| HashiCorp Vault | Primary production provider. KV-v2 + Transit engine both supported. |
-| OpenBao | Open-source fork of Vault (post Vault's BSL move). API-compatible with the Vault provider — same config path, same secret layout. First-class. |
-| AWS KMS | Envelope encryption; `GenerateDataKey` for DEK, `Decrypt` for KEK unwrap. Itself FIPS 140-3 L3 validated. |
-| GCP Cloud KMS | Envelope encryption via GCP. Itself FIPS 140-3 L3 validated. |
-| Azure Key Vault | Envelope encryption via Azure. Itself FIPS 140-3 L3 validated. |
-| AWS Secrets Manager | Password/token-style secrets. |
-| GCP Secret Manager | GCP-native equivalent of AWS SM. |
-| Environment variables | For CI / Helm / K8s-injected values (second-last resort). |
-| Literal YAML | Dev-only. Engine logs a startup warning if any literal secret is observed. |
+Backend status (2026-04-23):
+
+| Backend | Trait | Status |
+|---|---|---|
+| Env vars | SecretProvider | ✅ shipped (`EnvProvider`) |
+| `.env` file (`AEON_DOTENV_PATH`) | SecretProvider | ✅ shipped (`DotEnvProvider`) |
+| Literal YAML | SecretProvider | ✅ shipped (`LiteralProvider`) — dev-only, warn-once |
+| HashiCorp Vault KV-v2 | SecretProvider | 🟡 in-flight — `aeon-secrets` crate (task #35) |
+| OpenBao KV-v2 | SecretProvider | 🟡 in-flight — ships under the Vault adapter (API-compatible) |
+| AWS Secrets Manager | SecretProvider | ⬜ planned behind `aws-sm` feature (task #35 follow-up) |
+| GCP Secret Manager | SecretProvider | ⬜ planned |
+| Azure Key Vault (read) | SecretProvider | ⬜ planned |
+| Local AES-GCM (KEK bytes via SecretProvider) | KekProvider | ✅ shipped (`LocalKekProvider` in `aeon-crypto::kek`) |
+| AWS KMS | KekProvider | ⬜ planned behind `aws-kms` feature |
+| GCP Cloud KMS | KekProvider | ⬜ planned |
+| Azure Key Vault (crypto ops) | KekProvider | ⬜ planned |
+| Vault Transit | KekProvider | ⬜ planned (follows KV-v2) |
+| OpenBao Transit | KekProvider | ⬜ planned (shares Vault adapter) |
+| PKCS#11 direct | KekProvider | 🟥 deferred (task #33) |
+
+Until `aeon-secrets` lands, production deployments source KEK and connector
+credentials via `EnvProvider` (K8s / Helm / Vault-sidecar-injected env vars
+are the canonical path) with the envelope-encryption, dual-KEK, and rotation
+machinery all already live. Moving to a native Vault or KMS backend is a
+drop-in registration change, not a surface rewrite.
 
 Envelope encryption model:
 
@@ -500,12 +520,17 @@ list). Literal YAML values are dev-only.
 
 ### 11.2 HSM Custody (via Vault / OpenBao, not PKCS#11)
 
-Aeon's primary FIPS-track path is **indirect**: Aeon talks to Vault or
+Aeon's chosen FIPS-track path is **indirect**: Aeon will talk to Vault or
 OpenBao as its secret provider (§11.1), and Vault / OpenBao can themselves
 be sealed with an HSM backend (Thales / Entrust / Utimaco / CloudHSM) when
 direct hardware key custody is required. This keeps Aeon out of the
 PKCS#11 driver business and lets the operator choose the HSM on Vault's
 schedule, not ours.
+
+> **Status (2026-04-23):** the Vault / OpenBao adapter in `aeon-secrets`
+> is the in-flight deliverable for this path (task #35). Until it lands,
+> the "indirect HSM" claim below describes the target design, not a
+> shipped production path.
 
 For deployments that cannot run Vault / OpenBao at all and need Aeon to
 speak PKCS#11 directly to an HSM, the `aeon-crypto::hsm` trait exists as

@@ -397,7 +397,7 @@ workflows Aeon supports natively.
 
 - [ ] `compliance.regime: pci`, `enforcement: strict`.
 - [ ] All card fields listed in `selectors` with `class: pii`.
-- [ ] L2 + L3 encryption on, KEK sourced from Vault / KMS / SM.
+- [ ] L2 + L3 encryption on, KEK sourced from a `SecretProvider` (Env / DotEnv today; Vault / OpenBao / KMS / SM once the `aeon-secrets` adapter lands — task #35).
 - [ ] Retention configured on both tiers.
 - [ ] Audit channel routed to immutable sink.
 - [ ] KEK rotation schedule (primary + next) established.
@@ -409,7 +409,7 @@ workflows Aeon supports natively.
 
 - [ ] `compliance.regime: hipaa`, `enforcement: strict`.
 - [ ] All PHI fields listed in `selectors` with `class: phi`.
-- [ ] L2 + L3 encryption on, KEK sourced from production provider.
+- [ ] L2 + L3 encryption on, KEK sourced from a `SecretProvider` (Env / DotEnv today; Vault / OpenBao / KMS / SM once the `aeon-secrets` adapter lands — task #35).
 - [ ] Retention matches applicable statutory floor.
 - [ ] Audit channel separated and protected.
 - [ ] BAA-covered downstream services authenticated with `mtls` or
@@ -424,7 +424,7 @@ workflows Aeon supports natively.
 - [ ] Erasure API tested against a sample subject before go-live.
 - [ ] Right-to-export tested; null-receipt verified for an erased subject.
 - [ ] `erasure.max_delay_hours` set (24h default is usually fine).
-- [ ] L2 + L3 encryption on, KEK sourced from production provider.
+- [ ] L2 + L3 encryption on, KEK sourced from a `SecretProvider` (Env / DotEnv today; Vault / OpenBao / KMS / SM once the `aeon-secrets` adapter lands — task #35).
 - [ ] Retention ceiling configured (not just floor).
 - [ ] DPO has visibility into the audit channel.
 

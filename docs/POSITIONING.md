@@ -64,7 +64,7 @@ Comparisons that mix these categories are not apples-to-apples. Section 3 below 
 | Consensus | openraft (always-on) | JobManager HA via ZK / K8s |
 | Verifiable event chain | ✅ PoH + Merkle + MMR + Ed25519 | ❌ |
 | At-rest encryption | ✅ AES-256-GCM per-segment DEK across L2 body + L3 checkpoints | ⚠️ Filesystem / backend only |
-| Secret management | ✅ Provider abstraction (Vault primary, KMS, Secrets Manager) + dual KEK + envelope encryption + rotation | ❌ Config-file driven |
+| Secret management | 🟡 Provider trait + dual KEK + envelope encryption + rotation shipped. Env / DotEnv / Literal providers shipped; Vault / OpenBao / KMS / SM adapters in-flight in `aeon-secrets` crate (task #35) | ❌ Config-file driven |
 | Compliance regime enforcement | ✅ `validate_compliance` gate at pipeline start (PCI-DSS / HIPAA / GDPR) | ❌ Operator responsibility |
 | GDPR right-to-erasure | ✅ Subject-id extraction + tombstone store + null-receipt export + deny-list | ❌ Manual / external tooling |
 | Inbound connector auth | ✅ IP allow-list + API-key + HMAC + mTLS (per push source) | ⚠️ Operator responsibility |
@@ -83,7 +83,7 @@ Comparisons that mix these categories are not apples-to-apples. Section 3 below 
 - Use cases where the per-event budget is <1 µs.
 - Regulated workloads that need **compliance-regime preconditions enforced at pipeline start** (PCI-DSS / HIPAA / GDPR) rather than after-the-fact operator review.
 - Pipelines that need **GDPR right-to-erasure with cryptographic null-receipts** as a first-class engine feature, not a bolt-on.
-- Deployments where **secret material never touches disk in plaintext** is a hard requirement (Vault / KMS / SM provider abstraction with envelope encryption + KEK rotation).
+- Deployments adopting the provider-abstracted secret model — envelope encryption + dual KEK + KEK rotation are shipped; Vault / OpenBao / KMS / SM backends are in-flight in the `aeon-secrets` adapter crate.
 
 **Where Flink still wins:**
 - Anything requiring rich windowing or CEP.
@@ -197,7 +197,7 @@ This wedge is defensible because retrofitting any one piece (crypto chain, compl
 | **Production deployments outside of dev/test** | Whenever first user lands | No case study yet |
 | **Documentation / tutorials / cookbook** | Medium | Scale-out docs exist; SDK docs are strong; lacks "write your first processor" funnel |
 | **Direct PKCS#11 / HSM integration** | Deferred | FIPS-track claims are already satisfied via cloud KMS (AWS/GCP/Azure all FIPS 140-3 L3) and Vault/OpenBao-with-HSM-seal. Direct PKCS#11 only needed for air-gapped shops where Vault/OpenBao is not an option — trait stub (S1.4) is in place; real backend deferred until a customer asks. |
-| **OpenBao first-class provider** | Small | Vault provider should work unmodified; needs integration test + docs to promote to first-class alongside Vault (task #35) |
+| **`aeon-secrets` adapter crate (Vault / OpenBao / KMS / SM backends)** | Medium | `SecretProvider` trait + Env / DotEnv / Literal providers ship today; production backends are trait slots. Task #35 delivers the adapter crate with Vault + OpenBao (API-compatible) as reference; AWS / GCP / Azure KMS + SM backends follow behind their own feature flags. |
 | **Secret-provider production hardening** | Medium | Rotation runbook, error taxonomy, rate-limit handling across Vault / OpenBao / AWS KMS / AWS SM / GCP KMS (task #36) |
 | **WebSocket / WebTransport mTLS TLS-layer** | Small | S10 auth-mode matrix is complete; TLS-connector integration for WS/WT mTLS is a follow-up (warn-and-ignore today, task #34) |
 
