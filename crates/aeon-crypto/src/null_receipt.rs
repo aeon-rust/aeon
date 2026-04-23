@@ -320,9 +320,8 @@ mod tests {
         // Either deserialize fails outright, or the parsed value
         // differs from the original — in either case the chain can
         // detect tampering by recomputing the PoH entry.
-        match NullReceipt::from_chain_bytes(&bytes) {
-            Ok(back) => assert_ne!(back, r),
-            Err(_) => {}
+        if let Ok(back) = NullReceipt::from_chain_bytes(&bytes) {
+            assert_ne!(back, r);
         }
     }
 
