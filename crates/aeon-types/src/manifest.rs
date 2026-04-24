@@ -858,7 +858,7 @@ mod tests {
         // Nested: one entry keyed `"config"` holding the sub-object.
         assert_eq!(n.config.len(), 1);
         assert!(n.config.contains_key("config"));
-        assert!(n.config.get("count").is_none());
+        assert!(!n.config.contains_key("count"));
 
         // Flat: two entries, both reachable by their intended keys.
         assert_eq!(f.config.len(), 2);

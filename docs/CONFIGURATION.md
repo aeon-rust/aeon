@@ -497,17 +497,19 @@ pipelines:
       type: kafka
       topic: input-events
       partitions: [0, 1, 2, 3]
-      config:
-        bootstrap.servers: "redpanda:9092"
-        group.id: "aeon-my-pipeline"
+      # Connector keys are flattened onto the source/sink — do NOT
+      # nest under a literal `config:` block (see the
+      # `source_config_keys_must_be_flat_not_nested` test in
+      # `aeon-types::manifest`).
+      bootstrap.servers: "redpanda:9092"
+      group.id: "aeon-my-pipeline"
     processor:
       name: my-processor
       version: "1.2.0"
     sink:
       type: kafka
       topic: output-events
-      config:
-        bootstrap.servers: "redpanda:9092"
+      bootstrap.servers: "redpanda:9092"
     upgrade_strategy: drain-swap  # or blue-green, canary
 
   - name: analytics-pipeline

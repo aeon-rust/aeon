@@ -7,6 +7,19 @@ use aeon_types::AeonError;
 
 use crate::config::{ClusterConfig, RaftTiming, TlsConfig};
 
+/// Install `ring` as the process-wide rustls default crypto provider if
+/// nothing is installed yet. Idempotent — safe to call from multiple
+/// threads and multiple call sites.
+///
+/// Required since the S10 feature expansion pulled `aws-lc-rs` into the
+/// workspace graph alongside the pre-existing `ring` (aeon-crypto /
+/// quinn / tokio-rustls). Without an explicit default, rustls panics
+/// on the first `ClientConfig::builder()` / `ServerConfig::builder()`.
+/// Mirrors `aeon_crypto::tls::ensure_rustls_default_provider`.
+fn ensure_rustls_default_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 /// Build a shared `quinn::TransportConfig` sized from the cluster's Raft
 /// timing. Sets two knobs that quinn leaves disabled by default:
 ///
@@ -36,6 +49,7 @@ fn build_transport_config(raft_timing: &RaftTiming) -> Arc<quinn::TransportConfi
 
 /// Build a rustls ServerConfig for QUIC from TLS file paths.
 pub fn build_server_config(tls: &TlsConfig) -> Result<rustls::ServerConfig, AeonError> {
+    ensure_rustls_default_provider();
     let cert_pem = std::fs::read(&tls.cert).map_err(|e| AeonError::Config {
         message: format!("failed to read cert file {:?}: {e}", tls.cert),
     })?;
@@ -91,6 +105,7 @@ pub fn build_server_config(tls: &TlsConfig) -> Result<rustls::ServerConfig, Aeon
 
 /// Build a rustls ClientConfig for QUIC from TLS file paths.
 pub fn build_client_config(tls: &TlsConfig) -> Result<rustls::ClientConfig, AeonError> {
+    ensure_rustls_default_provider();
     let cert_pem = std::fs::read(&tls.cert).map_err(|e| AeonError::Config {
         message: format!("failed to read cert file {:?}: {e}", tls.cert),
     })?;
@@ -255,6 +270,7 @@ pub fn dev_self_signed_cert(
 #[cfg(any(test, feature = "auto-tls"))]
 #[allow(clippy::unwrap_used)]
 pub fn dev_quic_configs() -> (quinn::ServerConfig, quinn::ClientConfig) {
+    ensure_rustls_default_provider();
     let (cert_der, key_der) = dev_self_signed_cert(vec!["localhost".to_string()]);
 
     // Server config
@@ -289,6 +305,7 @@ pub fn dev_quic_configs() -> (quinn::ServerConfig, quinn::ClientConfig) {
 #[cfg(any(test, feature = "auto-tls"))]
 #[allow(clippy::unwrap_used)]
 pub fn dev_quic_configs_insecure() -> (quinn::ServerConfig, quinn::ClientConfig) {
+    ensure_rustls_default_provider();
     let (cert_der, key_der) = dev_self_signed_cert(vec!["localhost".to_string()]);
 
     // Server config — no client auth required
