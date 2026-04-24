@@ -34,9 +34,20 @@ pipelines:
         # Connector config is flattened directly onto the SourceManifest
         # (not nested under a `config:` key). The manifest-to-pipeline
         # bridge copies unknown-top-level keys through to the factory.
-        # 0 = unbounded; cap via run duration instead of count so the
-        # sustained-sweep timing is deterministic across laptop reps.
-        count: "0"
+        #
+        # `count: "0"` runs unbounded — which on a containerised RD pod
+        # (2Gi memory limit in helm/aeon/values-local.yaml) OOMs within
+        # a couple of seconds at this synthesis rate (~900MB/s of Event
+        # structs). Empirically 10M also OOMs under the current wiring:
+        # the Blackhole sink drain doesn't keep up with synthesis when
+        # the pipeline runs three parallel source loops (one per owned
+        # partition), so buffered events accumulate faster than limits
+        # allow. 1M per pod is the safe headline figure and reliably
+        # completes in ~1 s per pod on 2Gi. For multi-minute sustained
+        # sweeps, raise the pod memory limit in
+        # helm/aeon/values-local.yaml or switch to a Kafka source that
+        # naturally flow-controls on empty.
+        count: "1000000"
         payload_size: "256"
         batch_size: "1024"
 

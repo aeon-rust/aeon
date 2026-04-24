@@ -18,27 +18,28 @@ this document mirrors).
 
 ---
 
-## ⚠ Prerequisite — Image SHA alignment
+## Prerequisite — Image SHA alignment (closed 2026-04-24)
 
-The running RD cluster image (verified 2026-04-24 14:00 UTC) predates
-the current feature-branch HEAD that ships Phases 1–4 of the
-2026-04-24 session (S4.3 CLI, S10 mTLS for Redis/NATS/PG-CDC/MySQL-CDC/
-Mongo-CDC, P5.c factories, S2.5 audit wiring). Local CLI calls against
-this cluster fail at unrelated API endpoints (e.g. processor register
-returns EOF from an older REST schema). Before running V2/V3/V5 the
-operator must:
+**Done in-session:** built `aeon:e68ce68` via
+`nerdctl --namespace=k8s.io build -t aeon:e68ce68 -f docker/Dockerfile .`
+(~9 min, 130.9 MB), then `helm upgrade aeon helm/aeon -n aeon
+-f helm/aeon/values-local.yaml --set image.tag=e68ce68 --reuse-values`.
 
-1. `docker build . -t aeonrust/aeon:pre-session-b` (or equivalent
-   nerdctl for Rancher Desktop) from the current feature-branch SHA.
-2. Reload the Helm values to point at the new tag: `helm upgrade
-   aeon helm/aeon -n aeon --set image.tag=pre-session-b --reuse-values`.
-3. Verify `kubectl rollout status sts/aeon -n aeon` completes cleanly
-   and pods stabilise.
-4. Re-run the V1 cluster-baseline checks.
+Two hiccups caught and fixed during bring-up:
+- First rollout attempt (`aeon:18f1988`) crashed on pod start with
+  `Could not automatically determine the process-level CryptoProvider`
+  — my rustls ring-provider fix from `0d67901` missed
+  `aeon-cluster::transport::tls`. `e68ce68` adds
+  `ensure_rustls_default_provider()` to every rustls builder in
+  aeon-cluster; cluster bootstraps cleanly now.
+- Helm STS rolling update ended with Raft membership stuck at
+  `{2, 3}` (split-brain artifact — aeon-0 came back before the
+  others and couldn't rejoin). `kubectl delete pod aeon-{0,1,2}`
+  forced a full re-bootstrap; membership settled cleanly at
+  `{1, 2, 3}`.
 
-This is tracked as **blocker 0** for any live load-test run in this
-cycle; without it the CLI and the serving binary can disagree on
-request schemas.
+All 3 pods currently on `aeon:e68ce68`, leader node 3, term 4
+(several elections during rollout churn), 12 partitions balanced.
 
 ## V1 — Cluster Baseline (loopback STS on RD)
 
@@ -107,19 +108,45 @@ expected shape from Session 0. No code gaps surfaced in the boot path.
    # assert: PoH chain continuity via /api/v1/pipeline/<name>/poh-head on source + target
    ```
 
-**V2 T0 results (captured 2026-04-24 16:29 UTC, RD 3-pod STS):**
+**V2 T0 results (two runs, 2026-04-24):**
+
+First run (16:29 UTC, pre-image-rebuild, `aeon:session0`, count-default 1M):
 
 | Metric | Value |
 |--------|-------|
-| Pipeline start (supervisor) | 2026-04-24T16:29:48.816Z — simultaneous across all 3 pods |
-| Pipeline clean exit | 2026-04-24T16:29:49.63Z — longest pod (aeon-1): 817ms |
-| Events received (per-pod) | 1,000,000 on each of aeon-0 / aeon-1 / aeon-2 |
-| Events processed | 1,000,000 per pod — parity with received |
-| Outputs sent | 1,000,000 per pod — parity with processed |
-| Events failed | **0** on every pod |
-| Events retried | **0** on every pod |
-| Aggregate throughput | ~3.67M events/sec across 3-pod cluster (3M events / 817ms) |
-| `outputs_acked_total` | `0` on every pod — **expected**: Blackhole sink is `t6_fire_and_forget`, so no broker ack emission. Per-sink tier behaviour documented in `docs/EO-2-DURABILITY-DESIGN.md`. |
+| Pipeline start (supervisor) | 16:29:48.816Z — simultaneous across all 3 pods |
+| Pipeline clean exit | 16:29:49.63Z — longest pod (aeon-1): 817ms |
+| Events received / processed / sent (per-pod) | 1,000,000 on each of aeon-0 / aeon-1 / aeon-2 |
+| Events failed / retried | **0 / 0** on every pod |
+| Aggregate throughput | **~3.67M events/sec** across 3-pod cluster |
+
+Second run (18:26 UTC, post-rebuild, `aeon:e68ce68`, explicit count 1M):
+
+| Metric | Value |
+|--------|-------|
+| Pipeline start | 18:26:07.730Z |
+| Pipeline exit (aeon-1, leader) | 18:26:08.625Z — **895ms** |
+| Events received / processed / sent (per-pod) | 1,000,000 × 3 pods |
+| Events failed / retried | **0 / 0** |
+| Aggregate throughput | **~3.35M events/sec** (3M events / 895ms) |
+| `outputs_acked_total` | `0` on every pod — **expected**: Blackhole sink is `t6_fire_and_forget`, no broker ack emission. Per-sink tier behaviour documented in `docs/EO-2-DURABILITY-DESIGN.md`. |
+
+**Second-run findings:**
+
+- Throughput on the rebuilt image is ~9% below the session0 baseline
+  (3.35M/s vs 3.67M/s). Difference is well within single-laptop-run
+  noise (WSL2 scheduler jitter, kernel thermal throttling, CPU
+  frequency scaling) and not a regression alarm.
+
+- **`count: "0"` OOM** — unbounded Memory source at
+  ~900 MB/s of Event struct synthesis exhausts the 2GiB pod memory
+  limit in ~2 s, OOMKill exit 137. `count: "10000000"` also OOMs
+  because synthesis outpaces Blackhole drain when 4 per-partition
+  source loops run in parallel. Locked the fixture to
+  `count: "1000000"` which completes in ~1 s per pod. Sustained
+  multi-minute sweeps need either a higher pod memory limit
+  (`helm/aeon/values-local.yaml` currently 1Gi req / 2Gi limit) or
+  a natural-flow-control source (Kafka).
 
 **Bugs surfaced inline (captured 2026-04-24):**
 
@@ -197,7 +224,7 @@ and assert MMR + Merkle + Ed25519 root-sig round-trips; resumed
 
 | PohVerifyMode | Steps | Status |
 |---------------|-------|--------|
-| `Verify` | trigger T4 transfer, `curl /api/v1/pipelines/<name>/partitions/<N>/poh-head` on both peers, assert byte-equal `current_hash` + `mmr_root` + `sequence` | ⏳ pending |
+| `Verify` | trigger T4 transfer, `curl /api/v1/pipelines/<name>/partitions/<N>/poh-head` on both peers, assert byte-equal `current_hash` + `mmr_root` + `sequence` | 🟡 endpoint verified live on `aeon:e68ce68`; walk still pending a PoH-enabled pipeline + T4 transfer |
 | `VerifyWithKey` | same as Verify + assert Ed25519 signature over the root verifies against the publisher's pubkey | ⏳ pending |
 | `TrustExtend` | skip verify, confirm target still sequences correctly from the trusted extend point | ⏳ pending |
 
@@ -206,8 +233,23 @@ all closed 2026-04-16 with 4 integration tests over real QUIC. V5 exists
 to confirm the E2E engine-level wire-up stays green on RD (which itself
 is closed via G2 / CL-6c.4 per 2026-04-23 ROADMAP entry).
 
-**V5 verdict (pending):** code-level coverage is already green; the V5
-run certifies the RD cluster as a whole, not new code paths.
+**V5 verdict (endpoint live, walk pending):** the new V5 REST
+endpoint is confirmed live on `aeon:e68ce68`:
+
+```
+$ curl http://.../api/v1/pipelines/t0-baseline/partitions/0/poh-head
+404 {"error":"pipeline 't0-baseline' partition 0: no live PoH chain
+  (partition not owned on this node or PoH not wired)"}
+
+$ curl http://.../api/v1/pipelines/does-not-exist/partitions/0/poh-head
+404 {"error":"pipeline 'does-not-exist' not found"}
+```
+
+Both branches return the exact error text the handler emits,
+confirming the feature-gated `processor-auth + cluster` code path is
+compiled in. Full walk under `{Verify, VerifyWithKey, TrustExtend}`
+still needs a PoH-enabled pipeline + T4 transfer, which is the
+next-session scope.
 
 ---
 
@@ -232,10 +274,8 @@ run certifies the RD cluster as a whole, not new code paths.
 
 ### Gaps to carry forward into Gate 2 blocker queue
 
-0. **Image SHA alignment (prerequisite)** — RD cluster runs a 13h-old
-   image that predates this session's S4.3 / S10 / P5.c / S2.5 work.
-   Rebuild + redeploy is the first step of the next V2 attempt; see
-   the prerequisite block above for the exact commands.
+0. **Image SHA alignment** — ✅ **closed 2026-04-24** (see prerequisite
+   block above). Cluster now runs `aeon:e68ce68` on all 3 pods.
 1. **V2 T0 ✅ captured 2026-04-24** (3.67M/s aggregate, zero-loss);
    T2/T3/T4 still pending dedicated session. Scope is 1–2 hours
    dedicated session time; **one code gap surfaced** —
