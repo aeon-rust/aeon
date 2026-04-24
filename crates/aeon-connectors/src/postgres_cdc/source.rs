@@ -137,20 +137,40 @@ impl PostgresCdcSource {
 
 /// Establish a fresh tokio-postgres connection and (optionally) create the
 /// replication slot. Returns the client and the driver task handle.
+///
+/// TLS handling: `auth::resolve_config` returns an optional
+/// `rustls::ClientConfig` alongside the parsed `Config`. When `Some`, we
+/// wrap it in a `tokio_postgres_rustls::MakeRustlsConnect` and hand that
+/// to `Config::connect` so client-side mTLS is honoured. When `None`, we
+/// fall back to `NoTls`.
 async fn establish(
     config: &PostgresCdcSourceConfig,
 ) -> Result<(Client, tokio::task::JoinHandle<()>), AeonError> {
-    let pg_config = super::auth::resolve_config(&config.connection_string, config.auth.as_ref())?;
-    let (client, connection) = pg_config
-        .connect(NoTls)
-        .await
-        .map_err(|e| AeonError::connection(format!("postgres connect failed: {e}")))?;
+    let (pg_config, tls) =
+        super::auth::resolve_config(&config.connection_string, config.auth.as_ref())?;
 
-    let conn_handle = tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            tracing::error!(error = %e, "postgres connection error");
-        }
-    });
+    let (client, conn_handle) = if let Some(rustls_config) = tls {
+        let tls_connector = tokio_postgres_rustls::MakeRustlsConnect::new(rustls_config);
+        let (client, connection) = pg_config.connect(tls_connector).await.map_err(|e| {
+            AeonError::connection(format!("postgres mTLS connect failed: {e}"))
+        })?;
+        let conn_handle = tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                tracing::error!(error = %e, "postgres connection error");
+            }
+        });
+        (client, conn_handle)
+    } else {
+        let (client, connection) = pg_config.connect(NoTls).await.map_err(|e| {
+            AeonError::connection(format!("postgres connect failed: {e}"))
+        })?;
+        let conn_handle = tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                tracing::error!(error = %e, "postgres connection error");
+            }
+        });
+        (client, conn_handle)
+    };
 
     if config.create_slot {
         let create_sql = format!(

@@ -1,7 +1,8 @@
 //! S10 outbound-auth → async-nats `ConnectOptions` translation.
 //!
 //! Shared by `NatsSource` and `NatsSink`. The operator supplies only the
-//! server URL (`nats://host:4222`); credentials flow through the signer.
+//! server URL (`nats://host:4222` or `tls://host:4222`); credentials flow
+//! through the signer.
 //!
 //! **One mode per connector**, matching the kafka / redis translators:
 //!
@@ -18,14 +19,13 @@
 //!   At most one of the first three is used; the translator does not
 //!   attempt to combine them. Username/password may be combined with
 //!   any of the first three as an additional credential.
-//! - `Mtls` — warn-and-skip. async-nats 0.38's
-//!   `ConnectOptions::add_client_certificate` takes `PathBuf` (not
-//!   inline PEM) while Aeon's outbound-auth signer carries PEM bytes
-//!   in `SecretBytes`. Writing temp files would bleed secret material
-//!   to disk; a follow-up can either use a secure in-memory tmpfs
-//!   approach or a patched async-nats that accepts PEM bytes directly.
-//!   For server-auth TLS, use `tls://` / `nats://…` with TLS enabled
-//!   at the server plus `BrokerNative` credentials.
+//! - `Mtls` — async-nats 0.38 exposes
+//!   `ConnectOptions::tls_client_config(rustls::ClientConfig)` which
+//!   accepts an in-memory rustls config. The signer's cert/key PEMs
+//!   are parsed via [`crate::mtls_pem::build_mtls_client_config`] (the
+//!   same helper WebSocket + WebTransport use), and `require_tls(true)`
+//!   is flipped so the connector refuses plaintext connections. No
+//!   tempfiles, no secrets on disk.
 //! - `Bearer` / `Basic` / `ApiKey` / `HmacSign` — warn-and-skip.
 
 use aeon_types::{AeonError, OutboundAuthMode, OutboundAuthSigner};
@@ -91,11 +91,14 @@ fn build_connect_options(
             }
         }
         OutboundAuthMode::Mtls => {
-            tracing::warn!(
-                "NATS connector: mTLS requires cert+key on disk (async-nats 0.38 API takes PathBuf); \
-                 inline PEM from OutboundAuthSigner is not wired. Use broker_native with \
-                 credentials/nkey_seed/token and server-side TLS for transport encryption."
-            );
+            let cert_pem = s.mtls_cert_pem().ok_or_else(|| {
+                AeonError::config("nats mTLS: signer is in Mtls mode but missing cert PEM")
+            })?;
+            let key_pem = s.mtls_key_pem().ok_or_else(|| {
+                AeonError::config("nats mTLS: signer is in Mtls mode but missing key PEM")
+            })?;
+            let tls = crate::mtls_pem::build_mtls_client_config(cert_pem, key_pem)?;
+            options = options.require_tls(true).tls_client_config(tls);
         }
         OutboundAuthMode::Bearer
         | OutboundAuthMode::Basic
@@ -220,19 +223,45 @@ mod tests {
         assert!(format!("{err}").contains("credentials"));
     }
 
+    fn fixture_cert_and_key() -> (String, String) {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        (cert.pem(), key.serialize_pem())
+    }
+
     #[test]
-    fn mtls_mode_warns_and_returns_default_options() {
+    fn mtls_mode_wires_rustls_client_config_into_options() {
+        let (cert_pem, key_pem) = fixture_cert_and_key();
+        let s = signer(OutboundAuthConfig {
+            mode: OutboundAuthMode::Mtls,
+            mtls: Some(aeon_types::OutboundMtlsConfig { cert_pem, key_pem }),
+            ..Default::default()
+        });
+        let opts = build_connect_options(Some(&s)).unwrap();
+        // async-nats ConnectOptions stores tls_client_config in a private
+        // field. The public Debug impl prints "XXXXXXXX" when the config
+        // is present; that's the tightest public-API-safe check we have.
+        let dbg = format!("{:?}", opts);
+        assert!(
+            dbg.contains("XXXXXXXX"),
+            "expected tls_client_config set on ConnectOptions: {dbg}"
+        );
+    }
+
+    #[test]
+    fn mtls_mode_rejects_malformed_pem() {
         let s = signer(OutboundAuthConfig {
             mode: OutboundAuthMode::Mtls,
             mtls: Some(aeon_types::OutboundMtlsConfig {
-                cert_pem: "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"
-                    .to_string(),
-                key_pem: "-----BEGIN PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----\n"
-                    .to_string(),
+                cert_pem: "not a PEM".to_string(),
+                key_pem: "not a key".to_string(),
             }),
             ..Default::default()
         });
-        assert!(build_connect_options(Some(&s)).is_ok());
+        let err = build_connect_options(Some(&s)).unwrap_err();
+        let msg = format!("{err}").to_lowercase();
+        assert!(msg.contains("mtls") || msg.contains("pem") || msg.contains("certificate"));
     }
 
     #[test]

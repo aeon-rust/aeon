@@ -7,7 +7,6 @@
 
 use aeon_types::{AeonError, OutboundAuthMode, OutboundAuthSigner};
 use std::sync::Arc;
-use wtransport::tls::rustls;
 
 /// Build a `wtransport::ClientConfig` whose TLS layer presents the signer's
 /// mTLS cert/key (S10 Mtls mode) and verifies the remote server against the
@@ -51,45 +50,14 @@ pub fn mtls_client_config_from_signer(
     let key_pem = signer
         .mtls_key_pem()
         .ok_or_else(|| AeonError::config("webtransport mTLS: signer missing key pem"))?;
-    let tls = build_mtls_rustls_client_config(cert_pem, key_pem)?;
+    // Delegate PEM → rustls::ClientConfig to the shared helper. WebTransport
+    // requires TLS 1.3 + `TLS13_AES_128_GCM_SHA256`, which is in the rustls
+    // ring-provider default cipher set.
+    let tls = crate::mtls_pem::build_mtls_client_config(cert_pem, key_pem)?;
     Ok(wtransport::ClientConfig::builder()
         .with_bind_default()
         .with_custom_tls(tls)
         .build())
-}
-
-/// Build a `rustls::ClientConfig` that presents `cert_pem` / `key_pem` as
-/// the client identity and verifies the remote server against the public
-/// `webpki-roots` trust store. Cipher suites are left at rustls defaults —
-/// wtransport requires TLS 1.3 + `TLS13_AES_128_GCM_SHA256`, which is in
-/// the default set when the ring provider is used.
-fn build_mtls_rustls_client_config(
-    cert_pem: &[u8],
-    key_pem: &[u8],
-) -> Result<rustls::ClientConfig, AeonError> {
-    let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
-        rustls_pemfile::certs(&mut std::io::Cursor::new(cert_pem))
-            .collect::<Result<_, _>>()
-            .map_err(|e| AeonError::config(format!("webtransport mTLS cert parse: {e}")))?;
-    if certs.is_empty() {
-        return Err(AeonError::config(
-            "webtransport mTLS: no certificate in pem".to_string(),
-        ));
-    }
-    let key = rustls_pemfile::private_key(&mut std::io::Cursor::new(key_pem))
-        .map_err(|e| AeonError::config(format!("webtransport mTLS key parse: {e}")))?
-        .ok_or_else(|| AeonError::config("webtransport mTLS: no private key in pem".to_string()))?;
-
-    let mut root_store = rustls::RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
-    rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_client_auth_cert(certs, key)
-        .map_err(|e| AeonError::Crypto {
-            message: format!("webtransport mTLS config build: {e}"),
-            source: None,
-        })
 }
 
 #[cfg(test)]
@@ -140,9 +108,12 @@ mod tests {
     #[test]
     fn empty_cert_pem_surfaces_config_error() {
         // No PEM envelope at all — certs parse yields an empty set and we
-        // short-circuit before even looking at the key.
+        // short-circuit before even looking at the key. Exercise via the
+        // shared helper directly since `build_mtls_rustls_client_config`
+        // was folded into `crate::mtls_pem::build_mtls_client_config`.
         let (_cert, key_pem) = fixture_cert_and_key();
-        let err = build_mtls_rustls_client_config(b"", key_pem.as_bytes()).unwrap_err();
+        let err = crate::mtls_pem::build_mtls_client_config(b"", key_pem.as_bytes())
+            .unwrap_err();
         let msg = format!("{err:?}");
         assert!(
             msg.to_lowercase().contains("certificate") || msg.to_lowercase().contains("pem"),

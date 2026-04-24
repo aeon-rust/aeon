@@ -134,9 +134,7 @@ pub struct RedisSink {
 impl RedisSink {
     /// Connect to Redis.
     pub async fn new(config: RedisSinkConfig) -> Result<Self, AeonError> {
-        let conn_info = super::auth::resolve_connection_info(&config.url, config.auth.as_ref())?;
-        let client = redis::Client::open(conn_info)
-            .map_err(|e| AeonError::connection(format!("redis client create failed: {e}")))?;
+        let client = super::auth::resolve_client(&config.url, config.auth.as_ref())?;
 
         let conn = client
             .get_multiplexed_async_connection()

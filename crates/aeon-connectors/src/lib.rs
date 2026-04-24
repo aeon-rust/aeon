@@ -27,6 +27,20 @@
 ))]
 pub mod push_buffer;
 
+// S10 mTLS — shared PEM → rustls::ClientConfig helper used by connector
+// features whose driver accepts an inline `rustls::ClientConfig` directly
+// (WebSocket, WebTransport, NATS, Postgres-CDC). MySQL-CDC + Redis-Streams
+// wire mTLS through their own driver-specific primitives
+// (`mysql_async::ClientIdentity`, `redis::TlsCertificates`) and don't
+// consume this helper.
+#[cfg(any(
+    feature = "websocket",
+    feature = "webtransport",
+    feature = "nats",
+    feature = "postgres-cdc",
+))]
+pub(crate) mod mtls_pem;
+
 // ─── Phase 11a — Streaming Connectors ──────────────────────────────────
 
 #[cfg(feature = "memory")]

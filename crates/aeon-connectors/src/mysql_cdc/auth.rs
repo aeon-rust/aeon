@@ -15,15 +15,17 @@
 //!
 //!   Signer credentials win over URL userinfo; a warn line flags the
 //!   conflict.
-//! - `Mtls` — warn-and-skip. mysql_async's `SslOpts` requires either
-//!   the `native-tls-tls` or `rustls-tls` cargo feature on the
-//!   mysql_async dep; neither is enabled in this build. Follow-up can
-//!   flip the feature and wire `SslOpts::with_client_identity` from
-//!   inline PEM.
+//! - `Mtls` — uses mysql_async's `rustls-tls` feature:
+//!   `SslOpts::with_client_identity(ClientIdentity::new(PathOrBuf::Buf(cert),
+//!   PathOrBuf::Buf(key)))`. The signer's in-memory cert/key PEMs are
+//!   handed directly to mysql_async as owned byte buffers — no tempfiles,
+//!   no secrets on disk. Note that mysql_async 0.34's rustls path only
+//!   accepts RSA private keys (`rsa_private_keys` iterator); Ed25519 /
+//!   ECDSA client keys are an upstream gap.
 //! - `Bearer` / `Basic` / `ApiKey` / `HmacSign` — warn-and-skip.
 
 use aeon_types::{AeonError, OutboundAuthMode, OutboundAuthSigner};
-use mysql_async::{Opts, OptsBuilder};
+use mysql_async::{ClientIdentity, Opts, OptsBuilder, SslOpts};
 use std::sync::Arc;
 
 /// Parse `url` into an `Opts` and apply any signer-supplied overrides.
@@ -71,11 +73,20 @@ pub(super) fn resolve_opts(
             Ok(builder.into())
         }
         OutboundAuthMode::Mtls => {
-            tracing::warn!(
-                "MySQL CDC connector: mTLS requires the mysql_async 'native-tls-tls' or \
-                 'rustls-tls' cargo feature (not enabled in this build). Use broker_native."
-            );
-            Ok(opts)
+            let cert_pem = s.mtls_cert_pem().ok_or_else(|| {
+                AeonError::config("mysql CDC mTLS: signer is in Mtls mode but missing cert PEM")
+            })?;
+            let key_pem = s.mtls_key_pem().ok_or_else(|| {
+                AeonError::config("mysql CDC mTLS: signer is in Mtls mode but missing key PEM")
+            })?;
+            // `From<Vec<u8>> for PathOrBuf<'static>` is the inline-PEM
+            // escape hatch — signer's SecretBytes are copied into owned
+            // vecs that mysql_async keeps in the Opts. Nothing lands on disk.
+            let identity =
+                ClientIdentity::new(cert_pem.to_vec().into(), key_pem.to_vec().into());
+            let ssl = SslOpts::default().with_client_identity(Some(identity));
+            let builder = OptsBuilder::from_opts(opts).ssl_opts(ssl);
+            Ok(builder.into())
         }
         OutboundAuthMode::Bearer
         | OutboundAuthMode::Basic
@@ -154,20 +165,33 @@ mod tests {
         assert_eq!(opts.user(), Some("u"));
     }
 
+    fn fixture_cert_and_key() -> (String, String) {
+        // Default algorithm (Ed25519 with ring backend). Note that
+        // mysql_async 0.34's rustls client-identity path loads only RSA
+        // keys at connect time — this test exercises only the resolve_opts
+        // wiring, which treats the PEMs as opaque bytes. Live connect
+        // against a real MySQL would require an RSA key.
+        let key = rcgen::KeyPair::generate().unwrap();
+        let params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        (cert.pem(), key.serialize_pem())
+    }
+
     #[test]
-    fn mtls_mode_is_warn_and_skip() {
+    fn mtls_mode_attaches_ssl_opts() {
+        let (cert_pem, key_pem) = fixture_cert_and_key();
         let s = signer(OutboundAuthConfig {
             mode: OutboundAuthMode::Mtls,
-            mtls: Some(aeon_types::OutboundMtlsConfig {
-                cert_pem: "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"
-                    .to_string(),
-                key_pem: "-----BEGIN PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----\n"
-                    .to_string(),
-            }),
+            mtls: Some(aeon_types::OutboundMtlsConfig { cert_pem, key_pem }),
             ..Default::default()
         });
         let opts = resolve_opts("mysql://u:p@127.0.0.1:3306/d", Some(&s)).unwrap();
         assert_eq!(opts.user(), Some("u"));
+        let ssl = opts.ssl_opts().expect("mTLS must attach SslOpts");
+        assert!(
+            ssl.client_identity().is_some(),
+            "SslOpts must carry ClientIdentity"
+        );
     }
 
     #[test]

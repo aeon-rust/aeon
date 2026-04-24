@@ -50,8 +50,9 @@ pub struct RedisSourceConfig {
     /// When `Group`, the mode's `group_id` overrides the `group` field.
     pub consumer_mode: ConsumerMode,
     /// S10 outbound auth. When `Some`, the signer's mode drives how the
-    /// `ConnectionInfo` passed to `redis::Client::open` is built — see
-    /// `redis_streams::auth::resolve_connection_info`.
+    /// `redis::Client` is constructed — `None` / `BrokerNative` go through
+    /// `Client::open`, `Mtls` through `Client::build_with_tls` with
+    /// inline PEM cert/key. See `redis_streams::auth::resolve_client`.
     pub auth: Option<Arc<OutboundAuthSigner>>,
 }
 
@@ -143,9 +144,7 @@ pub struct RedisSource {
 impl RedisSource {
     /// Connect to Redis and ensure the consumer group exists.
     pub async fn new(config: RedisSourceConfig) -> Result<Self, AeonError> {
-        let conn_info = super::auth::resolve_connection_info(&config.url, config.auth.as_ref())?;
-        let client = redis::Client::open(conn_info)
-            .map_err(|e| AeonError::connection(format!("redis client create failed: {e}")))?;
+        let client = super::auth::resolve_client(&config.url, config.auth.as_ref())?;
 
         // Initial connect is validated synchronously so misconfiguration
         // (bad URL, wrong auth) surfaces on startup. Runtime failures later
