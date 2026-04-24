@@ -8,9 +8,12 @@
 //! occasional loss is acceptable and low latency is critical.
 
 use crate::push_buffer::{PushBufferConfig, PushBufferRx, push_buffer};
-use aeon_types::{AeonError, CoreLocalUuidGenerator, Event, PartitionId, Source};
+use aeon_types::{
+    AeonError, AuthContext, CoreLocalUuidGenerator, Event, InboundAuthVerifier, PartitionId,
+    Source, SourceKind,
+};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Configuration for `WebTransportDatagramSource`.
 pub struct WebTransportDatagramSourceConfig {
@@ -25,6 +28,10 @@ pub struct WebTransportDatagramSourceConfig {
     pub buffer_config: PushBufferConfig,
     /// Timeout waiting for first event in `next_batch()`.
     pub poll_timeout: Duration,
+    /// S9: optional inbound auth verifier. Only `ip_allowlist` mode
+    /// applies at session acceptance time; datagrams themselves carry
+    /// no header/body for HTTP-style auth.
+    pub auth: Option<Arc<InboundAuthVerifier>>,
 }
 
 impl WebTransportDatagramSourceConfig {
@@ -38,6 +45,7 @@ impl WebTransportDatagramSourceConfig {
             source_name: Arc::from("webtransport-dgram"),
             buffer_config: PushBufferConfig::default(),
             poll_timeout: Duration::from_secs(1),
+            auth: None,
         }
     }
 
@@ -50,6 +58,13 @@ impl WebTransportDatagramSourceConfig {
     /// Set the poll timeout.
     pub fn with_poll_timeout(mut self, timeout: Duration) -> Self {
         self.poll_timeout = timeout;
+        self
+    }
+
+    /// Attach an inbound auth verifier (S9). Only `ip_allowlist` mode is
+    /// enforceable on WebTransport datagrams.
+    pub fn with_auth(mut self, verifier: Arc<InboundAuthVerifier>) -> Self {
+        self.auth = Some(verifier);
         self
     }
 }
@@ -87,8 +102,9 @@ impl WebTransportDatagramSource {
 
         let (tx, rx) = push_buffer(config.buffer_config);
         let source_name = config.source_name;
+        let auth = config.auth;
 
-        let handle = tokio::spawn(datagram_accept_loop(endpoint, tx, source_name));
+        let handle = tokio::spawn(datagram_accept_loop(endpoint, tx, source_name, auth));
 
         Ok(Self {
             rx,
@@ -102,9 +118,38 @@ async fn datagram_accept_loop(
     endpoint: wtransport::Endpoint<wtransport::endpoint::endpoint_side::Server>,
     tx: crate::push_buffer::PushBufferTx,
     source_name: Arc<str>,
+    auth: Option<Arc<InboundAuthVerifier>>,
 ) {
     loop {
         let incoming = endpoint.accept().await;
+
+        // S9: pre-handshake IP allow-list check.
+        if let Some(verifier) = &auth {
+            let peer_ip = incoming.remote_address().ip();
+            let now_unix = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let ctx = AuthContext {
+                peer_ip,
+                method: "WT-DGRAM",
+                path: "",
+                body: b"",
+                headers: &[],
+                now_unix,
+                client_cert_subjects: None,
+            };
+            if let Err(rejection) = verifier.verify(&ctx) {
+                tracing::warn!(
+                    source = %source_name,
+                    reason = rejection.reason_tag(),
+                    peer_ip = ?rejection.redacted_peer_ip(),
+                    "webtransport dgram auth rejected"
+                );
+                incoming.refuse();
+                continue;
+            }
+        }
 
         let session_request = match incoming.await {
             Ok(req) => req,
@@ -162,6 +207,10 @@ async fn datagram_accept_loop(
 impl Source for WebTransportDatagramSource {
     async fn next_batch(&mut self) -> Result<Vec<Event>, AeonError> {
         self.rx.next_batch(self.poll_timeout).await
+    }
+
+    fn source_kind(&self) -> SourceKind {
+        SourceKind::Push
     }
 }
 

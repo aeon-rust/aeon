@@ -45,7 +45,10 @@ use aeon_connectors::{
 };
 use aeon_engine::{ConnectorRegistry, DynSink, DynSource, SinkFactory, SourceFactory};
 use aeon_types::{
-    AeonError, DeliveryStrategy,
+    AeonError, ApiKeyConfig, BasicConfig, BearerConfig, BrokerNativeConfig, DeliveryStrategy,
+    HmacAlgorithm, HmacConfig, HmacSignConfig, InboundAuthConfig, InboundAuthMode,
+    InboundAuthVerifier, IpAllowlistConfig, MtlsConfig, OutboundApiKeyConfig, OutboundAuthConfig,
+    OutboundAuthMode, OutboundAuthSigner, OutboundMtlsConfig, SsrfPolicy,
     registry::{SinkConfig, SourceConfig},
 };
 
@@ -155,6 +158,12 @@ impl SourceFactory for KafkaSourceFactory {
             kcfg = kcfg.with_max_empty_polls(parse_u32(Some(m), 10)?);
         }
 
+        // S10: outbound auth (BrokerNative / Mtls translated to rdkafka knobs;
+        // HTTP-style modes warned-and-ignored at the kafka::auth layer).
+        if let Some(signer) = build_outbound_auth_signer(&cfg.config)? {
+            kcfg = kcfg.with_auth(signer);
+        }
+
         Ok(Box::new(KafkaSource::new(kcfg)?))
     }
 }
@@ -194,6 +203,12 @@ impl SinkFactory for KafkaSinkFactory {
             // manifest works across every pod without hand-editing.
             let resolved = substitute_env_placeholders(tid)?;
             kcfg = kcfg.with_transactional_id(resolved);
+        }
+
+        // S10: outbound auth (BrokerNative / Mtls translated to rdkafka knobs;
+        // HTTP-style modes warned-and-ignored at the kafka::auth layer).
+        if let Some(signer) = build_outbound_auth_signer(&cfg.config)? {
+            kcfg = kcfg.with_auth(signer);
         }
 
         Ok(Box::new(KafkaSink::new(kcfg)?))
@@ -261,6 +276,11 @@ impl SourceFactory for HttpWebhookSourceFactory {
             hcfg = hcfg.with_source_name(Arc::<str>::from(name.as_str()));
         }
 
+        // S9: optional inbound auth verifier.
+        if let Some(verifier) = build_inbound_auth_verifier(&cfg.config)? {
+            hcfg = hcfg.with_auth(verifier);
+        }
+
         // HttpWebhookSource::new is async (binds the TCP listener). The
         // supervisor builds factories from a blocking context, so we enter
         // the tokio runtime via Handle::current(). If no runtime is
@@ -289,6 +309,10 @@ impl SourceFactory for HttpWebhookSourceFactory {
 /// - `timeout_ms` (default 30000)
 /// - `source_name` (default `http-poll`; goes into `Event.source`)
 /// - `header.<name>` (repeatable; each `header.X-Foo: bar` adds one request header)
+/// - `ssrf_allow_loopback` / `ssrf_allow_private` / `ssrf_allow_link_local` /
+///   `ssrf_allow_cgnat` (bools; S7 SSRF guard — defaults deny loopback /
+///   link-local / CGNAT, allow RFC1918)
+/// - `ssrf_extra_deny` / `ssrf_extra_allow` (comma-separated CIDR lists)
 pub struct HttpPollingSourceFactory;
 
 impl SourceFactory for HttpPollingSourceFactory {
@@ -298,7 +322,8 @@ impl SourceFactory for HttpPollingSourceFactory {
             .get("url")
             .ok_or_else(|| AeonError::config("http-polling source requires config.url"))?;
 
-        let mut pcfg = HttpPollingSourceConfig::new(url);
+        let mut pcfg = HttpPollingSourceConfig::new(url)
+            .with_ssrf_policy(parse_ssrf_policy(&cfg.config)?);
 
         if let Some(v) = cfg.config.get("interval_ms") {
             pcfg = pcfg.with_interval(std::time::Duration::from_millis(parse_u64(Some(v), 10_000)?));
@@ -313,6 +338,11 @@ impl SourceFactory for HttpPollingSourceFactory {
             if let Some(header_name) = k.strip_prefix("header.") {
                 pcfg = pcfg.with_header(header_name.to_string(), v.clone());
             }
+        }
+
+        // S10: optional outbound auth signer.
+        if let Some(signer) = build_outbound_auth_signer(&cfg.config)? {
+            pcfg = pcfg.with_auth(signer);
         }
 
         Ok(Box::new(HttpPollingSource::new(pcfg)?))
@@ -330,6 +360,10 @@ impl SourceFactory for HttpPollingSourceFactory {
 /// Optional keys (config map):
 /// - `timeout_ms` (default 30000)
 /// - `header.<name>` (repeatable; each `header.X-Foo: bar` adds one request header)
+/// - `ssrf_allow_loopback` / `ssrf_allow_private` / `ssrf_allow_link_local` /
+///   `ssrf_allow_cgnat` (bools; S7 SSRF guard — defaults deny loopback /
+///   link-local / CGNAT, allow RFC1918)
+/// - `ssrf_extra_deny` / `ssrf_extra_allow` (comma-separated CIDR lists)
 pub struct HttpSinkFactory;
 
 impl SinkFactory for HttpSinkFactory {
@@ -339,7 +373,7 @@ impl SinkFactory for HttpSinkFactory {
             .get("url")
             .ok_or_else(|| AeonError::config("http sink requires config.url"))?;
 
-        let mut scfg = HttpSinkConfig::new(url);
+        let mut scfg = HttpSinkConfig::new(url).with_ssrf_policy(parse_ssrf_policy(&cfg.config)?);
 
         if let Some(v) = cfg.config.get("timeout_ms") {
             scfg = scfg.with_timeout(std::time::Duration::from_millis(parse_u64(Some(v), 30_000)?));
@@ -348,6 +382,11 @@ impl SinkFactory for HttpSinkFactory {
             if let Some(header_name) = k.strip_prefix("header.") {
                 scfg = scfg.with_header(header_name.to_string(), v.clone());
             }
+        }
+
+        // S10: optional outbound auth signer.
+        if let Some(signer) = build_outbound_auth_signer(&cfg.config)? {
+            scfg = scfg.with_auth(signer);
         }
 
         Ok(Box::new(HttpSink::new(scfg)?))
@@ -485,6 +524,364 @@ fn parse_bool(s: Option<&String>) -> Result<bool, AeonError> {
     }
 }
 
+/// S7: read an [`SsrfPolicy`] from a connector's flat `config` map. Operators
+/// opt out of the production defaults by setting any of these keys:
+///
+///   - `ssrf_allow_loopback`   (default false)
+///   - `ssrf_allow_private`    (default true — matches in-VPC deployments)
+///   - `ssrf_allow_link_local` (default false — blocks IMDS 169.254/16)
+///   - `ssrf_allow_cgnat`      (default false)
+///   - `ssrf_extra_deny`       (comma-separated CIDRs to always deny)
+///   - `ssrf_extra_allow`      (comma-separated CIDRs to allow on top of policy)
+///
+/// Omitted keys fall through to [`SsrfPolicy::production`], so every
+/// URL-based connector is guarded by default even without operator config.
+fn parse_ssrf_policy(
+    cfg: &std::collections::BTreeMap<String, String>,
+) -> Result<SsrfPolicy, AeonError> {
+    let base = SsrfPolicy::production();
+    Ok(SsrfPolicy {
+        allow_loopback: match cfg.get("ssrf_allow_loopback") {
+            Some(v) => parse_bool(Some(v))?,
+            None => base.allow_loopback,
+        },
+        allow_private: match cfg.get("ssrf_allow_private") {
+            Some(v) => parse_bool(Some(v))?,
+            None => base.allow_private,
+        },
+        allow_link_local: match cfg.get("ssrf_allow_link_local") {
+            Some(v) => parse_bool(Some(v))?,
+            None => base.allow_link_local,
+        },
+        allow_cgnat: match cfg.get("ssrf_allow_cgnat") {
+            Some(v) => parse_bool(Some(v))?,
+            None => base.allow_cgnat,
+        },
+        extra_deny: parse_cidr_list(cfg.get("ssrf_extra_deny"))?,
+        extra_allow: parse_cidr_list(cfg.get("ssrf_extra_allow"))?,
+    })
+}
+
+/// S9: parse an [`InboundAuthConfig`] from a push-source's flat `config` map.
+///
+/// Returns `Ok(None)` when `auth_modes` is absent — no verifier is installed.
+/// Otherwise the following flat keys are recognized (comma-separated lists
+/// are split on `,` with whitespace trimmed). Secret-valued fields
+/// (`auth_api_keys`, `auth_hmac_secrets`) are expected to carry plaintext at
+/// this point — the CLI's S1.3 pre-parse YAML interpolation layer has
+/// already resolved `${VAULT:...}` / `${ENV:...}` tokens before the factory
+/// is invoked.
+///
+/// - `auth_modes`: comma list of `ip_allowlist`, `api_key`, `hmac`, `mtls`
+///   (declaration order == enforcement order; operator chooses cheap-first)
+/// - `auth_ip_cidrs`: comma list of CIDRs (required with `ip_allowlist` mode)
+/// - `auth_api_key_header`: header name override (default `X-Aeon-Api-Key`)
+/// - `auth_api_keys`: comma list of accepted key values (plaintext post-interp)
+/// - `auth_hmac_signature_header`: header name override (default `X-Aeon-Signature`)
+/// - `auth_hmac_timestamp_header`: header name override (default `X-Aeon-Timestamp`)
+/// - `auth_hmac_secrets`: comma list of accepted HMAC secrets
+/// - `auth_hmac_algorithm`: `hmac-sha256` (default) or `hmac-sha512`
+/// - `auth_hmac_skew_seconds`: accepted clock skew (default 300)
+/// - `auth_mtls_subjects`: comma list of accepted peer cert subjects (CN/SAN)
+fn parse_inbound_auth_config(
+    cfg: &std::collections::BTreeMap<String, String>,
+) -> Result<Option<InboundAuthConfig>, AeonError> {
+    let Some(modes_raw) = cfg.get("auth_modes") else {
+        return Ok(None);
+    };
+
+    let modes: Vec<InboundAuthMode> = modes_raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| match s {
+            "ip_allowlist" => Ok(InboundAuthMode::IpAllowlist),
+            "api_key" => Ok(InboundAuthMode::ApiKey),
+            "hmac" => Ok(InboundAuthMode::Hmac),
+            "mtls" => Ok(InboundAuthMode::Mtls),
+            other => Err(AeonError::config(format!(
+                "auth_modes: unknown mode '{other}' — expected \
+                 ip_allowlist | api_key | hmac | mtls"
+            ))),
+        })
+        .collect::<Result<_, _>>()?;
+
+    if modes.is_empty() {
+        return Ok(None);
+    }
+
+    let ip_allowlist = if modes.contains(&InboundAuthMode::IpAllowlist) {
+        Some(IpAllowlistConfig {
+            cidrs: parse_cidr_list(cfg.get("auth_ip_cidrs"))?,
+        })
+    } else {
+        None
+    };
+
+    let api_key = if modes.contains(&InboundAuthMode::ApiKey) {
+        Some(ApiKeyConfig {
+            header_name: cfg
+                .get("auth_api_key_header")
+                .cloned()
+                .unwrap_or_else(|| "X-Aeon-Api-Key".to_string()),
+            keys: parse_csv_plaintext(cfg.get("auth_api_keys")),
+        })
+    } else {
+        None
+    };
+
+    let hmac = if modes.contains(&InboundAuthMode::Hmac) {
+        let algorithm = match cfg.get("auth_hmac_algorithm").map(String::as_str) {
+            None | Some("hmac-sha256") => HmacAlgorithm::HmacSha256,
+            Some("hmac-sha512") => HmacAlgorithm::HmacSha512,
+            Some(other) => {
+                return Err(AeonError::config(format!(
+                    "auth_hmac_algorithm: unknown '{other}' — expected \
+                     hmac-sha256 | hmac-sha512"
+                )));
+            }
+        };
+        let skew_seconds = cfg
+            .get("auth_hmac_skew_seconds")
+            .map(|v| {
+                v.parse::<i64>().map_err(|e| {
+                    AeonError::config(format!("auth_hmac_skew_seconds '{v}': {e}"))
+                })
+            })
+            .transpose()?
+            .unwrap_or(300);
+        Some(HmacConfig {
+            signature_header: cfg
+                .get("auth_hmac_signature_header")
+                .cloned()
+                .unwrap_or_else(|| "X-Aeon-Signature".to_string()),
+            timestamp_header: cfg
+                .get("auth_hmac_timestamp_header")
+                .cloned()
+                .unwrap_or_else(|| "X-Aeon-Timestamp".to_string()),
+            secrets: parse_csv_plaintext(cfg.get("auth_hmac_secrets")),
+            algorithm,
+            skew_seconds,
+        })
+    } else {
+        None
+    };
+
+    let mtls = if modes.contains(&InboundAuthMode::Mtls) {
+        Some(MtlsConfig {
+            subject_allowlist: parse_csv_plaintext(cfg.get("auth_mtls_subjects")),
+        })
+    } else {
+        None
+    };
+
+    Ok(Some(InboundAuthConfig {
+        modes,
+        ip_allowlist,
+        api_key,
+        hmac,
+        mtls,
+    }))
+}
+
+/// Build an [`InboundAuthVerifier`] from the flat config map, or `None` if
+/// no `auth_modes` key is present. Convenience wrapper around
+/// [`parse_inbound_auth_config`] + [`InboundAuthVerifier::build`].
+fn build_inbound_auth_verifier(
+    cfg: &std::collections::BTreeMap<String, String>,
+) -> Result<Option<Arc<InboundAuthVerifier>>, AeonError> {
+    let Some(ac) = parse_inbound_auth_config(cfg)? else {
+        return Ok(None);
+    };
+    let verifier = InboundAuthVerifier::build(ac)?;
+    Ok(Some(Arc::new(verifier)))
+}
+
+/// S10: Parse the outbound-auth block for a source/sink from flat YAML keys.
+///
+/// Outbound auth is **single-mode** (no stacking) — exactly one
+/// `auth_mode` drives exactly one credential block:
+///
+/// ```yaml
+/// config:
+///   auth_mode: bearer          # none | bearer | basic | api_key |
+///                              #   hmac_sign | mtls | broker_native
+///   auth_bearer_token: "xyz"
+///   # or:
+///   auth_basic_username: "u"
+///   auth_basic_password: "p"
+///   # or:
+///   auth_api_key_header: "X-Aeon-Api-Key"   # optional, default shown
+///   auth_api_key: "k-123"
+///   # or:
+///   auth_hmac_sign_signature_header: "X-Aeon-Signature"   # optional
+///   auth_hmac_sign_timestamp_header: "X-Aeon-Timestamp"   # optional
+///   auth_hmac_sign_secret: "shh"
+///   auth_hmac_sign_algorithm: "hmac-sha256"   # optional
+///   # or:
+///   auth_mtls_cert_pem: "-----BEGIN CERTIFICATE-----…"
+///   auth_mtls_key_pem: "-----BEGIN PRIVATE KEY-----…"
+///   # or:
+///   auth_mode: broker_native
+///   auth_broker_native.sasl_mechanism: "SCRAM-SHA-256"
+///   auth_broker_native.username: "svc"
+///   auth_broker_native.password: "p"
+/// ```
+///
+/// Returns `Ok(None)` when `auth_mode` is absent — connectors then run
+/// without outbound auth (legitimate for in-VPC pull sources).
+fn parse_outbound_auth_config(
+    cfg: &std::collections::BTreeMap<String, String>,
+) -> Result<Option<OutboundAuthConfig>, AeonError> {
+    let Some(mode_raw) = cfg.get("auth_mode") else {
+        return Ok(None);
+    };
+
+    let mode = match mode_raw.trim() {
+        "none" => OutboundAuthMode::None,
+        "bearer" => OutboundAuthMode::Bearer,
+        "basic" => OutboundAuthMode::Basic,
+        "api_key" => OutboundAuthMode::ApiKey,
+        "hmac_sign" => OutboundAuthMode::HmacSign,
+        "mtls" => OutboundAuthMode::Mtls,
+        "broker_native" => OutboundAuthMode::BrokerNative,
+        other => {
+            return Err(AeonError::config(format!(
+                "auth_mode: unknown mode '{other}' — expected \
+                 none | bearer | basic | api_key | hmac_sign | mtls | broker_native"
+            )));
+        }
+    };
+
+    let bearer = if mode == OutboundAuthMode::Bearer {
+        Some(BearerConfig {
+            token: cfg.get("auth_bearer_token").cloned().unwrap_or_default(),
+        })
+    } else {
+        None
+    };
+
+    let basic = if mode == OutboundAuthMode::Basic {
+        Some(BasicConfig {
+            username: cfg.get("auth_basic_username").cloned().unwrap_or_default(),
+            password: cfg.get("auth_basic_password").cloned().unwrap_or_default(),
+        })
+    } else {
+        None
+    };
+
+    let api_key = if mode == OutboundAuthMode::ApiKey {
+        Some(OutboundApiKeyConfig {
+            header_name: cfg
+                .get("auth_api_key_header")
+                .cloned()
+                .unwrap_or_else(|| "X-Aeon-Api-Key".to_string()),
+            key: cfg.get("auth_api_key").cloned().unwrap_or_default(),
+        })
+    } else {
+        None
+    };
+
+    let hmac_sign = if mode == OutboundAuthMode::HmacSign {
+        let algorithm = match cfg.get("auth_hmac_sign_algorithm").map(String::as_str) {
+            None | Some("hmac-sha256") => HmacAlgorithm::HmacSha256,
+            Some("hmac-sha512") => HmacAlgorithm::HmacSha512,
+            Some(other) => {
+                return Err(AeonError::config(format!(
+                    "auth_hmac_sign_algorithm: unknown '{other}' — expected \
+                     hmac-sha256 | hmac-sha512"
+                )));
+            }
+        };
+        Some(HmacSignConfig {
+            signature_header: cfg
+                .get("auth_hmac_sign_signature_header")
+                .cloned()
+                .unwrap_or_else(|| "X-Aeon-Signature".to_string()),
+            timestamp_header: cfg
+                .get("auth_hmac_sign_timestamp_header")
+                .cloned()
+                .unwrap_or_else(|| "X-Aeon-Timestamp".to_string()),
+            secret: cfg
+                .get("auth_hmac_sign_secret")
+                .cloned()
+                .unwrap_or_default(),
+            algorithm,
+        })
+    } else {
+        None
+    };
+
+    let mtls = if mode == OutboundAuthMode::Mtls {
+        Some(OutboundMtlsConfig {
+            cert_pem: cfg.get("auth_mtls_cert_pem").cloned().unwrap_or_default(),
+            key_pem: cfg.get("auth_mtls_key_pem").cloned().unwrap_or_default(),
+        })
+    } else {
+        None
+    };
+
+    let broker_native = if mode == OutboundAuthMode::BrokerNative {
+        let mut values = std::collections::BTreeMap::new();
+        for (k, v) in cfg {
+            if let Some(tail) = k.strip_prefix("auth_broker_native.") {
+                if !tail.is_empty() {
+                    values.insert(tail.to_string(), v.clone());
+                }
+            }
+        }
+        Some(BrokerNativeConfig { values })
+    } else {
+        None
+    };
+
+    Ok(Some(OutboundAuthConfig {
+        mode,
+        bearer,
+        basic,
+        api_key,
+        hmac_sign,
+        mtls,
+        broker_native,
+    }))
+}
+
+/// Build an [`OutboundAuthSigner`] from the flat config map, or `None` if
+/// no `auth_mode` key is present. Convenience wrapper around
+/// [`parse_outbound_auth_config`] + [`OutboundAuthSigner::build`].
+fn build_outbound_auth_signer(
+    cfg: &std::collections::BTreeMap<String, String>,
+) -> Result<Option<Arc<OutboundAuthSigner>>, AeonError> {
+    let Some(ac) = parse_outbound_auth_config(cfg)? else {
+        return Ok(None);
+    };
+    let signer = OutboundAuthSigner::build(ac)?;
+    Ok(Some(Arc::new(signer)))
+}
+
+fn parse_csv_plaintext(s: Option<&String>) -> Vec<String> {
+    let Some(s) = s else { return Vec::new() };
+    s.split(',')
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn parse_cidr_list(s: Option<&String>) -> Result<Vec<ipnet::IpNet>, AeonError> {
+    let Some(s) = s else {
+        return Ok(Vec::new());
+    };
+    s.split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            part.parse::<ipnet::IpNet>()
+                .map_err(|e| AeonError::config(format!("invalid CIDR '{part}': {e}")))
+        })
+        .collect()
+}
+
 /// Substitute `${VAR}` placeholders in `input` with the values of the
 /// corresponding process environment variables. Only `HOSTNAME` and
 /// `POD_NAME` are recognised — deliberately narrow, because the only
@@ -569,6 +966,228 @@ mod tests {
         for k in ["blackhole", "stdout", "kafka", "http", "file"] {
             assert!(reg.has_sink(k), "missing sink: {k}");
         }
+    }
+
+    #[test]
+    fn inbound_auth_absent_when_key_missing() {
+        let cfg = BTreeMap::new();
+        assert!(parse_inbound_auth_config(&cfg).unwrap().is_none());
+        assert!(build_inbound_auth_verifier(&cfg).unwrap().is_none());
+    }
+
+    #[test]
+    fn inbound_auth_parses_ip_allowlist_only() {
+        let mut cfg = BTreeMap::new();
+        cfg.insert("auth_modes".into(), "ip_allowlist".into());
+        cfg.insert("auth_ip_cidrs".into(), "10.0.0.0/8, 192.168.1.0/24".into());
+
+        let ac = parse_inbound_auth_config(&cfg).unwrap().unwrap();
+        assert_eq!(ac.modes, vec![InboundAuthMode::IpAllowlist]);
+        let cidrs = ac.ip_allowlist.as_ref().unwrap().cidrs.clone();
+        assert_eq!(cidrs.len(), 2);
+
+        // Verifier builds.
+        let v = build_inbound_auth_verifier(&cfg).unwrap().unwrap();
+        assert_eq!(v.modes(), &[InboundAuthMode::IpAllowlist]);
+    }
+
+    #[test]
+    fn inbound_auth_parses_all_modes() {
+        let mut cfg = BTreeMap::new();
+        cfg.insert(
+            "auth_modes".into(),
+            "ip_allowlist,api_key,hmac,mtls".into(),
+        );
+        cfg.insert("auth_ip_cidrs".into(), "10.0.0.0/8".into());
+        cfg.insert("auth_api_keys".into(), "key-a,key-b".into());
+        cfg.insert("auth_hmac_secrets".into(), "sec-a".into());
+        cfg.insert("auth_hmac_algorithm".into(), "hmac-sha512".into());
+        cfg.insert("auth_hmac_skew_seconds".into(), "120".into());
+        cfg.insert(
+            "auth_mtls_subjects".into(),
+            "CN=producer-1,CN=producer-2".into(),
+        );
+
+        let ac = parse_inbound_auth_config(&cfg).unwrap().unwrap();
+        assert_eq!(ac.modes.len(), 4);
+        assert_eq!(ac.api_key.as_ref().unwrap().keys.len(), 2);
+        let hmac = ac.hmac.as_ref().unwrap();
+        assert_eq!(hmac.algorithm, aeon_types::HmacAlgorithm::HmacSha512);
+        assert_eq!(hmac.skew_seconds, 120);
+        assert_eq!(hmac.secrets.len(), 1);
+        assert_eq!(ac.mtls.as_ref().unwrap().subject_allowlist.len(), 2);
+
+        let v = build_inbound_auth_verifier(&cfg).unwrap().unwrap();
+        assert_eq!(v.modes().len(), 4);
+    }
+
+    #[test]
+    fn inbound_auth_rejects_unknown_mode() {
+        let mut cfg = BTreeMap::new();
+        cfg.insert("auth_modes".into(), "ip_allowlist,bogus".into());
+        let err = parse_inbound_auth_config(&cfg).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("bogus"), "{msg}");
+    }
+
+    #[test]
+    fn inbound_auth_rejects_unknown_hmac_algorithm() {
+        let mut cfg = BTreeMap::new();
+        cfg.insert("auth_modes".into(), "hmac".into());
+        cfg.insert("auth_hmac_secrets".into(), "s".into());
+        cfg.insert("auth_hmac_algorithm".into(), "md5".into());
+        let err = parse_inbound_auth_config(&cfg).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("md5"), "{msg}");
+    }
+
+    #[test]
+    fn outbound_auth_absent_when_key_missing() {
+        let cfg = BTreeMap::new();
+        assert!(parse_outbound_auth_config(&cfg).unwrap().is_none());
+        assert!(build_outbound_auth_signer(&cfg).unwrap().is_none());
+    }
+
+    #[test]
+    fn outbound_auth_parses_none_mode() {
+        let mut cfg = BTreeMap::new();
+        cfg.insert("auth_mode".into(), "none".into());
+        let ac = parse_outbound_auth_config(&cfg).unwrap().unwrap();
+        assert_eq!(ac.mode, OutboundAuthMode::None);
+        let signer = build_outbound_auth_signer(&cfg).unwrap().unwrap();
+        assert_eq!(signer.mode(), OutboundAuthMode::None);
+    }
+
+    #[test]
+    fn outbound_auth_parses_bearer() {
+        let mut cfg = BTreeMap::new();
+        cfg.insert("auth_mode".into(), "bearer".into());
+        cfg.insert("auth_bearer_token".into(), "tok-1".into());
+        let ac = parse_outbound_auth_config(&cfg).unwrap().unwrap();
+        assert_eq!(ac.mode, OutboundAuthMode::Bearer);
+        assert_eq!(ac.bearer.as_ref().unwrap().token, "tok-1");
+        let signer = build_outbound_auth_signer(&cfg).unwrap().unwrap();
+        assert_eq!(signer.mode(), OutboundAuthMode::Bearer);
+    }
+
+    #[test]
+    fn outbound_auth_parses_basic() {
+        let mut cfg = BTreeMap::new();
+        cfg.insert("auth_mode".into(), "basic".into());
+        cfg.insert("auth_basic_username".into(), "alice".into());
+        cfg.insert("auth_basic_password".into(), "secret".into());
+        let ac = parse_outbound_auth_config(&cfg).unwrap().unwrap();
+        assert_eq!(ac.mode, OutboundAuthMode::Basic);
+        let b = ac.basic.as_ref().unwrap();
+        assert_eq!(b.username, "alice");
+        assert_eq!(b.password, "secret");
+    }
+
+    #[test]
+    fn outbound_auth_parses_api_key_with_default_header() {
+        let mut cfg = BTreeMap::new();
+        cfg.insert("auth_mode".into(), "api_key".into());
+        cfg.insert("auth_api_key".into(), "k-1".into());
+        let ac = parse_outbound_auth_config(&cfg).unwrap().unwrap();
+        assert_eq!(ac.mode, OutboundAuthMode::ApiKey);
+        let k = ac.api_key.as_ref().unwrap();
+        assert_eq!(k.header_name, "X-Aeon-Api-Key");
+        assert_eq!(k.key, "k-1");
+    }
+
+    #[test]
+    fn outbound_auth_parses_api_key_with_custom_header() {
+        let mut cfg = BTreeMap::new();
+        cfg.insert("auth_mode".into(), "api_key".into());
+        cfg.insert("auth_api_key_header".into(), "X-Upstream-Token".into());
+        cfg.insert("auth_api_key".into(), "k-9".into());
+        let ac = parse_outbound_auth_config(&cfg).unwrap().unwrap();
+        let k = ac.api_key.as_ref().unwrap();
+        assert_eq!(k.header_name, "X-Upstream-Token");
+        assert_eq!(k.key, "k-9");
+    }
+
+    #[test]
+    fn outbound_auth_parses_hmac_sign_defaults() {
+        let mut cfg = BTreeMap::new();
+        cfg.insert("auth_mode".into(), "hmac_sign".into());
+        cfg.insert("auth_hmac_sign_secret".into(), "shh".into());
+        let ac = parse_outbound_auth_config(&cfg).unwrap().unwrap();
+        let h = ac.hmac_sign.as_ref().unwrap();
+        assert_eq!(h.signature_header, "X-Aeon-Signature");
+        assert_eq!(h.timestamp_header, "X-Aeon-Timestamp");
+        assert_eq!(h.secret, "shh");
+        assert_eq!(h.algorithm, aeon_types::HmacAlgorithm::HmacSha256);
+    }
+
+    #[test]
+    fn outbound_auth_parses_hmac_sign_sha512() {
+        let mut cfg = BTreeMap::new();
+        cfg.insert("auth_mode".into(), "hmac_sign".into());
+        cfg.insert("auth_hmac_sign_secret".into(), "shh".into());
+        cfg.insert("auth_hmac_sign_algorithm".into(), "hmac-sha512".into());
+        let ac = parse_outbound_auth_config(&cfg).unwrap().unwrap();
+        let h = ac.hmac_sign.as_ref().unwrap();
+        assert_eq!(h.algorithm, aeon_types::HmacAlgorithm::HmacSha512);
+    }
+
+    #[test]
+    fn outbound_auth_parses_mtls() {
+        let mut cfg = BTreeMap::new();
+        cfg.insert("auth_mode".into(), "mtls".into());
+        cfg.insert("auth_mtls_cert_pem".into(), "-----BEGIN CERT-----".into());
+        cfg.insert("auth_mtls_key_pem".into(), "-----BEGIN KEY-----".into());
+        let ac = parse_outbound_auth_config(&cfg).unwrap().unwrap();
+        let m = ac.mtls.as_ref().unwrap();
+        assert_eq!(m.cert_pem, "-----BEGIN CERT-----");
+        assert_eq!(m.key_pem, "-----BEGIN KEY-----");
+    }
+
+    #[test]
+    fn outbound_auth_parses_broker_native_values() {
+        let mut cfg = BTreeMap::new();
+        cfg.insert("auth_mode".into(), "broker_native".into());
+        cfg.insert(
+            "auth_broker_native.sasl_mechanism".into(),
+            "SCRAM-SHA-256".into(),
+        );
+        cfg.insert("auth_broker_native.username".into(), "svc".into());
+        cfg.insert("auth_broker_native.password".into(), "p".into());
+        let ac = parse_outbound_auth_config(&cfg).unwrap().unwrap();
+        let bn = ac.broker_native.as_ref().unwrap();
+        assert_eq!(bn.values.len(), 3);
+        assert_eq!(bn.values.get("sasl_mechanism").unwrap(), "SCRAM-SHA-256");
+        assert_eq!(bn.values.get("username").unwrap(), "svc");
+    }
+
+    #[test]
+    fn outbound_auth_rejects_unknown_mode() {
+        let mut cfg = BTreeMap::new();
+        cfg.insert("auth_mode".into(), "bogus".into());
+        let err = parse_outbound_auth_config(&cfg).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("bogus"), "{msg}");
+    }
+
+    #[test]
+    fn outbound_auth_rejects_unknown_hmac_sign_algorithm() {
+        let mut cfg = BTreeMap::new();
+        cfg.insert("auth_mode".into(), "hmac_sign".into());
+        cfg.insert("auth_hmac_sign_secret".into(), "s".into());
+        cfg.insert("auth_hmac_sign_algorithm".into(), "md5".into());
+        let err = parse_outbound_auth_config(&cfg).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("md5"), "{msg}");
+    }
+
+    #[test]
+    fn outbound_auth_build_rejects_empty_bearer() {
+        let mut cfg = BTreeMap::new();
+        cfg.insert("auth_mode".into(), "bearer".into());
+        // auth_bearer_token absent → empty token → BearerEmpty
+        let err = build_outbound_auth_signer(&cfg).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("bearer"), "{msg}");
     }
 
     #[tokio::test]
@@ -753,6 +1372,7 @@ mod tests {
         valid.insert("timeout_ms".into(), "1000".into());
         valid.insert("source_name".into(), "poll-smoke".into());
         valid.insert("header.X-From".into(), "aeon".into());
+        valid.insert("ssrf_allow_loopback".into(), "true".into());
         let ok_cfg = SourceConfig {
             source_type: "http-polling".into(),
             topic: None,
@@ -806,6 +1426,7 @@ mod tests {
         config.insert("url".into(), format!("http://{addr}/"));
         config.insert("timeout_ms".into(), "2000".into());
         config.insert("header.X-Aeon".into(), "test".into());
+        config.insert("ssrf_allow_loopback".into(), "true".into());
         let cfg = SinkConfig {
             sink_type: "http".into(),
             topic: None,
@@ -944,6 +1565,38 @@ mod tests {
         assert!(!parse_bool(Some(&"0".to_string())).unwrap());
         assert!(!parse_bool(None).unwrap());
         assert!(parse_bool(Some(&"maybe".to_string())).is_err());
+    }
+
+    #[test]
+    fn parse_ssrf_policy_defaults_to_production() {
+        let cfg = BTreeMap::new();
+        let p = parse_ssrf_policy(&cfg).unwrap();
+        assert!(!p.allow_loopback);
+        assert!(p.allow_private);
+        assert!(!p.allow_link_local);
+        assert!(!p.allow_cgnat);
+        assert!(p.extra_deny.is_empty());
+    }
+
+    #[test]
+    fn parse_ssrf_policy_reads_bools_and_cidrs() {
+        let mut cfg = BTreeMap::new();
+        cfg.insert("ssrf_allow_loopback".into(), "true".into());
+        cfg.insert("ssrf_allow_private".into(), "false".into());
+        cfg.insert("ssrf_extra_deny".into(), "10.0.0.0/8, 192.168.0.0/16".into());
+        cfg.insert("ssrf_extra_allow".into(), "127.0.0.0/8".into());
+        let p = parse_ssrf_policy(&cfg).unwrap();
+        assert!(p.allow_loopback);
+        assert!(!p.allow_private);
+        assert_eq!(p.extra_deny.len(), 2);
+        assert_eq!(p.extra_allow.len(), 1);
+    }
+
+    #[test]
+    fn parse_ssrf_policy_rejects_malformed_cidr() {
+        let mut cfg = BTreeMap::new();
+        cfg.insert("ssrf_extra_deny".into(), "not-a-cidr".into());
+        assert!(parse_ssrf_policy(&cfg).is_err());
     }
 
     #[test]

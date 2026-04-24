@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<testsuites failures="0" name="Dastardly scan results - have a vulnerability-free day!" tests="2">
+    <testsuite failures="0" name="http://aeon.aeon.svc.cluster.local:4471/" tests="1">
+        <testcase name="No issues were identified"/>
+    </testsuite>
+    <testsuite failures="0" name="http://aeon.aeon.svc.cluster.local:4471/robots.txt" tests="1">
+        <testcase name="No issues were identified"/>
+    </testsuite>
+</testsuites>

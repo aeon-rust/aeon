@@ -148,6 +148,22 @@ pub trait Source: Send + Sync {
     ) -> impl std::future::Future<Output = Result<(), AeonError>> + Send {
         async { Ok(()) }
     }
+
+    /// B4: whether this source delegates partition ownership to its
+    /// upstream broker's rebalance protocol (Kafka `subscribe` group
+    /// mode, Redis Streams XREADGROUP multi-consumer mode).
+    ///
+    /// When `true`, the pipeline start path refuses to attach a Raft-
+    /// driven partition-reassign watcher — the broker's rebalance
+    /// protocol and Aeon's `partition_table` would otherwise fight
+    /// over the same resource. See `aeon_types::ConsumerMode` for the
+    /// config shape.
+    ///
+    /// Default: `false` — all `ConsumerMode::Single` sources and any
+    /// source that does not model consumer groups.
+    fn broker_coordinated_partitions(&self) -> bool {
+        false
+    }
 }
 
 /// Event delivery sink. Batch-first: accepts `Vec<Output>` per flush.

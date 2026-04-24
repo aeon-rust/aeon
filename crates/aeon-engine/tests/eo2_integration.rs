@@ -13,6 +13,9 @@
 //! - Multi-sink with one stalled (shared AckSeqTracker pins GC to laggard)
 //! - Multi-source interleaving (Pull + Push + Poll fan-in via DAG runner)
 
+#![allow(clippy::field_reassign_with_default)]
+#![allow(clippy::manual_async_fn)]
+
 use aeon_engine::checkpoint::{CheckpointPersist, CheckpointRecord, WalCheckpointStore};
 use aeon_engine::delivery::{CheckpointBackend, L2BodyStoreConfig};
 use aeon_engine::eo2::PipelineL2Registry;
@@ -266,8 +269,10 @@ async fn crash_recovery_push_source_no_loss_no_duplicates() {
     let l2_handle = registry
         .open("crash-recovery", PartitionId::new(0))
         .unwrap();
-    let guard = l2_handle.lock().unwrap();
-    let l2_events = guard.iter_from(0).unwrap();
+    let l2_events = {
+        let guard = l2_handle.lock().unwrap();
+        guard.iter_from(0).unwrap()
+    };
 
     // Phase 2: "Restart" — replay events from L2 that are past the ack
     // frontier. In a real crash scenario, some events would be un-acked.
@@ -363,14 +368,15 @@ async fn crash_mid_batch_l2_replay_fills_gap() {
     let l2_handle = registry
         .open("crash-mid", PartitionId::new(0))
         .unwrap();
-    let guard = l2_handle.lock().unwrap();
-    let l2_events: Vec<Event> = guard
-        .iter_from(0)
-        .unwrap()
-        .into_iter()
-        .map(|(_, ev)| ev)
-        .collect();
-    drop(guard);
+    let l2_events: Vec<Event> = {
+        let guard = l2_handle.lock().unwrap();
+        guard
+            .iter_from(0)
+            .unwrap()
+            .into_iter()
+            .map(|(_, ev)| ev)
+            .collect()
+    };
 
     // L2 should have captured the events that the source emitted before
     // the abort (up to 25).

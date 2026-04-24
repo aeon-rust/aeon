@@ -1,0 +1,43 @@
+NAME                                INSTALLED  FIXED IN        TYPE           VULNERABILITY        SEVERITY  EPSS           RISK   
+golang.org/x/crypto                 v0.26.0    0.31.0          go-module      GHSA-v778-237x-gjrc  Critical  30.3% (96th)   27.4   
+golang.org/x/crypto                 v0.26.0    0.35.0          go-module      GHSA-hcg3-q754-cr77  High      0.6% (69th)    0.5    
+golang.org/x/net                    v0.28.0    0.38.0          go-module      GHSA-vvgc-356p-c3xw  Medium    0.1% (32nd)    < 0.1  
+wasmtime                            29.0.1     36.0.7          rust-crate     GHSA-xx5w-cvp6-jv83  Critical  < 0.1% (15th)  < 0.1  
+wasmtime                            29.0.1     36.0.6          rust-crate     GHSA-852m-cvvp-9p4w  Medium    < 0.1% (23rd)  < 0.1  
+github.com/quic-go/quic-go          v0.53.0    0.57.0          go-module      GHSA-g754-hx8w-x2g6  Medium    < 0.1% (23rd)  < 0.1  
+composer                            2.9.5      2.2.27, *2.9.6  php-composer   CVE-2026-40261       High      < 0.1% (11th)  < 0.1  
+github.com/quic-go/quic-go          v0.53.0    0.54.1          go-module      GHSA-47m2-4cr7-mhcw  High      < 0.1% (10th)  < 0.1  
+wasmtime                            29.0.1     36.0.7          rust-crate     GHSA-f984-pcp8-v2p7  Medium    < 0.1% (14th)  < 0.1  
+wasmtime                            29.0.1     36.0.6          rust-crate     GHSA-243v-98vx-264h  Medium    < 0.1% (7th)   < 0.1  
+golang.org/x/crypto                 v0.26.0    0.45.0          go-module      GHSA-j5w8-q4qc-rx2x  Medium    < 0.1% (8th)   < 0.1  
+golang.org/x/net                    v0.28.0    0.36.0          go-module      GHSA-qxp5-gwg8-xv66  Medium    < 0.1% (6th)   < 0.1  
+github.com/quic-go/webtransport-go  v0.9.0     0.10.0          go-module      GHSA-g6x7-jq8p-6q9q  Medium    < 0.1% (5th)   < 0.1  
+github.com/quic-go/webtransport-go  v0.9.0     0.10.0          go-module      GHSA-px4r-g4p3-hhqv  Medium    < 0.1% (5th)   < 0.1  
+github.com/quic-go/webtransport-go  v0.9.0     0.10.0          go-module      GHSA-2f2x-8mwp-p2gc  Medium    < 0.1% (5th)   < 0.1  
+wasmtime                            29.0.1     36.0.7          rust-crate     GHSA-hx6p-xpx3-jvvv  Medium    < 0.1% (4th)   < 0.1  
+wasmtime                            29.0.1     36.0.7          rust-crate     GHSA-jxhv-7h78-9775  Medium    < 0.1% (3rd)   < 0.1  
+wasmtime                            29.0.1     36.0.7          rust-crate     GHSA-q49f-xg75-m9xw  Medium    < 0.1% (3rd)   < 0.1  
+wasmtime                            29.0.1     36.0.7          rust-crate     GHSA-m758-wjhj-p3jq  Medium    < 0.1% (3rd)   < 0.1  
+composer                            2.9.5      2.2.27, *2.9.6  php-composer   CVE-2026-40176       High      < 0.1% (1st)   < 0.1  
+wasmtime                            29.0.1     36.0.7          rust-crate     GHSA-394w-hwhg-8vgm  Medium    < 0.1% (1st)   < 0.1  
+golang.org/x/crypto                 v0.26.0    0.45.0          go-module      GHSA-f6x5-jh6r-wrfv  Medium    < 0.1% (1st)   < 0.1  
+wasmtime                            29.0.1     36.0.7          rust-crate     GHSA-qqfj-4vcm-26hv  Medium    < 0.1% (1st)   < 0.1  
+wasmtime                            29.0.1     36.0.5          rust-crate     GHSA-vc8c-j3xm-xj73  Medium    < 0.1% (0th)   < 0.1  
+wasmtime                            29.0.1     36.0.7          rust-crate     GHSA-m9w2-8782-2946  Low       < 0.1% (1st)   < 0.1  
+wasmtime                            29.0.1     36.0.3          rust-crate     GHSA-hc7m-r6v8-hg9q  Low       < 0.1% (1st)   < 0.1  
+wasmtime                            29.0.1     36.0.7          rust-crate     GHSA-6wgr-89rj-399p  Low       < 0.1% (1st)   < 0.1  
+actions/download-artifact           v4         4.1.3           github-action  GHSA-cxww-7g56-2vh6  High      N/A            N/A    
+openssl                             0.10.76    0.10.78         rust-crate     GHSA-8c75-8mhr-p7r9  High      N/A            N/A    
+openssl                             0.10.76    0.10.78         rust-crate     GHSA-ghm9-cr32-g9qj  High      N/A            N/A    
+openssl                             0.10.76    0.10.78         rust-crate     GHSA-hppc-g8h3-xhp3  High      N/A            N/A    
+openssl                             0.10.76    0.10.78         rust-crate     GHSA-pqf5-4pqq-29f5  High      N/A            N/A    
+rustls-webpki                       0.102.8    0.103.10        rust-crate     GHSA-pwjx-qhcg-rvj4  Medium    N/A            N/A    
+lru                                 0.12.5     0.16.3          rust-crate     GHSA-rhfx-m35p-ff5j  Low       N/A            N/A    
+openssl                             0.10.76    0.10.78         rust-crate     GHSA-xmgf-hq76-4vx2  Low       N/A            N/A    
+rand                                0.10.0     0.10.1          rust-crate     GHSA-cq8v-f236-94qc  Low       N/A            N/A    
+rand                                0.8.5      0.8.6           rust-crate     GHSA-cq8v-f236-94qc  Low       N/A            N/A    
+rand                                0.9.2      0.9.3           rust-crate     GHSA-cq8v-f236-94qc  Low       N/A            N/A    
+rustls-webpki                       0.102.8    0.103.12        rust-crate     GHSA-965h-392x-2mh5  Low       N/A            N/A    
+rustls-webpki                       0.102.8    0.103.12        rust-crate     GHSA-xgp8-3hg3-c2mh  Low       N/A            N/A    
+rustls-webpki                       0.103.10   0.103.12        rust-crate     GHSA-965h-392x-2mh5  Low       N/A            N/A    
+rustls-webpki                       0.103.10   0.103.12        rust-crate     GHSA-xgp8-3hg3-c2mh  Low       N/A            N/A

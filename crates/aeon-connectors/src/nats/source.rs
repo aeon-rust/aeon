@@ -3,7 +3,10 @@
 //! Uses JetStream pull-based consumer for durable, at-least-once delivery.
 //! Messages are acknowledged after being returned from `next_batch()`.
 
-use aeon_types::{AeonError, BackoffPolicy, CoreLocalUuidGenerator, Event, PartitionId, Source};
+use aeon_types::{
+    AeonError, BackoffPolicy, CoreLocalUuidGenerator, Event, OutboundAuthSigner, PartitionId,
+    Source,
+};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -27,6 +30,9 @@ pub struct NatsSourceConfig {
     /// pull stream errors out (typically a broken connection). Exponential
     /// growth with jitter prevents reconnect storms during NATS outages.
     pub backoff: BackoffPolicy,
+    /// S10 outbound auth. When `Some`, the signer drives `ConnectOptions`
+    /// construction — see `nats::auth::connect_with_auth`.
+    pub auth: Option<Arc<OutboundAuthSigner>>,
 }
 
 impl NatsSourceConfig {
@@ -45,7 +51,14 @@ impl NatsSourceConfig {
             fetch_timeout: Duration::from_secs(1),
             source_name: Arc::from("nats"),
             backoff: BackoffPolicy::default(),
+            auth: None,
         }
+    }
+
+    /// S10: attach an outbound-auth signer.
+    pub fn with_auth(mut self, signer: Arc<OutboundAuthSigner>) -> Self {
+        self.auth = Some(signer);
+        self
     }
 
     /// Override the reconnect backoff policy.
@@ -97,9 +110,7 @@ pub struct NatsSource {
 impl NatsSource {
     /// Connect to NATS and create/bind to a JetStream consumer.
     pub async fn new(config: NatsSourceConfig) -> Result<Self, AeonError> {
-        let client = async_nats::connect(&config.url)
-            .await
-            .map_err(|e| AeonError::connection(format!("nats connect failed: {e}")))?;
+        let client = super::auth::connect_with_auth(&config.url, config.auth.as_ref()).await?;
 
         let jetstream = async_nats::jetstream::new(client);
 

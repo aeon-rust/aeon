@@ -28,7 +28,19 @@ rdkafka = { workspace = true, optional = true }
 
 # Optional: WebSocket
 futures-util = { workspace = true, optional = true }
-tokio-tungstenite = { workspace = true, optional = true }
+# `rustls-tls-webpki-roots` enables the rustls backend + webpki-roots
+# trust store — required for the `Connector::Rustls(...)` path used by
+# S10 mTLS outbound and S9 mTLS inbound on wss://.
+tokio-tungstenite = { workspace = true, optional = true, features = ["rustls-tls-webpki-roots"] }
+# Parse the mTLS cert/key PEMs carried by OutboundAuthSigner into rustls
+# types. Only the websocket (+ future webtransport-mtls) path uses this.
+rustls-pemfile = { workspace = true, optional = true }
+# Static public CA trust store for verifying the remote server on
+# wss:// mTLS outbound. Private-CA server verification would need a
+# separate ConnectorTlsConfig (not in scope for #34).
+webpki-roots = { workspace = true, optional = true }
+# Subject (CN + SAN) extractor used by mTLS server-side verification.
+aeon-crypto = { workspace = true, optional = true }
 
 # Optional: HTTP (webhook + polling)
 axum = { workspace = true, optional = true }
@@ -61,6 +73,8 @@ mongodb = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 rdkafka = { workspace = true }
 tempfile = "3"
+# Fixture certs for websocket / webtransport mTLS tests.
+rcgen = { workspace = true }
 
 [features]
 default = ["memory", "blackhole", "stdout"]
@@ -69,14 +83,30 @@ blackhole = []
 stdout = []
 kafka = ["dep:rdkafka", "dep:tokio", "dep:futures-util"]
 file = ["dep:tokio"]
-websocket = ["dep:tokio-tungstenite", "dep:futures-util", "dep:tokio"]
+websocket = [
+    "dep:tokio-tungstenite",
+    "dep:futures-util",
+    "dep:tokio",
+    "dep:rustls",
+    "dep:rustls-pemfile",
+    "dep:webpki-roots",
+    "dep:aeon-crypto",
+]
 http = ["dep:axum", "dep:reqwest", "dep:tokio"]
 redis-streams = ["dep:redis", "dep:tokio"]
 nats = ["dep:async-nats", "dep:futures-util", "dep:tokio"]
 mqtt = ["dep:rumqttc", "dep:tokio"]
 rabbitmq = ["dep:lapin", "dep:futures-util", "dep:tokio"]
 quic = ["dep:quinn", "dep:rustls", "dep:rcgen", "dep:tokio", "dep:futures-util"]
-webtransport = ["dep:wtransport", "dep:tokio", "dep:futures-util"]
+webtransport = [
+    "dep:wtransport",
+    "dep:tokio",
+    "dep:futures-util",
+    "dep:rustls",
+    "dep:rustls-pemfile",
+    "dep:webpki-roots",
+    "dep:aeon-crypto",
+]
 postgres-cdc = ["dep:tokio-postgres", "dep:tokio", "dep:serde", "dep:serde_json"]
 mysql-cdc = ["dep:mysql_async", "dep:tokio", "dep:serde", "dep:serde_json"]
 mongodb-cdc = ["dep:mongodb", "dep:tokio", "dep:futures-util", "dep:serde", "dep:serde_json"]

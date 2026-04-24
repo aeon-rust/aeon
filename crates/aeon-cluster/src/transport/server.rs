@@ -22,6 +22,180 @@ use crate::types::{
     PohChainTransferResponse, RemoveNodeRequest, RemoveNodeResponse,
 };
 
+/// Shared provider slots for source-side CL-6 handlers. The three slots
+/// (segment / PoH / cutover) are populated **post-bootstrap** by the
+/// engine layer via `ClusterNode::install_{segment,poh,cutover}_provider`,
+/// because [`ClusterNode::bootstrap_multi`] must start the QUIC accept
+/// loop before `aeon-cli` has built the engine-side installers.
+///
+/// The serve loop reads each slot **per-request** (cold-path `RwLock`
+/// read) so providers become active as soon as they are installed,
+/// without restarting the accept task. Cheaply cloneable — every field
+/// is `Arc<RwLock<Option<Arc<...>>>>`.
+///
+/// CL-6c.4 (engine-side write-freeze wiring): the cutover slot is the
+/// hook by which the target-node `PartitionTransferDriver` reaches the
+/// source-node `WriteGate` over QUIC. Before this slot is populated,
+/// every inbound `PartitionCutoverRequest` replies with a "no
+/// coordinator configured" failure and the transfer aborts.
+#[derive(Clone, Default)]
+pub struct SourceProviderSlots {
+    segment: Arc<tokio::sync::RwLock<Option<Arc<dyn PartitionTransferProvider>>>>,
+    poh: Arc<tokio::sync::RwLock<Option<Arc<dyn PohChainProvider>>>>,
+    cutover: Arc<tokio::sync::RwLock<Option<Arc<dyn CutoverCoordinator>>>>,
+}
+
+impl SourceProviderSlots {
+    /// Empty slots — all three providers default to `None`. The serve
+    /// loop replies with a failure frame on any incoming request until a
+    /// provider is installed via the corresponding `install_*` method.
+    pub fn new_empty() -> Self {
+        Self::default()
+    }
+
+    /// Seed the slots with fixed provider handles. Primarily a test seam
+    /// — production callers construct empty slots and install providers
+    /// post-bootstrap.
+    pub fn from_fixed(
+        segment: Option<Arc<dyn PartitionTransferProvider>>,
+        poh: Option<Arc<dyn PohChainProvider>>,
+        cutover: Option<Arc<dyn CutoverCoordinator>>,
+    ) -> Self {
+        Self {
+            segment: Arc::new(tokio::sync::RwLock::new(segment)),
+            poh: Arc::new(tokio::sync::RwLock::new(poh)),
+            cutover: Arc::new(tokio::sync::RwLock::new(cutover)),
+        }
+    }
+
+    pub async fn install_segment_provider(&self, p: Arc<dyn PartitionTransferProvider>) {
+        *self.segment.write().await = Some(p);
+    }
+
+    pub async fn install_poh_provider(&self, p: Arc<dyn PohChainProvider>) {
+        *self.poh.write().await = Some(p);
+    }
+
+    pub async fn install_cutover_coordinator(&self, c: Arc<dyn CutoverCoordinator>) {
+        *self.cutover.write().await = Some(c);
+    }
+
+    async fn current_segment(&self) -> Option<Arc<dyn PartitionTransferProvider>> {
+        self.segment.read().await.clone()
+    }
+
+    async fn current_poh(&self) -> Option<Arc<dyn PohChainProvider>> {
+        self.poh.read().await.clone()
+    }
+
+    async fn current_cutover(&self) -> Option<Arc<dyn CutoverCoordinator>> {
+        self.cutover.read().await.clone()
+    }
+}
+
+/// Slot-based variant of [`serve`]. Reads providers from [`SourceProviderSlots`]
+/// per stream, so providers installed after the accept loop starts become
+/// active without a restart. Used by `ClusterNode` bootstrap paths;
+/// prefer [`serve`] for tests that wire a fixed set of providers.
+pub async fn serve_with_slots(
+    endpoint: Arc<QuicEndpoint>,
+    raft: Raft<AeonRaftConfig>,
+    self_id: NodeId,
+    shutdown: Arc<AtomicBool>,
+    slots: SourceProviderSlots,
+) {
+    while !shutdown.load(Ordering::Relaxed) {
+        let incoming = tokio::select! {
+            incoming = endpoint.accept() => {
+                match incoming {
+                    Some(i) => i,
+                    None => break, // Endpoint closed
+                }
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => continue,
+        };
+
+        let raft = raft.clone();
+        let slots = slots.clone();
+        tokio::spawn(async move {
+            let connection = match incoming.await {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!("QUIC handshake failed: {e}");
+                    return;
+                }
+            };
+
+            loop {
+                let stream = match connection.accept_bi().await {
+                    Ok(s) => s,
+                    Err(quinn::ConnectionError::ApplicationClosed(_)) => break,
+                    Err(e) => {
+                        tracing::debug!("QUIC stream accept error: {e}");
+                        break;
+                    }
+                };
+
+                let raft = raft.clone();
+                let slots = slots.clone();
+                tokio::spawn(handle_stream_slots(raft, self_id, slots, stream));
+            }
+        });
+    }
+}
+
+/// Per-stream handler that resolves providers from shared slots at
+/// dispatch time, rather than capturing them at spawn time (which
+/// [`handle_stream`] does). Keeps late-installation correct.
+async fn handle_stream_slots(
+    raft: Raft<AeonRaftConfig>,
+    self_id: NodeId,
+    slots: SourceProviderSlots,
+    (mut send, mut recv): (quinn::SendStream, quinn::RecvStream),
+) {
+    let (msg_type, payload) = match framing::read_frame(&mut recv).await {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::debug!("failed to read frame: {e}");
+            return;
+        }
+    };
+
+    let result = match msg_type {
+        MessageType::AppendEntries => handle_append_entries(&raft, &payload, &mut send).await,
+        MessageType::Vote => handle_vote(&raft, &payload, &mut send).await,
+        MessageType::InstallSnapshot => handle_install_snapshot(&raft, &payload, &mut send).await,
+        MessageType::FullSnapshot => handle_full_snapshot(&raft, &payload, &mut send).await,
+        MessageType::AddNodeRequest => {
+            handle_add_node(&raft, self_id, &payload, &mut send).await
+        }
+        MessageType::RemoveNodeRequest => {
+            handle_remove_node(&raft, self_id, &payload, &mut send).await
+        }
+        MessageType::HealthPing => health::handle_health_ping(self_id, &payload, &mut send).await,
+        MessageType::PartitionTransferRequest => {
+            let provider = slots.current_segment().await;
+            handle_partition_transfer(provider.as_deref(), payload, send).await
+        }
+        MessageType::PohChainTransferRequest => {
+            let provider = slots.current_poh().await;
+            handle_poh_chain_transfer(provider.as_deref(), payload, send).await
+        }
+        MessageType::PartitionCutoverRequest => {
+            let coord = slots.current_cutover().await;
+            handle_partition_cutover(coord.as_deref(), payload, send).await
+        }
+        _ => {
+            tracing::warn!("unexpected message type: {:?}", msg_type);
+            Ok(())
+        }
+    };
+
+    if let Err(e) = result {
+        tracing::debug!("RPC handler error: {e}");
+    }
+}
+
 /// Run the QUIC server accept loop, dispatching incoming RPCs to the Raft node.
 ///
 /// `self_id` is the authoritative node id for this process — the value that
@@ -40,6 +214,10 @@ use crate::types::{
 /// initiates handover. Pass `None` in contexts that don't own a live L2
 /// body store / PoH chain / partition-write path (tests, raft-only
 /// benches) — the relevant requests will receive a failure response.
+///
+/// This variant captures the providers at spawn time — late installation
+/// after the loop starts is invisible here. For production where the
+/// engine wires providers post-bootstrap, use [`serve_with_slots`].
 pub async fn serve(
     endpoint: Arc<QuicEndpoint>,
     raft: Raft<AeonRaftConfig>,

@@ -42,6 +42,7 @@ use aeon_types::{AeonError, PartitionId};
 use crate::l2_transfer::SegmentWriter;
 
 type WritersMap = HashMap<(String, u16), SegmentWriter>;
+type LivePohChainMap = HashMap<(String, u16), Arc<tokio::sync::Mutex<PohChain>>>;
 
 // ── L2 segment installer ──────────────────────────────────────────────
 
@@ -203,6 +204,87 @@ impl InstalledPohChainRegistry {
             .map_err(|e| AeonError::state(format!("poh-installer: registry lock poisoned: {e}")))?
             .insert(key, chain);
         Ok(())
+    }
+}
+
+// ── Live source-side PoH chain registry (CL-6c.4) ─────────────────────
+
+/// CL-6c.4 — registry of *live* `Arc<Mutex<PohChain>>` handles for
+/// partitions currently owned by this node. Mirrors
+/// [`InstalledPohChainRegistry`] but holds the live mutable handle the
+/// processor task is appending to, not a frozen snapshot.
+///
+/// Populated by [`crate::pipeline::create_poh_state`] when a pipeline
+/// task starts on this node, and consulted by the source-side
+/// `PohChainExportProvider` in `engine_providers.rs` when a peer asks
+/// for this partition's PoH state during a CL-6 handover.
+///
+/// Removal happens implicitly: on a successful cutover the WriteGate
+/// goes `Frozen` and the pipeline task winds down — explicit
+/// `unregister` is provided for the supervisor's `stop()` path so a
+/// stale handle never leaks across restarts on the same node.
+///
+/// Cheap to clone — wraps `Arc<Mutex<…>>`. The registry's index uses a
+/// `std::sync::Mutex` (registrations are infrequent and brief), but the
+/// stored chain handle uses `tokio::sync::Mutex<PohChain>` to match
+/// `crate::pipeline::PohState` so the live processor task can `lock()`
+/// it asynchronously without lock-type juggling.
+#[derive(Clone, Default)]
+pub struct LivePohChainRegistry {
+    inner: Arc<Mutex<LivePohChainMap>>,
+}
+
+impl LivePohChainRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register the live chain handle for `(pipeline, partition)`.
+    /// Replaces any previous registration for the same key — pipeline
+    /// restart on the same node is the documented case.
+    pub fn register(
+        &self,
+        pipeline: &str,
+        partition: PartitionId,
+        chain: Arc<tokio::sync::Mutex<PohChain>>,
+    ) -> Result<(), AeonError> {
+        let key = (pipeline.to_owned(), partition.as_u16());
+        self.inner
+            .lock()
+            .map_err(|e| AeonError::state(format!("live-poh: lock poisoned: {e}")))?
+            .insert(key, chain);
+        Ok(())
+    }
+
+    /// Drop the registration for `(pipeline, partition)`. Best-effort —
+    /// a poisoned registry lock is a startup-time bug, not something to
+    /// surface at shutdown.
+    pub fn unregister(&self, pipeline: &str, partition: PartitionId) {
+        let key = (pipeline.to_owned(), partition.as_u16());
+        if let Ok(mut g) = self.inner.lock() {
+            g.remove(&key);
+        }
+    }
+
+    /// Drop every registration whose pipeline name matches. Used by the
+    /// supervisor's `stop()` path so handles don't leak across pipeline
+    /// restarts. Best-effort, same poison-tolerant policy as
+    /// `unregister`.
+    pub fn remove_pipeline(&self, pipeline: &str) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.retain(|(p, _), _| p != pipeline);
+        }
+    }
+
+    /// Look up the live chain handle. Returns a clone of the inner
+    /// `Arc`, so the caller can lock without holding the registry lock.
+    pub fn get(
+        &self,
+        pipeline: &str,
+        partition: PartitionId,
+    ) -> Option<Arc<tokio::sync::Mutex<PohChain>>> {
+        let key = (pipeline.to_owned(), partition.as_u16());
+        self.inner.lock().ok()?.get(&key).cloned()
     }
 }
 
@@ -493,6 +575,63 @@ mod tests {
         installer.install(&req, Vec::new()).unwrap();
         // Nothing got inserted.
         assert!(registry.take("pl", PartitionId::new(0)).is_none());
+    }
+
+    // ── Live PoH registry ─────────────────────────────────────────────
+
+    #[test]
+    fn live_poh_registry_register_get_unregister_roundtrip() {
+        let reg = LivePohChainRegistry::new();
+        let chain = Arc::new(tokio::sync::Mutex::new(PohChain::new(PartitionId::new(7), 64)));
+        reg.register("pl", PartitionId::new(7), Arc::clone(&chain)).unwrap();
+
+        let got = reg
+            .get("pl", PartitionId::new(7))
+            .expect("registered chain should be retrievable");
+        assert!(Arc::ptr_eq(&chain, &got), "registry must hand back the same Arc");
+
+        reg.unregister("pl", PartitionId::new(7));
+        assert!(reg.get("pl", PartitionId::new(7)).is_none());
+    }
+
+    #[test]
+    fn live_poh_registry_register_replaces_previous() {
+        let reg = LivePohChainRegistry::new();
+        let chain1 = Arc::new(tokio::sync::Mutex::new(PohChain::new(PartitionId::new(0), 64)));
+        let chain2 = Arc::new(tokio::sync::Mutex::new(PohChain::new(PartitionId::new(0), 64)));
+        reg.register("pl", PartitionId::new(0), Arc::clone(&chain1)).unwrap();
+        reg.register("pl", PartitionId::new(0), Arc::clone(&chain2)).unwrap();
+        let got = reg.get("pl", PartitionId::new(0)).unwrap();
+        assert!(
+            Arc::ptr_eq(&chain2, &got),
+            "second register must replace the first",
+        );
+    }
+
+    #[test]
+    fn live_poh_registry_get_missing_returns_none() {
+        let reg = LivePohChainRegistry::new();
+        assert!(reg.get("pl", PartitionId::new(0)).is_none());
+    }
+
+    #[test]
+    fn live_poh_registry_remove_pipeline_drops_all_partitions() {
+        let reg = LivePohChainRegistry::new();
+        for p in 0u16..3 {
+            let chain = Arc::new(tokio::sync::Mutex::new(PohChain::new(PartitionId::new(p), 64)));
+            reg.register("pl", PartitionId::new(p), chain).unwrap();
+        }
+        let other = Arc::new(tokio::sync::Mutex::new(PohChain::new(PartitionId::new(0), 64)));
+        reg.register("other", PartitionId::new(0), other).unwrap();
+
+        reg.remove_pipeline("pl");
+        for p in 0u16..3 {
+            assert!(reg.get("pl", PartitionId::new(p)).is_none());
+        }
+        assert!(
+            reg.get("other", PartitionId::new(0)).is_some(),
+            "remove_pipeline must not touch sibling pipelines",
+        );
     }
 
     #[test]

@@ -17,8 +17,12 @@
 //!   `BatchResult::all_pending`. `flush()` awaits all stashed tasks and credits
 //!   them. Used by the pipeline sink task at flush intervals.
 
-use aeon_types::{AeonError, BatchResult, DeliveryStrategy, IdempotentSink, Output, Sink};
+use aeon_types::{
+    AeonError, BatchResult, DeliveryStrategy, IdempotentSink, OutboundAuthSigner, Output, Sink,
+    SinkAckCallback,
+};
 use redis::aio::MultiplexedConnection;
+use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -47,6 +51,8 @@ pub struct RedisSinkConfig {
     /// Key prefix for dedup records. Full key is `{prefix}{stream_key}:{event_id}`.
     /// Defaults to `"aeon:dedup:"`. Only used when `dedup_ttl` is set.
     pub dedup_key_prefix: String,
+    /// S10 outbound auth. See `RedisSourceConfig::auth`.
+    pub auth: Option<Arc<OutboundAuthSigner>>,
 }
 
 impl RedisSinkConfig {
@@ -59,7 +65,14 @@ impl RedisSinkConfig {
             strategy: DeliveryStrategy::default(),
             dedup_ttl: None,
             dedup_key_prefix: "aeon:dedup:".to_string(),
+            auth: None,
         }
+    }
+
+    /// S10: attach an outbound-auth signer.
+    pub fn with_auth(mut self, signer: Arc<OutboundAuthSigner>) -> Self {
+        self.auth = Some(signer);
+        self
     }
 
     /// Set approximate maximum stream length (trimming with MAXLEN ~).
@@ -111,12 +124,18 @@ pub struct RedisSink {
     pending_tasks: Vec<tokio::task::JoinHandle<Result<(), AeonError>>>,
     /// Count of outputs enqueued but not yet confirmed (UnorderedBatch).
     pending: u64,
+    /// Engine-installed callback fired when XADD round-trips succeed. Drives
+    /// the `outputs_acked_total` companion metric so the operator can see the
+    /// gap between `outputs_sent` (write_batch calls) and broker-confirmed
+    /// delivery. UnorderedBatch fires on flush, not on enqueue.
+    ack_callback: Option<SinkAckCallback>,
 }
 
 impl RedisSink {
     /// Connect to Redis.
     pub async fn new(config: RedisSinkConfig) -> Result<Self, AeonError> {
-        let client = redis::Client::open(config.url.as_str())
+        let conn_info = super::auth::resolve_connection_info(&config.url, config.auth.as_ref())?;
+        let client = redis::Client::open(conn_info)
             .map_err(|e| AeonError::connection(format!("redis client create failed: {e}")))?;
 
         let conn = client
@@ -136,6 +155,7 @@ impl RedisSink {
             delivered: 0,
             pending_tasks: Vec::new(),
             pending: 0,
+            ack_callback: None,
         })
     }
 
@@ -147,6 +167,17 @@ impl RedisSink {
     /// Number of outputs enqueued but not yet confirmed (UnorderedBatch).
     pub fn pending(&self) -> u64 {
         self.pending
+    }
+
+    /// Fire the engine-installed ack callback. Shared by PerEvent/OrderedBatch
+    /// write paths and the UnorderedBatch flush drain.
+    fn fire_ack(&self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        if let Some(cb) = self.ack_callback.as_ref() {
+            cb(n);
+        }
     }
 }
 
@@ -216,6 +247,7 @@ impl Sink for RedisSink {
                         })?;
                     self.delivered += 1;
                 }
+                self.fire_ack(count);
                 Ok(BatchResult::all_delivered(event_ids))
             }
             DeliveryStrategy::OrderedBatch => {
@@ -226,6 +258,7 @@ impl Sink for RedisSink {
                     AeonError::connection(format!("redis XADD pipeline failed: {e}"))
                 })?;
                 self.delivered += count as u64;
+                self.fire_ack(count);
                 Ok(BatchResult::all_delivered(event_ids))
             }
             DeliveryStrategy::UnorderedBatch => {
@@ -260,9 +293,15 @@ impl Sink for RedisSink {
                 AeonError::connection(format!("redis sink task join failed: {e}"))
             })??;
         }
-        self.delivered += self.pending;
+        let newly_acked = self.pending;
+        self.delivered += newly_acked;
         self.pending = 0;
+        self.fire_ack(newly_acked as usize);
         Ok(())
+    }
+
+    fn on_ack_callback(&mut self, cb: SinkAckCallback) {
+        self.ack_callback = Some(cb);
     }
 }
 

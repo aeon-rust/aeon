@@ -80,6 +80,7 @@ fn bench_blackhole(
                 max_batch_size: bsize,
                 ..Default::default()
             },
+            gate_registry: None,
         };
         let metrics = Arc::new(PipelineMetrics::new());
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -120,6 +121,7 @@ fn bench_filesink(
                 max_batch_size: bsize,
                 ..Default::default()
             },
+            gate_registry: None,
         };
         let metrics = Arc::new(PipelineMetrics::new());
         let shutdown = Arc::new(AtomicBool::new(false));

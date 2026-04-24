@@ -5,7 +5,9 @@
 //! Phase 3 backpressure: when overloaded, uses basic.cancel to stop delivery.
 
 use crate::push_buffer::{PushBufferConfig, PushBufferRx, push_buffer};
-use aeon_types::{AeonError, BackoffPolicy, CoreLocalUuidGenerator, Event, PartitionId, Source};
+use aeon_types::{
+    AeonError, BackoffPolicy, CoreLocalUuidGenerator, Event, PartitionId, Source, SourceKind,
+};
 use bytes::Bytes;
 use lapin::options::*;
 use lapin::types::FieldTable;
@@ -299,5 +301,9 @@ async fn drive_consumer(
 impl Source for RabbitMqSource {
     async fn next_batch(&mut self) -> Result<Vec<Event>, AeonError> {
         self.rx.next_batch(self.poll_timeout).await
+    }
+
+    fn source_kind(&self) -> SourceKind {
+        SourceKind::Push
     }
 }

@@ -1249,17 +1249,16 @@ async fn a12_java_ws_t4_memory_roundtrip() {
     let events = make_test_events(msg_count);
     let result = e2e_ws_harness::drive_events_through_transport(&server.ws_host, events, 64).await;
 
-    if result.is_err() {
-        let _ = child.kill();
-        let output = child.wait_with_output().unwrap();
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        panic!(
-            "A12: drive_events failed: {}\nJava stdout: {stdout}\nJava stderr: {stderr}",
-            result.unwrap_err()
-        );
-    }
-    let outputs = result.unwrap();
+    let outputs = match result {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = child.kill();
+            let output = child.wait_with_output().unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            panic!("A12: drive_events failed: {e}\nJava stdout: {stdout}\nJava stderr: {stderr}");
+        }
+    };
 
     assert_eq!(outputs.len(), msg_count, "A12 C1: event count mismatch");
     for (i, output) in outputs.iter().enumerate() {

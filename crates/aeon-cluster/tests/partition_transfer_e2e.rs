@@ -259,8 +259,12 @@ struct FixedPohProvider {
 }
 
 impl PohChainProvider for FixedPohProvider {
-    fn export_state(&self, _req: &PohChainTransferRequest) -> Result<Vec<u8>, AeonError> {
-        Ok(self.payload.clone())
+    fn export_state<'a>(
+        &'a self,
+        _req: &'a PohChainTransferRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, AeonError>> + Send + 'a>> {
+        let payload = self.payload.clone();
+        Box::pin(async move { Ok(payload) })
     }
 }
 

@@ -750,7 +750,8 @@ async fn e10_http_polling_source_to_memory_sink() {
     });
 
     let config = HttpPollingSourceConfig::new(format!("http://{addr}/data"))
-        .with_interval(Duration::from_millis(10));
+        .with_interval(Duration::from_millis(10))
+        .with_ssrf_policy(aeon_types::SsrfPolicy::permissive_for_tests());
     let mut source = HttpPollingSource::new(config).unwrap();
     let processor = PassthroughProcessor::new(Arc::from("output"));
     let mut sink = MemorySink::new();
@@ -822,7 +823,8 @@ async fn e11_memory_source_to_http_sink() {
 
     let mut source = MemorySource::new(events, 32);
     let processor = PassthroughProcessor::new(Arc::from("output"));
-    let config = HttpSinkConfig::new(format!("http://{addr}/ingest"));
+    let config = HttpSinkConfig::new(format!("http://{addr}/ingest"))
+        .with_ssrf_policy(aeon_types::SsrfPolicy::permissive_for_tests());
     let mut sink = HttpSink::new(config).unwrap();
     let metrics = PipelineMetrics::new();
     let shutdown = AtomicBool::new(false);
@@ -1021,7 +1023,8 @@ async fn e13_memory_source_to_webtransport_sink() {
         .build();
 
     let sink_config =
-        WebTransportSinkConfig::new(format!("https://127.0.0.1:{port}"), client_config);
+        WebTransportSinkConfig::new(format!("https://127.0.0.1:{port}"), client_config)
+            .with_ssrf_policy(aeon_types::SsrfPolicy::permissive_for_tests());
     let mut sink = WebTransportSink::new(sink_config).await.unwrap();
     let metrics = PipelineMetrics::new();
     let shutdown = AtomicBool::new(false);

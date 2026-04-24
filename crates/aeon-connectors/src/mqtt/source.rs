@@ -13,7 +13,9 @@
 //! WebSocket source relies on.
 
 use crate::push_buffer::{PushBufferConfig, PushBufferRx, push_buffer};
-use aeon_types::{AeonError, BackoffPolicy, CoreLocalUuidGenerator, Event, PartitionId, Source};
+use aeon_types::{
+    AeonError, BackoffPolicy, CoreLocalUuidGenerator, Event, PartitionId, Source, SourceKind,
+};
 use rumqttc::{AsyncClient, EventLoop, MqttOptions, QoS};
 use std::sync::Arc;
 use std::time::Duration;
@@ -200,5 +202,9 @@ async fn mqtt_reader(
 impl Source for MqttSource {
     async fn next_batch(&mut self) -> Result<Vec<Event>, AeonError> {
         self.rx.next_batch(self.poll_timeout).await
+    }
+
+    fn source_kind(&self) -> SourceKind {
+        SourceKind::Push
     }
 }

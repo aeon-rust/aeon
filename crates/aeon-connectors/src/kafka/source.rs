@@ -3,7 +3,9 @@
 //! Uses `StreamConsumer` for async integration with tokio.
 //! Manual `assign()` instead of `subscribe()` — Aeon manages partition ownership.
 
-use aeon_types::{AeonError, CoreLocalUuidGenerator, Event, PartitionId, Source};
+use aeon_types::{
+    AeonError, ConsumerMode, CoreLocalUuidGenerator, Event, OutboundAuthSigner, PartitionId, Source,
+};
 use bytes::Bytes;
 use rdkafka::TopicPartitionList;
 use rdkafka::config::ClientConfig;
@@ -38,6 +40,19 @@ pub struct KafkaSourceConfig {
     pub max_empty_polls: u32,
     /// Optional: additional rdkafka config overrides.
     pub config_overrides: Vec<(String, String)>,
+    /// B4: consumer-group mode selector. `Single` (default) uses manual
+    /// `assign()` so Aeon's Raft-coordinated `partition_table` owns
+    /// partition ownership. `Group { group_id, broker_commit }` uses
+    /// `subscribe()` so the broker rebalances partitions across group
+    /// members — mutually exclusive with cluster-coordinated partition
+    /// ownership (validated at pipeline start). The `group_id` on
+    /// `ConsumerMode::Group` overrides the `group_id` field above.
+    pub consumer_mode: ConsumerMode,
+    /// S10: outbound auth signer. `BrokerNative` passes SASL/SSL knobs
+    /// directly to rdkafka; `Mtls` sets `security.protocol=ssl` +
+    /// `ssl.{certificate,key}.pem`. HTTP-style modes are warned-and-
+    /// ignored (not meaningful for the Kafka protocol).
+    pub auth: Option<Arc<OutboundAuthSigner>>,
 }
 
 impl KafkaSourceConfig {
@@ -54,7 +69,22 @@ impl KafkaSourceConfig {
             group_id: "aeon-manual".to_string(),
             max_empty_polls: 10,
             config_overrides: Vec::new(),
+            consumer_mode: ConsumerMode::Single,
+            auth: None,
         }
+    }
+
+    /// Set the consumer-group mode (B4). See `ConsumerMode`.
+    pub fn with_consumer_mode(mut self, mode: ConsumerMode) -> Self {
+        self.consumer_mode = mode;
+        self
+    }
+
+    /// Attach an outbound auth signer (S10). See [`crate::kafka::auth`]
+    /// for the per-mode translation onto rdkafka config knobs.
+    pub fn with_auth(mut self, signer: Arc<OutboundAuthSigner>) -> Self {
+        self.auth = Some(signer);
+        self
     }
 
     /// Set which partitions to consume (manual assignment).
@@ -129,18 +159,39 @@ pub struct KafkaSource {
 }
 
 impl KafkaSource {
-    /// Create a new KafkaSource and assign partitions.
+    /// Create a new KafkaSource and bind it to partitions.
+    ///
+    /// In `ConsumerMode::Single` (default), Aeon owns partition ownership via
+    /// `assign()`. In `ConsumerMode::Group`, the broker owns partition
+    /// ownership via `subscribe()` — the `group_id` on the mode variant
+    /// overrides the config's `group_id` field, and `enable.auto.commit` is
+    /// driven by `broker_commit`.
     pub fn new(config: KafkaSourceConfig) -> Result<Self, AeonError> {
         let mut client_config = ClientConfig::new();
+        let (effective_group_id, broker_commit) = match &config.consumer_mode {
+            ConsumerMode::Single => (config.group_id.as_str(), false),
+            ConsumerMode::Group {
+                group_id,
+                broker_commit,
+            } => (group_id.as_str(), *broker_commit),
+        };
+
         client_config
             .set("bootstrap.servers", &config.brokers)
-            .set("group.id", &config.group_id)
-            .set("enable.auto.commit", "false") // Aeon manages offsets
+            .set("group.id", effective_group_id)
+            .set(
+                "enable.auto.commit",
+                if broker_commit { "true" } else { "false" },
+            )
             .set("auto.offset.reset", "earliest")
             .set("fetch.min.bytes", "1")
             .set("fetch.wait.max.ms", "100")
             .set("queued.min.messages", "100000") // Pre-fetch aggressively
             .set("queued.max.messages.kbytes", "65536"); // 64MB pre-fetch buffer
+
+        // S10: outbound auth (BrokerNative / Mtls) before user overrides so
+        // the user escape-hatch (`config_overrides`) always wins for debugging.
+        super::auth::apply_outbound_auth(&mut client_config, config.auth.as_ref());
 
         // Apply user overrides
         for (k, v) in &config.config_overrides {
@@ -151,23 +202,46 @@ impl KafkaSource {
             .create()
             .map_err(|e| AeonError::connection(format!("kafka consumer create failed: {e}")))?;
 
-        // Manual partition assignment.
-        // With enable.auto.commit=false and auto.offset.reset=earliest,
-        // the consumer starts from the beginning when no committed offset exists.
-        let mut tpl = TopicPartitionList::new();
-        for &partition in &config.partitions {
-            tpl.add_partition(&config.topic, partition);
-        }
-        consumer
-            .assign(&tpl)
-            .map_err(|e| AeonError::connection(format!("kafka partition assign failed: {e}")))?;
+        match &config.consumer_mode {
+            ConsumerMode::Single => {
+                // Manual partition assignment — Aeon's partition_table owns
+                // ownership. With enable.auto.commit=false and
+                // auto.offset.reset=earliest, the consumer starts from the
+                // beginning when no committed offset exists.
+                let mut tpl = TopicPartitionList::new();
+                for &partition in &config.partitions {
+                    tpl.add_partition(&config.topic, partition);
+                }
+                consumer.assign(&tpl).map_err(|e| {
+                    AeonError::connection(format!("kafka partition assign failed: {e}"))
+                })?;
 
-        tracing::info!(
-            topic = %config.topic,
-            partitions = ?config.partitions,
-            batch_max = config.batch_max_messages,
-            "KafkaSource assigned partitions"
-        );
+                tracing::info!(
+                    topic = %config.topic,
+                    partitions = ?config.partitions,
+                    batch_max = config.batch_max_messages,
+                    mode = "single",
+                    "KafkaSource assigned partitions"
+                );
+            }
+            ConsumerMode::Group { group_id, .. } => {
+                // Broker-coordinated rebalance — `partitions` on the config is
+                // advisory only (broker decides). The pipeline start path must
+                // refuse to attach a Raft-driven partition watcher in this
+                // mode; see `broker_coordinated_partitions()` below.
+                consumer.subscribe(&[&config.topic]).map_err(|e| {
+                    AeonError::connection(format!("kafka subscribe failed: {e}"))
+                })?;
+
+                tracing::info!(
+                    topic = %config.topic,
+                    group_id = %group_id,
+                    batch_max = config.batch_max_messages,
+                    mode = "group",
+                    "KafkaSource subscribed to topic under broker-coordinated group"
+                );
+            }
+        }
 
         // Use core_id 0 for UUID generation. In multi-partition pipelines,
         // each partition's KafkaSource will run on its own core — but the core_id
@@ -297,6 +371,19 @@ impl Source for KafkaSource {
     }
 
     async fn reassign_partitions(&mut self, partitions: &[u16]) -> Result<(), AeonError> {
+        // B4: reject reassignment in broker-coordinated group mode —
+        // partition ownership belongs to the broker's rebalance protocol,
+        // not Aeon's partition_table. The pipeline start path is supposed
+        // to refuse to attach the watcher in this mode; this branch is a
+        // belt-and-braces guard so a stray Raft-driven reassign cannot
+        // stomp the broker's assignment.
+        if self.config.consumer_mode.is_broker_coordinated() {
+            return Err(AeonError::config(
+                "KafkaSource: reassign_partitions is not valid in ConsumerMode::Group — \
+                 partition ownership is broker-coordinated",
+            ));
+        }
+
         // Short-circuit if the set is unchanged — avoids needless
         // `assign()` calls on the consumer which would reset per-partition
         // fetch state.
@@ -329,6 +416,10 @@ impl Source for KafkaSource {
         );
         Ok(())
     }
+
+    fn broker_coordinated_partitions(&self) -> bool {
+        self.config.consumer_mode.is_broker_coordinated()
+    }
 }
 
 /// Helper to create a Redpanda-optimized source config.
@@ -345,4 +436,27 @@ pub fn redpanda_source_config(
         .with_config("fetch.min.bytes", "1")
         .with_batch_max(2048)
         .with_drain_timeout(Duration::from_millis(5))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_consumer_mode_is_single() {
+        let cfg = KafkaSourceConfig::new("localhost:9092", "topic");
+        assert_eq!(cfg.consumer_mode, ConsumerMode::Single);
+    }
+
+    #[test]
+    fn with_consumer_mode_sets_group_variant() {
+        let cfg = KafkaSourceConfig::new("localhost:9092", "topic").with_consumer_mode(
+            ConsumerMode::Group {
+                group_id: "ingest".to_string(),
+                broker_commit: false,
+            },
+        );
+        assert!(cfg.consumer_mode.is_broker_coordinated());
+        assert_eq!(cfg.consumer_mode.group_id(), Some("ingest"));
+    }
 }

@@ -3,7 +3,10 @@
 //! Uses consumer groups for reliable delivery with acknowledgment.
 //! Pull-source: `next_batch()` issues XREADGROUP with COUNT and BLOCK.
 
-use aeon_types::{AeonError, Backoff, BackoffPolicy, CoreLocalUuidGenerator, Event, PartitionId, Source};
+use aeon_types::{
+    AeonError, Backoff, BackoffPolicy, ConsumerMode, CoreLocalUuidGenerator, Event,
+    OutboundAuthSigner, PartitionId, Source,
+};
 use bytes::Bytes;
 use redis::AsyncCommands;
 use redis::aio::MultiplexedConnection;
@@ -31,6 +34,25 @@ pub struct RedisSourceConfig {
     /// current delay, and returns an empty batch so the pipeline stays alive.
     /// The next `next_batch()` rebuilds the connection and retries.
     pub backoff: BackoffPolicy,
+    /// B4: consumer-group mode selector. Redis Streams always uses
+    /// XREADGROUP under the hood, but `ConsumerMode` governs whether
+    /// Aeon's Raft-coordinated partition_table may drive partition
+    /// ownership on top of the stream.
+    ///
+    /// - `Single` (default): Aeon owns the stream — at most one consumer
+    ///   per group per Aeon deployment; cluster-coordinated partition
+    ///   ownership is allowed.
+    /// - `Group { group_id, .. }`: multiple Aeon instances share the
+    ///   broker-managed group (each with a distinct `consumer` name);
+    ///   the broker distributes pending entries across instances and
+    ///   Raft-driven partition re-assignment is refused at pipeline start.
+    ///
+    /// When `Group`, the mode's `group_id` overrides the `group` field.
+    pub consumer_mode: ConsumerMode,
+    /// S10 outbound auth. When `Some`, the signer's mode drives how the
+    /// `ConnectionInfo` passed to `redis::Client::open` is built — see
+    /// `redis_streams::auth::resolve_connection_info`.
+    pub auth: Option<Arc<OutboundAuthSigner>>,
 }
 
 impl RedisSourceConfig {
@@ -50,13 +72,37 @@ impl RedisSourceConfig {
             block_ms: 1000,
             source_name: Arc::from("redis"),
             backoff: BackoffPolicy::default(),
+            consumer_mode: ConsumerMode::Single,
+            auth: None,
         }
+    }
+
+    /// S10: attach an outbound-auth signer.
+    pub fn with_auth(mut self, signer: Arc<OutboundAuthSigner>) -> Self {
+        self.auth = Some(signer);
+        self
     }
 
     /// Override the reconnect backoff policy.
     pub fn with_backoff(mut self, backoff: BackoffPolicy) -> Self {
         self.backoff = backoff;
         self
+    }
+
+    /// Set the consumer-group mode (B4). See `ConsumerMode`.
+    pub fn with_consumer_mode(mut self, mode: ConsumerMode) -> Self {
+        self.consumer_mode = mode;
+        self
+    }
+
+    /// Group id that will be passed to `XGROUP CREATE` / `XREADGROUP`:
+    /// the `ConsumerMode::Group` variant's `group_id` when present,
+    /// otherwise the config's `group` field.
+    pub fn effective_group(&self) -> &str {
+        match &self.consumer_mode {
+            ConsumerMode::Single => self.group.as_str(),
+            ConsumerMode::Group { group_id, .. } => group_id.as_str(),
+        }
     }
 
     /// Set batch size.
@@ -97,7 +143,8 @@ pub struct RedisSource {
 impl RedisSource {
     /// Connect to Redis and ensure the consumer group exists.
     pub async fn new(config: RedisSourceConfig) -> Result<Self, AeonError> {
-        let client = redis::Client::open(config.url.as_str())
+        let conn_info = super::auth::resolve_connection_info(&config.url, config.auth.as_ref())?;
+        let client = redis::Client::open(conn_info)
             .map_err(|e| AeonError::connection(format!("redis client create failed: {e}")))?;
 
         // Initial connect is validated synchronously so misconfiguration
@@ -140,7 +187,7 @@ impl RedisSource {
         let result: redis::RedisResult<String> = redis::cmd("XGROUP")
             .arg("CREATE")
             .arg(&config.stream_key)
-            .arg(&config.group)
+            .arg(config.effective_group())
             .arg("0")
             .arg("MKSTREAM")
             .query_async(&mut conn)
@@ -150,7 +197,7 @@ impl RedisSource {
             Ok(_) => {
                 tracing::info!(
                     stream = %config.stream_key,
-                    group = %config.group,
+                    group = %config.effective_group(),
                     "RedisSource created consumer group"
                 );
             }
@@ -179,7 +226,7 @@ impl RedisSource {
             .ok_or_else(|| AeonError::connection("redis conn not established"))?;
         let ids: Vec<&str> = self.pending_ack_ids.iter().map(|s| s.as_str()).collect();
         let _: u64 = conn
-            .xack(&self.config.stream_key, &self.config.group, &ids)
+            .xack(&self.config.stream_key, self.config.effective_group(), &ids)
             .await
             .map_err(|e| AeonError::connection(format!("redis XACK failed: {e}")))?;
 
@@ -234,7 +281,7 @@ impl Source for RedisSource {
         let opts = StreamReadOptions::default()
             .count(self.config.batch_size)
             .block(self.config.block_ms)
-            .group(&self.config.group, &self.config.consumer);
+            .group(self.config.effective_group(), &self.config.consumer);
 
         let conn = self
             .conn
@@ -311,6 +358,10 @@ impl Source for RedisSource {
 
         Ok(events)
     }
+
+    fn broker_coordinated_partitions(&self) -> bool {
+        self.config.consumer_mode.is_broker_coordinated()
+    }
 }
 
 /// Pack a Redis stream entry ID `"<ms>-<seq>"` into a monotonic `i64`.
@@ -355,5 +406,25 @@ mod tests {
         let a = parse_stream_id_to_i64("1-65535").unwrap();
         let b = parse_stream_id_to_i64("1-99999").unwrap();
         assert_eq!(a, b, "seq saturates at 0xFFFF");
+    }
+
+    #[test]
+    fn default_consumer_mode_is_single_and_uses_config_group() {
+        let cfg =
+            RedisSourceConfig::new("redis://localhost", "stream", "group-a", "consumer-1");
+        assert_eq!(cfg.consumer_mode, ConsumerMode::Single);
+        assert_eq!(cfg.effective_group(), "group-a");
+    }
+
+    #[test]
+    fn group_mode_overrides_effective_group() {
+        let cfg =
+            RedisSourceConfig::new("redis://localhost", "stream", "group-a", "consumer-1")
+                .with_consumer_mode(ConsumerMode::Group {
+                    group_id: "shared-group".to_string(),
+                    broker_commit: false,
+                });
+        assert!(cfg.consumer_mode.is_broker_coordinated());
+        assert_eq!(cfg.effective_group(), "shared-group");
     }
 }

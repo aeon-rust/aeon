@@ -51,6 +51,8 @@ pub trait DynSource: Send + Sync {
         &'a mut self,
         partitions: &'a [u16],
     ) -> Pin<Box<dyn Future<Output = Result<(), AeonError>> + Send + 'a>>;
+
+    fn broker_coordinated_partitions(&self) -> bool;
 }
 
 impl<S: Source + 'static> DynSource for S {
@@ -81,6 +83,10 @@ impl<S: Source + 'static> DynSource for S {
         partitions: &'a [u16],
     ) -> Pin<Box<dyn Future<Output = Result<(), AeonError>> + Send + 'a>> {
         Box::pin(self.reassign_partitions(partitions))
+    }
+
+    fn broker_coordinated_partitions(&self) -> bool {
+        Source::broker_coordinated_partitions(self)
     }
 }
 
@@ -153,6 +159,10 @@ impl Source for BoxedSourceAdapter {
     ) -> impl Future<Output = Result<(), AeonError>> + Send {
         let owned = partitions.to_vec();
         async move { self.0.reassign_partitions_boxed(&owned).await }
+    }
+
+    fn broker_coordinated_partitions(&self) -> bool {
+        self.0.broker_coordinated_partitions()
     }
 }
 

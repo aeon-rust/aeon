@@ -139,6 +139,14 @@ mod inner {
         transfer_driver: tokio::sync::RwLock<
             Option<Arc<crate::partition_driver::PartitionTransferDriver>>,
         >,
+        /// CL-6c.4 — source-side provider slots serviced by the QUIC
+        /// accept loop. Populated post-bootstrap by `aeon-cli` once the
+        /// engine-side installers exist. `install_segment_provider` /
+        /// `install_poh_provider` / `install_cutover_coordinator` delegate
+        /// here. Multi-node bootstrap paths hand a clone to
+        /// `server::serve_with_slots` so late installation becomes active
+        /// without restarting the accept task.
+        source_provider_slots: crate::transport::server::SourceProviderSlots,
         /// P5: receiver for the per-node owned-partitions watch. Subscribers
         /// (pipeline source loop) clone this via `watch_owned_partitions()`
         /// and select on `changed()` to re-assign the live source without
@@ -219,6 +227,7 @@ mod inner {
                 shared_state,
                 applier_slot,
                 transfer_driver: tokio::sync::RwLock::new(None),
+                source_provider_slots: crate::transport::server::SourceProviderSlots::new_empty(),
                 owned_partitions_rx,
             };
 
@@ -333,6 +342,7 @@ mod inner {
                 shared_state,
                 applier_slot,
                 transfer_driver: tokio::sync::RwLock::new(None),
+                source_provider_slots: crate::transport::server::SourceProviderSlots::new_empty(),
                 owned_partitions_rx,
             };
 
@@ -411,19 +421,20 @@ mod inner {
 
             // Start the QUIC RPC server
             let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let source_provider_slots =
+                crate::transport::server::SourceProviderSlots::new_empty();
             let server_ep = Arc::clone(&endpoint);
             let server_raft = raft.clone();
             let server_node_id = config.node_id;
             let server_shutdown = Arc::clone(&shutdown);
+            let server_slots = source_provider_slots.clone();
             tokio::spawn(async move {
-                server::serve(
+                server::serve_with_slots(
                     server_ep,
                     server_raft,
                     server_node_id,
                     server_shutdown,
-                    None,
-                    None,
-                    None,
+                    server_slots,
                 )
                 .await;
             });
@@ -464,6 +475,7 @@ mod inner {
                 shared_state,
                 applier_slot,
                 transfer_driver: tokio::sync::RwLock::new(None),
+                source_provider_slots,
                 owned_partitions_rx,
             };
 
@@ -525,19 +537,20 @@ mod inner {
 
             // Start the QUIC RPC server so the bootstrap leader can reach us
             let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let source_provider_slots =
+                crate::transport::server::SourceProviderSlots::new_empty();
             let server_ep = Arc::clone(&endpoint);
             let server_raft = raft.clone();
             let server_node_id = config.node_id;
             let server_shutdown = Arc::clone(&shutdown);
+            let server_slots = source_provider_slots.clone();
             tokio::spawn(async move {
-                server::serve(
+                server::serve_with_slots(
                     server_ep,
                     server_raft,
                     server_node_id,
                     server_shutdown,
-                    None,
-                    None,
-                    None,
+                    server_slots,
                 )
                 .await;
             });
@@ -558,6 +571,7 @@ mod inner {
                 shared_state,
                 applier_slot,
                 transfer_driver: tokio::sync::RwLock::new(None),
+                source_provider_slots,
                 owned_partitions_rx,
             };
 
@@ -613,19 +627,20 @@ mod inner {
 
             // Start the QUIC RPC server so peers can reach us
             let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let source_provider_slots =
+                crate::transport::server::SourceProviderSlots::new_empty();
             let server_ep = Arc::clone(&endpoint);
             let server_raft = raft.clone();
             let server_node_id = config.node_id;
             let server_shutdown = Arc::clone(&shutdown);
+            let server_slots = source_provider_slots.clone();
             tokio::spawn(async move {
-                server::serve(
+                server::serve_with_slots(
                     server_ep,
                     server_raft,
                     server_node_id,
                     server_shutdown,
-                    None,
-                    None,
-                    None,
+                    server_slots,
                 )
                 .await;
             });
@@ -705,6 +720,7 @@ mod inner {
                 shared_state: crate::store::SharedClusterState::default(),
                 applier_slot,
                 transfer_driver: tokio::sync::RwLock::new(None),
+                source_provider_slots,
                 owned_partitions_rx,
             };
 
@@ -1071,6 +1087,55 @@ mod inner {
             driver: Arc<crate::partition_driver::PartitionTransferDriver>,
         ) {
             *self.transfer_driver.write().await = Some(driver);
+        }
+
+        /// CL-6a — install the source-side L2 segment transfer provider.
+        /// Serves inbound `PartitionTransferRequest` streams. Called by
+        /// `aeon-cli` once the engine-side `L2SegmentTransferProvider` is
+        /// built over the live `L2BodyStore`. Idempotent.
+        ///
+        /// Has no effect on single-node bootstrap paths because they don't
+        /// run a QUIC server — the slot is still populated for API
+        /// uniformity.
+        pub async fn install_segment_provider(
+            &self,
+            provider: Arc<dyn crate::transport::partition_transfer::PartitionTransferProvider>,
+        ) {
+            self.source_provider_slots
+                .install_segment_provider(provider)
+                .await;
+        }
+
+        /// CL-6b — install the source-side PoH chain export provider.
+        /// Serves inbound `PohChainTransferRequest` streams. Called by
+        /// `aeon-cli` once the engine-side `PohChainExportProvider` is
+        /// built over the live per-partition `PohChain`. Idempotent.
+        pub async fn install_poh_provider(
+            &self,
+            provider: Arc<dyn crate::transport::poh_transfer::PohChainProvider>,
+        ) {
+            self.source_provider_slots
+                .install_poh_provider(provider)
+                .await;
+        }
+
+        /// CL-6c.4 — install the source-side cutover coordinator.
+        /// Serves inbound `PartitionCutoverRequest` streams: drains
+        /// in-flight writes, flips the `WriteGate` to `Frozen`, and
+        /// reports the final source offset + PoH sequence so the target
+        /// can resume without gap.
+        ///
+        /// Called by `aeon-cli` with an `EngineCutoverCoordinator`
+        /// wrapping the supervisor's `WriteGateRegistry`. Idempotent.
+        /// Without this hook, CL-6 handovers complete the bulk-sync
+        /// phase but fail at cutover (source writes never freeze).
+        pub async fn install_cutover_coordinator(
+            &self,
+            coordinator: Arc<dyn crate::transport::cutover::CutoverCoordinator>,
+        ) {
+            self.source_provider_slots
+                .install_cutover_coordinator(coordinator)
+                .await;
         }
 
         /// Shutdown flag shared with `ClusterNode`'s QUIC server. Exposed so

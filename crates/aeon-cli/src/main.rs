@@ -587,6 +587,42 @@ async fn install_partition_transfer_driver(
 
     node.install_transfer_driver(Arc::clone(&driver)).await;
 
+    // CL-6c.4 — wire the source-side half of CL-6: install the QUIC
+    // provider trio (L2 segment export, PoH state export, cutover
+    // coordinator) into `ClusterNode::source_provider_slots`. Without
+    // this the source-side QUIC accept loop has no providers to route
+    // to and incoming PartitionTransferRequest / PohChainTransferRequest /
+    // PartitionCutoverRequest frames return immediate failures.
+    {
+        let l2_registry_for_export = aeon_engine::eo2::PipelineL2Registry::new(
+            aeon_engine::delivery::L2BodyStoreConfig {
+                root: Some(std::path::PathBuf::from(&l2_root)),
+                segment_bytes: aeon_engine::delivery::L2BodyStoreConfig::default()
+                    .segment_bytes,
+            },
+        );
+        let segment_provider: Arc<
+            dyn aeon_cluster::transport::partition_transfer::PartitionTransferProvider,
+        > = Arc::new(aeon_engine::L2SegmentTransferProvider::new(
+            l2_registry_for_export,
+        ));
+        node.install_segment_provider(segment_provider).await;
+
+        let poh_provider: Arc<
+            dyn aeon_cluster::transport::poh_transfer::PohChainProvider,
+        > = Arc::new(aeon_engine::PohChainExportProvider::new(
+            supervisor.poh_live_chains(),
+        ));
+        node.install_poh_provider(poh_provider).await;
+
+        let cutover_coord: Arc<
+            dyn aeon_cluster::transport::cutover::CutoverCoordinator,
+        > = Arc::new(aeon_engine::EngineCutoverCoordinator::new(
+            supervisor.gate_registry(),
+        ));
+        node.install_cutover_coordinator(cutover_coord).await;
+    }
+
     let driver_shutdown = node.shutdown_flag();
     let driver_for_loop = Arc::clone(&driver);
     tokio::spawn(async move {
@@ -596,7 +632,7 @@ async fn install_partition_transfer_driver(
     tracing::info!(
         pipeline = %pipeline_name,
         l2_root = %l2_root,
-        "PartitionTransferDriver spawned — transfers will drive automatically"
+        "PartitionTransferDriver + source-side providers (L2 / PoH / cutover) installed"
     );
     Ok(())
 }
@@ -2349,9 +2385,25 @@ struct ExportManifest {
 /// Maximum YAML manifest size (1 MB) to prevent resource exhaustion (OWASP A04).
 const MAX_MANIFEST_SIZE: u64 = 1024 * 1024;
 
-fn cmd_apply(file: &Path, api: &str, dry_run: bool) -> Result<()> {
+/// Read a YAML manifest and run `${SCHEME:path}` secret interpolation
+/// through the default local registry (Env + DotEnv + Literal providers).
+///
+/// Interpolation is pre-parse: tokens are replaced in the raw YAML text,
+/// then `serde_yaml` parses the resolved string. This keeps every field
+/// value — connector `auth_token`, Kafka SASL user/password, L3 backend
+/// URLs, S3 key references, etc. — eligible for env-var / dotenv / Vault
+/// / AWS Secrets Manager resolution without per-field plumbing.
+///
+/// Vault and AWS providers are registered by downstream callers
+/// (post-S1.2 `aeon-secrets` crate); by default only Env / DotEnv /
+/// Literal are available, so a `${VAULT:...}` token in a manifest
+/// surfaces a clear `scheme not registered` error at load time.
+///
+/// Values containing YAML-reserved characters (colon, newline, quotes)
+/// may break parsing — base64-encode multi-line secrets.
+fn read_and_interpolate_manifest(path: &Path) -> Result<String> {
     let metadata =
-        std::fs::metadata(file).with_context(|| format!("failed to stat {}", file.display()))?;
+        std::fs::metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
     if metadata.len() > MAX_MANIFEST_SIZE {
         bail!(
             "manifest file exceeds maximum size ({} bytes > {} bytes)",
@@ -2359,8 +2411,17 @@ fn cmd_apply(file: &Path, api: &str, dry_run: bool) -> Result<()> {
             MAX_MANIFEST_SIZE
         );
     }
-    let content = std::fs::read_to_string(file)
-        .with_context(|| format!("failed to read {}", file.display()))?;
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let registry = aeon_types::SecretRegistry::default_local();
+    let resolved = registry
+        .interpolate_str(&raw)
+        .context("failed to resolve ${SCHEME:path} secret references in manifest")?;
+    Ok(resolved.into_owned())
+}
+
+fn cmd_apply(file: &Path, api: &str, dry_run: bool) -> Result<()> {
+    let content = read_and_interpolate_manifest(file)?;
     let manifest: Manifest = serde_yaml::from_str(&content).context("invalid YAML manifest")?;
 
     if manifest.pipelines.is_empty() && manifest.identities.is_empty() {
@@ -2568,8 +2629,7 @@ fn cmd_export(file: Option<&Path>, api: &str) -> Result<()> {
 }
 
 fn cmd_diff(file: &Path, api: &str) -> Result<()> {
-    let content = std::fs::read_to_string(file)
-        .with_context(|| format!("failed to read {}", file.display()))?;
+    let content = read_and_interpolate_manifest(file)?;
     let manifest: Manifest = serde_yaml::from_str(&content).context("invalid YAML manifest")?;
 
     let existing: serde_json::Value = ureq::get(&format!("{api}/api/v1/pipelines"))
@@ -3492,5 +3552,65 @@ mod tests {
             let n: u32 = p.parse().expect("numeric");
             assert!(n < 60);
         }
+    }
+
+    // ─── S1.3 secret interpolation on manifest load ────────────────
+
+    fn write_temp_yaml(body: &str) -> tempfile::NamedTempFile {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().expect("temp file");
+        f.write_all(body.as_bytes()).expect("write yaml");
+        f.flush().expect("flush yaml");
+        f
+    }
+
+    #[test]
+    fn manifest_interpolation_replaces_env_refs() {
+        const VAR: &str = "AEON_TEST_MANIFEST_INTERP_VALUE";
+        // SAFETY: test-only env mutation.
+        unsafe { std::env::set_var(VAR, "resolved-secret") };
+        let yaml = "token: ${ENV:AEON_TEST_MANIFEST_INTERP_VALUE}\n";
+        let f = write_temp_yaml(yaml);
+        let out = read_and_interpolate_manifest(f.path()).expect("interp");
+        assert!(out.contains("resolved-secret"));
+        assert!(!out.contains("${ENV:"));
+        unsafe { std::env::remove_var(VAR) };
+    }
+
+    #[test]
+    fn manifest_interpolation_preserves_plain_yaml() {
+        let yaml = "pipelines:\n  - name: foo\n    partitions: 4\n";
+        let f = write_temp_yaml(yaml);
+        let out = read_and_interpolate_manifest(f.path()).expect("plain");
+        assert_eq!(out, yaml);
+    }
+
+    #[test]
+    fn manifest_interpolation_reports_missing_env_var() {
+        let yaml = "token: ${ENV:AEON_TEST_DEFINITELY_UNSET_SECRET_ZZ}\n";
+        let f = write_temp_yaml(yaml);
+        let err = read_and_interpolate_manifest(f.path()).expect_err("missing env");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("not set") || msg.contains("EnvNotSet"),
+            "expected missing-env error, got {msg}");
+    }
+
+    #[test]
+    fn manifest_interpolation_rejects_unregistered_scheme() {
+        let yaml = "token: ${VAULT:secret/aeon/key}\n";
+        let f = write_temp_yaml(yaml);
+        let err = read_and_interpolate_manifest(f.path()).expect_err("unregistered");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("not registered") || msg.contains("Vault"),
+            "expected scheme-not-registered error, got {msg}");
+    }
+
+    #[test]
+    fn manifest_interpolation_rejects_oversize_file() {
+        // 2 MB of content (exceeds MAX_MANIFEST_SIZE = 1 MB).
+        let huge = "a".repeat(2 * 1024 * 1024);
+        let f = write_temp_yaml(&huge);
+        let err = read_and_interpolate_manifest(f.path()).expect_err("oversize");
+        assert!(format!("{err:#}").contains("maximum size"));
     }
 }

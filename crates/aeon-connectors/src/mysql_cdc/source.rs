@@ -7,7 +7,10 @@
 //! protocol directly. This implementation uses polling of the binlog via
 //! `SHOW BINLOG EVENTS` as a simpler starting point.
 
-use aeon_types::{AeonError, BackoffPolicy, CoreLocalUuidGenerator, Event, PartitionId, Source};
+use aeon_types::{
+    AeonError, BackoffPolicy, CoreLocalUuidGenerator, Event, OutboundAuthSigner, PartitionId,
+    Source,
+};
 use bytes::Bytes;
 use mysql_async::prelude::*;
 use std::sync::{Arc, Mutex};
@@ -35,6 +38,9 @@ pub struct MysqlCdcSourceConfig {
     /// out a connection or a query fails. Exponential + jitter prevents
     /// reconnect storms against a flaky MySQL primary.
     pub backoff: BackoffPolicy,
+    /// S10 outbound auth. When `Some`, the signer's mode drives
+    /// `mysql_async::Opts` construction from `url`.
+    pub auth: Option<Arc<OutboundAuthSigner>>,
 }
 
 impl MysqlCdcSourceConfig {
@@ -50,7 +56,14 @@ impl MysqlCdcSourceConfig {
             binlog_file: None,
             binlog_position: None,
             backoff: BackoffPolicy::default(),
+            auth: None,
         }
+    }
+
+    /// S10: attach an outbound-auth signer.
+    pub fn with_auth(mut self, signer: Arc<OutboundAuthSigner>) -> Self {
+        self.auth = Some(signer);
+        self
     }
 
     /// Override the reconnect backoff policy.
@@ -111,7 +124,8 @@ pub struct MysqlCdcSource {
 impl MysqlCdcSource {
     /// Connect to MySQL and determine the current binlog position.
     pub async fn new(config: MysqlCdcSourceConfig) -> Result<Self, AeonError> {
-        let pool = mysql_async::Pool::new(config.url.as_str());
+        let opts = super::auth::resolve_opts(&config.url, config.auth.as_ref())?;
+        let pool = mysql_async::Pool::new(opts);
 
         let mut conn = pool
             .get_conn()

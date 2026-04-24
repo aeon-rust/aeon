@@ -13,6 +13,7 @@ members = [
     "crates/aeon-engine",
     "crates/aeon-cluster",
     "crates/aeon-crypto",
+    "crates/aeon-secrets",
     "crates/aeon-observability",
     "crates/aeon-native-sdk",
     "crates/aeon-wasm-sdk",
@@ -80,16 +81,22 @@ axum = "0.8"
 tower-http = { version = "0.6", features = ["trace", "cors", "limit", "set-header"] }
 serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+ipnet = { version = "2", features = ["serde"] }
 
 # Crypto (integrity verification)
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 sha2 = "0.10"
+hmac = "0.12"
 hex = "0.4"
 base64 = "0.22"
+zeroize = { version = "1", features = ["derive"] }
 
 # Streaming connectors
 futures-util = "0.3"
 tokio-tungstenite = "0.26"
+# For custom rustls ClientConfig passed via `Connector::Rustls`.
+# Only aeon-connectors (websocket feature) pulls this.
+webpki-roots = "1.0"
 redis = { version = "0.27", features = ["tokio-comp", "streams"] }
 async-nats = "0.38"
 rumqttc = "0.24"
@@ -124,6 +131,7 @@ aeon-engine = { path = "crates/aeon-engine", version = "0.1.0" }
 aeon-connectors = { path = "crates/aeon-connectors", version = "0.1.0" }
 aeon-native-sdk = { path = "crates/aeon-native-sdk", version = "0.1.0" }
 aeon-crypto = { path = "crates/aeon-crypto", version = "0.1.0" }
+aeon-secrets = { path = "crates/aeon-secrets", version = "0.1.0" }
 aeon-cluster = { path = "crates/aeon-cluster", version = "0.1.0" }
 aeon-observability = { path = "crates/aeon-observability", version = "0.1.0" }
 aeon-processor-client = { path = "crates/aeon-processor-client", version = "0.1.0" }

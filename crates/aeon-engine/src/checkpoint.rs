@@ -11,7 +11,7 @@
 //! Each checkpoint is ~100-200 bytes. At 1/sec, 24h ≈ 8-17 MB.
 //! CRC32 integrity check on read — corrupted trailing records are skipped.
 
-use aeon_types::{AeonError, BatchOp, L3Store, PartitionId};
+use aeon_types::{AeonError, BatchEntry, BatchOp, L3Store, PartitionId};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -284,6 +284,10 @@ impl CheckpointPersist for WalCheckpointStore {
 pub struct L3CheckpointStore {
     l3: Arc<dyn L3Store>,
     next_checkpoint_id: u64,
+    /// S5: if `Some(n)`, records whose id falls below
+    /// `next_checkpoint_id - n` are purged after each `append`. `None`
+    /// (default) keeps every record forever — the pre-S5 behaviour.
+    max_records: Option<u32>,
 }
 
 /// Prefix used for all L3 checkpoint records. Kept stable to preserve
@@ -303,7 +307,21 @@ impl L3CheckpointStore {
         Ok(Self {
             l3,
             next_checkpoint_id: next,
+            max_records: None,
         })
+    }
+
+    /// S5: cap the number of historical checkpoint records retained.
+    /// After each append, records with id below `next_checkpoint_id -
+    /// max_records` are deleted. `None` (default) keeps every record.
+    pub fn with_max_records(mut self, max_records: Option<u32>) -> Self {
+        self.max_records = max_records;
+        self
+    }
+
+    /// Access to the retention cap — primarily for tests / probes.
+    pub fn max_records(&self) -> Option<u32> {
+        self.max_records
     }
 
     fn record_key(id: u64) -> Vec<u8> {
@@ -311,6 +329,31 @@ impl L3CheckpointStore {
         k.extend_from_slice(L3_CHECKPOINT_PREFIX);
         k.extend_from_slice(&id.to_be_bytes());
         k
+    }
+
+    /// S5: delete checkpoint records with id strictly below
+    /// `low_watermark`. No-op when the caller opted out of max_records
+    /// or the store is still below the cap.
+    fn purge_below(&self, low_watermark: u64) -> Result<(), AeonError> {
+        // scan_prefix yields big-endian-sorted keys, so we can stop at
+        // the first key that is >= low_watermark.
+        let entries = self.l3.scan_prefix(L3_CHECKPOINT_PREFIX)?;
+        let mut ops: Vec<BatchEntry> = Vec::new();
+        for (k, _) in entries {
+            match parse_checkpoint_key(&k) {
+                Some(id) if id < low_watermark => {
+                    ops.push((BatchOp::Delete, k, None));
+                }
+                Some(_) => break,
+                None => continue,
+            }
+        }
+        if ops.is_empty() {
+            return Ok(());
+        }
+        self.l3.write_batch(&ops)?;
+        self.l3.flush()?;
+        Ok(())
     }
 }
 
@@ -338,6 +381,16 @@ impl CheckpointPersist for L3CheckpointStore {
         self.l3.write_batch(&ops)?;
         self.l3.flush()?;
         self.next_checkpoint_id += 1;
+
+        // S5: enforce max_records retention. `next - max` is the id at
+        // or below which records are purged. Saturating_sub keeps the
+        // arithmetic harmless when the store is still warming up.
+        if let Some(max) = self.max_records {
+            let low = self.next_checkpoint_id.saturating_sub(max as u64);
+            if low > 0 {
+                self.purge_below(low)?;
+            }
+        }
         Ok(())
     }
 
@@ -729,6 +782,93 @@ mod tests {
         // wrong for IDs that span a byte boundary (e.g. 255 vs 256).
         assert!(L3CheckpointStore::record_key(255) < L3CheckpointStore::record_key(256));
         assert!(L3CheckpointStore::record_key(1) < L3CheckpointStore::record_key(1 << 40));
+    }
+
+    // ── S5 L3 max_records retention ───────────────────────────────
+
+    #[test]
+    fn s5_l3_max_records_caps_history() {
+        let l3: Arc<dyn L3Store> = Arc::new(MemL3::default());
+        let mut store =
+            L3CheckpointStore::open(Arc::clone(&l3)).unwrap().with_max_records(Some(3));
+
+        for _ in 0..10u64 {
+            let mut rec = CheckpointRecord::new(0, HashMap::new(), vec![], 0, 0);
+            store.append(&mut rec).unwrap();
+        }
+
+        let surviving = l3.scan_prefix(L3_CHECKPOINT_PREFIX).unwrap();
+        assert_eq!(surviving.len(), 3, "cap of 3 must keep exactly 3 records");
+
+        // The 3 survivors are the most recent: ids 7, 8, 9.
+        let ids: Vec<u64> = surviving
+            .iter()
+            .filter_map(|(k, _)| parse_checkpoint_key(k))
+            .collect();
+        assert_eq!(ids, vec![7, 8, 9]);
+    }
+
+    #[test]
+    fn s5_l3_max_records_none_keeps_everything() {
+        let l3: Arc<dyn L3Store> = Arc::new(MemL3::default());
+        let mut store = L3CheckpointStore::open(Arc::clone(&l3)).unwrap();
+        assert_eq!(store.max_records(), None);
+
+        for _ in 0..5u64 {
+            let mut rec = CheckpointRecord::new(0, HashMap::new(), vec![], 0, 0);
+            store.append(&mut rec).unwrap();
+        }
+
+        let surviving = l3.scan_prefix(L3_CHECKPOINT_PREFIX).unwrap();
+        assert_eq!(surviving.len(), 5, "default keeps full history");
+    }
+
+    #[test]
+    fn s5_l3_max_records_no_purge_below_cap() {
+        let l3: Arc<dyn L3Store> = Arc::new(MemL3::default());
+        let mut store = L3CheckpointStore::open(Arc::clone(&l3))
+            .unwrap()
+            .with_max_records(Some(10));
+
+        // Append fewer than the cap — no purge should happen.
+        for _ in 0..4u64 {
+            let mut rec = CheckpointRecord::new(0, HashMap::new(), vec![], 0, 0);
+            store.append(&mut rec).unwrap();
+        }
+        let surviving = l3.scan_prefix(L3_CHECKPOINT_PREFIX).unwrap();
+        assert_eq!(surviving.len(), 4);
+    }
+
+    #[test]
+    fn s5_l3_max_records_survives_reopen() {
+        let l3: Arc<dyn L3Store> = Arc::new(MemL3::default());
+
+        // First session: pile up 10 records, no cap, then close.
+        {
+            let mut store = L3CheckpointStore::open(Arc::clone(&l3)).unwrap();
+            for _ in 0..10u64 {
+                let mut rec = CheckpointRecord::new(0, HashMap::new(), vec![], 0, 0);
+                store.append(&mut rec).unwrap();
+            }
+        }
+        assert_eq!(l3.scan_prefix(L3_CHECKPOINT_PREFIX).unwrap().len(), 10);
+
+        // Reopen with a cap of 2 — the next append must purge down to 2.
+        let mut store = L3CheckpointStore::open(Arc::clone(&l3))
+            .unwrap()
+            .with_max_records(Some(2));
+        assert_eq!(store.next_checkpoint_id(), 10);
+        let mut rec = CheckpointRecord::new(0, HashMap::new(), vec![], 0, 0);
+        store.append(&mut rec).unwrap();
+
+        let surviving = l3.scan_prefix(L3_CHECKPOINT_PREFIX).unwrap();
+        // cap=2 after id 10 is written → keep ids 9, 10.
+        assert_eq!(surviving.len(), 2);
+        let ids: Vec<u64> = surviving
+            .iter()
+            .filter_map(|(k, _)| parse_checkpoint_key(k))
+            .collect();
+        assert_eq!(ids, vec![9, 10]);
     }
 
     #[test]

@@ -388,7 +388,7 @@ mod tests {
     fn manifest_lists_segments_sorted_by_start_seq() {
         let dir = tmp_dir();
         // Force multi-segment rollover with a tiny threshold.
-        let mut store = L2BodyStore::open(&dir, L2BodyConfig { segment_bytes: 64 }).unwrap();
+        let mut store = L2BodyStore::open(&dir, L2BodyConfig { segment_bytes: 64, kek: None, gc_min_hold: std::time::Duration::ZERO }).unwrap();
         for i in 0..8u64 {
             store.append(&ev(i)).unwrap();
         }
@@ -454,7 +454,7 @@ mod tests {
         // Source: write a multi-segment store.
         let src = tmp_dir();
         {
-            let mut store = L2BodyStore::open(&src, L2BodyConfig { segment_bytes: 64 }).unwrap();
+            let mut store = L2BodyStore::open(&src, L2BodyConfig { segment_bytes: 64, kek: None, gc_min_hold: std::time::Duration::ZERO }).unwrap();
             for i in 0..10u64 {
                 store.append(&ev(i)).unwrap();
             }
@@ -490,7 +490,7 @@ mod tests {
     fn finish_fails_when_segment_missing() {
         let src = tmp_dir();
         {
-            let mut store = L2BodyStore::open(&src, L2BodyConfig { segment_bytes: 64 }).unwrap();
+            let mut store = L2BodyStore::open(&src, L2BodyConfig { segment_bytes: 64, kek: None, gc_min_hold: std::time::Duration::ZERO }).unwrap();
             for i in 0..6u64 {
                 store.append(&ev(i)).unwrap();
             }
@@ -626,7 +626,7 @@ mod tests {
     fn bytes_received_tracks_validated_segments() {
         let src = tmp_dir();
         {
-            let mut s = L2BodyStore::open(&src, L2BodyConfig { segment_bytes: 64 }).unwrap();
+            let mut s = L2BodyStore::open(&src, L2BodyConfig { segment_bytes: 64, kek: None, gc_min_hold: std::time::Duration::ZERO }).unwrap();
             for i in 0..8u64 {
                 s.append(&ev(i)).unwrap();
             }

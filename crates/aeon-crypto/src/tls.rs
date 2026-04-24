@@ -279,6 +279,21 @@ impl CertificateStore {
         parse_x509_not_after(der)
     }
 
+    /// Parse Subject CN + SubjectAltNames from a DER-encoded X.509 cert.
+    ///
+    /// Returns subjects as strings using OpenSSL conventions so operator
+    /// allow-lists are predictable across tooling:
+    /// - `CN=<value>` — Common Name attribute of Subject
+    /// - `DNS:<value>` — dNSName SAN
+    /// - `URI:<value>` — uniformResourceIdentifier SAN
+    /// - `IP:<value>` — iPAddress SAN (IPv4 dotted or IPv6 canonical)
+    ///
+    /// Used by WS / WT connector mTLS verification to populate
+    /// `AuthContext::client_cert_subjects` against the S9 allow-list.
+    pub fn parse_cert_subjects(der: &[u8]) -> Vec<String> {
+        parse_x509_subjects(der)
+    }
+
     /// Reload certificates from the original file paths.
     /// Useful for certificate rotation without restart.
     pub fn reload(&mut self) -> Result<(), AeonError> {
@@ -872,6 +887,188 @@ fn is_leap(y: i64) -> bool {
     (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
 
+// ── Subject / SAN extraction for mTLS ────────────────────────────────
+
+/// Walk tbsCertificate, extract CN from Subject + SANs from extensions.
+/// Returns subjects formatted with OpenSSL-style prefixes (`CN=`, `DNS:`,
+/// `URI:`, `IP:`). Any parse failure yields an empty vec rather than an
+/// error — the caller (S9 verifier) will reject "no subjects" the same
+/// way it rejects "no client cert presented".
+fn parse_x509_subjects(der: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some((_, cert_body)) = read_der_sequence(der) else {
+        return out;
+    };
+    let Some((_, tbs_body)) = read_der_sequence(cert_body) else {
+        return out;
+    };
+
+    let mut pos = tbs_body;
+    // Skip [0] EXPLICIT version if present.
+    if pos.first() == Some(&0xA0) {
+        let Some((rest, _)) = read_der_tlv(pos) else {
+            return out;
+        };
+        pos = rest;
+    }
+    // Skip serialNumber, signatureAlgorithm, issuer, validity.
+    for _ in 0..4 {
+        let Some((rest, _)) = read_der_tlv(pos) else {
+            return out;
+        };
+        pos = rest;
+    }
+    // Subject SEQUENCE.
+    let Some((rest, subject_body)) = read_der_sequence(pos) else {
+        return out;
+    };
+    extract_cn_from_subject(subject_body, &mut out);
+    pos = rest;
+
+    // Skip subjectPublicKeyInfo.
+    let Some((rest, _)) = read_der_tlv(pos) else {
+        return out;
+    };
+    pos = rest;
+
+    // Look for [3] EXPLICIT extensions, skipping [1] IMPLICIT
+    // issuerUniqueID (0x81) and [2] IMPLICIT subjectUniqueID (0x82) if
+    // present.
+    while !pos.is_empty() {
+        let tag = pos[0];
+        let Some((rest, body)) = read_der_tlv(pos) else {
+            return out;
+        };
+        if tag == 0xA3 {
+            let Some((_, ext_seq)) = read_der_sequence(body) else {
+                return out;
+            };
+            extract_sans_from_extensions(ext_seq, &mut out);
+            return out;
+        }
+        pos = rest;
+    }
+    out
+}
+
+// RDN OIDs (2.5.4.*). Encoded as tag 0x06 len 0x03 then these bytes.
+const CN_OID: &[u8] = &[0x55, 0x04, 0x03]; // 2.5.4.3 — commonName
+const SAN_OID: &[u8] = &[0x55, 0x1D, 0x11]; // 2.5.29.17 — subjectAltName
+
+fn extract_cn_from_subject(mut subject_body: &[u8], out: &mut Vec<String>) {
+    // Subject = SEQUENCE OF RelativeDistinguishedName
+    // RDN = SET OF AttributeTypeAndValue
+    // ATV = SEQUENCE { OID, Value }
+    while !subject_body.is_empty() {
+        let Some((rest, rdn_body)) = read_der_tlv(subject_body) else {
+            return;
+        };
+        subject_body = rest;
+        let mut p = rdn_body;
+        while !p.is_empty() {
+            let Some((r, atv_body)) = read_der_sequence(p) else {
+                return;
+            };
+            p = r;
+            let Some((after_oid, oid_body)) = read_der_tlv(atv_body) else {
+                continue;
+            };
+            if oid_body != CN_OID {
+                continue;
+            }
+            let Some((_, value_body)) = read_der_tlv(after_oid) else {
+                continue;
+            };
+            // PrintableString (0x13), UTF8String (0x0C), T61 (0x14),
+            // IA5String (0x16), BMPString (0x1E) — we accept any of
+            // these as UTF-8 best-effort. BMPString is UTF-16 but rare;
+            // treat it as opaque if non-UTF-8.
+            if let Ok(s) = std::str::from_utf8(value_body) {
+                out.push(format!("CN={s}"));
+            }
+        }
+    }
+}
+
+fn extract_sans_from_extensions(mut ext_seq: &[u8], out: &mut Vec<String>) {
+    while !ext_seq.is_empty() {
+        let Some((rest, ext_body)) = read_der_sequence(ext_seq) else {
+            return;
+        };
+        ext_seq = rest;
+
+        let Some((after_oid, oid_body)) = read_der_tlv(ext_body) else {
+            continue;
+        };
+        if oid_body != SAN_OID {
+            continue;
+        }
+
+        // Optional critical BOOLEAN (tag 0x01).
+        let mut p = after_oid;
+        if p.first() == Some(&0x01) {
+            let Some((r, _)) = read_der_tlv(p) else {
+                continue;
+            };
+            p = r;
+        }
+
+        // extnValue OCTET STRING wrapping SEQUENCE OF GeneralName.
+        let Some((_, octet_body)) = read_der_tlv(p) else {
+            continue;
+        };
+        let Some((_, san_seq_body)) = read_der_sequence(octet_body) else {
+            continue;
+        };
+
+        let mut q = san_seq_body;
+        while !q.is_empty() {
+            let tag = q[0];
+            let Some((r, value_body)) = read_der_tlv(q) else {
+                return;
+            };
+            q = r;
+            match tag {
+                // [2] IMPLICIT IA5String — dNSName
+                0x82 => {
+                    if let Ok(s) = std::str::from_utf8(value_body) {
+                        out.push(format!("DNS:{s}"));
+                    }
+                }
+                // [6] IMPLICIT IA5String — URI
+                0x86 => {
+                    if let Ok(s) = std::str::from_utf8(value_body) {
+                        out.push(format!("URI:{s}"));
+                    }
+                }
+                // [7] IMPLICIT OCTET STRING — iPAddress (4 or 16 bytes)
+                0x87 => match value_body.len() {
+                    4 => out.push(format!(
+                        "IP:{}.{}.{}.{}",
+                        value_body[0], value_body[1], value_body[2], value_body[3]
+                    )),
+                    16 => {
+                        let mut segs = [0u16; 8];
+                        for (i, seg) in segs.iter_mut().enumerate() {
+                            *seg = u16::from_be_bytes([
+                                value_body[2 * i],
+                                value_body[2 * i + 1],
+                            ]);
+                        }
+                        let ip = std::net::Ipv6Addr::new(
+                            segs[0], segs[1], segs[2], segs[3], segs[4], segs[5], segs[6],
+                            segs[7],
+                        );
+                        out.push(format!("IP:{ip}"));
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1364,5 +1561,119 @@ mod tests {
         let store = CertificateStore::new_insecure();
         assert!(store.leaf_cert_expiry_secs().is_none());
         assert!(store.leaf_cert_days_until_expiry().is_none());
+    }
+
+    // ── Subject / SAN extraction tests ──────────────────────────────
+
+    fn cert_with_cn_and_sans(cn: &str, sans: Vec<rcgen::SanType>) -> Vec<u8> {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::default();
+        params.distinguished_name.push(
+            rcgen::DnType::CommonName,
+            rcgen::DnValue::Utf8String(cn.to_string()),
+        );
+        params.subject_alt_names = sans;
+        let cert = params.self_signed(&key).unwrap();
+        cert.der().to_vec()
+    }
+
+    #[test]
+    fn subjects_extracts_cn() {
+        let der = cert_with_cn_and_sans("aeon-ingest", vec![]);
+        let subjects = CertificateStore::parse_cert_subjects(&der);
+        assert!(
+            subjects.contains(&"CN=aeon-ingest".to_string()),
+            "got: {subjects:?}"
+        );
+    }
+
+    #[test]
+    fn subjects_extracts_dns_san() {
+        let der = cert_with_cn_and_sans(
+            "svc",
+            vec![rcgen::SanType::DnsName(
+                "ingest.example.com".try_into().unwrap(),
+            )],
+        );
+        let subjects = CertificateStore::parse_cert_subjects(&der);
+        assert!(
+            subjects.contains(&"DNS:ingest.example.com".to_string()),
+            "got: {subjects:?}"
+        );
+    }
+
+    #[test]
+    fn subjects_extracts_ipv4_san() {
+        let der = cert_with_cn_and_sans(
+            "svc",
+            vec![rcgen::SanType::IpAddress(std::net::IpAddr::V4(
+                std::net::Ipv4Addr::new(10, 0, 0, 5),
+            ))],
+        );
+        let subjects = CertificateStore::parse_cert_subjects(&der);
+        assert!(
+            subjects.contains(&"IP:10.0.0.5".to_string()),
+            "got: {subjects:?}"
+        );
+    }
+
+    #[test]
+    fn subjects_extracts_ipv6_san() {
+        let der = cert_with_cn_and_sans(
+            "svc",
+            vec![rcgen::SanType::IpAddress(std::net::IpAddr::V6(
+                std::net::Ipv6Addr::LOCALHOST,
+            ))],
+        );
+        let subjects = CertificateStore::parse_cert_subjects(&der);
+        assert!(
+            subjects.iter().any(|s| s.starts_with("IP:")),
+            "expected IPv6 SAN, got: {subjects:?}"
+        );
+    }
+
+    #[test]
+    fn subjects_extracts_uri_san() {
+        let der = cert_with_cn_and_sans(
+            "svc",
+            vec![rcgen::SanType::URI(
+                "spiffe://cluster/ns/default/sa/aeon".try_into().unwrap(),
+            )],
+        );
+        let subjects = CertificateStore::parse_cert_subjects(&der);
+        assert!(
+            subjects.contains(&"URI:spiffe://cluster/ns/default/sa/aeon".to_string()),
+            "got: {subjects:?}"
+        );
+    }
+
+    #[test]
+    fn subjects_multiple_values_all_captured() {
+        let der = cert_with_cn_and_sans(
+            "multi-svc",
+            vec![
+                rcgen::SanType::DnsName("a.example.com".try_into().unwrap()),
+                rcgen::SanType::DnsName("b.example.com".try_into().unwrap()),
+                rcgen::SanType::IpAddress(std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                    192, 168, 1, 1,
+                ))),
+            ],
+        );
+        let subjects = CertificateStore::parse_cert_subjects(&der);
+        assert!(subjects.contains(&"CN=multi-svc".to_string()));
+        assert!(subjects.contains(&"DNS:a.example.com".to_string()));
+        assert!(subjects.contains(&"DNS:b.example.com".to_string()));
+        assert!(subjects.contains(&"IP:192.168.1.1".to_string()));
+    }
+
+    #[test]
+    fn subjects_garbage_input_returns_empty() {
+        let junk = b"not a cert".to_vec();
+        assert!(CertificateStore::parse_cert_subjects(&junk).is_empty());
+    }
+
+    #[test]
+    fn subjects_empty_input_returns_empty() {
+        assert!(CertificateStore::parse_cert_subjects(&[]).is_empty());
     }
 }

@@ -28,7 +28,7 @@
 //! See `docs/CONNECTOR-AUDIT.md` §4.4. MQTT is post-Gate 2 per `CLAUDE.md` so
 //! this investment is deferred.
 
-use aeon_types::{AeonError, BackoffPolicy, BatchResult, Output, Sink};
+use aeon_types::{AeonError, BackoffPolicy, BatchResult, Output, Sink, SinkAckCallback};
 use rumqttc::{AsyncClient, MqttOptions, QoS};
 use std::time::Duration;
 
@@ -97,6 +97,11 @@ pub struct MqttSink {
     config: MqttSinkConfig,
     delivered: u64,
     _eventloop_handle: tokio::task::JoinHandle<()>,
+    /// Engine-installed callback. MQTT has no per-publish ack observability
+    /// (see the module docstring), so it fires on enqueue-into-rumqttc. This
+    /// accurately reflects the fire-and-forget delivery semantics: once the
+    /// frame is on the channel, it's as "acked" as MQTT lets us observe.
+    ack_callback: Option<SinkAckCallback>,
 }
 
 impl MqttSink {
@@ -138,6 +143,7 @@ impl MqttSink {
             config,
             delivered: 0,
             _eventloop_handle: handle,
+            ack_callback: None,
         })
     }
 
@@ -145,11 +151,21 @@ impl MqttSink {
     pub fn delivered(&self) -> u64 {
         self.delivered
     }
+
+    fn fire_ack(&self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        if let Some(cb) = self.ack_callback.as_ref() {
+            cb(n);
+        }
+    }
 }
 
 impl Sink for MqttSink {
     async fn write_batch(&mut self, outputs: Vec<Output>) -> Result<BatchResult, AeonError> {
         let ids = outputs.iter().filter_map(|o| o.source_event_id).collect();
+        let count = outputs.len();
         for output in &outputs {
             // FT-11: publish_bytes accepts bytes::Bytes directly — clone is refcount-only.
             self.client
@@ -164,11 +180,16 @@ impl Sink for MqttSink {
             self.delivered += 1;
         }
 
+        self.fire_ack(count);
         Ok(BatchResult::all_delivered(ids))
     }
 
     async fn flush(&mut self) -> Result<(), AeonError> {
         // MQTT protocol handles delivery via QoS — no explicit flush needed
         Ok(())
+    }
+
+    fn on_ack_callback(&mut self, cb: SinkAckCallback) {
+        self.ack_callback = Some(cb);
     }
 }

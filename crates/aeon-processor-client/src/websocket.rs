@@ -4,7 +4,7 @@
 //! the processing loop. Handles heartbeats, batch decode/encode, and
 //! reconnection transparently.
 
-use aeon_types::AeonError;
+use aeon_types::{AeonError, redact_uri};
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message;
 
@@ -41,7 +41,7 @@ async fn run_websocket_inner(
         .await
         .map_err(|e| AeonError::state(format!("WebSocket connect failed: {e}")))?;
 
-    tracing::info!(url = %config.url, "Connected to Aeon");
+    tracing::info!(url = %redact_uri(&config.url), "Connected to Aeon");
 
     let (mut sink, mut stream) = ws_stream.split();
 

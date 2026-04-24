@@ -7,6 +7,7 @@
 //! - `KafkaSource::next_batch()` polls up to `batch_max_messages` per call
 //! - `KafkaSink::write_batch()` sends all outputs in a single produce batch
 
+mod auth;
 mod sink;
 mod source;
 

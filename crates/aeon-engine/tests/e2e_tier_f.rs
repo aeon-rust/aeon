@@ -1278,10 +1278,12 @@ async fn f6_websocket_rust_net_t4() {
     // === 4. Wire: WebSocketSource → T4 Processor → WebSocketSink ===
     let source_config = WebSocketSourceConfig::new(format!("ws://{source_addr}"))
         .with_source_name("f6-ws-source")
-        .with_poll_timeout(Duration::from_millis(500));
+        .with_poll_timeout(Duration::from_millis(500))
+        .with_ssrf_policy(aeon_types::SsrfPolicy::permissive_for_tests());
     let mut source = WebSocketSource::new(source_config).await.unwrap();
 
-    let sink_config = WebSocketSinkConfig::new(format!("ws://{sink_addr}"));
+    let sink_config = WebSocketSinkConfig::new(format!("ws://{sink_addr}"))
+        .with_ssrf_policy(aeon_types::SsrfPolicy::permissive_for_tests());
     let mut sink = WebSocketSink::new(sink_config).await.unwrap();
 
     let mut total_received = 0usize;

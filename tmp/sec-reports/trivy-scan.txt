@@ -1,0 +1,62 @@
+2026-04-24T02:54:53Z	INFO	[vulndb] Need to update DB
+2026-04-24T02:54:53Z	INFO	[vulndb] Downloading vulnerability DB...
+2026-04-24T02:54:53Z	INFO	[vulndb] Downloading artifact...	repo="mirror.gcr.io/aquasec/trivy-db:2"
+2026-04-24T02:55:31Z	INFO	[vulndb] Artifact successfully downloaded	repo="mirror.gcr.io/aquasec/trivy-db:2"
+2026-04-24T02:55:31Z	INFO	[vuln] Vulnerability scanning is enabled
+2026-04-24T02:55:31Z	INFO	[secret] Secret scanning is enabled
+2026-04-24T02:55:31Z	INFO	[secret] If your scanning is slow, please try '--scanners vuln' to disable secret scanning
+2026-04-24T02:55:31Z	INFO	[secret] Please see https://trivy.dev/docs/v0.70/guide/scanner/secret#recommendation for faster secret detection
+2026-04-24T02:55:41Z	INFO	Detected OS	family="debian" version="12.13"
+2026-04-24T02:55:41Z	INFO	[debian] Detecting vulnerabilities...	os_version="12" pkg_num=91
+2026-04-24T02:55:41Z	INFO	Number of language-specific files	num=0
+2026-04-24T02:55:41Z	WARN	Using severities from other vendors for some vulnerabilities. Read https://trivy.dev/docs/v0.70/guide/scanner/vulnerability#severity-selection for details.
+
+Report Summary
+
+┌────────────────────────────────────────┬────────┬─────────────────┬─────────┐
+│                 Target                 │  Type  │ Vulnerabilities │ Secrets │
+├────────────────────────────────────────┼────────┼─────────────────┼─────────┤
+│ /work/aeon-session0.tar (debian 12.13) │ debian │        8        │    -    │
+└────────────────────────────────────────┴────────┴─────────────────┴─────────┘
+Legend:
+- '-': Not scanned
+- '0': Clean (no security findings detected)
+
+
+/work/aeon-session0.tar (debian 12.13)
+======================================
+Total: 8 (HIGH: 7, CRITICAL: 1)
+
+┌──────────────┬────────────────┬──────────┬──────────────┬───────────────────┬───────────────┬──────────────────────────────────────────────────────────────┐
+│   Library    │ Vulnerability  │ Severity │    Status    │ Installed Version │ Fixed Version │                            Title                             │
+├──────────────┼────────────────┼──────────┼──────────────┼───────────────────┼───────────────┼──────────────────────────────────────────────────────────────┤
+│ libc-bin     │ CVE-2026-0861  │ HIGH     │ affected     │ 2.36-9+deb12u13   │               │ glibc: Integer overflow in memalign leads to heap corruption │
+│              │                │          │              │                   │               │ https://avd.aquasec.com/nvd/cve-2026-0861                    │
+├──────────────┤                │          │              │                   ├───────────────┤                                                              │
+│ libc6        │                │          │              │                   │               │                                                              │
+│              │                │          │              │                   │               │                                                              │
+├──────────────┼────────────────┤          │              ├───────────────────┼───────────────┼──────────────────────────────────────────────────────────────┤
+│ libsystemd0  │ CVE-2026-29111 │          │              │ 252.39-1~deb12u1  │               │ systemd: systemd: Arbitrary code execution or Denial of      │
+│              │                │          │              │                   │               │ Service via spurious IPC...                                  │
+│              │                │          │              │                   │               │ https://avd.aquasec.com/nvd/cve-2026-29111                   │
+├──────────────┼────────────────┤          │              ├───────────────────┼───────────────┼──────────────────────────────────────────────────────────────┤
+│ libtinfo6    │ CVE-2025-69720 │          │              │ 6.4-4             │               │ ncurses: ncurses: Buffer overflow vulnerability may lead to  │
+│              │                │          │              │                   │               │ arbitrary code execution.                                    │
+│              │                │          │              │                   │               │ https://avd.aquasec.com/nvd/cve-2025-69720                   │
+├──────────────┼────────────────┤          │              ├───────────────────┼───────────────┼──────────────────────────────────────────────────────────────┤
+│ libudev1     │ CVE-2026-29111 │          │              │ 252.39-1~deb12u1  │               │ systemd: systemd: Arbitrary code execution or Denial of      │
+│              │                │          │              │                   │               │ Service via spurious IPC...                                  │
+│              │                │          │              │                   │               │ https://avd.aquasec.com/nvd/cve-2026-29111                   │
+├──────────────┼────────────────┤          │              ├───────────────────┼───────────────┼──────────────────────────────────────────────────────────────┤
+│ ncurses-base │ CVE-2025-69720 │          │              │ 6.4-4             │               │ ncurses: ncurses: Buffer overflow vulnerability may lead to  │
+│              │                │          │              │                   │               │ arbitrary code execution.                                    │
+│              │                │          │              │                   │               │ https://avd.aquasec.com/nvd/cve-2025-69720                   │
+├──────────────┤                │          │              │                   ├───────────────┤                                                              │
+│ ncurses-bin  │                │          │              │                   │               │                                                              │
+│              │                │          │              │                   │               │                                                              │
+│              │                │          │              │                   │               │                                                              │
+├──────────────┼────────────────┼──────────┼──────────────┼───────────────────┼───────────────┼──────────────────────────────────────────────────────────────┤
+│ zlib1g       │ CVE-2023-45853 │ CRITICAL │ will_not_fix │ 1:1.2.13.dfsg-1   │               │ zlib: integer overflow and resultant heap-based buffer       │
+│              │                │          │              │                   │               │ overflow in zipOpenNewFileInZip4_6                           │
+│              │                │          │              │                   │               │ https://avd.aquasec.com/nvd/cve-2023-45853                   │
+└──────────────┴────────────────┴──────────┴──────────────┴───────────────────┴───────────────┴──────────────────────────────────────────────────────────────┘
