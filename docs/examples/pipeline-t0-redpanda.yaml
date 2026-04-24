@@ -26,11 +26,14 @@ pipelines:
           mode: broker
         topic: aeon-source
         partitions: [0, 1, 2, 3]
-        config:
-          brokers: "redpanda:9092"
-          group_id: "aeon-t1"
-          batch_max: "1024"
-          max_empty_polls: "10"
+        # Connector keys live at the source's top level (SourceManifest
+        # uses #[serde(flatten)] on its config BTreeMap — nesting under
+        # a literal `config:` key puts the whole sub-object as one entry
+        # and the factory's lookup misses every field).
+        brokers: "redpanda:9092"
+        group_id: "aeon-t1"
+        batch_max: "1024"
+        max_empty_polls: "10"
 
     processor:
       name: passthrough
@@ -42,7 +45,7 @@ pipelines:
         type: kafka
         eos_tier: t2_transactional_stream
         topic: aeon-sink
-        config:
-          brokers: "redpanda:9092"
-          strategy: ordered_batch
-          transactional_id: "aeon-t1-${ENV:HOSTNAME}"
+        # Same flatten rule on SinkManifest — top-level keys only.
+        brokers: "redpanda:9092"
+        strategy: ordered_batch
+        transactional_id: "aeon-t1-${ENV:HOSTNAME}"

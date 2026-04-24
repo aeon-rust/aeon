@@ -49,13 +49,14 @@ pipelines:
           mode: broker
         topic: card-auth-raw
         partitions: [0, 1, 2, 3]
-        config:
-          brokers: "${ENV:REDPANDA_BOOTSTRAP}"
-          group_id: "aeon-card-auth-pci"
-          batch_max: "512"
-          outbound_auth_mode: "mtls"
-          outbound_auth_mtls_cert_pem: "${VAULT:kv/aeon/mtls/kafka/cert}"
-          outbound_auth_mtls_key_pem: "${VAULT:kv/aeon/mtls/kafka/key}"
+        # Connector keys live at the source's top level (SourceManifest
+        # uses #[serde(flatten)] on its config BTreeMap).
+        brokers: "${ENV:REDPANDA_BOOTSTRAP}"
+        group_id: "aeon-card-auth-pci"
+        batch_max: "512"
+        outbound_auth_mode: "mtls"
+        outbound_auth_mtls_cert_pem: "${VAULT:kv/aeon/mtls/kafka/cert}"
+        outbound_auth_mtls_key_pem: "${VAULT:kv/aeon/mtls/kafka/key}"
 
     processor:
       name: mask-pan
@@ -67,10 +68,9 @@ pipelines:
         type: kafka
         eos_tier: t2_transactional_stream
         topic: card-auth-masked
-        config:
-          brokers: "${ENV:REDPANDA_BOOTSTRAP}"
-          strategy: ordered_batch
-          transactional_id: "aeon-card-mask-${ENV:HOSTNAME}"
-          outbound_auth_mode: "mtls"
-          outbound_auth_mtls_cert_pem: "${VAULT:kv/aeon/mtls/kafka/cert}"
-          outbound_auth_mtls_key_pem: "${VAULT:kv/aeon/mtls/kafka/key}"
+        brokers: "${ENV:REDPANDA_BOOTSTRAP}"
+        strategy: ordered_batch
+        transactional_id: "aeon-card-mask-${ENV:HOSTNAME}"
+        outbound_auth_mode: "mtls"
+        outbound_auth_mtls_cert_pem: "${VAULT:kv/aeon/mtls/kafka/cert}"
+        outbound_auth_mtls_key_pem: "${VAULT:kv/aeon/mtls/kafka/key}"
