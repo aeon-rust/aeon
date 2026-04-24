@@ -42,6 +42,17 @@ use aeon_connectors::{
     },
     kafka::{KafkaSink, KafkaSinkConfig, KafkaSource, KafkaSourceConfig},
     push_buffer::PushBufferConfig,
+    // P5.c — additional connector imports for WebSocket / Redis / NATS /
+    // Postgres-CDC / MySQL-CDC / MongoDB-CDC factories.
+    mongodb_cdc::{MongoDbCdcSource, MongoDbCdcSourceConfig},
+    mysql_cdc::{MysqlCdcSource, MysqlCdcSourceConfig},
+    nats::{NatsSink, NatsSinkConfig, NatsSource, NatsSourceConfig},
+    postgres_cdc::{PostgresCdcSource, PostgresCdcSourceConfig},
+    redis_streams::{
+        RedisSink as RedisStreamsSink, RedisSinkConfig as RedisStreamsSinkConfig,
+        RedisSource as RedisStreamsSource, RedisSourceConfig as RedisStreamsSourceConfig,
+    },
+    websocket::{WebSocketSink, WebSocketSinkConfig, WebSocketSource, WebSocketSourceConfig},
 };
 use aeon_engine::{ConnectorRegistry, DynSink, DynSource, SinkFactory, SourceFactory};
 use aeon_types::{
@@ -465,6 +476,396 @@ impl SinkFactory for FileSinkFactory {
     }
 }
 
+// ─── WebSocket source ──────────────────────────────────────────────────────
+
+/// Builds a `WebSocketSource` — connects to a ws/wss endpoint and reads
+/// messages as events. Required `url`; optional `source_name`,
+/// `channel_capacity`, `batch_size`, `poll_timeout_ms`, `header.<name>`,
+/// plus the S7 SSRF knobs (`ssrf_allow_*`, `ssrf_extra_*`) and the S9/S10
+/// auth keys.
+pub struct WebSocketSourceFactory;
+
+impl SourceFactory for WebSocketSourceFactory {
+    fn build(&self, cfg: &SourceConfig) -> Result<Box<dyn DynSource>, AeonError> {
+        let url = cfg
+            .config
+            .get("url")
+            .ok_or_else(|| AeonError::config("websocket source requires config.url"))?;
+
+        let mut wcfg =
+            WebSocketSourceConfig::new(url).with_ssrf_policy(parse_ssrf_policy(&cfg.config)?);
+
+        if let Some(name) = cfg.config.get("source_name") {
+            wcfg = wcfg.with_source_name(Arc::<str>::from(name.as_str()));
+        }
+        if let Some(v) = cfg.config.get("channel_capacity") {
+            wcfg = wcfg.with_channel_capacity(parse_usize(Some(v), 8192)?);
+        }
+        if let Some(v) = cfg.config.get("poll_timeout_ms") {
+            wcfg = wcfg.with_poll_timeout(std::time::Duration::from_millis(parse_u64(
+                Some(v),
+                1_000,
+            )?));
+        }
+        if let Some(signer) = build_outbound_auth_signer(&cfg.config)? {
+            wcfg = wcfg.with_auth(signer);
+        }
+
+        let handle = tokio::runtime::Handle::try_current().map_err(|_| {
+            AeonError::config("websocket source must be built from within a tokio runtime")
+        })?;
+        let src = tokio::task::block_in_place(|| handle.block_on(WebSocketSource::new(wcfg)))?;
+        Ok(Box::new(src))
+    }
+}
+
+// ─── WebSocket sink ────────────────────────────────────────────────────────
+
+/// Builds a `WebSocketSink` — persistent ws/wss connection that writes each
+/// output as a binary message. Required `url`; optional SSRF + S10 auth.
+pub struct WebSocketSinkFactory;
+
+impl SinkFactory for WebSocketSinkFactory {
+    fn build(&self, cfg: &SinkConfig) -> Result<Box<dyn DynSink>, AeonError> {
+        let url = cfg
+            .config
+            .get("url")
+            .ok_or_else(|| AeonError::config("websocket sink requires config.url"))?;
+
+        let mut wcfg =
+            WebSocketSinkConfig::new(url).with_ssrf_policy(parse_ssrf_policy(&cfg.config)?);
+
+        if let Some(signer) = build_outbound_auth_signer(&cfg.config)? {
+            wcfg = wcfg.with_auth(signer);
+        }
+
+        let handle = tokio::runtime::Handle::try_current().map_err(|_| {
+            AeonError::config("websocket sink must be built from within a tokio runtime")
+        })?;
+        let sink = tokio::task::block_in_place(|| handle.block_on(WebSocketSink::new(wcfg)))?;
+        Ok(Box::new(sink))
+    }
+}
+
+// ─── Redis Streams source ──────────────────────────────────────────────────
+
+/// Builds a `RedisStreamsSource` — consumes via `XREADGROUP`. Required
+/// `url`, `stream_key`, `group`, `consumer`. Optional `batch_size`,
+/// `block_ms`, `source_name`, plus S10 auth.
+pub struct RedisStreamsSourceFactory;
+
+impl SourceFactory for RedisStreamsSourceFactory {
+    fn build(&self, cfg: &SourceConfig) -> Result<Box<dyn DynSource>, AeonError> {
+        let url = cfg
+            .config
+            .get("url")
+            .ok_or_else(|| AeonError::config("redis-streams source requires config.url"))?;
+        let stream_key = cfg
+            .config
+            .get("stream_key")
+            .ok_or_else(|| AeonError::config("redis-streams source requires config.stream_key"))?;
+        let group = cfg
+            .config
+            .get("group")
+            .ok_or_else(|| AeonError::config("redis-streams source requires config.group"))?;
+        let consumer = cfg
+            .config
+            .get("consumer")
+            .ok_or_else(|| AeonError::config("redis-streams source requires config.consumer"))?;
+
+        let mut rcfg = RedisStreamsSourceConfig {
+            url: url.clone(),
+            stream_key: stream_key.clone(),
+            group: group.clone(),
+            consumer: consumer.clone(),
+            batch_size: cfg
+                .config
+                .get("batch_size")
+                .map(|v| parse_usize(Some(v), 1024))
+                .transpose()?
+                .unwrap_or(1024),
+            block_ms: cfg
+                .config
+                .get("block_ms")
+                .map(|v| parse_usize(Some(v), 1_000))
+                .transpose()?
+                .unwrap_or(1_000),
+            source_name: Arc::from(
+                cfg.config
+                    .get("source_name")
+                    .map(String::as_str)
+                    .unwrap_or("redis"),
+            ),
+            backoff: aeon_types::BackoffPolicy::default(),
+            consumer_mode: aeon_types::ConsumerMode::Single,
+            auth: None,
+        };
+        if let Some(signer) = build_outbound_auth_signer(&cfg.config)? {
+            rcfg = rcfg.with_auth(signer);
+        }
+
+        let handle = tokio::runtime::Handle::try_current().map_err(|_| {
+            AeonError::config("redis-streams source must be built from within a tokio runtime")
+        })?;
+        let src = tokio::task::block_in_place(|| handle.block_on(RedisStreamsSource::new(rcfg)))?;
+        Ok(Box::new(src))
+    }
+}
+
+// ─── Redis Streams sink ────────────────────────────────────────────────────
+
+/// Builds a `RedisStreamsSink` — writes each output as an `XADD` entry.
+/// Required `url`, `stream_key`. Optional `strategy`, S10 auth.
+pub struct RedisStreamsSinkFactory;
+
+impl SinkFactory for RedisStreamsSinkFactory {
+    fn build(&self, cfg: &SinkConfig) -> Result<Box<dyn DynSink>, AeonError> {
+        let url = cfg
+            .config
+            .get("url")
+            .ok_or_else(|| AeonError::config("redis-streams sink requires config.url"))?;
+        let stream_key = cfg
+            .config
+            .get("stream_key")
+            .ok_or_else(|| AeonError::config("redis-streams sink requires config.stream_key"))?;
+
+        let mut rcfg = RedisStreamsSinkConfig::new(url, stream_key);
+        if let Some(s) = cfg.config.get("strategy") {
+            rcfg = rcfg.with_strategy(parse_strategy(s)?);
+        }
+        if let Some(signer) = build_outbound_auth_signer(&cfg.config)? {
+            rcfg = rcfg.with_auth(signer);
+        }
+
+        let handle = tokio::runtime::Handle::try_current().map_err(|_| {
+            AeonError::config("redis-streams sink must be built from within a tokio runtime")
+        })?;
+        let sink = tokio::task::block_in_place(|| handle.block_on(RedisStreamsSink::new(rcfg)))?;
+        Ok(Box::new(sink))
+    }
+}
+
+// ─── NATS source ───────────────────────────────────────────────────────────
+
+/// Builds a `NatsSource` — consumes from a JetStream durable consumer.
+/// Required `url`, `stream`, `subject`. Optional `consumer` (default
+/// `aeon`), `batch_size`, `source_name`, S10 auth.
+pub struct NatsSourceFactory;
+
+impl SourceFactory for NatsSourceFactory {
+    fn build(&self, cfg: &SourceConfig) -> Result<Box<dyn DynSource>, AeonError> {
+        let url = cfg
+            .config
+            .get("url")
+            .ok_or_else(|| AeonError::config("nats source requires config.url"))?;
+        let stream = cfg
+            .config
+            .get("stream")
+            .ok_or_else(|| AeonError::config("nats source requires config.stream"))?;
+        let subject = cfg
+            .config
+            .get("subject")
+            .ok_or_else(|| AeonError::config("nats source requires config.subject"))?;
+
+        let mut ncfg = NatsSourceConfig::new(url, stream, subject);
+        if let Some(c) = cfg.config.get("consumer") {
+            ncfg = ncfg.with_consumer(c.clone());
+        }
+        if let Some(v) = cfg.config.get("batch_size") {
+            ncfg = ncfg.with_batch_size(parse_usize(Some(v), 1024)?);
+        }
+        if let Some(name) = cfg.config.get("source_name") {
+            ncfg = ncfg.with_source_name(Arc::<str>::from(name.as_str()));
+        }
+        if let Some(signer) = build_outbound_auth_signer(&cfg.config)? {
+            ncfg = ncfg.with_auth(signer);
+        }
+
+        let handle = tokio::runtime::Handle::try_current().map_err(|_| {
+            AeonError::config("nats source must be built from within a tokio runtime")
+        })?;
+        let src = tokio::task::block_in_place(|| handle.block_on(NatsSource::new(ncfg)))?;
+        Ok(Box::new(src))
+    }
+}
+
+// ─── NATS sink ─────────────────────────────────────────────────────────────
+
+/// Builds a `NatsSink` — JetStream (default) or core NATS publish. Required
+/// `url`, `subject`. Optional `jetstream: false` for core, `strategy`,
+/// `dedup` (bool), S10 auth.
+pub struct NatsSinkFactory;
+
+impl SinkFactory for NatsSinkFactory {
+    fn build(&self, cfg: &SinkConfig) -> Result<Box<dyn DynSink>, AeonError> {
+        let url = cfg
+            .config
+            .get("url")
+            .ok_or_else(|| AeonError::config("nats sink requires config.url"))?;
+        let subject = cfg
+            .config
+            .get("subject")
+            .ok_or_else(|| AeonError::config("nats sink requires config.subject"))?;
+
+        let mut ncfg = NatsSinkConfig::new(url, subject);
+        if let Some(v) = cfg.config.get("jetstream") {
+            if !parse_bool(Some(v))? {
+                ncfg = ncfg.with_core_nats();
+            }
+        }
+        if let Some(s) = cfg.config.get("strategy") {
+            ncfg = ncfg.with_strategy(parse_strategy(s)?);
+        }
+        if let Some(v) = cfg.config.get("dedup") {
+            if parse_bool(Some(v))? {
+                ncfg = ncfg.with_dedup();
+            }
+        }
+        if let Some(signer) = build_outbound_auth_signer(&cfg.config)? {
+            ncfg = ncfg.with_auth(signer);
+        }
+
+        let handle = tokio::runtime::Handle::try_current().map_err(|_| {
+            AeonError::config("nats sink must be built from within a tokio runtime")
+        })?;
+        let sink = tokio::task::block_in_place(|| handle.block_on(NatsSink::new(ncfg)))?;
+        Ok(Box::new(sink))
+    }
+}
+
+// ─── Postgres CDC source ───────────────────────────────────────────────────
+
+/// Builds a `PostgresCdcSource` — logical-replication-backed CDC. Required
+/// `connection_string`, `slot_name`, `publication`. Optional `create_slot`
+/// (bool, default true), `batch_size`, `source_name`, S10 auth (mTLS via
+/// `tokio-postgres-rustls`).
+pub struct PostgresCdcSourceFactory;
+
+impl SourceFactory for PostgresCdcSourceFactory {
+    fn build(&self, cfg: &SourceConfig) -> Result<Box<dyn DynSource>, AeonError> {
+        let conn_str = cfg.config.get("connection_string").ok_or_else(|| {
+            AeonError::config("postgres-cdc source requires config.connection_string")
+        })?;
+        let slot_name = cfg
+            .config
+            .get("slot_name")
+            .ok_or_else(|| AeonError::config("postgres-cdc source requires config.slot_name"))?;
+        let publication = cfg
+            .config
+            .get("publication")
+            .ok_or_else(|| AeonError::config("postgres-cdc source requires config.publication"))?;
+
+        let mut pcfg = PostgresCdcSourceConfig::new(conn_str, slot_name, publication);
+        if let Some(v) = cfg.config.get("create_slot") {
+            pcfg.create_slot = parse_bool(Some(v))?;
+        }
+        if let Some(v) = cfg.config.get("batch_size") {
+            pcfg = pcfg.with_batch_size(parse_usize(Some(v), 1024)?);
+        }
+        if let Some(name) = cfg.config.get("source_name") {
+            pcfg = pcfg.with_source_name(Arc::<str>::from(name.as_str()));
+        }
+        if let Some(signer) = build_outbound_auth_signer(&cfg.config)? {
+            pcfg = pcfg.with_auth(signer);
+        }
+
+        let handle = tokio::runtime::Handle::try_current().map_err(|_| {
+            AeonError::config("postgres-cdc source must be built from within a tokio runtime")
+        })?;
+        let src = tokio::task::block_in_place(|| handle.block_on(PostgresCdcSource::new(pcfg)))?;
+        Ok(Box::new(src))
+    }
+}
+
+// ─── MySQL CDC source ──────────────────────────────────────────────────────
+
+/// Builds a `MysqlCdcSource` — binlog-polling CDC. Required `url`. Optional
+/// `server_id`, `batch_size`, `tables` (comma-separated), `source_name`,
+/// S10 auth (mTLS via `mysql_async`'s rustls-tls path, RSA keys only).
+pub struct MysqlCdcSourceFactory;
+
+impl SourceFactory for MysqlCdcSourceFactory {
+    fn build(&self, cfg: &SourceConfig) -> Result<Box<dyn DynSource>, AeonError> {
+        let url = cfg
+            .config
+            .get("url")
+            .ok_or_else(|| AeonError::config("mysql-cdc source requires config.url"))?;
+
+        let mut mcfg = MysqlCdcSourceConfig::new(url);
+        if let Some(v) = cfg.config.get("server_id") {
+            mcfg = mcfg.with_server_id(parse_u32(Some(v), 1000)?);
+        }
+        if let Some(v) = cfg.config.get("batch_size") {
+            mcfg = mcfg.with_batch_size(parse_usize(Some(v), 1024)?);
+        }
+        if let Some(t) = cfg.config.get("tables") {
+            let tables: Vec<String> = t
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string)
+                .collect();
+            mcfg.tables = tables;
+        }
+        if let Some(name) = cfg.config.get("source_name") {
+            mcfg = mcfg.with_source_name(Arc::<str>::from(name.as_str()));
+        }
+        if let Some(signer) = build_outbound_auth_signer(&cfg.config)? {
+            mcfg = mcfg.with_auth(signer);
+        }
+
+        let handle = tokio::runtime::Handle::try_current().map_err(|_| {
+            AeonError::config("mysql-cdc source must be built from within a tokio runtime")
+        })?;
+        let src = tokio::task::block_in_place(|| handle.block_on(MysqlCdcSource::new(mcfg)))?;
+        Ok(Box::new(src))
+    }
+}
+
+// ─── MongoDB CDC source ────────────────────────────────────────────────────
+
+/// Builds a `MongoDbCdcSource` — change-streams-backed CDC (requires
+/// replica-set topology). Required `uri`, `database`. Optional
+/// `collection` (default watches whole db), `batch_size`, `source_name`,
+/// `resume_token_path`, S10 auth (mTLS via process-owned tempfile).
+pub struct MongoDbCdcSourceFactory;
+
+impl SourceFactory for MongoDbCdcSourceFactory {
+    fn build(&self, cfg: &SourceConfig) -> Result<Box<dyn DynSource>, AeonError> {
+        let uri = cfg
+            .config
+            .get("uri")
+            .ok_or_else(|| AeonError::config("mongodb-cdc source requires config.uri"))?;
+        let database = cfg
+            .config
+            .get("database")
+            .ok_or_else(|| AeonError::config("mongodb-cdc source requires config.database"))?;
+
+        let mut mcfg = MongoDbCdcSourceConfig::new(uri, database);
+        if let Some(coll) = cfg.config.get("collection") {
+            mcfg = mcfg.with_collection(coll.clone());
+        }
+        if let Some(v) = cfg.config.get("batch_size") {
+            mcfg.buffer_config.batch_size = parse_usize(Some(v), 1024)?;
+        }
+        if let Some(name) = cfg.config.get("source_name") {
+            mcfg.source_name = Arc::<str>::from(name.as_str());
+        }
+        if let Some(p) = cfg.config.get("resume_token_path") {
+            mcfg = mcfg.with_resume_token_path(std::path::PathBuf::from(p));
+        }
+        if let Some(signer) = build_outbound_auth_signer(&cfg.config)? {
+            mcfg.auth = Some(signer);
+        }
+
+        let handle = tokio::runtime::Handle::try_current().map_err(|_| {
+            AeonError::config("mongodb-cdc source must be built from within a tokio runtime")
+        })?;
+        let src = tokio::task::block_in_place(|| handle.block_on(MongoDbCdcSource::new(mcfg)))?;
+        Ok(Box::new(src))
+    }
+}
+
 // ─── Registration ──────────────────────────────────────────────────────────
 
 /// Register every connector compiled into the binary onto the registry.
@@ -477,11 +878,24 @@ pub fn register_defaults(reg: &mut ConnectorRegistry) {
     reg.register_source("http-polling", Arc::new(HttpPollingSourceFactory));
     reg.register_source("file", Arc::new(FileSourceFactory));
 
+    // P5.c — WebSocket / Redis / NATS / CDC source+sink registration.
+    reg.register_source("websocket", Arc::new(WebSocketSourceFactory));
+    reg.register_source("redis-streams", Arc::new(RedisStreamsSourceFactory));
+    reg.register_source("nats", Arc::new(NatsSourceFactory));
+    reg.register_source("postgres-cdc", Arc::new(PostgresCdcSourceFactory));
+    reg.register_source("mysql-cdc", Arc::new(MysqlCdcSourceFactory));
+    reg.register_source("mongodb-cdc", Arc::new(MongoDbCdcSourceFactory));
+
     reg.register_sink("blackhole", Arc::new(BlackholeSinkFactory));
     reg.register_sink("stdout", Arc::new(StdoutSinkFactory));
     reg.register_sink("kafka", Arc::new(KafkaSinkFactory));
     reg.register_sink("http", Arc::new(HttpSinkFactory));
     reg.register_sink("file", Arc::new(FileSinkFactory));
+
+    // P5.c sinks.
+    reg.register_sink("websocket", Arc::new(WebSocketSinkFactory));
+    reg.register_sink("redis-streams", Arc::new(RedisStreamsSinkFactory));
+    reg.register_sink("nats", Arc::new(NatsSinkFactory));
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
