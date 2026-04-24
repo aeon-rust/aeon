@@ -818,6 +818,60 @@ mod tests {
         matches!(back, IdentityConfig::Compound { .. });
     }
 
+    /// Empirical proof that `#[serde(flatten)]` + `BTreeMap<String, Value>`
+    /// on `SourceManifest::config` requires connector keys at the **source
+    /// top level**, NOT nested under a literal `config:` block. Nesting
+    /// collapses the whole sub-object as a single entry `("config", …)`
+    /// and downstream factory lookups miss every field.
+    ///
+    /// Found the hard way during the 2026-04-24 Gate 2 Pre-Session-B
+    /// T0 run — the `count: "0"` unbounded escape didn't reach the
+    /// Memory source because the fixture used the aspirational
+    /// nested-block shape from `docs/EO-2-DURABILITY-DESIGN.md`.
+    /// This test locks the actual wiring in place so anyone writing
+    /// fresh fixtures against the design doc sees the regression
+    /// here first.
+    #[test]
+    fn source_config_keys_must_be_flat_not_nested() {
+        // Use JSON (aeon-types ships serde_json, not serde_yaml) — the
+        // flatten behaviour is format-agnostic, YAML parses through the
+        // same code path.
+        let nested = r#"{
+            "name": "test",
+            "type": "memory",
+            "kind": "push",
+            "config": {
+                "count": "0",
+                "payload_size": "256"
+            }
+        }"#;
+        let flat = r#"{
+            "name": "test",
+            "type": "memory",
+            "kind": "push",
+            "count": "0",
+            "payload_size": "256"
+        }"#;
+        let n: SourceManifest = serde_json::from_str(nested).unwrap();
+        let f: SourceManifest = serde_json::from_str(flat).unwrap();
+
+        // Nested: one entry keyed `"config"` holding the sub-object.
+        assert_eq!(n.config.len(), 1);
+        assert!(n.config.contains_key("config"));
+        assert!(n.config.get("count").is_none());
+
+        // Flat: two entries, both reachable by their intended keys.
+        assert_eq!(f.config.len(), 2);
+        assert_eq!(
+            f.config.get("count").and_then(|v| v.as_str()),
+            Some("0")
+        );
+        assert_eq!(
+            f.config.get("payload_size").and_then(|v| v.as_str()),
+            Some("256")
+        );
+    }
+
     #[test]
     fn manifest_json_roundtrip() {
         let m = sample_manifest();
