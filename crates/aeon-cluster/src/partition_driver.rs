@@ -346,7 +346,20 @@ impl PartitionTransferDriver {
                 return Err(e);
             }
         };
-        if let Err(e) = self.poh_installer.install(&poh_req, poh_bytes) {
+        // Empty response is the source-side sentinel for "this pipeline
+        // has no PoH leg on this partition" — see
+        // `aeon_engine::engine_providers::PohChainExportProvider::export_state`.
+        // Skip the install call in that case; the target has nothing to
+        // seed a local chain from, and installing an empty payload would
+        // just surface a decode error. Non-empty payloads go through as
+        // before.
+        if poh_bytes.is_empty() {
+            tracing::debug!(
+                partition = partition.as_u16(),
+                source = ?source,
+                "partition-driver: source signalled no PoH leg for this partition; skipping install"
+            );
+        } else if let Err(e) = self.poh_installer.install(&poh_req, poh_bytes) {
             self.abort_with_reason(
                 partition,
                 source,
