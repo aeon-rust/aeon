@@ -467,6 +467,12 @@ pub fn validate_pipeline_shape(m: &PipelineManifest) -> Result<(), AeonError> {
             )));
         }
     }
+
+    // S4.3 — client-side compliance block sanity check.
+    m.compliance
+        .validate_shape()
+        .map_err(|e| AeonError::state(format!("pipeline '{}': {e}", m.name)))?;
+
     Ok(())
 }
 
@@ -750,6 +756,29 @@ mod tests {
     #[test]
     fn pipeline_shape_happy_path() {
         assert!(validate_pipeline_shape(&sample_manifest()).is_ok());
+    }
+
+    #[test]
+    fn pipeline_shape_rejects_malformed_compliance_block() {
+        use crate::compliance::{
+            ComplianceRegime, DataClass, EnforcementLevel, ErasureConfig, PayloadFormat,
+            PiiSelector,
+        };
+        let mut m = sample_manifest();
+        m.compliance = ComplianceBlock {
+            regime: ComplianceRegime::Pci,
+            enforcement: EnforcementLevel::Warn,
+            selectors: vec![PiiSelector {
+                path: "".into(), // empty — validate_shape should reject
+                format: PayloadFormat::Json,
+                class: DataClass::Pii,
+            }],
+            erasure: ErasureConfig::default(),
+        };
+        let err = validate_pipeline_shape(&m).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("selectors[0].path"), "expected selector error: {msg}");
+        assert!(msg.contains("'orders'"), "expected pipeline name prefix: {msg}");
     }
 
     // ── YAML-adjacent round-trips via serde_json ────────────────────────

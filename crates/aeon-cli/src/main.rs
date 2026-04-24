@@ -2420,6 +2420,30 @@ fn read_and_interpolate_manifest(path: &Path) -> Result<String> {
     Ok(resolved.into_owned())
 }
 
+/// S4.3 — render a short `, compliance: <regime>/<enforcement>` tag for CLI
+/// output when the block is active. Returns an empty string for the inert
+/// default so a pipeline that hasn't opted in stays visually quiet.
+fn compliance_preview(b: &aeon_types::compliance::ComplianceBlock) -> String {
+    use aeon_types::compliance::{ComplianceRegime, EnforcementLevel};
+    if matches!(b.regime, ComplianceRegime::None) && matches!(b.enforcement, EnforcementLevel::Off)
+    {
+        return String::new();
+    }
+    let regime = match b.regime {
+        ComplianceRegime::None => "none",
+        ComplianceRegime::Pci => "pci",
+        ComplianceRegime::Hipaa => "hipaa",
+        ComplianceRegime::Gdpr => "gdpr",
+        ComplianceRegime::Mixed => "mixed",
+    };
+    let enforcement = match b.enforcement {
+        EnforcementLevel::Off => "off",
+        EnforcementLevel::Warn => "warn",
+        EnforcementLevel::Strict => "strict",
+    };
+    format!(", compliance: {regime}/{enforcement}")
+}
+
 fn cmd_apply(file: &Path, api: &str, dry_run: bool) -> Result<()> {
     let content = read_and_interpolate_manifest(file)?;
     let manifest: Manifest = serde_yaml::from_str(&content).context("invalid YAML manifest")?;
@@ -2466,23 +2490,29 @@ fn cmd_apply(file: &Path, api: &str, dry_run: bool) -> Result<()> {
         let pipeline_def = pipeline_manifest.to_pipeline_definition();
         let exists = existing_names.contains(&name.to_string());
 
+        // S4.3 — surface the declared compliance posture so operators
+        // can eyeball it before the REST call (strict enforcement is a
+        // server-side gate, but spotting a typoed regime at CLI time
+        // avoids a pointless round-trip).
+        let compliance_tag = compliance_preview(&pipeline_manifest.compliance);
+
         if dry_run {
             if exists {
-                println!("[dry-run] pipeline '{name}' — already exists (skip)");
+                println!("[dry-run] pipeline '{name}' — already exists (skip){compliance_tag}");
             } else {
                 println!(
-                    "[dry-run] pipeline '{name}' — would create ({} source(s), {} sink(s))",
+                    "[dry-run] pipeline '{name}' — would create ({} source(s), {} sink(s)){compliance_tag}",
                     pipeline_manifest.sources.len(),
                     pipeline_manifest.sinks.len(),
                 );
             }
         } else if exists {
-            println!("pipeline '{name}' — already exists (skip)");
+            println!("pipeline '{name}' — already exists (skip){compliance_tag}");
         } else {
             ureq::post(&format!("{api}/api/v1/pipelines"))
                 .send_json(&pipeline_def)
                 .with_context(|| format!("failed to create pipeline '{name}'"))?;
-            println!("pipeline '{name}' — created");
+            println!("pipeline '{name}' — created{compliance_tag}");
         }
     }
 

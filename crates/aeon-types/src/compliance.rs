@@ -195,6 +195,53 @@ impl ComplianceBlock {
     pub fn is_active(&self) -> bool {
         self.enforcement.is_active() && !matches!(self.regime, ComplianceRegime::None)
     }
+
+    /// S4.3 — cheap client-side shape validation. Runs before a manifest
+    /// leaves the CLI so operators see structural mistakes immediately
+    /// rather than at pipeline start on the server. Distinct from S4.2
+    /// `validate_compliance`, which cross-references resolved plans from
+    /// S3 / S5 / S6 and therefore must run inside the engine.
+    ///
+    /// Checks:
+    /// - selector `path` is non-empty (the regex/jsonpath evaluator will
+    ///   reject it anyway, but the error there is less actionable).
+    /// - `erasure.max_delay_hours > 0` — zero would mean "sweep every
+    ///   check", swamping the engine; we cap the floor at 1h to force a
+    ///   deliberate choice.
+    /// - `regime = Gdpr | Mixed` + `enforcement = Strict` is logically
+    ///   consistent with `erasure.max_delay_hours <= 24 * 30` (GDPR's
+    ///   30-day SLA). A larger cap is refused because strict enforcement
+    ///   then cannot meet the SLA even under ideal conditions.
+    pub fn validate_shape(&self) -> Result<(), crate::AeonError> {
+        for (idx, s) in self.selectors.iter().enumerate() {
+            if s.path.trim().is_empty() {
+                return Err(crate::AeonError::state(format!(
+                    "compliance.selectors[{idx}].path must not be empty"
+                )));
+            }
+        }
+
+        if self.erasure.max_delay_hours == 0 {
+            return Err(crate::AeonError::state(
+                "compliance.erasure.max_delay_hours must be > 0; pick a value >= 1"
+                    .to_string(),
+            ));
+        }
+
+        if self.regime.requires_erasure()
+            && matches!(self.enforcement, EnforcementLevel::Strict)
+            && self.erasure.max_delay_hours > 24 * 30
+        {
+            return Err(crate::AeonError::state(format!(
+                "compliance.erasure.max_delay_hours={} cannot satisfy the GDPR \
+                 30-day SLA under strict enforcement (cap: {} hours)",
+                self.erasure.max_delay_hours,
+                24 * 30
+            )));
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -398,5 +445,92 @@ mod tests {
         let j = r#"{"regime":"gdpr","enforcement":"strict"}"#;
         let b: ComplianceBlock = serde_json::from_str(j).unwrap();
         assert_eq!(b.erasure.max_delay_hours, 24);
+    }
+
+    // ── S4.3 validate_shape ────────────────────────────────────────────
+
+    #[test]
+    fn validate_shape_accepts_default_block() {
+        assert!(ComplianceBlock::default().validate_shape().is_ok());
+    }
+
+    #[test]
+    fn validate_shape_accepts_well_formed_gdpr_strict() {
+        let b = ComplianceBlock {
+            regime: ComplianceRegime::Gdpr,
+            enforcement: EnforcementLevel::Strict,
+            selectors: vec![PiiSelector {
+                path: "$.user.email".into(),
+                format: PayloadFormat::Json,
+                class: DataClass::Pii,
+            }],
+            erasure: ErasureConfig { max_delay_hours: 12 },
+        };
+        assert!(b.validate_shape().is_ok());
+    }
+
+    #[test]
+    fn validate_shape_rejects_empty_selector_path() {
+        let b = ComplianceBlock {
+            regime: ComplianceRegime::Pci,
+            enforcement: EnforcementLevel::Warn,
+            selectors: vec![PiiSelector {
+                path: "   ".into(),
+                format: PayloadFormat::Json,
+                class: DataClass::Pii,
+            }],
+            erasure: ErasureConfig::default(),
+        };
+        let err = b.validate_shape().unwrap_err();
+        assert!(format!("{err}").contains("selectors[0].path"));
+    }
+
+    #[test]
+    fn validate_shape_rejects_zero_erasure_delay() {
+        let b = ComplianceBlock {
+            regime: ComplianceRegime::Gdpr,
+            enforcement: EnforcementLevel::Warn,
+            selectors: vec![],
+            erasure: ErasureConfig { max_delay_hours: 0 },
+        };
+        let err = b.validate_shape().unwrap_err();
+        assert!(format!("{err}").contains("max_delay_hours"));
+    }
+
+    #[test]
+    fn validate_shape_rejects_gdpr_strict_beyond_30d_sla() {
+        let b = ComplianceBlock {
+            regime: ComplianceRegime::Gdpr,
+            enforcement: EnforcementLevel::Strict,
+            selectors: vec![],
+            erasure: ErasureConfig { max_delay_hours: 24 * 31 },
+        };
+        let err = b.validate_shape().unwrap_err();
+        assert!(format!("{err}").contains("30-day SLA"));
+    }
+
+    #[test]
+    fn validate_shape_permits_long_delay_under_warn() {
+        // Warn is advisory — operator can choose a longer window without
+        // the strict gate tripping.
+        let b = ComplianceBlock {
+            regime: ComplianceRegime::Gdpr,
+            enforcement: EnforcementLevel::Warn,
+            selectors: vec![],
+            erasure: ErasureConfig { max_delay_hours: 24 * 31 },
+        };
+        assert!(b.validate_shape().is_ok());
+    }
+
+    #[test]
+    fn validate_shape_permits_long_delay_for_non_erasure_regime() {
+        // PCI / HIPAA don't require GDPR erasure; the SLA cap doesn't apply.
+        let b = ComplianceBlock {
+            regime: ComplianceRegime::Pci,
+            enforcement: EnforcementLevel::Strict,
+            selectors: vec![],
+            erasure: ErasureConfig { max_delay_hours: 24 * 90 },
+        };
+        assert!(b.validate_shape().is_ok());
     }
 }
