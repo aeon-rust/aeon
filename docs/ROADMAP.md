@@ -3232,7 +3232,10 @@ re-run on a fresh cluster now depends only on:
   (a) New DO API token + cluster ID (user, tokens revoked 2026-04-24)
   (b) Rancher Desktop V2–V6 rehearsal pass on the freshly-rebuilt
       Aeon Docker image
-  (c) Chaos Mesh scripted into the cluster bring-up for T5/T6.
+  (c) **Security-testing tranche** on Rancher Desktop — Trivy,
+      Syft+Grype, Nuclei, testssl.sh, Dastardly, OWASP ZAP (see
+      [`SECURITY.md §12`](SECURITY.md)). Pentagi and Kali parked.
+  (d) Chaos Mesh scripted into the cluster bring-up for T5/T6.
 
 ### Session A re-run — to-do list (locked 2026-04-18)
 
@@ -3352,8 +3355,39 @@ All six Gate 2 Aeon code gaps (G8, G9, G10, G11, G14) + G13 infra workaround shi
 
 **Post-V6 flow:**
 
-1. **DOKS re-spin** is now non-optional because T5/T6 chaos realism can't be closed on RD. The re-spin also closes the remaining live-measurement rows left open at Phase 3 (G14 <5 s failover, T2/T4 on real NVMe, T6 active-load wall-clock with the G13 rollout-restart workaround in the evidence log).
-2. **Phase 4 (Session B / AWS EKS)** — throughput ceiling + anything DOKS under-serves because of the 2 Gbps / non-NVMe SKU constraint noted in `reference_doks_droplet_availability`.
+1. **Security-testing tranche on Rancher Desktop** (locked 2026-04-24).
+   Seven-tool suite runs against the same freshly-built image once V2–V6
+   close. Ordering and per-tool scope documented in
+   [`SECURITY.md §12`](SECURITY.md). One-line recap:
+
+   | Stage | Tool | Scope |
+   |-------|------|-------|
+   | Supply chain | **Trivy** | OS + language CVEs in the built image |
+   | Supply chain | **Syft + Grype** | CycloneDX SBOM + second-opinion dep CVE scan |
+   | Network surface | **Nuclei** | ProjectDiscovery templates + Aeon-custom templates on `:4471` / `:4472` |
+   | TLS hygiene | **testssl.sh** | Cipher suites + protocol versions + HSTS on `:4471` / `:4472` QUIC |
+   | DAST (fast) | **PortSwigger Dastardly** | Burp-subset baseline against REST API — CI-cheap, every build |
+   | DAST (deep) | **OWASP ZAP** | Authenticated baseline + active scan, release-candidate only |
+
+   **Parked for future consideration:** Pentagi (agentic pen-test
+   orchestrator — needs LLM-token budget) and Kali Linux (full
+   offensive toolkit — suits periodic manual engagements, not a CI
+   gate). Both revisit alongside a pre-GA hardening sprint.
+
+   Gate: every HIGH/CRITICAL finding either resolved or carries an
+   explicit waiver with fix window. Reports + SBOM published alongside
+   the image tag before any cloud re-spin.
+
+2. **DOKS re-spin** is now non-optional because T5/T6 chaos realism
+   can't be closed on RD. The re-spin also closes the remaining
+   live-measurement rows left open at Phase 3 (G14 <5 s failover,
+   T2/T4 on real NVMe, T6 active-load wall-clock with the G13
+   rollout-restart workaround in the evidence log). Entry cost now
+   also includes: (a) fresh DO API token + cluster ID (tokens revoked
+   2026-04-24), (b) a clean security-tranche report from step 1.
+3. **Phase 4 (Session B / AWS EKS)** — throughput ceiling + anything
+   DOKS under-serves because of the 2 Gbps / non-NVMe SKU constraint
+   noted in `reference_doks_droplet_availability`.
 
 **Phase 3b — Post-bundle DOKS re-run on fresh cluster `c3867cc5` (2026-04-19)**
 

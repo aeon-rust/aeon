@@ -22,7 +22,8 @@ REST API surface to the Wasm sandbox boundary.
 9. [Network Security](#9-network-security)
 10. [Wasm Sandboxing](#10-wasm-sandboxing)
 11. [Pipeline Data-Plane Security (S1–S10 Audit Landings)](#11-pipeline-data-plane-security-s1s10-audit-landings)
-12. [Production Hardening Checklist](#12-production-hardening-checklist)
+12. [Pre-Deployment Security Testing Toolchain](#12-pre-deployment-security-testing-toolchain)
+13. [Production Hardening Checklist](#13-production-hardening-checklist)
 
 ---
 
@@ -712,7 +713,126 @@ them into `InboundAuthVerifier`'s `mtls` subject check.
 
 ---
 
-## 12. Production Hardening Checklist
+## 12. Pre-Deployment Security Testing Toolchain
+
+Every release candidate passes a seven-tool scan tranche on Rancher
+Desktop before it is promoted to a staging / DOKS / EKS environment.
+The suite splits into four layers — **supply chain** (what's in the
+image), **network surface** (what's exposed to the world), **TLS
+hygiene** (how we terminate), and **DAST** (active attack against a
+running instance). All tools run locally against a freshly-rebuilt
+Aeon Docker image inside Rancher Desktop, so there is no cloud spend
+to the scan loop and no registry round-trip before the image is
+declared fit to push.
+
+### 12.1 Supply-chain: Trivy (image CVEs)
+
+Scope: OS-package + language-package CVE enumeration against the
+built `aeon:<tag>` image.
+
+```bash
+trivy image --severity HIGH,CRITICAL --exit-code 1 aeon:latest
+```
+
+Gate: HIGH/CRITICAL must be zero, or carry an explicit waiver entry
+(with justification + expected fix window) in the release notes.
+Runs before the image is tagged for push.
+
+### 12.2 Supply-chain: Syft + Grype (SBOM + dependency CVEs)
+
+Syft generates a CycloneDX SBOM the project ships alongside every
+image (auditable artefact; useful both to operators and to third
+parties under SLSA-style provenance claims). Grype consumes that SBOM
+and cross-references NVD/OSV for vulnerabilities — the second opinion
+on Trivy's result, used to catch divergence between scanner feeds.
+
+```bash
+syft aeon:latest -o cyclonedx-json > sbom.json
+grype sbom:sbom.json --fail-on high
+```
+
+Gate: matches Trivy's HIGH/CRITICAL gate. Any Grype-only finding or
+Trivy-only finding must be explained.
+
+### 12.3 Network surface: Nuclei (template vuln scan)
+
+Nuclei runs the ProjectDiscovery community template set plus
+Aeon-specific templates against the live container. In-scope surfaces:
+
+- `:4471` — REST API, WebSocket source/sink, `/metrics`, `/healthz`.
+- `:4472` — WebTransport + external QUIC.
+
+Custom templates under `security/nuclei/` (to be authored) cover
+Aeon-specific expectations — e.g. `/metrics` requires S9 auth, 404
+behaviour on unauthenticated management paths, header presence from
+§5 Security Headers.
+
+Gate: zero unexplained HIGH/CRITICAL matches. Template version and
+template run-id captured in the release's scan report.
+
+### 12.4 TLS hygiene: testssl.sh
+
+Validates cipher suites, protocol versions, cert chain, and HSTS
+behaviour on every TLS-facing port:
+
+- `:4471` (when rustls is enabled end-to-end).
+- `:4472` QUIC/HTTP/3 — via the testssl.sh `--quic` probe.
+
+Cross-checks the results with the S2 (redaction), S7 (SSRF), S9
+(inbound auth), and S10 (outbound auth) expectations in §11. Any
+deviation from the rustls + aws-lc-rs hardening assumption (FIPS 140-3
+path — see CLAUDE.md Key Decisions) flagged as a release blocker.
+
+### 12.5 DAST: PortSwigger Dastardly (baseline)
+
+Dastardly is the Burp-engine-subset, CI-friendly scanner that Port-
+Swigger ship for GitHub Actions. We run it first as a fast baseline
+against the REST API on `:4471` — it catches the Burp-style classes
+(missing security headers, cookie flags, obvious injection shapes)
+at < 10 minutes wall-clock. Dastardly is the gate for every release;
+it is fast enough to run on every build.
+
+Gate: zero HIGH, a justified-or-fixed list for MEDIUM. LOW advisory
+only.
+
+### 12.6 DAST: OWASP ZAP (deep scan)
+
+ZAP runs the deep complement to Dastardly — baseline scan + full
+active scan against both REST and WebSocket on `:4471`, using an
+authenticated context primed with an API key issued via the S9
+inbound-auth path.
+
+Gate: same as Dastardly, but runs only on release candidates (not on
+every build — too slow for the tight loop). Findings triage either
+resolves against SECURITY.md §11 behaviour or opens an issue tagged
+`security/dast`.
+
+### 12.7 Parked for future consideration
+
+- **Pentagi** — agentic pen-test orchestrator. Interesting for
+  producing narrative reports and chaining tool output, but adds an
+  LLM dependency to the scan pipeline that we are not ready to take on
+  until the core seven-tool suite is stable and we have a clear per-
+  release budget for token spend.
+- **Kali Linux** — full offensive toolkit. Too broad for a CI gate;
+  more suitable for periodic targeted manual pen-test engagements
+  (e.g. pre-GA hardening sprint). Revisit alongside any third-party
+  security audit.
+
+### 12.8 Where the tranche runs in the release flow
+
+1. `cargo clippy --workspace --all-features --all-targets -- -D warnings`
+2. `cargo test --workspace --all-features`
+3. Rebuild image: `docker build -f docker/Dockerfile -t aeon:<tag> .`
+4. Rancher Desktop V2..V6 functional validation.
+5. **Security tranche** — Trivy → Syft+Grype → Nuclei → testssl.sh →
+   Dastardly → (release candidate only) ZAP.
+6. Tag + push image; SBOM + scan reports published alongside.
+7. DOKS / EKS acceptance re-runs.
+
+---
+
+## 13. Production Hardening Checklist
 
 Follow this checklist before deploying Aeon to production.
 
