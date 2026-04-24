@@ -145,7 +145,7 @@ and assert MMR + Merkle + Ed25519 root-sig round-trips; resumed
 
 | PohVerifyMode | Steps | Status |
 |---------------|-------|--------|
-| `Verify` | trigger T4 transfer, `curl /api/v1/pipeline/<name>/poh-head` on both peers, assert byte-equal `current_hash` + `mmr_root` | ⏳ pending |
+| `Verify` | trigger T4 transfer, `curl /api/v1/pipelines/<name>/partitions/<N>/poh-head` on both peers, assert byte-equal `current_hash` + `mmr_root` + `sequence` | ⏳ pending |
 | `VerifyWithKey` | same as Verify + assert Ed25519 signature over the root verifies against the publisher's pubkey | ⏳ pending |
 | `TrustExtend` | skip verify, confirm target still sequences correctly from the trusted extend point | ⏳ pending |
 
@@ -193,9 +193,13 @@ run certifies the RD cluster as a whole, not new code paths.
 3. **V3 processor fixture files** — ✅ **closed 2026-04-24**
    (`docs/examples/pipeline-t0-baseline.yaml` + `pipeline-t0-redpanda.yaml`
    landed; both parse cleanly via `aeon apply --dry-run`).
-4. **V5 PoH head REST endpoint** — code exists (CL-6b closed); surfacing
-   it as a dedicated `/api/v1/pipeline/<name>/poh-head` endpoint may
-   need a tiny aeon-engine REST addition.
+4. **V5 PoH head REST endpoint** — ✅ **closed 2026-04-24**:
+   `GET /api/v1/pipelines/{name}/partitions/{partition}/poh-head`
+   landed in `aeon-engine::rest_api`, backed by
+   `PipelineSupervisor::poh_live_chains()` (the CL-6c.4 registry).
+   Returns `{sequence, current_hash, mmr_root}` per partition; 404
+   when the partition isn't owned on the target node. Feature-gated
+   on `processor-auth + cluster`, mirroring the registry.
 
 ### What a green Session B looks like
 

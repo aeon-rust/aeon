@@ -183,6 +183,18 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         )
         // Integrity verification
         .route("/api/v1/pipelines/{name}/verify", get(verify_pipeline))
+        ;
+    // V5 — per-partition PoH chain head. Gated on the same feature
+    // union as `PipelineSupervisor::poh_live_chains`. The endpoint
+    // surfaces the LivePohChainRegistry CL-6c.4 already maintains and
+    // is consumed by the Gate 2 Pre-Session-B crypto-chain E2E test
+    // (docs/GATE2-PRE-SESSION-B-VALIDATION.md).
+    #[cfg(all(feature = "processor-auth", feature = "cluster"))]
+    let api_routes = api_routes.route(
+        "/api/v1/pipelines/{name}/partitions/{partition}/poh-head",
+        get(poh_head),
+    );
+    let api_routes = api_routes
         // Cluster status
         .route("/api/v1/cluster/status", get(cluster_status))
         .route(
@@ -2150,6 +2162,83 @@ async fn verify_pipeline(
                 .into_response()
             }
         }
+    }
+}
+
+// ── Per-partition PoH chain head (V5) ───────────────────────────────
+
+/// GET /api/v1/pipelines/:name/partitions/:partition/poh-head
+///
+/// Surfaces the running PoH chain for a single partition. Backed by
+/// [`PipelineSupervisor::poh_live_chains`] — the
+/// [`LivePohChainRegistry`](crate::partition_install::LivePohChainRegistry)
+/// the supervisor populates whenever a pipeline's
+/// [`create_poh_state`](crate::pipeline::create_poh_state) runs. A 404
+/// means either the pipeline isn't registered, the partition isn't
+/// owned on this node, or PoH isn't wired for this pipeline.
+///
+/// Response shape (success):
+/// ```json
+/// {
+///   "pipeline": "<name>",
+///   "partition": <u16>,
+///   "poh_active": true,
+///   "chain": {
+///     "sequence": <u64>,
+///     "current_hash": "<hex-32B>",
+///     "mmr_root": "<hex-32B>"
+///   }
+/// }
+/// ```
+///
+/// Used by the Gate 2 Pre-Session-B V5 crypto-chain E2E test — the
+/// operator GETs this on both source and target peers after a
+/// partition transfer and asserts byte-equality across
+/// `current_hash`, `mmr_root`, and `sequence` to confirm the chain
+/// transferred cleanly under each `PohVerifyMode`.
+#[cfg(all(feature = "processor-auth", feature = "cluster"))]
+async fn poh_head(
+    State(state): State<Arc<AppState>>,
+    Path((name, partition)): Path<(String, u16)>,
+) -> impl IntoResponse {
+    // Verify the pipeline exists before attesting to its partition-level
+    // state. Avoids surfacing a confusing "pipeline not found on this
+    // node" for a pipeline that doesn't exist anywhere in the cluster.
+    if state.pipelines.get(&name).await.is_none() {
+        return api_error(
+            StatusCode::NOT_FOUND,
+            format!("pipeline '{name}' not found"),
+        )
+        .into_response();
+    }
+
+    let pid = aeon_types::PartitionId::new(partition);
+    let registry = state.supervisor.poh_live_chains();
+    match registry.get(&name, pid) {
+        Some(chain_arc) => {
+            let chain: tokio::sync::MutexGuard<'_, aeon_crypto::poh::PohChain> =
+                chain_arc.lock().await;
+            let chain_state = chain.export_state();
+            let json = serde_json::json!({
+                "pipeline": name,
+                "partition": partition,
+                "poh_active": true,
+                "chain": {
+                    "sequence": chain_state.sequence,
+                    "current_hash": hex::encode(chain_state.current_hash),
+                    "mmr_root": hex::encode(chain.mmr_root()),
+                },
+            });
+            (StatusCode::OK, Json(json)).into_response()
+        }
+        None => api_error(
+            StatusCode::NOT_FOUND,
+            format!(
+                "pipeline '{name}' partition {partition}: no live PoH chain \
+                 (partition not owned on this node or PoH not wired)"
+            ),
+        )
+        .into_response(),
     }
 }
 
