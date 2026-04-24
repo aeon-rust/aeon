@@ -100,7 +100,7 @@ pub fn redact_uri(s: &str) -> Cow<'_, str> {
 /// the call site already reaches for.
 #[inline]
 pub fn is_redacted_metadata_key(k: &str) -> bool {
-    METADATA_REDACT_DENYLIST.iter().any(|denied| *denied == k)
+    METADATA_REDACT_DENYLIST.contains(&k)
 }
 
 /// Return the log-safe value for a `(key, value)` pair. If the key is

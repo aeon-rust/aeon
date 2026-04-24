@@ -33,6 +33,7 @@ fn make_outputs(count: usize, payload_size: usize) -> Vec<Output> {
             source_event_id: None,
             source_partition: None,
             source_offset: None,
+            l2_seq: None,
         })
         .collect()
 }

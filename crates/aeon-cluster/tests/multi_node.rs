@@ -85,10 +85,10 @@ async fn wait_for_leader(raft: &Raft<AeonRaftConfig>, timeout_secs: u64) -> Opti
 }
 
 /// Get the Raft reference for a leader from a slice of (id, raft) pairs.
-fn leader_raft<'a>(
+fn leader_raft(
     leader_id: u64,
-    nodes: &'a [(u64, Raft<AeonRaftConfig>)],
-) -> &'a Raft<AeonRaftConfig> {
+    nodes: &[(u64, Raft<AeonRaftConfig>)],
+) -> &Raft<AeonRaftConfig> {
     nodes
         .iter()
         .find(|(id, _)| *id == leader_id)
@@ -410,8 +410,8 @@ async fn scale_three_to_five() {
 
     // Bootstrap 3-node cluster
     let mut members = BTreeMap::new();
-    for i in 0..3 {
-        members.insert((i + 1) as u64, NodeAddress::new("127.0.0.1", addrs[i].port()));
+    for (i, addr) in addrs.iter().enumerate().take(3) {
+        members.insert((i + 1) as u64, NodeAddress::new("127.0.0.1", addr.port()));
     }
     for raft in &rafts[0..3] {
         raft.initialize(members.clone()).await.unwrap();

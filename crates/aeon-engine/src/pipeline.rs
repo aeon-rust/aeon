@@ -365,7 +365,7 @@ pub fn create_poh_state(config: &PipelineConfig) -> Option<PohState> {
 
     #[cfg(feature = "cluster")]
     {
-        return Some(state);
+        Some(state)
     }
 
     #[cfg(not(feature = "cluster"))]
@@ -2590,6 +2590,7 @@ where
 }
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
     use crate::processor::PassthroughProcessor;
@@ -4524,7 +4525,7 @@ mod tests {
         }
 
         let outputs = sink_reader.lock().unwrap().clone();
-        assert!(outputs.len() > 0, "should have outputs after canary complete");
+        assert!(!outputs.is_empty(), "should have outputs after canary complete");
         assert!(outputs.iter().all(|o| {
             String::from_utf8_lossy(&o.payload).starts_with("B:")
         }), "all outputs after canary complete should be B-prefixed");

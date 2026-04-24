@@ -107,7 +107,7 @@ fn bench_batch_100(c: &mut Criterion) {
     let native = JsonEnrichProcessor::new("user_id", "enriched", "rust-native");
     group.bench_function("rust-native", |b| {
         b.iter(|| {
-            let events: Vec<Event> = (0..100).map(|i| make_json_event(i)).collect();
+            let events: Vec<Event> = (0..100).map(make_json_event).collect();
             let outputs = native.process_batch(black_box(events)).unwrap();
             black_box(outputs);
         });
@@ -117,7 +117,7 @@ fn bench_batch_100(c: &mut Criterion) {
     let rust_wasm = load_rust_wasm();
     group.bench_function("rust-wasm", |b| {
         b.iter(|| {
-            let events: Vec<Event> = (0..100).map(|i| make_json_event(i)).collect();
+            let events: Vec<Event> = (0..100).map(make_json_event).collect();
             let outputs = Processor::process_batch(&rust_wasm, black_box(events)).unwrap();
             black_box(outputs);
         });
@@ -127,7 +127,7 @@ fn bench_batch_100(c: &mut Criterion) {
     let as_wasm = load_assemblyscript_wasm();
     group.bench_function("assemblyscript-wasm", |b| {
         b.iter(|| {
-            let events: Vec<Event> = (0..100).map(|i| make_json_event(i)).collect();
+            let events: Vec<Event> = (0..100).map(make_json_event).collect();
             let outputs = Processor::process_batch(&as_wasm, black_box(events)).unwrap();
             black_box(outputs);
         });

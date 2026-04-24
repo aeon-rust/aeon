@@ -42,6 +42,7 @@ use aeon_types::{AeonError, PartitionId};
 use crate::l2_transfer::SegmentWriter;
 
 type WritersMap = HashMap<(String, u16), SegmentWriter>;
+type LivePohChainMap = HashMap<(String, u16), Arc<tokio::sync::Mutex<PohChain>>>;
 
 // ── L2 segment installer ──────────────────────────────────────────────
 
@@ -230,7 +231,7 @@ impl InstalledPohChainRegistry {
 /// it asynchronously without lock-type juggling.
 #[derive(Clone, Default)]
 pub struct LivePohChainRegistry {
-    inner: Arc<Mutex<HashMap<(String, u16), Arc<tokio::sync::Mutex<PohChain>>>>>,
+    inner: Arc<Mutex<LivePohChainMap>>,
 }
 
 impl LivePohChainRegistry {

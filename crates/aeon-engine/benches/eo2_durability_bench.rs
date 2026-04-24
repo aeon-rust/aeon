@@ -16,6 +16,8 @@
 //!
 //! Run: `cargo bench -p aeon-engine --bench eo2_durability_bench`
 
+#![allow(clippy::field_reassign_with_default)]
+
 use aeon_connectors::BlackholeSink;
 use aeon_engine::delivery::L2BodyStoreConfig;
 use aeon_engine::eo2::PipelineL2Registry;

@@ -132,6 +132,7 @@ fn bench_multi_consumer_throughput(
                 max_batch_size: 1024,
                 ..Default::default()
             },
+            gate_registry: None,
         };
         let metrics = Arc::new(PipelineMetrics::new());
         let shutdown = Arc::new(AtomicBool::new(false));
