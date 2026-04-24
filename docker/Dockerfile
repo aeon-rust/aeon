@@ -9,7 +9,7 @@
 #   FEATURES — Cargo features to enable (default: "native-loader,rest-api")
 
 # ── Stage 1: Builder ──────────────────────────────────────────────────
-FROM rust:1.85-bookworm AS builder
+FROM rust:1.94-bookworm AS builder
 
 WORKDIR /build
 
@@ -33,19 +33,25 @@ COPY crates/aeon-connectors/Cargo.toml crates/aeon-connectors/
 COPY crates/aeon-engine/Cargo.toml crates/aeon-engine/
 COPY crates/aeon-cluster/Cargo.toml crates/aeon-cluster/
 COPY crates/aeon-crypto/Cargo.toml crates/aeon-crypto/
+COPY crates/aeon-secrets/Cargo.toml crates/aeon-secrets/
 COPY crates/aeon-observability/Cargo.toml crates/aeon-observability/
 COPY crates/aeon-native-sdk/Cargo.toml crates/aeon-native-sdk/
 COPY crates/aeon-wasm-sdk/Cargo.toml crates/aeon-wasm-sdk/
+COPY crates/aeon-processor-client/Cargo.toml crates/aeon-processor-client/
 COPY crates/aeon-cli/Cargo.toml crates/aeon-cli/
+COPY samples/processors/rust-native/Cargo.toml samples/processors/rust-native/
 COPY samples/e2e-pipeline/Cargo.toml samples/e2e-pipeline/
+COPY xtask/Cargo.toml xtask/
 
-# Create stub lib.rs files so cargo can resolve the workspace
+# Create stub lib.rs/main.rs files so cargo can resolve the workspace
 RUN for dir in crates/*/; do mkdir -p "$dir/src" && echo "" > "$dir/src/lib.rs"; done \
     && mkdir -p crates/aeon-cli/src && echo "fn main() {}" > crates/aeon-cli/src/main.rs \
-    && mkdir -p samples/e2e-pipeline/src && echo "fn main() {}" > samples/e2e-pipeline/src/main.rs
+    && mkdir -p samples/processors/rust-native/src && echo "" > samples/processors/rust-native/src/lib.rs \
+    && mkdir -p samples/e2e-pipeline/src && echo "fn main() {}" > samples/e2e-pipeline/src/main.rs \
+    && mkdir -p xtask/src && echo "fn main() {}" > xtask/src/main.rs
 
 # Pre-build dependencies (cached unless Cargo.toml/lock change)
-ARG FEATURES="native-loader,rest-api"
+ARG FEATURES="native-validate,rest-api"
 RUN cargo build --release -p aeon-cli --features "$FEATURES" 2>/dev/null || true
 
 # Copy actual source code

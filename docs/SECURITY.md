@@ -316,7 +316,7 @@ cannot escalate to root privileges within the container.
 
 The multi-stage build produces a minimal runtime image:
 
-- **Build stage:** `rust:1.85-bookworm` (full toolchain, discarded after build).
+- **Build stage:** `rust:1.94-bookworm` (full toolchain, discarded after build).
 - **Runtime stage:** `debian:bookworm-slim` with only `ca-certificates` and
   `libssl3` installed.
 - APT lists are cleaned after installation (`rm -rf /var/lib/apt/lists/*`).
