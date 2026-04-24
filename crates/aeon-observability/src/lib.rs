@@ -69,7 +69,7 @@ pub mod tracing_spans;
 
 pub use audit::{
     AUDIT_STDERR_PREFIX, NullAuditSink, StderrAuditSink, audit_sink, emit_audit,
-    set_audit_sink,
+    emit_auth_rejected, now_unix_nanos, set_audit_sink,
 };
 pub use histogram::LatencyHistogram;
 pub use logging::{LogConfig, init_logging, mask_email, mask_pii};

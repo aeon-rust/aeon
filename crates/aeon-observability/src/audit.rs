@@ -135,6 +135,39 @@ pub fn emit_audit(event: &AuditEvent) {
     audit_sink().emit(event);
 }
 
+/// S2.5 — current Unix epoch nanoseconds, for call sites that would
+/// otherwise repeat the `SystemTime::now()` dance at every emit.
+/// Returns 0 on the (impossible) `SystemTime` regression path rather
+/// than panicking — audit emission must never fail the caller.
+pub fn now_unix_nanos() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0)
+}
+
+/// S2.5 helper — emit an `Auth / Denied` audit event for an inbound-auth
+/// rejection at a connector entry point. `resource` is the connector
+/// logical name (e.g. `"http-webhook/ingest"`); `reason_tag` is the
+/// stable reject reason from `AuthRejection::reason_tag()`; `peer` is
+/// the remote address as a string. The call site still returns the
+/// original rejection to the HTTP / QUIC / WS / WT stack — this helper
+/// does not propagate control flow.
+pub fn emit_auth_rejected(resource: &str, reason_tag: &str, peer: &str) {
+    use aeon_types::audit::{AuditCategory, AuditOutcome};
+    emit_audit(
+        &AuditEvent::new(
+            now_unix_nanos(),
+            AuditCategory::Auth,
+            "inbound.auth.rejected",
+            AuditOutcome::Denied,
+        )
+        .with_resource(resource.to_string())
+        .with_detail("reason_tag", reason_tag.to_string())
+        .with_detail("peer", peer.to_string()),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

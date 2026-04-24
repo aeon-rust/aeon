@@ -18,6 +18,8 @@ auto-tls = ["rcgen", "hostname"]  # Enable auto-generated self-signed certificat
 
 [dependencies]
 aeon-types = { workspace = true }
+# S2.5 audit — KEK lifecycle emits to the process-wide audit sink.
+aeon-observability = { path = "../aeon-observability" }
 serde = { workspace = true }
 bincode = { workspace = true }
 thiserror = { workspace = true }

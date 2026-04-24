@@ -336,6 +336,22 @@ impl PipelineSupervisor {
             &erasure_plan,
         )
         .map_err(|e| {
+            // S2.5 — audit the refusal on the dedicated channel so the
+            // SIEM side sees it regardless of the `tracing` subscriber
+            // configuration. `regime` + `enforcement` are stable tags,
+            // safe to emit; the full finding list is already in the
+            // human message of `e`.
+            aeon_observability::emit_audit(
+                &aeon_types::audit::AuditEvent::new(
+                    aeon_observability::now_unix_nanos(),
+                    aeon_types::audit::AuditCategory::Compliance,
+                    "compliance.validate.denied",
+                    aeon_types::audit::AuditOutcome::Denied,
+                )
+                .with_resource(format!("pipeline/{name}"))
+                .with_detail("regime", format!("{:?}", def.compliance.regime))
+                .with_detail("enforcement", format!("{:?}", def.compliance.enforcement)),
+            );
             AeonError::config(format!(
                 "pipeline '{name}' refused to start: {e}"
             ))

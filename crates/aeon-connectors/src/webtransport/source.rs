@@ -151,6 +151,11 @@ async fn wt_accept_loop(
                         peer_ip = ?rejection.redacted_peer_ip(),
                         "webtransport auth rejected (pre-handshake)"
                     );
+                    aeon_observability::emit_auth_rejected(
+                        &format!("webtransport/{source_name}"),
+                        rejection.reason_tag(),
+                        &peer_ip.to_string(),
+                    );
                     incoming.refuse();
                     continue;
                 }
@@ -211,6 +216,11 @@ async fn wt_accept_loop(
                         reason = rejection.reason_tag(),
                         peer_ip = ?rejection.redacted_peer_ip(),
                         "webtransport auth rejected (post-handshake)"
+                    );
+                    aeon_observability::emit_auth_rejected(
+                        &format!("webtransport-mtls/{source_name}"),
+                        rejection.reason_tag(),
+                        &peer_ip.to_string(),
                     );
                     // Close the QUIC connection carrying the session with a
                     // generic application error code. The client sees
