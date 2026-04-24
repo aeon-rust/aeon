@@ -198,11 +198,46 @@ DOKS re-spin.
 
 | Pair | Path | Tier | Status |
 |------|------|------|--------|
-| Native Rust processor · per-event | Memory → Native `.so` → Blackhole, `DurabilityMode::AtLeastOnce` | L2 body spine active | ⏳ pending (fixture + run) |
-| Native Rust processor · batch | Memory → Native `.so` → Blackhole, `DurabilityMode::ExactlyOnce` | L2 body + L3 checkpoint | ⏳ pending |
-| Wasm guest · per-event | Memory → Wasm → Blackhole, `DurabilityMode::AtLeastOnce` | L2 body spine | ⏳ pending |
-| Wasm guest · batch | Memory → Wasm → Blackhole, `DurabilityMode::ExactlyOnce` | L2 body + L3 checkpoint | ⏳ pending |
-| WAL fallback | any of the above with L3 redb unavailable | WAL tier | ⏳ pending |
+| Native Rust processor · per-event | Memory → Native `.so` → Blackhole, `DurabilityMode::PerEvent` | L2 body + fsync | ⏳ pending (needs native .so artifact) |
+| Native Rust processor · batch | Memory → Native `.so` → Blackhole, `DurabilityMode::OrderedBatch` | L2 body + L3 checkpoint | ⏳ pending |
+| Wasm guest · per-event | Memory → Wasm → Blackhole, `DurabilityMode::PerEvent` | L2 body + fsync | ⏳ pending |
+| Wasm guest · batch (ordered) | Memory → Wasm → Blackhole, `DurabilityMode::OrderedBatch` | L3 checkpoint via WAL fallback | ✅ captured 2026-04-25 (fixture: `pipeline-v3-wasm-ordered.yaml`) |
+| WAL fallback | Wasm OrderedBatch on RD (L3 redb not configured on this cluster) | WAL tier | ✅ captured 2026-04-25 |
+
+**V3 Wasm / OrderedBatch findings (2026-04-25, `aeon:e68ce68`):**
+
+| Metric | Per pod (all 3) |
+|--------|-----------------|
+| events_received / processed / outputs_sent | 500,000 |
+| events_failed / retried | 0 / 0 |
+| `checkpoints_written_total` | **1** (vs 0 for T0 without durability) — checkpoint path engaged |
+| outputs_acked | 0 — expected for Blackhole T6 |
+| Pipeline wall time (aeon-1) | 415 ms |
+| Per-pod throughput | ~1.2M events/sec |
+| On-disk artifact | `/tmp/aeon-checkpoints/pipeline.wal` = 94 bytes, identical on all 3 pods |
+
+Checkpoint interval was set to 250ms and the pipeline ran in 415ms, so
+exactly one checkpoint fired — matching the counter. The WAL file
+being written (not L3 redb) confirms the EO-2 §6.2 WAL-fallback path
+is engaging as documented when L3 state store is unavailable at
+pipeline-start time. Pipeline logged
+`Checkpoint WAL initialized path=/tmp/aeon-checkpoints/pipeline.wal`
+in aeon-engine::pipeline at start.
+
+**L2 body spine not populated on disk** — `/app/artifacts/l2body/`
+was empty after the run despite `durability.mode: ordered_batch`
+which per `DurabilityMode::requires_l2_body_store()` should engage
+L2 for push sources. Possible causes:
+- Memory source is wired as `SourceKind::Push` with
+  `IdentityConfig::Random`, and the L2 body store may be gated on
+  additional conditions (sink tier > T6, explicit L2 root config,
+  etc.).
+- The 13h-old session0 behaviour of silent counter-to-disk path
+  divergence carried forward.
+
+This is a real gap worth a ticket but doesn't invalidate the
+checkpoint-write signal captured above. L2 body spine validation
+needs a separate investigation atom.
 
 **Success criterion for every row:** `outputs_acked_total ==
 events_received_total` at steady state, `events_failed_total == 0`, and

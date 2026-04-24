@@ -1,0 +1,45 @@
+# V3 processor validation — Wasm passthrough + ordered_batch durability.
+#
+# Exercises the L2 body spine by forcing a durability mode that requires
+# event-body persistence. The Memory source is push-kind so the L2 body
+# store writes each event before acking the source (per
+# DurabilityMode::requires_l2_body_store documentation in
+# crates/aeon-types/src/durability.rs).
+#
+# Success signals:
+# - aeon_pipeline_events_received_total{pipeline="v3-wasm-ordered"} == count per pod
+# - aeon_l2_body_bytes_written counter non-zero (L2 spine engaged)
+# - aeon_pipeline_checkpoints_written_total non-zero (L3 checkpoint writes)
+# - events_failed_total == 0
+
+pipelines:
+  - name: v3-wasm-ordered
+    partitions: 4
+
+    durability:
+      mode: ordered_batch
+      checkpoint:
+        backend: state_store
+        interval: 250ms
+
+    sources:
+      - name: memory-synth
+        type: memory
+        kind: push
+        identity:
+          mode: random
+        event_time:
+          mode: aeon_ingest
+        count: "500000"
+        payload_size: "256"
+        batch_size: "1024"
+
+    processor:
+      name: passthrough
+      version: "1.0.0"
+      tier: wasm
+
+    sinks:
+      - name: blackhole-discard
+        type: blackhole
+        eos_tier: t6_fire_and_forget
