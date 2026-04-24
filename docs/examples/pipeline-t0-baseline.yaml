@@ -31,12 +31,14 @@ pipelines:
           mode: random
         event_time:
           mode: aeon_ingest
-        config:
-          # 0 = unbounded; cap via run duration instead of count so the
-          # sustained-sweep timing is deterministic across laptop reps.
-          count: "0"
-          payload_size: "256"
-          batch_size: "1024"
+        # Connector config is flattened directly onto the SourceManifest
+        # (not nested under a `config:` key). The manifest-to-pipeline
+        # bridge copies unknown-top-level keys through to the factory.
+        # 0 = unbounded; cap via run duration instead of count so the
+        # sustained-sweep timing is deterministic across laptop reps.
+        count: "0"
+        payload_size: "256"
+        batch_size: "1024"
 
     processor:
       name: passthrough

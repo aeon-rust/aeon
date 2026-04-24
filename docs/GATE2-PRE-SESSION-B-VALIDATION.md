@@ -121,18 +121,43 @@ expected shape from Session 0. No code gaps surfaced in the boot path.
 | Aggregate throughput | ~3.67M events/sec across 3-pod cluster (3M events / 817ms) |
 | `outputs_acked_total` | `0` on every pod — **expected**: Blackhole sink is `t6_fire_and_forget`, so no broker ack emission. Per-sink tier behaviour documented in `docs/EO-2-DURABILITY-DESIGN.md`. |
 
-**Bug flagged inline, not yet in a ticket:** the fixture's `count: "0"`
-(YAML string → factory `parse_usize` → `StreamingMemorySource::new(0, ...)`
-which the memory source treats as unbounded) did not reach the source
-constructor — events_received capped at exactly 1M, the factory's
-default. Most likely the `config` map's `count` key isn't surviving
-the `PipelineManifest::to_pipeline_definition()` bridge (serde_json
-`Value::String("0")` → `.to_string()` → `"\"0\""` → `trim_matches('"')`).
-Not blocking T0 today (1M-per-pod is plenty to measure throughput),
-but a proper 3-min sustained sweep needs `count: 0` honoured. Repro
-is trivial: run this fixture, observe events_received lands on 1M
-not open-ended. Fix is in the source-factory parse or the manifest
-bridge.
+**Bugs surfaced inline (captured 2026-04-24):**
+
+1. **Fixture `config:` nesting is wrong.** The first attempt used
+   `config: { count: "0", ... }` under the source. `SourceManifest`
+   has `#[serde(default, flatten)] pub config: BTreeMap<..>`, which
+   means connector keys live at the source's **top level**, not
+   nested under a `config:` key. When nested, the whole sub-object
+   ends up as a single entry `("config", <json object>)` in the
+   flattened map and `cfg.config.get("count")` returns `None` →
+   factory default 1M wins. Fix: `docs/examples/pipeline-t0-baseline.yaml`
+   now puts `count:` / `payload_size:` / `batch_size:` directly under
+   the source. Followup: the Kafka + compliance examples likely have
+   the same mistake — they haven't been live-tested yet.
+
+2. **Unbounded source crashes the 13h-old running image.** Second
+   T0 attempt with the fixed fixture (`count: "0"` unbounded) started
+   cleanly ("source re-assigned to partitions [2, 5, 8, 11]") and
+   then every pod exited within ~6 s with no diagnostic in the
+   tracing output (log stream just stops mid-stride). `kubectl get
+   pods` shows `RESTARTS` ticked from 1 → 2. The currently-running
+   image predates this session's SHA; the streaming Memory source's
+   unbounded path in that build may have an OOM / infinite-loop
+   regression that HEAD has since fixed, or the same bug persists.
+   Not investigated further because Blocker 0 (rebuild image from
+   HEAD) changes the code under test anyway.
+
+3. **Declared partition count vs. cluster partition table.** The
+   manifest declared `partitions: 4`, but the source got re-assigned
+   to `[2, 5, 8, 11]` — the pipeline inherited the cluster's 12-slot
+   partition table at apply time and node 3 owns every 3rd slot.
+   Minor surprise; documented so the next Gate 2 reader isn't
+   confused by the log output.
+
+Not blocking the **T0 headline number** above — that was the
+first-attempt 1M-per-pod bounded sweep and was clean from source to
+sink. A proper 3-min sustained sweep needs Blocker 0 resolved and
+bugs 1 + 2 closed.
 
 **V2 verdict:** T0 green with 3.67M/s aggregate on RD (no I/O, no
 broker). T2/T3/T4 still pending dedicated session; the unbounded-count
