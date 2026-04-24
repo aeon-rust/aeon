@@ -3840,12 +3840,12 @@ wiring tracked as TODO in each S-workstream.
 | **S1**  | Secret provider (Vault / AWS KMS+SM / env / .env-outside-deploy-dir), dual KEK domains (log-context vs data-context), envelope encryption, hot+cold rotation | **Closed 2026-04-22** |
 | **S9**  | Inbound connector auth — IP allow-list + API-key + HMAC-signed-request + mTLS on HTTP ingest / WebTransport / QUIC sources (JWT deferred to S9.2) | **Closed 2026-04-22** |
 | **S10** | Outbound connector auth — Bearer / Basic / API-key / HMAC-sign / mTLS credential injection on every client-side dial site | **Closed 2026-04-23** — primitives + HTTP + WebSocket + Kafka + Redis + NATS + Postgres-CDC + MySQL-CDC + Mongo-CDC broker-native + WebTransport sink HTTP/3 CONNECT header auth closed 2026-04-22; **WS/WT mTLS TLS-layer landed 2026-04-23** (task #34): WS sink+source route `Mtls` signer cert/key through a rustls `Connector` and `connect_async_tls_with_config`; shared `build_mtls_client_config` lives in `crates/aeon-connectors/src/websocket/mtls.rs`; WT sink exposes public helper `webtransport::mtls_client_config_from_signer(&signer) -> wtransport::ClientConfig` that bakes the identity via `ClientConfigBuilder::with_custom_tls`; WT source splits accept loop into pre-/post-handshake paths via `classify_auth_modes`, extracts peer-cert CN + SAN post-handshake via `aeon_crypto::tls::CertificateStore::parse_cert_subjects`, and feeds them to the S9 verifier for subject matching. aeon-cli factory wiring for WS / Redis / NATS / PG-CDC / MySQL-CDC / Mongo-CDC source/sink tracked under P5.c. |
-| S4      | Compliance mode manifest + enforcement (PCI-DSS, HIPAA, GDPR, generic)          | **In progress** — S4.1 primitives landed 2026-04-22; **S4.2 precondition validator closed 2026-04-23** (`aeon-engine::compliance_validator::validate_compliance` gates `PipelineSupervisor::start` on regime-driven encryption/retention/erasure preconditions); S4.3 CLI YAML surface + S4.4 docs remain |
+| S4      | Compliance mode manifest + enforcement (PCI-DSS, HIPAA, GDPR, generic)          | **Closed 2026-04-24** — S4.1 primitives landed 2026-04-22; S4.2 precondition validator closed 2026-04-23 (`aeon-engine::compliance_validator::validate_compliance` gates `PipelineSupervisor::start` on regime-driven encryption/retention/erasure preconditions); **S4.3 CLI YAML surface closed 2026-04-24** — `ComplianceBlock::validate_shape()` client-side sanity checks (empty selector path / zero erasure delay / GDPR 30-day SLA cap), `cmd_apply` dry-run + live preview print `, compliance: <regime>/<enforcement>`, 11 new integration tests in `crates/aeon-cli/tests/cli_compliance.rs`, reference YAMLs at `docs/examples/pipeline-compliance-{gdpr,pci}.yaml`. S4.4 docs absorbed into ROADMAP (2026-04-23 decision). |
 | S3      | L2 + L3 at-rest encryption (AES-256-GCM, per-segment DEK) + perf re-bench       | **Closed 2026-04-22** — S3.1 `EncryptionBlock` on manifest, S3.2 `AtRestCipher` primitive in `aeon-crypto::at_rest`, S3.3 L2 body sealed per-segment with `.l2b.meta` sidecar, S3.4 `EncryptedL3Store<S: L3Store>` wrapper in `aeon-state::l3_encrypted`, S3.5 pipeline-start probe (`aeon-engine::encryption_probe`), S3.6 re-bench group `eo2_l2_append_encrypted` (64B +1.09 µs / 256B +2.51 µs / 1024B +1.94 µs / 4096B +10.15 µs), S3.7 probe wired into `PipelineSupervisor::start` via `encryption` field on `PipelineDefinition` + `PipelineConfig.encryption_plan` + `set_data_context_kek` — `at_rest=required` without node KEK hard-refuses pipeline start |
 | S5      | Configurable retention — L2 body window + L3 ack window                         | **Closed 2026-04-23** — S5.1 `RetentionBlock` on manifest (`l2_body.hold_after_ack` string + `l3_ack.max_records` u32, both inert by default, nested under `DurabilityBlock`), S5.2 `L2BodyConfig.gc_min_hold` + `PipelineL2Registry::with_gc_min_hold` — `L2BodyStore::gc_up_to` stamps first-seen-eligible `Instant` per segment and defers `remove_file` until the hold elapses (`gc_up_to_at` test seam accepts explicit `now`), S5.3 `L3CheckpointStore::with_max_records` — `append` purges ids below `next - max` via `BatchOp::Delete` after every write, S5.4 pipeline-start probe (`aeon-engine::retention_probe`) parses `"300s"/"5m"/"1h"/"250ms"` with a clear `config(...)` refusal on malformed input; wired into `PipelineSupervisor::start` via `PipelineConfig.retention_plan` — `L3CheckpointStore` receives the cap at construction time, S5.5 5+3+4+11+3 tests across retention/L2/L3/probe/supervisor all green |
 | S6      | GDPR subject-id (metadata `aeon.subject_id`, multi-value `ns/id`) + erasure API + PoH null-receipt + right-to-export | **Closed 2026-04-23** — S6.1 `aeon-types::subject_id` (`SubjectId`, `MAX_COMPONENT_LEN`, `METADATA_KEY_SUBJECT_ID`, `collect_subject_ids` / `try_collect_subject_ids` / `validate_namespace_for_wildcard`), S6.2 erasure API (`aeon-types::erasure::{ErasureRequest, ErasureSelector, ErasureTombstone, TombstoneState}`), S6.3 tombstone store (`aeon-engine::erasure_store`), S6.4 right-to-export (`aeon-engine::subject_export` scans across L2 segments), S6.5 subject-id deny-list enforced via `aeon-types::redact::METADATA_REDACT_DENYLIST` + `is_redacted_metadata_key` + `redact_metadata_value`, S6.6 extractor config via `SubjectExtractConfig` on manifest, S6.7 `ErasurePolicy` in `aeon-engine::erasure_policy`, S6.8 PoH null-receipt primitive (`aeon-crypto::null_receipt`), S6.9 pipeline-start probe (`aeon-engine::erasure_probe`) wired into `PipelineSupervisor::start` |
 | S1.4    | HSM / PKCS#11 trait stub (trait-now-driver-later)                                | **Closed 2026-04-23** — `aeon-crypto::hsm::HsmClient` trait stub landed; driver impls deferred until a concrete HSM backend is selected |
-| S2.5    | Audit log channel separate from data-path tracing                                | **Closed 2026-04-23** — `aeon-types::audit::{AuditEvent, AuditCategory, AuditOutcome, AuditSink}` + `aeon-observability::audit` channel carry audit emissions on a subscriber separate from the `tracing` data-path spans. Call-site emission wiring (auth rejections, KEK rotation, erasure requests, compliance refusals) remains a follow-up — captured inline in each S-workstream's code as TODO |
+| S2.5    | Audit log channel separate from data-path tracing                                | **Fully closed 2026-04-24** — primitives landed 2026-04-23 (`aeon-types::audit::{AuditEvent, AuditCategory, AuditOutcome, AuditSink}` + `aeon-observability::audit` channel). **Call-site emission wiring closed 2026-04-24**: `aeon_observability::{emit_audit, emit_auth_rejected, now_unix_nanos}` re-exported at the crate root; wired at inbound auth rejections (HTTP webhook + QUIC + WebTransport source + WebTransport datagram, 4 call sites), KEK unwrap failures (`KekHandle::unwrap_dek` domain mismatch / unknown kek id / AEAD decrypt failure — active + previous), erasure request accept (`L3ErasureStore::append`), compliance refusal (`PipelineSupervisor::start` after `validate_compliance` abort). `aeon-observability` added as a regular dep on `aeon-crypto` + `aeon-connectors`; promoted from dev-dep to regular dep on `aeon-engine`. |
 | CL-6c.4 | Engine-side write-freeze + buffer-and-replay integration                         | **Closed 2026-04-23** — `crates/aeon-engine/src/engine_providers.rs` ships the production provider trio: `L2SegmentTransferProvider` (impls `aeon_cluster::PartitionTransferProvider` via `PipelineL2Registry::partition_dir` + `SegmentReader`) and `PohChainExportProvider` (impls `aeon_cluster::PohChainProvider` via `LivePohChainRegistry::get` → `tokio::sync::Mutex<PohChain>::lock().await.export_state()`). `LivePohChainRegistry` added to `partition_install.rs`; `create_poh_state` registers the live chain on both fresh-genesis and G11.c resume paths. `PipelineSupervisor` owns the registry and hands its Arc to every pipeline via `PipelineConfig.poh_live_chains`; `stop()` removes the pipeline's entries. `PohChainProvider::export_state` lifted sync→async so impls can await a tokio mutex. `aeon-cli`'s `install_partition_transfer_driver` now installs all three providers (segment + PoH + `EngineCutoverCoordinator`) into `ClusterNode::source_provider_slots` after bootstrap. 5 new `engine_providers` unit tests + 4 new `LivePohChainRegistry` unit tests + existing 3-node partition-transfer / full-handover integration tests all green. G2 leader-side transfer driver is now wired end-to-end (target pulls L2 + PoH, source freezes via coordinator). |
 
 **S8 — closed 2026-04-21**, three sub-items:
@@ -4284,14 +4284,25 @@ YAML**. Shared HMAC helper + header-parse primitives come from S9.
   Commits: `e2e7a18` (subject extractor) · `d4c2f2e` (WS sink) ·
   `17badf9` (WS source + shared mtls helper) · `f553d9e` (WT sink
   builder helper) · `53258a5` (WT source post-handshake subjects).
-- **Remaining S10 work:** Redis `tls-rustls` feature +
-  `redis::TlsCertificates` wiring for mTLS; NATS mTLS via in-memory
-  PEM or secure ramfs; Postgres mTLS via `tokio-postgres-rustls`;
-  MySQL mTLS via `native-tls-tls`/`rustls-tls` feature toggle;
-  MongoDB mTLS via tempfile or driver patch; aeon-cli YAML factory
-  wiring for WebSocket / Redis / NATS / PG-CDC / MySQL-CDC /
-  Mongo-CDC source/sink (tracked under P5.c — not-yet-registered
-  connectors).
+- **S10 mTLS for all five remaining connectors closed 2026-04-24:**
+  Redis (`tls-rustls` feature + `Client::build_with_tls` inline
+  `TlsCertificates`, auto-upgrade to `rediss://`); NATS
+  (`ConnectOptions::tls_client_config(rustls::ClientConfig)` via the
+  new shared helper `mtls_pem::build_mtls_client_config`, no
+  tempfile); Postgres-CDC (`tokio-postgres-rustls::MakeRustlsConnect`
+  on the rustls `ClientConfig`, branched in `source::establish()`);
+  MySQL-CDC (`mysql_async` `default-rustls` feature +
+  `SslOpts::with_client_identity(ClientIdentity::new(cert.into(),
+  key.into()))` via `From<Vec<u8>> for PathOrBuf<'static>`);
+  MongoDB-CDC (process-owned `SecureMtlsTempFile` at 0600 perms on
+  Unix / owner-only ACL on Windows, held by the source struct so
+  driver reconnects keep working, zeroised on drop). Tests: 3 Redis
+  mTLS + 2 NATS + 2 Postgres + 1 MySQL + 1 Mongo + 3 tempfile
+  lifecycle = **12 new unit tests**, all green across the
+  combined-feature clippy gate.
+- **Remaining S10 work:** aeon-cli YAML factory wiring for WebSocket /
+  Redis / NATS / PG-CDC / MySQL-CDC / Mongo-CDC source/sink (tracked
+  under P5.c — not-yet-registered connectors).
 
 **S4 — in progress**, per-pipeline compliance declaration + enforcement
 (PCI-DSS, HIPAA, GDPR, mixed). YAML surface:
@@ -4338,10 +4349,25 @@ separate future initiative.
   S6 subject-id plumbing + erasure API wiring. Wired into
   `PipelineSupervisor::start` before any task spawns — `strict` hard-
   refuses pipeline start with a structured finding list.
-- **S4.3 CLI YAML surface pending** — aeon-cli reader for the
-  `compliance:` block (struct already serde-wired; needs CLI
-  integration tests covering the regime × enforcement × probes
-  matrix + doc examples).
+- **S4.3 closed (2026-04-24)** — `ComplianceBlock::validate_shape()`
+  lands in `aeon-types/src/compliance.rs` (7 unit tests: default inert,
+  well-formed gdpr/strict, empty selector path, zero erasure delay,
+  GDPR 30-day SLA cap under strict, warn-lenience, non-erasure-regime
+  lenience). Hooked into `validate_pipeline_shape()` in
+  `aeon-types/src/manifest.rs` so `cmd_apply` / `cmd_diff` refuse
+  malformed blocks before any REST round-trip. `cmd_apply` prints a
+  `, compliance: <regime>/<enforcement>` tag next to pipeline status
+  for active blocks; default (inert) blocks stay visually quiet.
+  New integration-test file `crates/aeon-cli/tests/cli_compliance.rs`
+  (11 tests) covers: dry-run tag visibility, default-block quiet,
+  POST-body regime × enforcement matrix (pci/warn, hipaa/strict,
+  gdpr/strict, mixed/warn), selectors round-trip through YAML → REST
+  payload (pii/phi × json/message_pack), erasure override
+  round-trip, empty-selector-path fails before network, oversized
+  GDPR SLA fails before network, env-var interpolation inside the
+  compliance block (`${ENV:REGIME}`). Reference manifests landed at
+  `docs/examples/pipeline-compliance-gdpr.yaml` +
+  `pipeline-compliance-pci.yaml`.
 - **S4.4 docs** — COMPLIANCE.md deferred; absorbed into the consolidated
   ROADMAP reference section above (light-pass decision, 2026-04-23).
 
@@ -4358,3 +4384,57 @@ S1, S3–S6 workstreams are tracked against the design decisions locked in memor
 `project_security_compliance_design.md` (dual KEK, envelope encryption, hot
 rotation default, metadata-convention subject-ids, PoH null-receipt for
 GDPR-erased events, inbound/outbound connector auth, etc.).
+
+## Session Plan — 2026-04-24 (S4.3 → S10 mTLS → P5.c → S2.5 → Pre-Session-B V2–V6)
+
+Active session closing out the remaining open rows on the S-sequence, wiring
+P5.c factories, and completing the Rancher Desktop (Session 0) validation
+matrix before the DOKS re-spin. Broken down into five phases, each committed
+independently once tests are green.
+
+| Phase | ID                                | Status        | Notes |
+|-------|-----------------------------------|--------------:|-------|
+| 1     | **S4.3** aeon-cli compliance surface | ✅ closed 2026-04-24 | `ComplianceBlock::validate_shape()` + `validate_pipeline_shape()` hook + dry-run preview tag + 11 integration tests in `cli_compliance.rs` + `docs/examples/pipeline-compliance-{gdpr,pci}.yaml`. Full detail in the Security/Compliance index above. |
+| 2     | **S10 mTLS** Redis                | ✅ closed 2026-04-24 | `tls-rustls` + `tokio-rustls-comp` + `tls-rustls-webpki-roots` features on the workspace `redis` dep; `Client::build_with_tls(info, TlsCertificates { client_tls: Some(ClientTlsConfig { cert_pem, key_pem }), root_cert: None })` bridge in `redis_streams::auth::build_mtls_client`; auto-upgrade `redis://` → `rediss://` on mTLS since the redis crate refuses non-TLS schemes. 3 new mTLS unit tests on top of the 7 existing. Source + sink share the path via `resolve_client(url, signer) -> redis::Client`. |
+| 2     | **S10 mTLS** NATS                 | ✅ closed 2026-04-24 | `async-nats 0.38` exposes `ConnectOptions::tls_client_config(rustls::ClientConfig)` — in-memory rustls config, no tempfile required. PEM → `rustls::ClientConfig` lives in the new shared helper `aeon-connectors::mtls_pem::build_mtls_client_config` (lifted out of `websocket::mtls`). `require_tls(true)` is flipped so plaintext fallback is rejected. 2 new mTLS unit tests (`tls_client_config` attached via Debug trait assertion + malformed-PEM rejection). Cargo feature `nats` now pulls `rustls`, `rustls-pemfile`, `webpki-roots`. |
+| 2     | **S10 mTLS** Postgres-CDC         | ✅ closed 2026-04-24 | New workspace dep `tokio-postgres-rustls = "0.13"`; `postgres_cdc::auth::resolve_config` now returns `(Config, Option<rustls::ClientConfig>)`. Source's `establish()` branches: `Some(tls)` → `MakeRustlsConnect::new(tls)` + `Config::connect(connector)`, `None` → `NoTls`. Shared PEM helper reused. 2 new mTLS unit tests (rustls_client_config produced, malformed-PEM rejection). Cargo feature `postgres-cdc` pulls `rustls`, `rustls-pemfile`, `webpki-roots`. |
+| 2     | **S10 mTLS** MySQL-CDC            | ✅ closed 2026-04-24 | Workspace `mysql_async = { default-features = false, features = ["default-rustls"] }` — default feature set includes `native-tls-tls`, mutually exclusive with `rustls-tls`, so opt-in explicitly. `SslOpts::default().with_client_identity(ClientIdentity::new(cert_pem.into(), key_pem.into()))` — `From<Vec<u8>> for PathOrBuf<'static>` is the inline-PEM escape hatch; no tempfile needed. 1 new mTLS unit test (SslOpts carries ClientIdentity). **Known upstream limitation**: mysql_async 0.34's rustls path loads only RSA private keys at connect time — Ed25519/ECDSA client keys need an upstream patch. |
+| 2     | **S10 mTLS** Mongo-CDC            | ✅ closed 2026-04-24 | `mongodb 3.5` `TlsOptions::cert_key_file_path` takes a PathBuf only, no inline-PEM accessor. New module `mongodb_cdc::mtls_tempfile::SecureMtlsTempFile` materialises `cert_pem \n key_pem` to a process-owned `NamedTempFile` (0600 on Unix via `set_permissions`, owner-only ACL on Windows via `tempfile` defaults), hands the path to `TlsOptions`, and lives on the `MongoDbCdcSource` struct so driver reconnects don't lose the file. Drop impl zeroises the bytes before unlink. `resolve_client(...) -> (mongodb::Client, Option<SecureMtlsTempFile>)`. 3 new tempfile unit tests (create/drop, cert-then-key concatenation, 0600 perms on Unix) + 1 new auth mTLS test (tempfile path wired into `Tls::Enabled(TlsOptions)`). Cargo feature `mongodb-cdc` pulls `tempfile`. |
+| 3     | **P5.c** aeon-cli factories       | ✅ closed 2026-04-24 | 9 new factories in `aeon-cli/src/connectors.rs` (WebSocket src+sink, Redis-Streams src+sink, NATS src+sink, Postgres-CDC src, MySQL-CDC src, MongoDB-CDC src). YAML keys registered: `websocket`, `redis-streams`, `nats`, `postgres-cdc`, `mysql-cdc`, `mongodb-cdc`. All reuse the existing `build_outbound_auth_signer` / `parse_ssrf_policy` / `parse_strategy` helpers; async constructors go through `tokio::task::block_in_place(|| handle.block_on(...))` (same shape as the HTTP-webhook factory). Cargo feature set on the `aeon-connectors` dep now includes `websocket`, `redis-streams`, `nats`, `postgres-cdc`, `mysql-cdc`, `mongodb-cdc`. All 52 bin tests + 11 compliance integration tests still green, clippy clean across the workspace. |
+| 4     | **S2.5** Auth audit (S9)          | ✅ closed 2026-04-24 | New `aeon_observability::emit_auth_rejected(resource, reason_tag, peer)` helper (plus `now_unix_nanos()` and re-exports at the crate root). Wired at all 4 inbound verifier reject paths: HTTP webhook `log_rejection`, QUIC source, WebTransport source (pre-handshake + post-handshake), WebTransport datagram source. Resources use namespaced form (`http-webhook/<source>`, `quic/<source>`, `webtransport/<source>`, `webtransport-mtls/<source>`, `webtransport-dgram/<source>`). `aeon-observability` added as a regular dep on `aeon-connectors`. |
+| 4     | **S2.5** Key audit (S1)           | ✅ closed 2026-04-24 | `KekHandle::unwrap_dek` emits on every failure path — domain mismatch, unknown kek id, AEAD decrypt failure on active or previous key. Stable action tags (`kek.unwrap.denied` / `kek.unwrap.failed`), category Key, resource `kek/<domain>/<kek_id>`. Success paths intentionally NOT audited — every encrypted L2/L3 read would fire; too noisy for the audit channel. `wrap_new_dek` / `wrap_dek` success are also quiet (future rotation atom can audit explicit rotate events separately). `aeon-observability` added as a regular dep on `aeon-crypto`. |
+| 4     | **S2.5** Erasure audit (S6)       | ✅ closed 2026-04-24 | `L3ErasureStore::append` emits `erasure.request.accepted` with category Erasure + resource `pipeline/<name>` + details `tombstone_id` + `selector_kind` (`subject` / `namespace`). Subject id is deliberately NOT included — it's a regulated identifier and the tombstone uuid is sufficient for cross-reference. |
+| 4     | **S2.5** Compliance audit (S4)    | ✅ closed 2026-04-24 | `PipelineSupervisor::start` audits the refusal path on `validate_compliance(...)` → Err, BEFORE remapping to `AeonError::config`. Category Compliance, outcome Denied, resource `pipeline/<name>`, details `regime` + `enforcement`. `aeon-observability` promoted from dev-dep to regular dep on `aeon-engine`. |
+| 5     | **V1** cluster baseline on RD     | ✅ shipped 2026-04-24 | Existing 3-pod `aeon` StS + Redpanda on Rancher Desktop k3s re-verified: all pods `1/1 Running`, `aeon-0.1.0` Helm chart at revision 2, `/metrics` serving full EO-2 counter set, `/api/v1/cluster/status` shows 3-node Raft membership (leader node 3, term 2), 12 partitions balanced 4/4/4 across owners. |
+| 5     | **V2** T0/T2/T3/T4 on RD          | 🟡 scaffolded 2026-04-24 | Run plan + exact commands captured in `docs/GATE2-PRE-SESSION-B-VALIDATION.md` § V2. Execution requires dedicated 1–2h session against the live RD cluster — not yet run. T5/T6 explicitly deferred to DOKS re-spin (Chaos Mesh). Issue #80. |
+| 5     | **V3** Processor validation       | 🟡 scaffolded 2026-04-24 | Test matrix (native per-event / native batch / Wasm per-event / Wasm batch / WAL fallback) scoped in `GATE2-PRE-SESSION-B-VALIDATION.md` § V3. Fixture YAMLs not yet landed. Issue #81. |
+| 5     | **V5** Crypto chain E2E           | 🟡 scaffolded 2026-04-24 | Plan in `GATE2-PRE-SESSION-B-VALIDATION.md` § V5 — walk a transferred partition under each `PohVerifyMode::{Verify, VerifyWithKey, TrustExtend}` and assert MMR + Merkle + Ed25519 root-sig round-trips. Depends on a small REST addition for `/api/v1/pipeline/<name>/poh-head` (tracked inline). Issue #83. |
+| 5     | **V6** Consolidated report        | ✅ closed 2026-04-24 | `docs/GATE2-PRE-SESSION-B-VALIDATION.md` shipped — V1 signed off (cluster baseline), V2/V3/V5 run plans captured with explicit commands, T5/T6-on-RD gap carried forward to DOKS re-spin with Chaos Mesh, Session-B readiness checklist + 4-item gap list populated. Back-propagates the DOKS token-rotation + Block-Storage teardown warnings from memory. Issue #84. |
+
+**Phase order:** 1 → 2 → 3 → 4 → 5. Within Phase 2, the five mTLS wirings are
+independent and could parallelise but are executed sequentially to keep diffs
+review-sized. Phase 5 depends on a running Rancher Desktop + `helm/aeon`
+install; prerequisite verified at phase entry.
+
+**Commit discipline:** one phase = one commit (or small group of commits when
+a phase has multiple independent sub-units, e.g. Phase 2). Every commit
+passes `cargo clippy --workspace -- -D warnings` and relevant test suites
+before landing.
+
+### Post-phase cross-cutting fix: rustls CryptoProvider selection (2026-04-24)
+
+Phase 2's S10 mTLS feature additions (Redis `tls-rustls`, MySQL
+`default-rustls`) pulled `aws-lc-rs` into the workspace graph alongside
+the pre-existing `ring` used by aeon-crypto / quinn / tokio-rustls.
+rustls auto-select panics when more than one provider is linked and
+none is installed as the process default. Fix:
+`rustls::crypto::ring::default_provider().install_default()` is called
+at the entry of every mTLS client/server config builder — `aeon-crypto::tls`
+(4 call sites: `build_mtls_server_config` / `build_tls_server_config`
+/ `build_mtls_client_config` / `build_tls_client_config` / the
+connector-TLS builder), `aeon-connectors::mtls_pem::build_mtls_client_config`
+(shared PEM helper consumed by WS / WT / NATS / Postgres), and
+`aeon-connectors::quic::tls::dev_quic_configs` (the dev-cert QUIC
+bootstrap). Idempotent via `.ok()` — safe on repeated calls and across
+threads. Restores 9 previously-failing aeon-crypto + aeon-connectors
+tests to green; zero clippy warnings workspace-wide.
