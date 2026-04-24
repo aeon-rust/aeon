@@ -229,14 +229,96 @@ v3-wasm-ordered, pipeline-compliance-*) fall into this bucket
 because none of them opt into PoH via a `durability.poh` block or
 similar.
 
-**Fix candidates (not landed this session)**:
-1. `PohChainExportProvider::export_state` returns
-   `Ok(PohChainState::empty())` when no chain is registered instead
-   of Err; target accepts and skips PoH resume.
-2. `drive_poh_chain_transfer` short-circuits when the source
-   advertises "no PoH for this partition" at the request phase.
-3. Dispatcher-level: inspect pipeline config at transfer-plan time
-   and skip the PoH leg when `durability.poh` is not enabled.
+**Fix landed 2026-04-25 (commit `7d3fc3b`, image `aeon:7d3fc3b`)**
+— variant of candidate #1: `PohChainExportProvider::export_state` now
+returns `Ok(Vec::new())` when the `LivePohChainRegistry` lookup misses
+(instead of `Err`), and `aeon_cluster::partition_driver::drive_one`
+short-circuits the `poh_installer.install` call when
+`poh_bytes.is_empty()`. The empty response is the wire-protocol
+sentinel for "this pipeline has no PoH leg on this partition; skip
+install and continue to cutover".
+
+**Re-test on `aeon:7d3fc3b` (2026-04-25):** PoH no longer blocks —
+logs confirm the fix landed (no more `no live chain registered`
+errors). The next layer down surfaced a related cutover-coordinator
+bug; same empty-sentinel pattern applied in commit `30bdf2d` (image
+`aeon:30bdf2d`):
+
+`EngineCutoverCoordinator::drain_and_freeze` returns sentinel
+offsets (`final_source_offset = -1`, `final_poh_sequence = 0`)
+when no `WriteGate` is registered for `(pipeline, partition)` —
+the pipeline isn't running on this node so there's nothing to
+drain and no real offset to communicate. Mirror of the
+`PohChainExportProvider` empty-bytes sentinel.
+
+**Re-test on `aeon:30bdf2d` (2026-04-25):** **Drain is functionally
+working** — node 1 went from 4 partitions to **0** within seconds:
+
+```
+=== drain accepted: 4 partitions ===
+=== status after +5s ===
+      4 "owner": 2     ← node 2 picked up 4 (total 8 → 4 → 4 stable)
+      6 "owner": 3     ← node 3 picked up 6 (total 8 → 6 stable)
+     10 "status": "owned"
+      2 "status": "transferring"
+```
+
+But 2 of the 4 transfers are stuck in `transferring` for a
+**different** root cause now visible in the logs:
+
+```
+aeon-1 (node 2): partition-driver: drive_one failed partition=0
+  error=cluster error: partition-driver:
+  CompleteTransfer propose failed:
+  has to forward request to:
+    Some(3),
+    Some(NodeAddress { host: "aeon-2.aeon-headless...", port: 4470 })
+```
+
+**Third bug, structural / design-level**: the partition driver runs
+on **every** node (each node owns its own L2 segments, so the
+source pod has to drive its own transfers). At the final
+`CompleteTransfer` Raft propose step, the driver calls
+`self.raft.client_write()` directly. openraft's `client_write`
+returns `ForwardToLeader` from a follower instead of auto-
+forwarding. So 2 of the 4 transfers — those whose source pod is
+the current leader — succeed; the other 2 fail at the Raft
+propose step.
+
+**Why partial?** Only the source pod that *also happens to be the
+leader* can propose `CompleteTransfer` locally. In this run
+node 3 is leader, and node 1 is being drained — so node 1 (a
+follower) handles all 4 transfers and fails the propose 4 times.
+The 2 that "succeed" on the visible counter actually got picked
+up by another mechanism (probably the leader's watch_loop seeing
+the stuck `Transferring` state and proposing the complete itself).
+
+**Fix shape (not landed in this session)**: at the
+`CompleteTransfer` propose call site in
+`aeon_cluster::partition_driver::drive_one`, when the propose
+returns `ForwardToLeader`, RPC the request over the existing
+QUIC transport to the named leader. The address is in the error
+itself. `aeon_cluster::node::propose_partition_transfer` already
+gates on `is_leader()` and returns `NotLeader { current_leader }`
+to the caller — but that's a *different* propose path; the
+`drive_one` propose has no leader-check and no forwarder.
+
+**Severity**: this gates T3 drain end-to-end and any
+`aeon cluster transfer-partition` invoked from a non-leader pod.
+T4 manual cutover is the same code path. The fix is mechanical
+once the forwarding helper exists; the design question is whether
+to:
+1. Add a forwarder in `node.rs` that wraps `client_write` and
+   transparently RPCs to leader on `ForwardToLeader`. Reusable
+   by every other propose-from-driver site.
+2. Change `partition_driver` to drive the propose only on the
+   leader (it already has access to `is_leader()` via
+   `node.is_leader()`). The source pod still copies bytes, but
+   the leader's driver is the one that proposes Complete after
+   the source signals "transfer done".
+
+Option 1 is smaller. Option 2 is cleaner but moves the
+choreography across more files.
 
 Recovery: `kubectl delete pod aeon-{0,1,2}` forces a re-bootstrap
 that clears the stuck transferring state.
