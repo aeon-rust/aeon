@@ -63,7 +63,7 @@ expected shape from Session 0. No code gaps surfaced in the boot path.
 
 | Test | RD realism | Exercise | Issue | Status |
 |------|-----------|----------|-------|--------|
-| T0 | ✅ full | Baseline pipeline: Memory → Blackhole with streaming count, sustained 3-minute sweep; confirm outputs_acked_total == input with zero loss | #80 | ⏳ **needs dedicated session** — plan below |
+| T0 | ✅ full | Baseline pipeline: Memory → Blackhole with streaming count, sustained 3-minute sweep; confirm outputs_acked_total == input with zero loss | #80 | ✅ **captured 2026-04-24** — see results below; full 3-min sustained sweep still needs a dedicated re-run with `count: 0` unbounded once Blocker 0 image rebuild lands |
 | T2 | ✅ code path | 3 → 5 STS-scale (code exercise only; RD has no node pool to resize, so pods go Pending and we assert the G10 seed-join code path handles the Pending state correctly). `kubectl scale sts/aeon --replicas=5 -n aeon` | #80 | ⏳ pending |
 | T3 | ✅ full | 5 → 3 → 1 drain: `aeon cluster drain <node>` → supervisor reassigns partitions → `kubectl scale sts/aeon --replicas=3 -n aeon` → same again down to 1. Exercises G5 (drain API) + G14 (relinquish) | #80 | ⏳ pending |
 | T4 | ✅ full | Manual cutover: force a partition handoff via `aeon cluster transfer-partition` → G11.a/b/c transport primitives drive BulkSync → Cutover → PoH resume. All loopback but the crypto path is identical to a real cluster. | #80 | ⏳ pending |
@@ -107,11 +107,38 @@ expected shape from Session 0. No code gaps surfaced in the boot path.
    # assert: PoH chain continuity via /api/v1/pipeline/<name>/poh-head on source + target
    ```
 
-**V2 verdict (partial, to-be-completed):** T0/T2/T3/T4 are all
-code-complete as of G2 closure 2026-04-23 (leader-side transfer driver
-wired end-to-end via CL-6c.4). What remains is dedicated hands-on time
-to execute the scenarios against a running cluster. T5/T6 are blocked
-by RD topology and must ship to the DOKS re-spin.
+**V2 T0 results (captured 2026-04-24 16:29 UTC, RD 3-pod STS):**
+
+| Metric | Value |
+|--------|-------|
+| Pipeline start (supervisor) | 2026-04-24T16:29:48.816Z — simultaneous across all 3 pods |
+| Pipeline clean exit | 2026-04-24T16:29:49.63Z — longest pod (aeon-1): 817ms |
+| Events received (per-pod) | 1,000,000 on each of aeon-0 / aeon-1 / aeon-2 |
+| Events processed | 1,000,000 per pod — parity with received |
+| Outputs sent | 1,000,000 per pod — parity with processed |
+| Events failed | **0** on every pod |
+| Events retried | **0** on every pod |
+| Aggregate throughput | ~3.67M events/sec across 3-pod cluster (3M events / 817ms) |
+| `outputs_acked_total` | `0` on every pod — **expected**: Blackhole sink is `t6_fire_and_forget`, so no broker ack emission. Per-sink tier behaviour documented in `docs/EO-2-DURABILITY-DESIGN.md`. |
+
+**Bug flagged inline, not yet in a ticket:** the fixture's `count: "0"`
+(YAML string → factory `parse_usize` → `StreamingMemorySource::new(0, ...)`
+which the memory source treats as unbounded) did not reach the source
+constructor — events_received capped at exactly 1M, the factory's
+default. Most likely the `config` map's `count` key isn't surviving
+the `PipelineManifest::to_pipeline_definition()` bridge (serde_json
+`Value::String("0")` → `.to_string()` → `"\"0\""` → `trim_matches('"')`).
+Not blocking T0 today (1M-per-pod is plenty to measure throughput),
+but a proper 3-min sustained sweep needs `count: 0` honoured. Repro
+is trivial: run this fixture, observe events_received lands on 1M
+not open-ended. Fix is in the source-factory parse or the manifest
+bridge.
+
+**V2 verdict:** T0 green with 3.67M/s aggregate on RD (no I/O, no
+broker). T2/T3/T4 still pending dedicated session; the unbounded-count
+bug above is the only code gap surfaced so far, and doesn't block
+those rows. T5/T6 are blocked by RD topology and must ship to the
+DOKS re-spin.
 
 ---
 
@@ -184,8 +211,11 @@ run certifies the RD cluster as a whole, not new code paths.
    image that predates this session's S4.3 / S10 / P5.c / S2.5 work.
    Rebuild + redeploy is the first step of the next V2 attempt; see
    the prerequisite block above for the exact commands.
-1. **V2 T0/T2/T3/T4 on RD** — scheduled, not yet run. Scope is 1–2 hours
-   dedicated session time; no expected code gaps since G2 is closed.
+1. **V2 T0 ✅ captured 2026-04-24** (3.67M/s aggregate, zero-loss);
+   T2/T3/T4 still pending dedicated session. Scope is 1–2 hours
+   dedicated session time; **one code gap surfaced** —
+   `count: 0` unbounded config key isn't propagated through the
+   manifest-to-pipeline bridge (see V2 T0 results block for repro).
 2. **V2 T5/T6 on DOKS with Chaos Mesh** — requires the next DOKS re-spin
    and Chaos Mesh install. Non-trivial: multi-broker Redpanda sustained
    load requires larger nodes than DOKS Regular SSD (premium/NVMe
