@@ -66,7 +66,7 @@ expected shape from Session 0. No code gaps surfaced in the boot path.
 |------|-----------|----------|-------|--------|
 | T0 | ✅ full | Baseline pipeline: Memory → Blackhole with streaming count, sustained 3-minute sweep; confirm outputs_acked_total == input with zero loss | #80 | ✅ **captured 2026-04-24** — see results below; full 3-min sustained sweep still needs a dedicated re-run with `count: 0` unbounded once Blocker 0 image rebuild lands |
 | T2 | ✅ code path | 3 → 5 STS-scale (code exercise only; RD has no node pool to resize, so pods go Pending and we assert the G10 seed-join code path handles the Pending state correctly). `kubectl scale sts/aeon --replicas=5 -n aeon` | #80 | ⏳ pending |
-| T3 | ✅ full | 5 → 3 → 1 drain: `aeon cluster drain <node>` → supervisor reassigns partitions → `kubectl scale sts/aeon --replicas=3 -n aeon` → same again down to 1. Exercises G5 (drain API) + G14 (relinquish) | #80 | ⏳ pending |
+| T3 | ✅ full | 5 → 3 → 1 drain: `aeon cluster drain <node>` → supervisor reassigns partitions → `kubectl scale sts/aeon --replicas=3 -n aeon` → same again down to 1. Exercises G5 (drain API) + G14 (relinquish) | #80 | 🔴 **bug surfaced 2026-04-25** — see below |
 | T4 | ✅ full | Manual cutover: force a partition handoff via `aeon cluster transfer-partition` → G11.a/b/c transport primitives drive BulkSync → Cutover → PoH resume. All loopback but the crypto path is identical to a real cluster. | #80 | ⏳ pending |
 | T5 | ❌ not realistic on single-node RD | NetworkChaos split-brain between peer pods is meaningless when all pods share the host kernel | #80 | ❌ **deferred to DOKS re-spin with Chaos Mesh** |
 | T6 | ❌ not realistic on single-node RD | Multi-node chaos (random pod kills under load) needs a real node pool to reveal node-local state vs cluster-replicated state regressions | #80 | ❌ **deferred to DOKS re-spin with Chaos Mesh** |
@@ -186,11 +186,67 @@ first-attempt 1M-per-pod bounded sweep and was clean from source to
 sink. A proper 3-min sustained sweep needs Blocker 0 resolved and
 bugs 1 + 2 closed.
 
-**V2 verdict:** T0 green with 3.67M/s aggregate on RD (no I/O, no
-broker). T2/T3/T4 still pending dedicated session; the unbounded-count
-bug above is the only code gap surfaced so far, and doesn't block
-those rows. T5/T6 are blocked by RD topology and must ship to the
-DOKS re-spin.
+**V2 T3 drain attempt (2026-04-25, `aeon:e68ce68`, `t0-baseline`
+pipeline running):**
+
+```
+$ aeon cluster drain --node 1
+{ "status": "accepted", "planned": 4, "accepted": 4, ... }
+```
+
+Before: 4/4/4 partitions on nodes 1/2/3. After ~30s: 2/4/4 with
+**2 partitions stuck in `status: "transferring"` indefinitely**.
+
+Log snippet from aeon-1 (leader) + aeon-2 (target for stuck pair):
+
+```
+aeon-1: partition-driver: transfer aborted, ownership reverted
+        partition=0 source=1 reason=poh-chain transfer failed:
+        cluster error: poh-transfer: remote reported failure:
+        state error: poh-export: no live chain registered for
+        pipeline 't0-baseline' partition 0
+
+aeon-2: partition-driver: AbortTransfer propose failed
+        partition=3 source=1 error=has to forward request to:
+        Some(2) ... (retried every 500 ms, never commits)
+```
+
+**Root cause**: CL-6c.4's `PohChainExportProvider::export_state` is
+unconditionally invoked as part of the partition transfer handshake.
+When the pipeline doesn't have PoH enabled (e.g. t0-baseline here —
+the Memory source is push-kind with DurabilityMode::OrderedBatch at
+most, no PoH wiring) the provider returns a "no live chain"
+state-error, the remote target treats it as a terminal transfer
+failure, and the source-side `AbortTransfer` Raft propose fails
+because it ran from a non-leader pod (node 3 → needs forwarding to
+node 2). The resulting state: partition flagged `transferring`,
+both sides stuck, `rebalance` sees it as "unbalanced by 2 but we
+have in-flight transfers" and noops.
+
+**Impact**: T3 drain is **unusable for pipelines without PoH
+enabled**. All current fixture examples (t0-baseline, t0-redpanda,
+v3-wasm-ordered, pipeline-compliance-*) fall into this bucket
+because none of them opt into PoH via a `durability.poh` block or
+similar.
+
+**Fix candidates (not landed this session)**:
+1. `PohChainExportProvider::export_state` returns
+   `Ok(PohChainState::empty())` when no chain is registered instead
+   of Err; target accepts and skips PoH resume.
+2. `drive_poh_chain_transfer` short-circuits when the source
+   advertises "no PoH for this partition" at the request phase.
+3. Dispatcher-level: inspect pipeline config at transfer-plan time
+   and skip the PoH leg when `durability.poh` is not enabled.
+
+Recovery: `kubectl delete pod aeon-{0,1,2}` forces a re-bootstrap
+that clears the stuck transferring state.
+
+**V2 verdict:** T0 green on both runs (~3.67M/s session0,
+~3.35M/s rebuilt). T3 exposed a real CL-6c.4 engine-provider bug —
+partition transfer requires PoH chain presence that not every
+pipeline carries. T2 (STS scale-up) + T4 (manual partition cutover)
+still pending; T4 will hit the same PoH-gating bug. T5/T6 deferred
+to DOKS re-spin as before.
 
 ---
 
