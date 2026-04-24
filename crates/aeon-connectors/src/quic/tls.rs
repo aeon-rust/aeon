@@ -17,6 +17,12 @@ use std::sync::Arc;
 /// indicate a fundamental rcgen/rustls bug, not a runtime condition.
 #[allow(clippy::unwrap_used)]
 pub fn dev_quic_configs() -> (quinn::ServerConfig, quinn::ClientConfig) {
+    // Pin the rustls crypto provider to ring. Required since multiple
+    // rustls providers (ring + aws-lc-rs) are now linked via the
+    // expanded S10 feature set — without an explicit default, rustls
+    // panics on first `ClientConfig::builder()` / `ServerConfig::builder()`.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let key_pair = rcgen::KeyPair::generate().unwrap();
     let cert_params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
     let cert = cert_params.self_signed(&key_pair).unwrap();

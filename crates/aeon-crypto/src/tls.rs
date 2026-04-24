@@ -15,6 +15,17 @@ use std::sync::Arc;
 use aeon_types::AeonError;
 use serde::{Deserialize, Serialize};
 
+/// Install `ring` as the process-wide rustls default crypto provider
+/// if nothing is installed yet. Idempotent: safe to call from multiple
+/// threads and multiple call sites. Required because the workspace
+/// links both `ring` (aeon-crypto / quinn / tokio-rustls) and
+/// `aws-lc-rs` (pulled transitively by some connector TLS features);
+/// without an explicit selection rustls panics on the first
+/// `ClientConfig::builder()` / `ServerConfig::builder()` call.
+fn ensure_rustls_default_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 /// TLS mode for an Aeon endpoint.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -176,6 +187,7 @@ impl CertificateStore {
 
     /// Build a rustls ServerConfig with mTLS (client cert required).
     pub fn build_mtls_server_config(&self) -> Result<rustls::ServerConfig, AeonError> {
+        ensure_rustls_default_provider();
         let identity = self.identity.as_ref().ok_or_else(|| AeonError::Config {
             message: "mTLS server requires a TLS identity (cert + key)".into(),
         })?;
@@ -205,6 +217,7 @@ impl CertificateStore {
 
     /// Build a rustls ServerConfig with TLS only (no client cert).
     pub fn build_tls_server_config(&self) -> Result<rustls::ServerConfig, AeonError> {
+        ensure_rustls_default_provider();
         let identity = self.identity.as_ref().ok_or_else(|| AeonError::Config {
             message: "TLS server requires a TLS identity (cert + key)".into(),
         })?;
@@ -220,6 +233,7 @@ impl CertificateStore {
 
     /// Build a rustls ClientConfig with mTLS (present client cert).
     pub fn build_mtls_client_config(&self) -> Result<rustls::ClientConfig, AeonError> {
+        ensure_rustls_default_provider();
         let identity = self.identity.as_ref().ok_or_else(|| AeonError::Config {
             message: "mTLS client requires a TLS identity (cert + key)".into(),
         })?;
@@ -241,6 +255,7 @@ impl CertificateStore {
 
     /// Build a rustls ClientConfig with TLS only (no client cert, verify server).
     pub fn build_tls_client_config(&self) -> Result<rustls::ClientConfig, AeonError> {
+        ensure_rustls_default_provider();
         if self.root_store.is_empty() {
             return Err(AeonError::Config {
                 message: "TLS client requires CA roots for server verification".into(),
@@ -698,6 +713,7 @@ impl ConnectorTlsConfig {
     /// For TCP-based connectors (non-Kafka) that use tokio-rustls.
     /// Returns `None` if mode is `none`.
     pub fn build_rustls_client_config(&self) -> Result<Option<rustls::ClientConfig>, AeonError> {
+        ensure_rustls_default_provider();
         match self.mode {
             ConnectorTlsMode::None => Ok(None),
             ConnectorTlsMode::SystemCa => {
