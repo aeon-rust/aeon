@@ -105,16 +105,36 @@ impl CutoverCoordinator for EngineCutoverCoordinator {
     ) -> Pin<Box<dyn Future<Output = Result<CutoverOffsets, AeonError>> + Send + 'a>>
     {
         Box::pin(async move {
-            let gate = self
-                .gates
-                .get(&req.pipeline, req.partition)
-                .ok_or_else(|| {
-                    AeonError::state(format!(
-                        "cutover: no write-gate for pipeline '{}' partition {}",
-                        req.pipeline,
-                        req.partition.as_u16()
-                    ))
-                })?;
+            // No write-gate registered for (pipeline, partition) means
+            // the pipeline isn't currently running on this node — either
+            // it exited cleanly, was never started here, or stopped
+            // between the partition transfer's BulkSync phase and the
+            // Cutover handshake. There's nothing to drain (no live
+            // source loop is writing) and no real offset to communicate,
+            // so return the no-offset sentinel `final_source_offset =
+            // -1` and continue the transfer rather than aborting it.
+            //
+            // Before [2026-04-25] this returned `AeonError::State`,
+            // which surfaced as a remote cutover failure that aborted
+            // the partition transfer. T3 drain testing surfaced the
+            // race: a fast pipeline (T0 baseline at 1M events / ~1 s)
+            // exits before the operator gets to type `aeon cluster
+            // drain`, the supervisor cleans up the WriteGate, and the
+            // first transfer attempt finds the gate missing and dies.
+            // Mirrors the empty-response sentinel applied in
+            // `aeon_engine::engine_providers::PohChainExportProvider`.
+            let Some(gate) = self.gates.get(&req.pipeline, req.partition) else {
+                tracing::debug!(
+                    pipeline = %req.pipeline,
+                    partition = req.partition.as_u16(),
+                    "cutover: no write-gate (pipeline not running here); \
+                     returning no-offset sentinel and continuing"
+                );
+                return Ok(CutoverOffsets {
+                    final_source_offset: -1,
+                    final_poh_sequence: 0,
+                });
+            };
 
             gate.request_freeze_and_drain(self.drain_timeout)
                 .await
@@ -221,19 +241,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_gate_returns_state_error() {
+    async fn missing_gate_returns_no_offset_sentinel() {
+        // 2026-04-25: flipped from Err("no write-gate") to Ok(sentinel
+        // offsets) so partition transfer doesn't abort when the
+        // pipeline has exited / never started on this node — there's
+        // nothing to drain and nothing to communicate. Mirrors the
+        // empty-bytes sentinel in PohChainExportProvider.
         let gates = Arc::new(WriteGateRegistry::new());
         let coord = EngineCutoverCoordinator::new(gates);
 
-        let err = coord
+        let offsets = coord
             .drain_and_freeze(&req("unknown", 0))
             .await
-            .expect_err("must fail — partition not hosted here");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("no write-gate"),
-            "error must name the reason, got: {msg}"
+            .expect("missing gate must yield sentinel, not error");
+        assert_eq!(
+            offsets.final_source_offset, -1,
+            "final_source_offset must be the no-offset sentinel"
         );
+        assert_eq!(offsets.final_poh_sequence, 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
