@@ -178,6 +178,19 @@ impl Source for StreamingMemorySource {
         Ok(batch)
     }
 
+    /// `StreamingMemorySource` synthesises events in-process — there is no
+    /// external broker to replay from on crash, so the engine must persist
+    /// each event to L2 before acking the source under
+    /// `durability != none`. Push semantics is the right model here.
+    /// (Default `Source::source_kind()` returns `Pull`, which would skip
+    /// L2 writes. Discovered 2026-04-25 during V3 OrderedBatch
+    /// validation: events flowed cleanly but `/app/artifacts/l2body/`
+    /// stayed empty because L2WritingSource saw `Pull` and short-
+    /// circuited via `is_passthrough()`.)
+    fn source_kind(&self) -> aeon_types::SourceKind {
+        aeon_types::SourceKind::Push
+    }
+
     async fn pause(&mut self) {
         self.paused = true;
     }
