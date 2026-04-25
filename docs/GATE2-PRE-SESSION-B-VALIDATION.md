@@ -67,7 +67,7 @@ expected shape from Session 0. No code gaps surfaced in the boot path.
 | T0 | ✅ full | Baseline pipeline: Memory → Blackhole with streaming count, sustained 3-minute sweep; confirm outputs_acked_total == input with zero loss | #80 | ✅ **captured 2026-04-24** — see results below; full 3-min sustained sweep still needs a dedicated re-run with `count: 0` unbounded once Blocker 0 image rebuild lands |
 | T2 | ✅ code path | 3 → 5 STS-scale (code exercise only; RD has no node pool to resize, so pods go Pending and we assert the G10 seed-join code path handles the Pending state correctly). `kubectl scale sts/aeon --replicas=5 -n aeon` | #80 | ⏳ pending |
 | T3 | ✅ full | 5 → 3 → 1 drain: `aeon cluster drain <node>` → supervisor reassigns partitions → `kubectl scale sts/aeon --replicas=3 -n aeon` → same again down to 1. Exercises G5 (drain API) + G14 (relinquish) | #80 | ✅ **closed 2026-04-25** — drain + rebalance bidirectional both work end-to-end. See findings + fix history below. |
-| T4 | ✅ full | Manual cutover: force a partition handoff via `aeon cluster transfer-partition` → G11.a/b/c transport primitives drive BulkSync → Cutover → PoH resume. All loopback but the crypto path is identical to a real cluster. | #80 | ⏳ pending |
+| T4 | ✅ full | Manual cutover: force a partition handoff via `aeon cluster transfer-partition` → G11.a/b/c transport primitives drive BulkSync → Cutover → PoH resume. All loopback but the crypto path is identical to a real cluster. | #80 | ✅ **closed 2026-04-25** — `transfer-partition --partition 0 --target 3` migrated partition 0 from node 1 to node 3 cleanly on `aeon:8f0aa10`. Final state: `{"owner": 3, "status": "owned"}`, zero stuck transfers. Same code path as T3 drain — same fix series unblocked it. |
 | T5 | ❌ not realistic on single-node RD | NetworkChaos split-brain between peer pods is meaningless when all pods share the host kernel | #80 | ❌ **deferred to DOKS re-spin with Chaos Mesh** |
 | T6 | ❌ not realistic on single-node RD | Multi-node chaos (random pod kills under load) needs a real node pool to reveal node-local state vs cluster-replicated state regressions | #80 | ❌ **deferred to DOKS re-spin with Chaos Mesh** |
 
@@ -350,9 +350,9 @@ that clears the stuck transferring state.
 (1) PoH empty-bytes sentinel for non-PoH pipelines,
 (2) cutover sentinel offsets when no WriteGate registered,
 (3) ProposeForward RPC for follower-side `client_write` calls.
-Drain and rebalance both work end-to-end. T2 (STS scale-up) +
-T4 (manual partition cutover, same code path now-fixed) still
-pending dedicated runs. T5/T6 deferred to DOKS re-spin as before.
+Drain and rebalance both work end-to-end. **T4 also closed** — same
+code path. T2 (STS scale-up code-exercise on RD) still pending.
+T5/T6 deferred to DOKS re-spin as before.
 
 ---
 
