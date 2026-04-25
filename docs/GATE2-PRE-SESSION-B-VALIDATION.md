@@ -426,20 +426,62 @@ pipeline-start time. Pipeline logged
 `Checkpoint WAL initialized path=/tmp/aeon-checkpoints/pipeline.wal`
 in aeon-engine::pipeline at start.
 
-**L2 body spine not populated on disk** — `/app/artifacts/l2body/`
-was empty after the run despite `durability.mode: ordered_batch`
-which per `DurabilityMode::requires_l2_body_store()` should engage
-L2 for push sources. Possible causes:
-- Memory source is wired as `SourceKind::Push` with
-  `IdentityConfig::Random`, and the L2 body store may be gated on
-  additional conditions (sink tier > T6, explicit L2 root config,
-  etc.).
-- The 13h-old session0 behaviour of silent counter-to-disk path
-  divergence carried forward.
+**L2 body spine — investigated and fixed 2026-04-25.** Three
+sequential bugs gated this:
 
-This is a real gap worth a ticket but doesn't invalidate the
-checkpoint-write signal captured above. L2 body spine validation
-needs a separate investigation atom.
+1. **Supervisor never wired the L2 registry** (commit `0bde230`):
+   `pipeline_config_for(def)` constructed a fresh `PipelineConfig`
+   with `l2_registry: None` for every cluster pipeline, regardless
+   of the manifest's declared durability mode. The pre-existing
+   inline comment ("EO-2 L2/L3 plumbing [...] is left at defaults
+   — DurabilityMode::None pipelines do not need them, and
+   stronger-mode wiring lands in the follow-up commit") flagged
+   the gap; the follow-up never landed. Fix: added
+   `OnceLock<PathBuf>` for the L2 root, `install_l2_root` method,
+   and supervisor `start()` builds a `PipelineL2Registry` rooted
+   at that path when `def.durability.mode.requires_l2_body_store()`
+   returns true. `cmd_serve` installs the root from `AEON_L2_ROOT`
+   (default `<artifact_dir>/l2body`).
+
+2. **`StreamingMemorySource` defaulted to Pull** (commit `a6c40f3`):
+   the `Source::source_kind()` trait method defaults to
+   `SourceKind::Pull`, and StreamingMemorySource never overrode
+   it. `L2WritingSource::is_passthrough()` short-circuits on
+   `Pull`, so even with a registry installed the wrap call did
+   nothing. Fix: one-line override returning `SourceKind::Push`.
+   The trait doc literally warns about this exact case ("Forgetting
+   to override in a push connector is a silent data-loss bug
+   under durability != none.").
+
+3. **`run_buffered_managed` skipped the wrap** (commit `b0d0d41`):
+   the lower-level `run_buffered` (used by single-pipeline tests)
+   wraps the source; `run_buffered_managed` (used by every
+   supervisor-built pipeline) consumed the source `S` directly
+   without going through `MaybeL2Wrapped::wrap`. So even with
+   #1 and #2 in place, supervisor-managed pipelines silently
+   skipped L2. Fix: added the same wrap call at the top of
+   `run_buffered_managed` and re-wrapped the swap path so hot-
+   swapped sources stay consistent.
+
+**V3 final results (2026-04-25 on `aeon:b0d0d41`)** — durability
+mode `ordered_batch`, 500K events, push Memory source:
+
+| Metric | Per pod (all 3) |
+|--------|-----------------|
+| events_received / processed / outputs_sent | 500,000 |
+| events_failed / retried | 0 / 0 |
+| `checkpoints_written_total` | 1 |
+| **L2 body segment** | `/app/artifacts/l2body/v3-wasm-ordered/p00000/00000000000000000000.l2b` |
+| **L2 segment size** | **177,372,652 bytes** (~177 MiB) — **identical across all 3 pods** |
+| `outputs_acked_total` | 0 (Blackhole T6, expected) |
+
+Identical segment size on all 3 pods proves: deterministic event
+synthesis (the StreamingMemorySource generates from `count` /
+`payload_size` only), L2 path engaging end-to-end, and the
+`L2BodyStore::append` path producing byte-identical output. Single-
+partition file because Memory source emits all events with
+`PartitionId::new(0)` regardless of cluster ownership — that's a
+documented fixture limitation, not an L2 bug.
 
 **Success criterion for every row:** `outputs_acked_total ==
 events_received_total` at steady state, `events_failed_total == 0`, and
