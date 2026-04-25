@@ -65,7 +65,7 @@ expected shape from Session 0. No code gaps surfaced in the boot path.
 | Test | RD realism | Exercise | Issue | Status |
 |------|-----------|----------|-------|--------|
 | T0 | ✅ full | Baseline pipeline: Memory → Blackhole with streaming count, sustained 3-minute sweep; confirm outputs_acked_total == input with zero loss | #80 | ✅ **captured 2026-04-24** — see results below; full 3-min sustained sweep still needs a dedicated re-run with `count: 0` unbounded once Blocker 0 image rebuild lands |
-| T2 | ✅ code path | 3 → 5 STS-scale (code exercise only; RD has no node pool to resize, so pods go Pending and we assert the G10 seed-join code path handles the Pending state correctly). `kubectl scale sts/aeon --replicas=5 -n aeon` | #80 | ⏳ pending |
+| T2 | ✅ code path | 3 → 5 STS-scale (code exercise only; RD has no node pool to resize, so pods go Pending and we assert the G10 seed-join code path handles the Pending state correctly). `kubectl scale sts/aeon --replicas=5 -n aeon` | #80 | 🟡 **partial 2026-04-25** — see findings below |
 | T3 | ✅ full | 5 → 3 → 1 drain: `aeon cluster drain <node>` → supervisor reassigns partitions → `kubectl scale sts/aeon --replicas=3 -n aeon` → same again down to 1. Exercises G5 (drain API) + G14 (relinquish) | #80 | ✅ **closed 2026-04-25** — drain + rebalance bidirectional both work end-to-end. See findings + fix history below. |
 | T4 | ✅ full | Manual cutover: force a partition handoff via `aeon cluster transfer-partition` → G11.a/b/c transport primitives drive BulkSync → Cutover → PoH resume. All loopback but the crypto path is identical to a real cluster. | #80 | ✅ **closed 2026-04-25** — `transfer-partition --partition 0 --target 3` migrated partition 0 from node 1 to node 3 cleanly on `aeon:8f0aa10`. Final state: `{"owner": 3, "status": "owned"}`, zero stuck transfers. Same code path as T3 drain — same fix series unblocked it. |
 | T5 | ❌ not realistic on single-node RD | NetworkChaos split-brain between peer pods is meaningless when all pods share the host kernel | #80 | ❌ **deferred to DOKS re-spin with Chaos Mesh** |
@@ -345,13 +345,53 @@ transfers**. The fix landed.
 Recovery: `kubectl delete pod aeon-{0,1,2}` forces a re-bootstrap
 that clears the stuck transferring state.
 
+**V2 T2 STS scale-up findings (2026-04-25, `aeon:8f0aa10`):**
+
+```
+$ kubectl scale sts/aeon --replicas=5 -n aeon
+=> aeon-3 / aeon-4 came up 1/1 within ~25 s — RD had spare capacity
+=> Auto-join: G10 seed-join code path added them to Raft cleanly
+=> Membership advanced to {1, 2, 3, 4, 5}, leader = node 2
+=> /api/v1/cluster/status reported the full 5-node config
+
+$ aeon cluster rebalance
+=> 3 transfers planned/accepted toward nodes 4 + 5
+
+After ~30 s: 3 transfers stuck "transferring" indefinitely.
+```
+
+Logs surfaced an STS DNS race rather than an Aeon code bug:
+
+```
+aeon-1: openraft::replication: error replication to target=4
+  error=NetworkError: failed to resolve
+  aeon-3.aeon-headless.aeon.svc.cluster.local:4470: failed to
+  lookup address information: Name or service not known
+```
+
+The new pods registered themselves via auto-join with their
+StatefulSet pod-DNS names (`aeon-3.aeon-headless...`,
+`aeon-4.aeon-headless...`), but DNS resolution from the existing
+pods returned NXDOMAIN for some time after the join. Without
+peer-to-peer Raft replication working, openraft can't drive the
+new transfers' AppendEntries committed — so the partition
+driver's `CompleteTransfer` waits forever.
+
+**Net:** the G10 seed-join code path **does work** (membership
+advanced cleanly) — but follow-on partition rebalance is gated
+on the STS pod-DNS publish lag. On a real K8s cluster (DOKS, EKS)
+with a properly-tuned `publishNotReadyAddresses` and DNS TTL this
+should resolve naturally; on RD/k3s it's flaky enough to be a
+noted gap. Out of session-scope to debug.
+
 **V2 verdict:** T0 green on both runs (~3.67M/s session0,
 ~3.35M/s rebuilt). **T3 fully closed** after three layered fixes:
 (1) PoH empty-bytes sentinel for non-PoH pipelines,
 (2) cutover sentinel offsets when no WriteGate registered,
 (3) ProposeForward RPC for follower-side `client_write` calls.
 Drain and rebalance both work end-to-end. **T4 also closed** — same
-code path. T2 (STS scale-up code-exercise on RD) still pending.
+code path. **T2 partial** — code-path-level seed-join works,
+follow-on rebalance gated on STS DNS race not on Aeon code.
 T5/T6 deferred to DOKS re-spin as before.
 
 ---
