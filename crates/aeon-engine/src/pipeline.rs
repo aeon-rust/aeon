@@ -2238,7 +2238,7 @@ impl PipelineControl {
 /// never need hot-swap (benchmarks, tests, static pipelines).
 #[allow(clippy::too_many_arguments)]
 pub async fn run_buffered_managed<S, K>(
-    mut source: S,
+    source: S,
     processor: Box<dyn Processor + Send + Sync>,
     sink: K,
     config: PipelineConfig,
@@ -2254,6 +2254,23 @@ where
     reject_broker_coord_with_reassign(&source, &config)?;
 
     let core_assignment = config.core_pinning.resolve();
+
+    // EO-2: wrap the source in `L2WritingSource` when the durability
+    // mode requires L2 body persistence. This mirrors the wrap call in
+    // the lower-level `run_buffered` — without it, supervisor-managed
+    // pipelines (the cmd_serve path) silently skip L2 even when the
+    // manifest declares durability.mode = ordered_batch /
+    // unordered_batch / per_event. Discovered 2026-04-25 during V3
+    // validation: registry was being built (commit 0bde230), source
+    // override was added (commit a6c40f3), and L2 still didn't engage
+    // because run_buffered_managed never called wrap.
+    let mut source = crate::eo2::MaybeL2Wrapped::wrap(
+        source,
+        &config.pipeline_name,
+        config.l2_registry.as_ref(),
+        config.delivery.durability,
+        config.eo2_capacity.as_ref(),
+    );
 
     // Initialize PoH chain if configured
     #[cfg(feature = "processor-auth")]
@@ -2274,6 +2291,14 @@ where
     // triggers `source.reassign_partitions(&new)` on the live source instead
     // of a pipeline restart.
     let mut reassign_rx = config.partition_reassign.clone();
+
+    // Snapshot the EO-2 wiring the swap-rewrap path needs into the
+    // source task — `config` itself is moved into the processor task
+    // shortly after, and the source task is spawned first.
+    let l2_pipeline_name = config.pipeline_name.clone();
+    let l2_registry = config.l2_registry.clone();
+    let l2_durability = config.delivery.durability;
+    let l2_capacity = config.eo2_capacity.clone();
 
     // Source task: identical to run_buffered, but checks control.paused.
     // When paused, checks for source swap before yielding.
@@ -2315,7 +2340,17 @@ where
                     let mut slot = control_src.new_source.lock().await;
                     if let Some(new_source_any) = slot.take() {
                         if let Ok(new_source) = new_source_any.downcast::<S>() {
-                            source = *new_source;
+                            // Re-wrap the swapped-in source so L2
+                            // persistence stays consistent across hot-
+                            // swaps. `MaybeL2Wrapped::wrap` is cheap —
+                            // returns `Direct(S)` when L2 is disabled.
+                            source = crate::eo2::MaybeL2Wrapped::wrap(
+                                *new_source,
+                                &l2_pipeline_name,
+                                l2_registry.as_ref(),
+                                l2_durability,
+                                l2_capacity.as_ref(),
+                            );
                             source_kind = source.source_kind();
                             control_src.swap_complete.notify_one();
                         }
