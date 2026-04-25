@@ -488,10 +488,13 @@ events_received_total` at steady state, `events_failed_total == 0`, and
 the tier-specific metric non-zero (`aeon_l2_body_bytes_written`,
 `aeon_l3_checkpoints_written_total`, `aeon_wal_records_written_total`).
 
-**V3 verdict (pending):** the native loader + Wasm runtime + per-event
-and batch paths are all unit-tested and benched in the Rust test suite
-(Phase 7 / Phase 12b). V3 validates the cluster-level integration — the
-remaining work is running the fixtures against the RD cluster.
+**V3 verdict (Wasm OrderedBatch row green; rest pending):** Wasm
+OrderedBatch + WAL fallback rows captured cleanly on `aeon:b0d0d41`
+after the three-fix L2-spine series. Native rows still need a real
+`.so` artifact built from `samples/processors/rust-native`; PerEvent
+rows are blocked on `count` headroom (per-event fsync would dominate
+the 1M-event run) — they need either a Kafka source for natural
+flow control or a smaller `count`. Tracked as V3.x sub-rows.
 
 ---
 
@@ -554,19 +557,25 @@ next-session scope.
 ### Gaps to carry forward into Gate 2 blocker queue
 
 0. **Image SHA alignment** — ✅ **closed 2026-04-24** (see prerequisite
-   block above). Cluster now runs `aeon:e68ce68` on all 3 pods.
-1. **V2 T0 ✅ captured 2026-04-24** (3.67M/s aggregate, zero-loss);
-   T2/T3/T4 still pending dedicated session. Scope is 1–2 hours
-   dedicated session time; **one code gap surfaced** —
-   `count: 0` unbounded config key isn't propagated through the
-   manifest-to-pipeline bridge (see V2 T0 results block for repro).
+   block above). Cluster now runs `aeon:b0d0d41` after several
+   in-session rebuilds (`e68ce68` → `7d3fc3b` → `30bdf2d` → `8f0aa10`
+   → `0bde230` → `a6c40f3` → `b0d0d41`).
+1. **V2 T0 / T3 / T4 ✅ captured 2026-04-25** — T0 throughput on two
+   image generations (~3.67M/s session0, ~3.35M/s rebuilt). T3 drain
+   migrates 4→0 partitions with rebalance back to 4/4/4. T4 manual
+   `transfer-partition` migrates partition 0 cleanly. V2 T2 partial:
+   G10 seed-join code path works (Raft membership advanced to
+   `{1, 2, 3, 4, 5}` cleanly); follow-on rebalance gated on RD-
+   specific STS pod-DNS race (NOT an Aeon code bug — DOKS/EKS with
+   `publishNotReadyAddresses` should resolve naturally).
 2. **V2 T5/T6 on DOKS with Chaos Mesh** — requires the next DOKS re-spin
    and Chaos Mesh install. Non-trivial: multi-broker Redpanda sustained
    load requires larger nodes than DOKS Regular SSD (premium/NVMe
    unavailable per 2026-04-18).
 3. **V3 processor fixture files** — ✅ **closed 2026-04-24**
    (`docs/examples/pipeline-t0-baseline.yaml` + `pipeline-t0-redpanda.yaml`
-   landed; both parse cleanly via `aeon apply --dry-run`).
+   + `pipeline-v3-wasm-ordered.yaml`); all parse cleanly via
+   `aeon apply --dry-run`. Wasm-OrderedBatch row green end-to-end.
 4. **V5 PoH head REST endpoint** — ✅ **closed 2026-04-24**:
    `GET /api/v1/pipelines/{name}/partitions/{partition}/poh-head`
    landed in `aeon-engine::rest_api`, backed by
@@ -574,6 +583,20 @@ next-session scope.
    Returns `{sequence, current_hash, mmr_root}` per partition; 404
    when the partition isn't owned on the target node. Feature-gated
    on `processor-auth + cluster`, mirroring the registry.
+5. **V5 PoH manifest wiring (V5.1)** — 🟡 **scoped, not yet built**:
+   PoH config currently lives at runtime as `PipelineConfig.poh:
+   Option<PohConfig>` with no manifest YAML mapping. V5 walk under
+   `{Verify, VerifyWithKey, TrustExtend}` is blocked until a
+   `compliance.poh` or `durability.poh` block is wired through
+   `PipelineManifest` → `to_pipeline_definition()` → `pipeline_config_for`.
+   Pattern matches the existing `compliance` / `encryption` /
+   `durability` block plumbing — sized at ~1 day. Tracked in
+   ROADMAP "Live cluster validation tranche" follow-up.
+6. **V3 native processor + per-event rows** — 🟡 still pending. Native
+   `.so` artifact needs to be built from `samples/processors/rust-native`
+   and registered. PerEvent rows need either a Kafka source for
+   natural flow control or a smaller `count` to avoid the 2GiB pod
+   memory limit while doing fsync-per-event (high amplification).
 
 ### What a green Session B looks like
 

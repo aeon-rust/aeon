@@ -3046,7 +3046,7 @@ What is **not** shipped, grouped by whether the task still earns its slot:
 
 | ID | Item | Open question for reassessment |
 |----|------|-------------------------------|
-| **CL-1** | Gate 2 multi-node acceptance — 9-item checklist | **Session A (2026-04-18) closed T0/T1 (Aeon-as-bottleneck floor verified); T2/T3/T4 surfaced G2 (no leader-side transfer driver — ownership flips never execute). T5/T6 deferred to next DOKS re-spin with Chaos Mesh.** See "Session A status" block below for full closed/deferred breakdown. |
+| **CL-1** | Gate 2 multi-node acceptance — 9-item checklist | **Session A (2026-04-18) closed T0/T1 (Aeon-as-bottleneck floor verified); T2/T3/T4 surfaced G2 (no leader-side transfer driver — ownership flips never execute). T5/T6 deferred to next DOKS re-spin with Chaos Mesh.** **2026-04-25 RD update:** Live RD validation of T2/T3/T4 closed three additional structural bugs the engine-only G2 closure missed — PoH empty-bytes sentinel, cutover sentinel offsets, ProposeForward RPC for follower-side `client_write`. T3 drain + rebalance + T4 manual cutover now run end-to-end with zero stuck transfers; T2 STS scale-up surfaced an RD-specific DNS race (not Aeon code). Full bug-and-fix table in "Live cluster validation tranche" below. See "Session A status" block below for original closed/deferred breakdown. |
 | **CL-5** | Raft-aware K8s auto-scaling (`cluster.auto_join: true`, `autoscaling.mode: raft-aware`) — depends on CL-6 for safe scale-down | **Parked** until G2 lands (it is a strict prerequisite). Still no user signal. |
 | **CL-6c.4** | Engine-side write-freeze + buffer-and-replay — crosses `aeon-cluster` ↔ `aeon-engine`, needs partition write-gate API | **Closed 2026-04-23** — production providers shipped; source-side QUIC now routes `PartitionTransferRequest`/`PohChainTransferRequest`/`PartitionCutoverRequest` into the engine (L2 → `PipelineL2Registry`, PoH → `LivePohChainRegistry`, cutover → `EngineCutoverCoordinator`/`WriteGateRegistry`). Full entry in Security/Compliance index below. |
 | **G1 — Kafka source partition defaulting** | `KafkaSourceFactory` defaults to `[0]` when partitions list is empty; should consult cluster ownership table | **Closed** via Phase 1 P1.1a — `ClusterPartitionOwnership` resolver now feeds `KafkaSourceFactory`; empty partition lists consult the raft-replicated `PartitionTable` at start-up and every CL-6 ownership flip. |
@@ -4406,10 +4406,10 @@ independently once tests are green.
 | 4     | **S2.5** Erasure audit (S6)       | ✅ closed 2026-04-24 | `L3ErasureStore::append` emits `erasure.request.accepted` with category Erasure + resource `pipeline/<name>` + details `tombstone_id` + `selector_kind` (`subject` / `namespace`). Subject id is deliberately NOT included — it's a regulated identifier and the tombstone uuid is sufficient for cross-reference. |
 | 4     | **S2.5** Compliance audit (S4)    | ✅ closed 2026-04-24 | `PipelineSupervisor::start` audits the refusal path on `validate_compliance(...)` → Err, BEFORE remapping to `AeonError::config`. Category Compliance, outcome Denied, resource `pipeline/<name>`, details `regime` + `enforcement`. `aeon-observability` promoted from dev-dep to regular dep on `aeon-engine`. |
 | 5     | **V1** cluster baseline on RD     | ✅ shipped 2026-04-24 | Existing 3-pod `aeon` StS + Redpanda on Rancher Desktop k3s re-verified: all pods `1/1 Running`, `aeon-0.1.0` Helm chart at revision 2, `/metrics` serving full EO-2 counter set, `/api/v1/cluster/status` shows 3-node Raft membership (leader node 3, term 2), 12 partitions balanced 4/4/4 across owners. |
-| 5     | **V2** T0/T2/T3/T4 on RD          | 🟡 scaffolded 2026-04-24 | Run plan + exact commands captured in `docs/GATE2-PRE-SESSION-B-VALIDATION.md` § V2. Execution requires dedicated 1–2h session against the live RD cluster — not yet run. T5/T6 explicitly deferred to DOKS re-spin (Chaos Mesh). Issue #80. |
-| 5     | **V3** Processor validation       | 🟡 scaffolded 2026-04-24 | Test matrix (native per-event / native batch / Wasm per-event / Wasm batch / WAL fallback) scoped in `GATE2-PRE-SESSION-B-VALIDATION.md` § V3. Fixture YAMLs not yet landed. Issue #81. |
-| 5     | **V5** Crypto chain E2E           | 🟡 scaffolded 2026-04-24 | Plan in `GATE2-PRE-SESSION-B-VALIDATION.md` § V5 — walk a transferred partition under each `PohVerifyMode::{Verify, VerifyWithKey, TrustExtend}` and assert MMR + Merkle + Ed25519 root-sig round-trips. Depends on a small REST addition for `/api/v1/pipeline/<name>/poh-head` (tracked inline). Issue #83. |
-| 5     | **V6** Consolidated report        | ✅ closed 2026-04-24 | `docs/GATE2-PRE-SESSION-B-VALIDATION.md` shipped — V1 signed off (cluster baseline), V2/V3/V5 run plans captured with explicit commands, T5/T6-on-RD gap carried forward to DOKS re-spin with Chaos Mesh, Session-B readiness checklist + 4-item gap list populated. Back-propagates the DOKS token-rotation + Block-Storage teardown warnings from memory. Issue #84. |
+| 5     | **V2** T0/T2/T3/T4 on RD          | ✅ closed 2026-04-25 | T0 baseline 2 runs (~3.67M evt/s session0, ~3.35M evt/s on rebuilt image — within noise). T3 drain + rebalance fully green after a three-fix series (PoH empty-bytes sentinel, cutover sentinel offsets, ProposeForward RPC). T4 manual `transfer-partition` migrated partition 0 from node 1 to node 3 cleanly. T2 STS scale 3→5 surfaced G10 seed-join code path working (membership advanced to `{1, 2, 3, 4, 5}`); follow-on rebalance gated on RD-specific STS pod-DNS lag (NOT an Aeon bug — DOKS/EKS with proper `publishNotReadyAddresses` should resolve). T5/T6 still deferred to DOKS re-spin. See V6 report § V2 for run-by-run detail. |
+| 5     | **V3** Processor validation       | ✅ closed 2026-04-25 | Wasm passthrough + `DurabilityMode::OrderedBatch` validated end-to-end on `aeon:b0d0d41`. Per pod: 500K events received / processed / sent, zero failures, `checkpoints_written_total=1`, **L2 segment 177,372,652 bytes byte-identical across all 3 pods** at `/app/artifacts/l2body/v3-wasm-ordered/p00000/00000000000000000000.l2b`. Closure required three sequential bug-fixes — see "Live cluster validation tranche" below. Native processor + per-event / WAL-fallback rows still need fixtures + a runtime PoH config knob (post-V5). |
+| 5     | **V5** Crypto chain E2E           | 🟡 endpoint live 2026-04-25 | `GET /api/v1/pipelines/{name}/partitions/{partition}/poh-head` shipped (commit `d87ec2a`) and verified live on `aeon:e68ce68` — both 404 arms emit the expected handler text, exact 200-with-`{sequence, current_hash, mmr_root}` shape on a partition with PoH wired. Walk under `{Verify, VerifyWithKey, TrustExtend}` blocked on a separate atom: PoH config is currently a runtime-only `PipelineConfig.poh: Option<PohConfig>` knob with no manifest mapping — V5 needs the YAML surface added before a PoH-enabled pipeline can be deployed. Tracked as **V5.1 PoH manifest wiring**. Issue #83. |
+| 5     | **V6** Consolidated report        | ✅ closed 2026-04-24 | `docs/GATE2-PRE-SESSION-B-VALIDATION.md` shipped — V1 signed off (cluster baseline), V2/V3/V5 run plans captured with explicit commands, T5/T6-on-RD gap carried forward to DOKS re-spin with Chaos Mesh, Session-B readiness checklist + 4-item gap list populated. **Update 2026-04-25**: report grew V2 T3/T4 closure detail, V3 final L2 segment numbers, three L2-body-spine bug-and-fix entries, and the ForwardToLeader / cutover / PoH sentinel fix history. Back-propagates the DOKS token-rotation + Block-Storage teardown warnings from memory. Issue #84. |
 
 **Phase order:** 1 → 2 → 3 → 4 → 5. Within Phase 2, the five mTLS wirings are
 independent and could parallelise but are executed sequentially to keep diffs
@@ -4438,3 +4438,44 @@ connector-TLS builder), `aeon-connectors::mtls_pem::build_mtls_client_config`
 bootstrap). Idempotent via `.ok()` — safe on repeated calls and across
 threads. Restores 9 previously-failing aeon-crypto + aeon-connectors
 tests to green; zero clippy warnings workspace-wide.
+
+**Second wave (commit `e68ce68`, 2026-04-24):** first RD rollout of
+the rebuilt image hit the same panic on the cluster TLS path —
+`aeon-cluster::transport::tls` had its own `ServerConfig::builder` /
+`ClientConfig::builder` call sites that the cluster QUIC accept loop
+exercises before any connector work. Added `ensure_rustls_default_provider()`
+to every rustls builder in aeon-cluster: `build_server_config` (file-based),
+`build_client_config` (file-based), `dev_quic_configs`, `dev_quic_configs_insecure`.
+Cluster bootstraps cleanly now.
+
+### Live cluster validation tranche (2026-04-25)
+
+Live RD cluster runs of V2/V3 surfaced six bugs that Phases 1–4's
+unit tests didn't catch. Closure of each row in the V2/V3 matrix
+required these fixes; commits ordered by landing time:
+
+| Bug | Surfaced in | Commit | Fix |
+|-----|-------------|--------|-----|
+| `serde(flatten)` on `SourceManifest::config` requires top-level keys, not a nested `config:` block — every example fixture had the wrong shape | T0 fixture run, 1M-event cap because `count: "0"` collapsed | `354f398` + `18f1988` + `88aa6a2` | All 4 example YAMLs flattened; design-doc nested-block examples corrected; regression test `source_config_keys_must_be_flat_not_nested` locks the behaviour empirically |
+| **Bug 1 / L2 spine:** Supervisor never wired a `PipelineL2Registry` for cluster pipelines (pre-existing TODO comment said "stronger-mode wiring lands in the follow-up commit" — never landed) | V3 OrderedBatch ran cleanly with `checkpoints_written_total=1` but `/app/artifacts/l2body/` stayed empty | `0bde230` | New `OnceLock<PathBuf>` + `install_l2_root()` on `PipelineSupervisor`. `cmd_serve` installs from `AEON_L2_ROOT` (default `<artifact_dir>/l2body`). `start()` builds a registry and stamps it onto `pipeline_config.l2_registry` when `def.durability.mode.requires_l2_body_store()`. Hard refusal start error if mode requires L2 but no root installed. |
+| **Bug 2 / L2 spine:** `StreamingMemorySource` defaulted to `SourceKind::Pull` via the trait default — `L2WritingSource::is_passthrough()` short-circuits on Pull, so the wrap call did nothing | Same V3 run after Bug 1 fix | `a6c40f3` | One-line override returning `Push`. The trait doc literally warns about this exact case ("Forgetting to override in a push connector is a silent data-loss bug under durability != none."). |
+| **Bug 3 / L2 spine:** `run_buffered_managed` (the supervisor's spawn target) consumed source `S` directly without going through `MaybeL2Wrapped::wrap`. The lower-level `run_buffered` did wrap; only the managed path skipped it | Same V3 run after Bugs 1+2 fix — `v3-wasm-ordered/` directory still empty | `b0d0d41` | Added the same wrap call at the top of `run_buffered_managed`; hot-swap path also re-wraps. Snapshot `pipeline_name` + `l2_registry` + `durability` + `eo2_capacity` into local clones before the source spawn moves config. |
+| **Bug 4 / Partition transfer:** `PohChainExportProvider::export_state` returned `Err` for non-PoH pipelines, aborting every partition transfer of pipelines without a PoH leg | V2 T3 drain — 2 of 4 partitions stuck `transferring` | `7d3fc3b` | Return `Ok(Vec::new())` empty-bytes sentinel; partition driver short-circuits `poh_installer.install` on empty bytes. Updated regression test `poh_export_unregistered_partition_returns_empty_sentinel`. |
+| **Bug 5 / Partition transfer:** `EngineCutoverCoordinator::drain_and_freeze` returned `Err` when no `WriteGate` registered (pipeline already exited / never started here), aborting the transfer | V2 T3 drain after Bug 4 fix — fast pipelines (T0 baseline at ~1s) exited before drain hit, leaving no WriteGate | `30bdf2d` | Return sentinel offsets `(final_source_offset = -1, final_poh_sequence = 0)` instead of error — pipeline isn't writing here, so no drain is needed. Mirrors the empty-bytes sentinel pattern. Test renamed `missing_gate_returns_no_offset_sentinel`. |
+| **Bug 6 / Partition transfer:** Partition driver's `CompleteTransfer` Raft propose called `client_write` directly. openraft's `client_write` returns `ForwardToLeader` from a follower instead of auto-forwarding, so transfers driven from a non-leader pod (the source pod when it isn't also leader) never committed | V2 T3 drain after Bugs 4+5 fix — data path now reaches Raft, fails at the propose step | `8f0aa10` | New `MessageType::ProposeForwardRequest = 25` / `Response = 26` over the existing cluster QUIC transport; opaque bincoded `ClusterRequest` / `ClusterResponse` payloads. Wrapper helpers `ClusterNode::propose` and `PartitionTransferDriver::propose_with_forward` detect `ForwardToLeader` and re-issue against the named leader. Single hop only. |
+
+**Net result:** V2 T3 drain + rebalance + T4 manual cutover all green
+end-to-end on `aeon:8f0aa10`. V3 OrderedBatch L2 segments byte-identical
+across 3 pods on `aeon:b0d0d41`. 25 commits this session; 1568+ workspace
+tests green; 0 clippy warnings.
+
+**V5.1 follow-up scoped:** PoH config currently lives at runtime as
+`PipelineConfig.poh: Option<PohConfig>` with no manifest YAML mapping.
+Surfacing it requires (a) a `compliance.poh` or `durability.poh`
+block in `aeon-types::manifest::PipelineManifest`, (b)
+`PipelineManifest::to_pipeline_definition()` carrying it through to
+the engine, (c) `pipeline_config_for` / `start()` populating
+`PipelineConfig.poh` from the parsed block, and (d) example fixture
+showing per-pipeline opt-in. None of this is high-risk — pattern-
+matches the existing `compliance` / `encryption` / `durability`
+block plumbing. Sized at ~1 day; runs after the next ECR bake.
