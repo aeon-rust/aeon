@@ -66,7 +66,7 @@ expected shape from Session 0. No code gaps surfaced in the boot path.
 |------|-----------|----------|-------|--------|
 | T0 | ✅ full | Baseline pipeline: Memory → Blackhole with streaming count, sustained 3-minute sweep; confirm outputs_acked_total == input with zero loss | #80 | ✅ **captured 2026-04-24** — see results below; full 3-min sustained sweep still needs a dedicated re-run with `count: 0` unbounded once Blocker 0 image rebuild lands |
 | T2 | ✅ code path | 3 → 5 STS-scale (code exercise only; RD has no node pool to resize, so pods go Pending and we assert the G10 seed-join code path handles the Pending state correctly). `kubectl scale sts/aeon --replicas=5 -n aeon` | #80 | ⏳ pending |
-| T3 | ✅ full | 5 → 3 → 1 drain: `aeon cluster drain <node>` → supervisor reassigns partitions → `kubectl scale sts/aeon --replicas=3 -n aeon` → same again down to 1. Exercises G5 (drain API) + G14 (relinquish) | #80 | 🔴 **bug surfaced 2026-04-25** — see below |
+| T3 | ✅ full | 5 → 3 → 1 drain: `aeon cluster drain <node>` → supervisor reassigns partitions → `kubectl scale sts/aeon --replicas=3 -n aeon` → same again down to 1. Exercises G5 (drain API) + G14 (relinquish) | #80 | ✅ **closed 2026-04-25** — drain + rebalance bidirectional both work end-to-end. See findings + fix history below. |
 | T4 | ✅ full | Manual cutover: force a partition handoff via `aeon cluster transfer-partition` → G11.a/b/c transport primitives drive BulkSync → Cutover → PoH resume. All loopback but the crypto path is identical to a real cluster. | #80 | ⏳ pending |
 | T5 | ❌ not realistic on single-node RD | NetworkChaos split-brain between peer pods is meaningless when all pods share the host kernel | #80 | ❌ **deferred to DOKS re-spin with Chaos Mesh** |
 | T6 | ❌ not realistic on single-node RD | Multi-node chaos (random pod kills under load) needs a real node pool to reveal node-local state vs cluster-replicated state regressions | #80 | ❌ **deferred to DOKS re-spin with Chaos Mesh** |
@@ -317,18 +317,42 @@ to:
    the leader's driver is the one that proposes Complete after
    the source signals "transfer done".
 
-Option 1 is smaller. Option 2 is cleaner but moves the
-choreography across more files.
+**Fix landed 2026-04-25 (commit `8f0aa10`, image `aeon:8f0aa10`)** —
+took option 1 because it's reusable by every propose-from-driver
+site. New cluster-internal RPC `MessageType::ProposeForwardRequest`
+(=25) / `Response` (=26) carries opaque bincoded `ClusterRequest`
+/ `ClusterResponse` payloads. `ClusterNode::propose` and
+`PartitionTransferDriver::propose_with_forward` both intercept
+`ForwardToLeader` errors, look up the leader's `NodeAddress` from
+the openraft error itself, and re-issue via `send_propose_forward`.
+Single hop only — if the leader's own propose returns
+`ForwardToLeader` (mid-flight election) the caller surfaces an
+error and the partition driver aborts the transfer.
+
+**T3 final live test on `aeon:8f0aa10` (2026-04-25):**
+
+```
+Pre-drain:    4 owner=1 / 4 owner=2 / 4 owner=3       (12 owned)
+After drain --node 1:
+              0 owner=1 / 6 owner=2 / 6 owner=3       (12 owned, 0 transferring)
+After rebalance:
+              4 owner=1 / 4 owner=2 / 4 owner=3       (12 owned, 0 transferring)
+```
+
+Drain + rebalance both ran clean end-to-end with **zero stuck
+transfers**. The fix landed.
 
 Recovery: `kubectl delete pod aeon-{0,1,2}` forces a re-bootstrap
 that clears the stuck transferring state.
 
 **V2 verdict:** T0 green on both runs (~3.67M/s session0,
-~3.35M/s rebuilt). T3 exposed a real CL-6c.4 engine-provider bug —
-partition transfer requires PoH chain presence that not every
-pipeline carries. T2 (STS scale-up) + T4 (manual partition cutover)
-still pending; T4 will hit the same PoH-gating bug. T5/T6 deferred
-to DOKS re-spin as before.
+~3.35M/s rebuilt). **T3 fully closed** after three layered fixes:
+(1) PoH empty-bytes sentinel for non-PoH pipelines,
+(2) cutover sentinel offsets when no WriteGate registered,
+(3) ProposeForward RPC for follower-side `client_write` calls.
+Drain and rebalance both work end-to-end. T2 (STS scale-up) +
+T4 (manual partition cutover, same code path now-fixed) still
+pending dedicated runs. T5/T6 deferred to DOKS re-spin as before.
 
 ---
 
