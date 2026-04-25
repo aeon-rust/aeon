@@ -673,6 +673,29 @@ fn cmd_serve(addr: &str, artifact_dir: &str) -> Result<()> {
         let connectors = Arc::new(connectors);
         let supervisor = Arc::new(aeon_engine::PipelineSupervisor::new(Arc::clone(&connectors)));
 
+        // EO-2: install the L2 body root so durability modes that
+        // require L2 persistence engage. Same path the cluster crate's
+        // L2SegmentTransferProvider reads (built later via
+        // `install_partition_transfer_driver`). Installed here, once,
+        // before any pipeline.start() runs — see the comment on
+        // `PipelineSupervisor::install_l2_root`.
+        let l2_root_path = std::env::var("AEON_L2_ROOT")
+            .unwrap_or_else(|_| format!("{dir}/l2body"));
+        if let Err(e) = supervisor.install_l2_root(std::path::PathBuf::from(&l2_root_path)) {
+            tracing::warn!(
+                error = %e,
+                l2_root = %l2_root_path,
+                "supervisor L2 root install failed (already set?) — \
+                 stronger-durability pipelines may fail to start"
+            );
+        } else {
+            tracing::info!(
+                l2_root = %l2_root_path,
+                "supervisor L2 root installed (EO-2 OrderedBatch / \
+                 UnorderedBatch / PerEvent will engage)"
+            );
+        }
+
         // Cluster initialization — detect K8s environment
         let cluster_enabled = std::env::var("AEON_CLUSTER_ENABLED")
             .map(|v| v.to_lowercase() == "true")

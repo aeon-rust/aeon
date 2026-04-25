@@ -122,6 +122,18 @@ pub struct PipelineSupervisor {
     /// manifest = hard refusal to start. Tests / benches / single-node
     /// callers that don't care about at-rest leave this unset.
     data_context_kek: OnceLock<Arc<KekHandle>>,
+    /// EO-2: L2 body store root directory. Installed once by
+    /// `cmd_serve` (same path the cluster crate's
+    /// `L2SegmentTransferProvider` reads). Consumed by
+    /// `pipeline_config_for` to build a `PipelineL2Registry` for
+    /// pipelines whose `durability.mode.requires_l2_body_store()`
+    /// returns true — without this, those pipelines would silently
+    /// pass through `MaybeL2Wrapped::Direct` and skip L2 persistence.
+    /// Discovered 2026-04-25 during V3 OrderedBatch validation: the
+    /// pre-existing wiring left `l2_registry` at `None` for every
+    /// supervisor-built pipeline and `/app/artifacts/l2body/` stayed
+    /// empty even with `durability.mode = ordered_batch`.
+    l2_root: OnceLock<std::path::PathBuf>,
 }
 
 impl PipelineSupervisor {
@@ -138,7 +150,26 @@ impl PipelineSupervisor {
                 crate::partition_install::LivePohChainRegistry::new(),
             ),
             data_context_kek: OnceLock::new(),
+            l2_root: OnceLock::new(),
         }
+    }
+
+    /// EO-2: install the node-wide L2 body store root. Intended to be
+    /// called once by `cmd_serve` after `bootstrap_multi` finishes,
+    /// using the same path the cluster crate's
+    /// `L2SegmentTransferProvider` is configured with. Returns `Err`
+    /// if already set — startup ordering bug. Tests / benches that
+    /// don't exercise L2-requiring durability modes simply leave it
+    /// unset; pipelines that declare an L2-requiring mode without a
+    /// root installed surface a clear `AeonError::state` at
+    /// pipeline start rather than silently passing through.
+    pub fn install_l2_root(
+        &self,
+        root: std::path::PathBuf,
+    ) -> Result<(), AeonError> {
+        self.l2_root.set(root).map_err(|_| {
+            AeonError::state("supervisor: L2 root already installed")
+        })
     }
 
     /// S3: install the node-wide data-context KEK used to wrap per-
@@ -376,6 +407,45 @@ impl PipelineSupervisor {
         let mut pipeline_config = pipeline_config_for(def);
         pipeline_config.partition_id = partition_id;
         pipeline_config.write_gate = Some(gate);
+        // EO-2: build a `PipelineL2Registry` rooted at the supervisor's
+        // installed L2 root so `MaybeL2Wrapped::wrap` engages on
+        // durability modes that require body persistence. Without this,
+        // `pipeline_config.l2_registry` stays `None` and OrderedBatch /
+        // UnorderedBatch / PerEvent silently degrade to passthrough.
+        // Discovered 2026-04-25 during V3 validation: 500K events flowed
+        // cleanly with `checkpoints_written_total=1` but
+        // `/app/artifacts/l2body/` was empty because the L2 body spine
+        // never engaged.
+        //
+        // Reads `encryption_plan` + `retention_plan` before they get
+        // moved into `pipeline_config`.
+        if def.durability.mode.requires_l2_body_store() {
+            let root = self.l2_root.get().ok_or_else(|| {
+                AeonError::state(format!(
+                    "pipeline '{name}' declares durability.mode={:?} which \
+                     requires L2 body persistence, but no L2 root is \
+                     installed on this supervisor (call \
+                     PipelineSupervisor::install_l2_root from cmd_serve)",
+                    def.durability.mode
+                ))
+            })?;
+            let mut registry = crate::eo2::PipelineL2Registry::new(
+                crate::delivery::L2BodyStoreConfig {
+                    root: Some(root.clone()),
+                    segment_bytes: crate::delivery::L2BodyStoreConfig::default()
+                        .segment_bytes,
+                },
+            );
+            // S5 retention is already resolved via `retention_plan`;
+            // forward the hold so segment GC honours it.
+            registry = registry.with_gc_min_hold(retention_plan.l2_hold_after_ack);
+            // S3: hand the data-context KEK to the registry so newly
+            // opened segments are encrypted in place when at-rest is on.
+            if let Some(kek) = encryption_plan.kek.as_ref() {
+                registry = registry.with_kek(Arc::clone(kek));
+            }
+            pipeline_config.l2_registry = Some(registry);
+        }
         pipeline_config.encryption_plan = Some(encryption_plan);
         pipeline_config.retention_plan = Some(retention_plan);
         // G11.c: share the process-wide PoH-chain install registry so
