@@ -51,6 +51,16 @@ pub enum MessageType {
     /// offset and PoH sequence at the moment of freeze.
     PartitionCutoverRequest = 23,
     PartitionCutoverResponse = 24,
+    /// Forwarded Raft client-write proposal: a follower opens a
+    /// bidirectional stream to the current leader carrying a
+    /// `ProposeForwardRequest` (bincode-serialized `ClusterRequest`);
+    /// the leader runs `raft.client_write` locally and replies with a
+    /// `ProposeForwardResponse` carrying the bincoded
+    /// `ClusterResponse`. Used by `partition_driver` so non-leader
+    /// nodes can complete the `CompleteTransfer` / `AbortTransfer`
+    /// proposes that openraft otherwise rejects with `ForwardToLeader`.
+    ProposeForwardRequest = 25,
+    ProposeForwardResponse = 26,
 }
 
 impl MessageType {
@@ -80,6 +90,8 @@ impl MessageType {
             22 => Some(Self::PohChainTransferResponse),
             23 => Some(Self::PartitionCutoverRequest),
             24 => Some(Self::PartitionCutoverResponse),
+            25 => Some(Self::ProposeForwardRequest),
+            26 => Some(Self::ProposeForwardResponse),
             _ => None,
         }
     }
@@ -181,12 +193,12 @@ mod tests {
 
     #[test]
     fn message_type_roundtrip() {
-        for i in 1..=24u8 {
+        for i in 1..=26u8 {
             let mt = MessageType::from_u8(i).unwrap();
             assert_eq!(mt as u8, i);
         }
         assert!(MessageType::from_u8(0).is_none());
-        assert!(MessageType::from_u8(25).is_none());
+        assert!(MessageType::from_u8(27).is_none());
     }
 
     #[test]
