@@ -1,0 +1,64 @@
+# Memory-source Proof-of-History pipeline — V5.1 cluster validation.
+#
+# Kafka-source PoH example (`pipeline-poh-enabled.yaml`) needs an
+# upstream producer to advance the chain. This fixture uses the memory
+# synth source so the chain advances immediately on apply, letting us
+# curl `/poh-head` and observe a non-zero sequence without setting up
+# Redpanda topics.
+#
+# Pairs with the V5.1 RD validation step in
+# `docs/GATE2-PRE-SESSION-B-VALIDATION.md`.
+
+pipelines:
+  - name: poh-memory
+    partitions: 4
+
+    # V5.1 — opt in to PoH. The other peer blocks (durability /
+    # encryption / compliance) stay default-inert because they are
+    # independent of PoH.
+    poh:
+      enabled: true
+      max_recent_entries: 4096
+
+    durability:
+      mode: none
+
+    sources:
+      - name: memory-synth
+        type: memory
+        kind: push
+        identity:
+          mode: random
+        event_time:
+          mode: aeon_ingest
+        count: "100000"
+        payload_size: "256"
+        batch_size: "1024"
+
+    processor:
+      name: __identity
+      version: "0.0.0"
+      tier: native
+
+    sinks:
+      - name: blackhole-discard
+        type: blackhole
+        eos_tier: t6_fire_and_forget
+
+# Apply with (from inside an aeon pod):
+#   aeon apply -f /app/manifests/pipeline-poh-memory.yaml
+#
+# Then per partition (the synth source partitions across 4 partitions):
+#   curl -s http://localhost:4471/api/v1/pipelines/poh-memory/partitions/0/poh-head
+#
+# Expected after the source has run a batch:
+#   {
+#     "pipeline": "poh-memory",
+#     "partition": 0,
+#     "poh_active": true,
+#     "chain": {
+#       "sequence": <u64 >= 1>,
+#       "current_hash": "<128 hex chars>",
+#       "mmr_root": "<hex>"
+#     }
+#   }

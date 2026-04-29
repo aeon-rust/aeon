@@ -583,15 +583,22 @@ next-session scope.
    Returns `{sequence, current_hash, mmr_root}` per partition; 404
    when the partition isn't owned on the target node. Feature-gated
    on `processor-auth + cluster`, mirroring the registry.
-5. **V5 PoH manifest wiring (V5.1)** — 🟡 **scoped, not yet built**:
-   PoH config currently lives at runtime as `PipelineConfig.poh:
-   Option<PohConfig>` with no manifest YAML mapping. V5 walk under
-   `{Verify, VerifyWithKey, TrustExtend}` is blocked until a
-   `compliance.poh` or `durability.poh` block is wired through
-   `PipelineManifest` → `to_pipeline_definition()` → `pipeline_config_for`.
-   Pattern matches the existing `compliance` / `encryption` /
-   `durability` block plumbing — sized at ~1 day. Tracked in
-   ROADMAP "Live cluster validation tranche" follow-up.
+5. **V5 PoH manifest wiring (V5.1)** — ✅ **closed 2026-04-29
+   (issue #83)**: new `aeon-types::poh::PohBlock` peer block on
+   `PipelineManifest` and `PipelineDefinition` (`enabled`,
+   `max_recent_entries`, `signing_key_ref`);
+   `PipelineManifest::to_pipeline_definition()` clones it through;
+   `pipeline_supervisor::pipeline_config_for` translates
+   `def.poh.enabled` onto `PipelineConfig.poh` with the manifest's
+   `max_recent_entries`; `start()` mirrors the supervisor-stamped
+   `partition_id` onto `poh.partition`; example fixture at
+   `docs/examples/pipeline-poh-enabled.yaml`. The `Verify` and
+   `TrustExtend` walks now run end-to-end against a YAML-deployed
+   PoH-enabled pipeline. `VerifyWithKey` awaits a separate
+   signing-key resolver atom (the schema preserves `signing_key_ref`
+   today but the engine ignores it). 6 new poh-module tests + 2
+   manifest-bridge tests + 2 `pipeline_config_for` tests; clippy
+   clean.
 6. **V3 native processor + per-event rows** — 🟡 still pending. Native
    `.so` artifact needs to be built from `samples/processors/rust-native`
    and registered. PerEvent rows need either a Kafka source for

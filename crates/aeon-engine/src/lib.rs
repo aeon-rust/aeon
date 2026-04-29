@@ -58,6 +58,8 @@ pub mod metrics_server;
 pub mod pipeline;
 pub mod pipeline_manager;
 pub mod pipeline_supervisor;
+#[cfg(feature = "processor-auth")]
+pub mod poh_probe;
 pub mod processor;
 pub mod registry;
 pub mod retry;
@@ -107,6 +109,8 @@ pub use pipeline::{
 };
 #[cfg(feature = "processor-auth")]
 pub use pipeline::{PohConfig, PohState, create_poh_state};
+#[cfg(feature = "processor-auth")]
+pub use poh_probe::resolve_poh_signing_key;
 pub use pipeline_manager::PipelineManager;
 pub use pipeline_supervisor::{IDENTITY_PROCESSOR, PipelineSupervisor};
 pub use processor::PassthroughProcessor;

@@ -23,6 +23,7 @@ use crate::durability::DurabilityMode;
 use crate::encryption::EncryptionBlock;
 use crate::error::AeonError;
 use crate::event_time::EventTime;
+use crate::poh::PohBlock;
 use crate::traits::{SinkEosTier, SourceKind};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -49,6 +50,14 @@ pub struct PipelineManifest {
     /// (`at_rest=Off`) so dev pipelines pay zero cost.
     #[serde(default, skip_serializing_if = "encryption_is_default")]
     pub encryption: EncryptionBlock,
+
+    /// V5 — Proof-of-History declaration. Defaults to an inert block
+    /// (`enabled=false`) so pipelines opt in explicitly. When enabled,
+    /// the engine wires a `PipelineConfig.poh` and the PoH chain head
+    /// becomes accessible at
+    /// `/api/v1/pipelines/{name}/partitions/{partition}/poh-head`.
+    #[serde(default, skip_serializing_if = "PohBlock::is_default")]
+    pub poh: PohBlock,
 
     pub sources: Vec<SourceManifest>,
 
@@ -551,6 +560,7 @@ impl PipelineManifest {
             durability: self.durability.clone(),
             encryption: self.encryption.clone(),
             compliance: self.compliance.clone(),
+            poh: self.poh.clone(),
         }
     }
 }
@@ -588,6 +598,7 @@ mod tests {
             durability: DurabilityBlock::default(),
             compliance: ComplianceBlock::default(),
             encryption: EncryptionBlock::default(),
+            poh: PohBlock::default(),
             sources: vec![sample_source()],
             processor: ProcessorManifest {
                 name: "p".into(),
@@ -964,6 +975,33 @@ mod tests {
         let m = sample_manifest();
         let def = m.to_pipeline_definition();
         assert!(def.sinks[0].config.get("eos_tier").unwrap().contains("T2"));
+    }
+
+    // ── V5.1 PohBlock carry-through ────────────────────────────────────
+
+    #[test]
+    fn to_pipeline_definition_default_poh_block_round_trips_inert() {
+        let m = sample_manifest();
+        let def = m.to_pipeline_definition();
+        assert!(def.poh.is_default());
+        assert!(!def.poh.enabled);
+    }
+
+    #[test]
+    fn to_pipeline_definition_carries_enabled_poh_through() {
+        let mut m = sample_manifest();
+        m.poh = crate::poh::PohBlock {
+            enabled: true,
+            max_recent_entries: 8192,
+            signing_key_ref: Some("data-context/v1".into()),
+        };
+        let def = m.to_pipeline_definition();
+        assert!(def.poh.enabled);
+        assert_eq!(def.poh.max_recent_entries, 8192);
+        assert_eq!(
+            def.poh.signing_key_ref.as_deref(),
+            Some("data-context/v1")
+        );
     }
 
     // ── S6.7 SubjectExtractConfig ──────────────────────────────────────

@@ -4408,7 +4408,7 @@ independently once tests are green.
 | 5     | **V1** cluster baseline on RD     | ✅ shipped 2026-04-24 | Existing 3-pod `aeon` StS + Redpanda on Rancher Desktop k3s re-verified: all pods `1/1 Running`, `aeon-0.1.0` Helm chart at revision 2, `/metrics` serving full EO-2 counter set, `/api/v1/cluster/status` shows 3-node Raft membership (leader node 3, term 2), 12 partitions balanced 4/4/4 across owners. |
 | 5     | **V2** T0/T2/T3/T4 on RD          | ✅ closed 2026-04-25 | T0 baseline 2 runs (~3.67M evt/s session0, ~3.35M evt/s on rebuilt image — within noise). T3 drain + rebalance fully green after a three-fix series (PoH empty-bytes sentinel, cutover sentinel offsets, ProposeForward RPC). T4 manual `transfer-partition` migrated partition 0 from node 1 to node 3 cleanly. T2 STS scale 3→5 surfaced G10 seed-join code path working (membership advanced to `{1, 2, 3, 4, 5}`); follow-on rebalance gated on RD-specific STS pod-DNS lag (NOT an Aeon bug — DOKS/EKS with proper `publishNotReadyAddresses` should resolve). T5/T6 still deferred to DOKS re-spin. See V6 report § V2 for run-by-run detail. |
 | 5     | **V3** Processor validation       | ✅ closed 2026-04-25 | Wasm passthrough + `DurabilityMode::OrderedBatch` validated end-to-end on `aeon:b0d0d41`. Per pod: 500K events received / processed / sent, zero failures, `checkpoints_written_total=1`, **L2 segment 177,372,652 bytes byte-identical across all 3 pods** at `/app/artifacts/l2body/v3-wasm-ordered/p00000/00000000000000000000.l2b`. Closure required three sequential bug-fixes — see "Live cluster validation tranche" below. Native processor + per-event / WAL-fallback rows still need fixtures + a runtime PoH config knob (post-V5). |
-| 5     | **V5** Crypto chain E2E           | 🟡 endpoint live 2026-04-25 | `GET /api/v1/pipelines/{name}/partitions/{partition}/poh-head` shipped (commit `d87ec2a`) and verified live on `aeon:e68ce68` — both 404 arms emit the expected handler text, exact 200-with-`{sequence, current_hash, mmr_root}` shape on a partition with PoH wired. Walk under `{Verify, VerifyWithKey, TrustExtend}` blocked on a separate atom: PoH config is currently a runtime-only `PipelineConfig.poh: Option<PohConfig>` knob with no manifest mapping — V5 needs the YAML surface added before a PoH-enabled pipeline can be deployed. Tracked as **V5.1 PoH manifest wiring**. Issue #83. |
+| 5     | **V5** Crypto chain E2E           | 🟡 endpoint live 2026-04-25; manifest unblocked 2026-04-29 | `GET /api/v1/pipelines/{name}/partitions/{partition}/poh-head` shipped (commit `d87ec2a`) and verified live on `aeon:e68ce68` — both 404 arms emit the expected handler text, exact 200-with-`{sequence, current_hash, mmr_root}` shape on a partition with PoH wired. **V5.1 PoH manifest wiring closed 2026-04-29** (issue #83): new `aeon-types::poh::PohBlock` peer block on `PipelineManifest` + `PipelineDefinition` (`enabled`, `max_recent_entries`, `signing_key_ref`); `PipelineManifest::to_pipeline_definition()` clones it through; `pipeline_supervisor::pipeline_config_for` translates `def.poh.enabled` onto `PipelineConfig.poh` with the manifest's `max_recent_entries`; `start()` mirrors the supervisor-stamped `partition_id` onto `poh.partition` so the chain genesises on the right partition; example fixture at `docs/examples/pipeline-poh-enabled.yaml`. The `Verify` / `TrustExtend` walks now run end-to-end against a YAML-deployed PoH-enabled pipeline; the `VerifyWithKey` walk awaits a separate signing-key resolver atom (the schema preserves `signing_key_ref` today but the engine ignores it). 6 new poh-module tests + 2 manifest-bridge tests + 2 `pipeline_config_for` tests; clippy clean. |
 | 5     | **V6** Consolidated report        | ✅ closed 2026-04-24 | `docs/GATE2-PRE-SESSION-B-VALIDATION.md` shipped — V1 signed off (cluster baseline), V2/V3/V5 run plans captured with explicit commands, T5/T6-on-RD gap carried forward to DOKS re-spin with Chaos Mesh, Session-B readiness checklist + 4-item gap list populated. **Update 2026-04-25**: report grew V2 T3/T4 closure detail, V3 final L2 segment numbers, three L2-body-spine bug-and-fix entries, and the ForwardToLeader / cutover / PoH sentinel fix history. Back-propagates the DOKS token-rotation + Block-Storage teardown warnings from memory. Issue #84. |
 
 **Phase order:** 1 → 2 → 3 → 4 → 5. Within Phase 2, the five mTLS wirings are
@@ -4469,13 +4469,54 @@ end-to-end on `aeon:8f0aa10`. V3 OrderedBatch L2 segments byte-identical
 across 3 pods on `aeon:b0d0d41`. 25 commits this session; 1568+ workspace
 tests green; 0 clippy warnings.
 
-**V5.1 follow-up scoped:** PoH config currently lives at runtime as
-`PipelineConfig.poh: Option<PohConfig>` with no manifest YAML mapping.
-Surfacing it requires (a) a `compliance.poh` or `durability.poh`
-block in `aeon-types::manifest::PipelineManifest`, (b)
-`PipelineManifest::to_pipeline_definition()` carrying it through to
-the engine, (c) `pipeline_config_for` / `start()` populating
-`PipelineConfig.poh` from the parsed block, and (d) example fixture
-showing per-pipeline opt-in. None of this is high-risk — pattern-
-matches the existing `compliance` / `encryption` / `durability`
-block plumbing. Sized at ~1 day; runs after the next ECR bake.
+**V5.1 closed 2026-04-29 (issue #83):** PoH is now declarable via a
+peer `poh:` block on `PipelineManifest`, mirroring the existing
+`compliance` / `encryption` / `durability` plumbing. Atoms shipped:
+
+- (a) `aeon-types::poh::PohBlock` (new module) with
+  `enabled: bool`, `max_recent_entries: u32`, `signing_key_ref:
+  Option<String>`, `is_default()`/`is_active()` helpers, full
+  serde round-trip tests. Re-exported at the crate root as
+  `aeon_types::PohBlock`. Top-level peer field on
+  `PipelineManifest` and `PipelineDefinition` (chose top-level
+  rather than nesting under `compliance` because PoH at runtime
+  is independent of compliance regime — schema mirrors the engine
+  layout).
+- (b) `PipelineManifest::to_pipeline_definition()` clones
+  `self.poh` through; bridge tests cover both default-inert and
+  enabled-roundtrip paths. `PipelineDefinition::new()` initialises
+  `poh` to `PohBlock::default()`; existing serialized definitions
+  deserialize cleanly via `#[serde(default)]`.
+- (c) `aeon-engine::pipeline_supervisor::pipeline_config_for`
+  translates `def.poh.enabled` onto `PipelineConfig.poh`, picking
+  up `max_recent_entries` from the manifest. The supervisor's
+  `start()` mirrors the stamped `partition_id` into
+  `poh.partition` after `pipeline_config_for` returns so the
+  chain genesises on the correct partition. Both code paths
+  feature-gated under `processor-auth`. 2 new
+  `pipeline_config_for_*_poh_*` unit tests.
+- (d) `docs/examples/pipeline-poh-enabled.yaml` shows per-pipeline
+  opt-in alongside an existing source/sink/processor combination
+  with operator-facing comments on the `/poh-head` REST endpoint.
+
+The `Verify` and `TrustExtend` walks now run end-to-end against
+a YAML-deployed PoH-enabled pipeline.
+
+**V5.1 R1 closed 2026-04-29 (signing-key resolver):** new
+`aeon-engine::poh_probe::resolve_poh_signing_key(block, registry)`
+translates `PohBlock.signing_key_ref` against the
+`aeon-types::SecretRegistry` and stamps an `Arc<SigningKey>` onto
+`PipelineConfig.poh.signing_key`. Resolution table:
+disabled-or-no-ref → `Ok(None)`; ref set without registry → hard
+refusal; unknown scheme / wrong-length material → hard refusal;
+resolved 32-raw-bytes or 64-char-hex → `Ok(Some(..))`. Hex
+fallback makes `${ENV:AEON_POH_SIGNING_KEY}` work directly with
+the default env-only registry; raw-byte path covers Vault-transit /
+KMS providers. The supervisor grew a peer
+`secret_registry: OnceLock<Arc<SecretRegistry>>` slot +
+`set_secret_registry()` installer (mirroring `set_data_context_kek`);
+`start()` calls the probe after `pipeline_config_for` and surfaces
+resolution errors as a `start()` refusal — same shape as the
+encryption probe's `Required` path. 9 new probe tests + 2 new
+supervisor tests (refuse-without-registry, install-once-only).
+The `VerifyWithKey` walk now resolves end-to-end.

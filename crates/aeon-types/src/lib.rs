@@ -28,6 +28,7 @@ pub mod l2_transfer;
 pub mod manifest;
 pub mod oauth;
 pub mod partition;
+pub mod poh;
 pub mod processor_identity;
 pub mod processor_transport;
 pub mod redact;
@@ -76,6 +77,7 @@ pub use manifest::{
 };
 pub use oauth::OAuthConfig;
 pub use partition::PartitionId;
+pub use poh::PohBlock;
 pub use processor_identity::{PipelineScope, ProcessorIdentity};
 pub use processor_transport::{
     ProcessorBinding, ProcessorConnectionConfig, ProcessorHealth, ProcessorInfo, ProcessorTier,
