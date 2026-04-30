@@ -1,0 +1,51 @@
+# T1/T6 Kafka ceiling — Redpanda → passthrough → Redpanda.
+#
+# Per GATE2-ACCEPTANCE-PLAN.md § 12, T1 measures Aeon's throughput when
+# the broker path is saturated, and T6 is the same pipeline held at
+# sustained load for the duration of the session. Consumes from the
+# `aeon-source` topic and publishes to `aeon-sink`.
+#
+# Assumes the `redpanda-init` Job has pre-created both topics — see
+# docker-compose.dev.yml or the chart's init container for the
+# `rpk topic create aeon-source aeon-sink --partitions 4` step.
+#
+# Register the `passthrough` processor first (see T0 fixture for the
+# command line).
+
+pipelines:
+  - name: t1-redpanda
+    partitions: 4
+
+    sources:
+      - name: redpanda-source
+        type: kafka
+        kind: pull
+        identity:
+          mode: native
+        event_time:
+          mode: broker
+        topic: aeon-source
+        partitions: [0, 1, 2, 3]
+        # Connector keys live at the source's top level (SourceManifest
+        # uses #[serde(flatten)] on its config BTreeMap — nesting under
+        # a literal `config:` key puts the whole sub-object as one entry
+        # and the factory's lookup misses every field).
+        brokers: "redpanda:9092"
+        group_id: "aeon-t1"
+        batch_max: "1024"
+        max_empty_polls: "10"
+
+    processor:
+      name: passthrough
+      version: "1.0.0"
+      tier: native
+
+    sinks:
+      - name: redpanda-sink
+        type: kafka
+        eos_tier: t2_transactional_stream
+        topic: aeon-sink
+        # Same flatten rule on SinkManifest — top-level keys only.
+        brokers: "redpanda:9092"
+        strategy: ordered_batch
+        transactional_id: "aeon-t1-${ENV:HOSTNAME}"

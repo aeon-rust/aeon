@@ -1,0 +1,62 @@
+# T0 baseline — Memory → Blackhole.
+#
+# Per GATE2-ACCEPTANCE-PLAN.md § 12, T0 measures Aeon's internal
+# processing ceiling with zero downstream I/O cost (no broker, no disk).
+# The streaming Memory source synthesises events lazily, the processor
+# passes them through unchanged, and the Blackhole sink discards them.
+# Success criterion: outputs_acked_total == events_received_total at
+# steady state, events_failed_total == 0, no backpressure stalls.
+#
+# Register the `passthrough` processor first:
+#   aeon processor register passthrough --version 1.0.0 \
+#     --artifact <path-to-passthrough.wasm-or-.so>
+#
+# Then apply this manifest:
+#   aeon apply -f docs/examples/pipeline-t0-baseline.yaml
+#
+# Watch metrics (3-minute sustained run):
+#   kubectl port-forward -n aeon svc/aeon 14471:4471 &
+#   curl http://localhost:14471/metrics \
+#     | grep -E "events_received_total|outputs_acked_total|events_failed_total"
+
+pipelines:
+  - name: t0-baseline
+    partitions: 4
+
+    sources:
+      - name: memory-synth
+        type: memory
+        kind: push
+        identity:
+          mode: random
+        event_time:
+          mode: aeon_ingest
+        # Connector config is flattened directly onto the SourceManifest
+        # (not nested under a `config:` key). The manifest-to-pipeline
+        # bridge copies unknown-top-level keys through to the factory.
+        #
+        # `count: "0"` runs unbounded — which on a containerised RD pod
+        # (2Gi memory limit in helm/aeon/values-local.yaml) OOMs within
+        # a couple of seconds at this synthesis rate (~900MB/s of Event
+        # structs). Empirically 10M also OOMs under the current wiring:
+        # the Blackhole sink drain doesn't keep up with synthesis when
+        # the pipeline runs three parallel source loops (one per owned
+        # partition), so buffered events accumulate faster than limits
+        # allow. 1M per pod is the safe headline figure and reliably
+        # completes in ~1 s per pod on 2Gi. For multi-minute sustained
+        # sweeps, raise the pod memory limit in
+        # helm/aeon/values-local.yaml or switch to a Kafka source that
+        # naturally flow-controls on empty.
+        count: "1000000"
+        payload_size: "256"
+        batch_size: "1024"
+
+    processor:
+      name: passthrough
+      version: "1.0.0"
+      tier: native
+
+    sinks:
+      - name: blackhole-discard
+        type: blackhole
+        eos_tier: t6_fire_and_forget

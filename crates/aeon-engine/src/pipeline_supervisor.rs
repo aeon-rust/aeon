@@ -122,6 +122,29 @@ pub struct PipelineSupervisor {
     /// manifest = hard refusal to start. Tests / benches / single-node
     /// callers that don't care about at-rest leave this unset.
     data_context_kek: OnceLock<Arc<KekHandle>>,
+    /// EO-2: L2 body store root directory. Installed once by
+    /// `cmd_serve` (same path the cluster crate's
+    /// `L2SegmentTransferProvider` reads). Consumed by
+    /// `pipeline_config_for` to build a `PipelineL2Registry` for
+    /// pipelines whose `durability.mode.requires_l2_body_store()`
+    /// returns true — without this, those pipelines would silently
+    /// pass through `MaybeL2Wrapped::Direct` and skip L2 persistence.
+    /// Discovered 2026-04-25 during V3 OrderedBatch validation: the
+    /// pre-existing wiring left `l2_registry` at `None` for every
+    /// supervisor-built pipeline and `/app/artifacts/l2body/` stayed
+    /// empty even with `durability.mode = ordered_batch`.
+    l2_root: OnceLock<std::path::PathBuf>,
+    /// V5.1: node-wide `SecretRegistry` used to resolve PoH
+    /// `signing_key_ref` references at pipeline start. Installed once
+    /// by `cmd_serve` after the bootstrap layer composes the env /
+    /// dotenv / vault provider chain. `start()` passes a borrow into
+    /// `resolve_poh_signing_key`, which fails fast if a pipeline's
+    /// manifest sets `poh.signing_key_ref` while no registry is
+    /// installed. Without this OnceLock, supervisor callers that don't
+    /// reference signing keys (most tests, single-node + chain-only
+    /// verification) keep working without the bootstrap step.
+    #[cfg(feature = "processor-auth")]
+    secret_registry: OnceLock<Arc<aeon_types::SecretRegistry>>,
 }
 
 impl PipelineSupervisor {
@@ -138,7 +161,49 @@ impl PipelineSupervisor {
                 crate::partition_install::LivePohChainRegistry::new(),
             ),
             data_context_kek: OnceLock::new(),
+            l2_root: OnceLock::new(),
+            #[cfg(feature = "processor-auth")]
+            secret_registry: OnceLock::new(),
         }
+    }
+
+    /// V5.1: install the node-wide `SecretRegistry`. Intended to be
+    /// called once by `cmd_serve` after the secret-provider chain is
+    /// composed; the same `Arc` is shared across all pipelines on this
+    /// node. Returns `Err` if a registry is already installed —
+    /// startup ordering bug, not a runtime condition. Pipelines that
+    /// declare `poh.signing_key_ref` without this installed surface a
+    /// clear `AeonError::state` at pipeline start (chain-only
+    /// `Verify` + `TrustExtend` walks still work, since they require
+    /// no signing key).
+    #[cfg(feature = "processor-auth")]
+    pub fn set_secret_registry(
+        &self,
+        registry: Arc<aeon_types::SecretRegistry>,
+    ) -> Result<(), AeonError> {
+        self.secret_registry.set(registry).map_err(|_| {
+            AeonError::state(
+                "PipelineSupervisor: secret registry already installed",
+            )
+        })
+    }
+
+    /// EO-2: install the node-wide L2 body store root. Intended to be
+    /// called once by `cmd_serve` after `bootstrap_multi` finishes,
+    /// using the same path the cluster crate's
+    /// `L2SegmentTransferProvider` is configured with. Returns `Err`
+    /// if already set — startup ordering bug. Tests / benches that
+    /// don't exercise L2-requiring durability modes simply leave it
+    /// unset; pipelines that declare an L2-requiring mode without a
+    /// root installed surface a clear `AeonError::state` at
+    /// pipeline start rather than silently passing through.
+    pub fn install_l2_root(
+        &self,
+        root: std::path::PathBuf,
+    ) -> Result<(), AeonError> {
+        self.l2_root.set(root).map_err(|_| {
+            AeonError::state("supervisor: L2 root already installed")
+        })
     }
 
     /// S3: install the node-wide data-context KEK used to wrap per-
@@ -336,6 +401,22 @@ impl PipelineSupervisor {
             &erasure_plan,
         )
         .map_err(|e| {
+            // S2.5 — audit the refusal on the dedicated channel so the
+            // SIEM side sees it regardless of the `tracing` subscriber
+            // configuration. `regime` + `enforcement` are stable tags,
+            // safe to emit; the full finding list is already in the
+            // human message of `e`.
+            aeon_observability::emit_audit(
+                &aeon_types::audit::AuditEvent::new(
+                    aeon_observability::now_unix_nanos(),
+                    aeon_types::audit::AuditCategory::Compliance,
+                    "compliance.validate.denied",
+                    aeon_types::audit::AuditOutcome::Denied,
+                )
+                .with_resource(format!("pipeline/{name}"))
+                .with_detail("regime", format!("{:?}", def.compliance.regime))
+                .with_detail("enforcement", format!("{:?}", def.compliance.enforcement)),
+            );
             AeonError::config(format!(
                 "pipeline '{name}' refused to start: {e}"
             ))
@@ -360,6 +441,69 @@ impl PipelineSupervisor {
         let mut pipeline_config = pipeline_config_for(def);
         pipeline_config.partition_id = partition_id;
         pipeline_config.write_gate = Some(gate);
+        // V5.1: keep `poh.partition` in lock-step with `partition_id` so
+        // `create_poh_state` genesises the chain with the right partition
+        // id. `pipeline_config_for` initialises `poh.partition` to
+        // `PartitionId::new(0)` at config-build time; this stamp is what
+        // makes single-partition supervisor pipelines produce a chain
+        // keyed on the actual owned partition. Multi-partition runners
+        // do their own per-task rewrite in `run_multi_partition`.
+        //
+        // V5.1 R1: resolve `poh.signing_key_ref` against the installed
+        // `SecretRegistry` and stamp the result onto
+        // `pipeline_config.poh.signing_key`. Disabled / no-ref paths
+        // are no-ops; ref set without a registry, with an unknown
+        // scheme, or with wrong-length material is a hard refusal,
+        // matching the encryption probe's "required without KEK"
+        // pattern.
+        #[cfg(feature = "processor-auth")]
+        if let Some(poh) = pipeline_config.poh.as_mut() {
+            poh.partition = partition_id;
+            let registry = self.secret_registry.get().map(|r| r.as_ref());
+            poh.signing_key = crate::poh_probe::resolve_poh_signing_key(
+                &def.poh,
+                registry,
+            )?;
+        }
+        // EO-2: build a `PipelineL2Registry` rooted at the supervisor's
+        // installed L2 root so `MaybeL2Wrapped::wrap` engages on
+        // durability modes that require body persistence. Without this,
+        // `pipeline_config.l2_registry` stays `None` and OrderedBatch /
+        // UnorderedBatch / PerEvent silently degrade to passthrough.
+        // Discovered 2026-04-25 during V3 validation: 500K events flowed
+        // cleanly with `checkpoints_written_total=1` but
+        // `/app/artifacts/l2body/` was empty because the L2 body spine
+        // never engaged.
+        //
+        // Reads `encryption_plan` + `retention_plan` before they get
+        // moved into `pipeline_config`.
+        if def.durability.mode.requires_l2_body_store() {
+            let root = self.l2_root.get().ok_or_else(|| {
+                AeonError::state(format!(
+                    "pipeline '{name}' declares durability.mode={:?} which \
+                     requires L2 body persistence, but no L2 root is \
+                     installed on this supervisor (call \
+                     PipelineSupervisor::install_l2_root from cmd_serve)",
+                    def.durability.mode
+                ))
+            })?;
+            let mut registry = crate::eo2::PipelineL2Registry::new(
+                crate::delivery::L2BodyStoreConfig {
+                    root: Some(root.clone()),
+                    segment_bytes: crate::delivery::L2BodyStoreConfig::default()
+                        .segment_bytes,
+                },
+            );
+            // S5 retention is already resolved via `retention_plan`;
+            // forward the hold so segment GC honours it.
+            registry = registry.with_gc_min_hold(retention_plan.l2_hold_after_ack);
+            // S3: hand the data-context KEK to the registry so newly
+            // opened segments are encrypted in place when at-rest is on.
+            if let Some(kek) = encryption_plan.kek.as_ref() {
+                registry = registry.with_kek(Arc::clone(kek));
+            }
+            pipeline_config.l2_registry = Some(registry);
+        }
         pipeline_config.encryption_plan = Some(encryption_plan);
         pipeline_config.retention_plan = Some(retention_plan);
         // G11.c: share the process-wide PoH-chain install registry so
@@ -619,6 +763,31 @@ fn pipeline_config_for(def: &PipelineDefinition) -> PipelineConfig {
         cfg.delivery.checkpoint.backend = crate::delivery::CheckpointBackend::None;
         cfg.delivery.checkpoint.retention = std::time::Duration::ZERO;
     }
+    // V5.1: translate the manifest's PoH posture onto runtime config.
+    // The supervisor stamps the real partition id into `cfg.partition_id`
+    // *after* `pipeline_config_for` returns; `create_poh_state` reads
+    // `config.poh.partition` first and falls back to `config.partition_id`
+    // if they disagree, but mirroring the supervisor-installed partition
+    // here means the chain genesises with the correct id from the start
+    // for the T0 single-partition path. Multi-partition pipelines have
+    // their per-partition sub-tasks rewrite this in `run_multi_partition`.
+    #[cfg(feature = "processor-auth")]
+    {
+        cfg.poh = if def.poh.is_active() {
+            Some(crate::pipeline::PohConfig {
+                partition: PartitionId::new(0),
+                max_recent_entries: def.poh.max_recent_entries as usize,
+                // V5.1 schema preserves `signing_key_ref` but the secret
+                // resolver atom that maps it onto an `Arc<SigningKey>`
+                // lands separately; chain-only verification (`Verify`,
+                // `TrustExtend`) works without a signing key, so the
+                // unblock is real even before the resolver is wired.
+                signing_key: None,
+            })
+        } else {
+            None
+        };
+    }
     cfg
 }
 
@@ -709,6 +878,80 @@ mod tests {
             },
             0,
         )
+    }
+
+    // V5.1: pipeline_config_for must translate `def.poh` onto runtime
+    // `PipelineConfig.poh`. Disabled is the legacy default — `cfg.poh`
+    // stays None. Enabled produces a `PohConfig` with the manifest's
+    // `max_recent_entries`, ready for `create_poh_state` to genesise
+    // a per-partition chain.
+    #[cfg(feature = "processor-auth")]
+    #[test]
+    fn pipeline_config_for_default_poh_is_disabled() {
+        let def = def_for("p");
+        let cfg = pipeline_config_for(&def);
+        assert!(cfg.poh.is_none());
+    }
+
+    #[cfg(feature = "processor-auth")]
+    #[test]
+    fn pipeline_config_for_enabled_poh_populates_pipeline_config() {
+        let mut def = def_for("p");
+        def.poh = aeon_types::poh::PohBlock {
+            enabled: true,
+            max_recent_entries: 4096,
+            signing_key_ref: None,
+        };
+        let cfg = pipeline_config_for(&def);
+        let poh = cfg.poh.expect("PohConfig must be populated when enabled");
+        assert_eq!(poh.max_recent_entries, 4096);
+        // Partition mirrors the supervisor-stamped value at start(); the
+        // builder sets a placeholder of 0 here.
+        assert_eq!(poh.partition.as_u16(), 0);
+        assert!(poh.signing_key.is_none());
+    }
+
+    // V5.1 R1: a manifest declaring `signing_key_ref` without an installed
+    // SecretRegistry must hard-fail at start() — not silently strip the
+    // reference and run unsigned. Mirrors the encryption probe's
+    // "required-without-KEK" behaviour. Idempotent registry install is
+    // also covered.
+    #[cfg(feature = "processor-auth")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_refuses_pipeline_with_signing_key_ref_when_no_registry() {
+        let mut reg = ConnectorRegistry::new();
+        reg.register_source("count", Arc::new(CountingSourceFactory(10)));
+        let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        reg.register_sink("capture", Arc::new(CapturingSinkFactory(counter)));
+
+        let sup = PipelineSupervisor::new(Arc::new(reg));
+        let mut def = def_for("poh-needs-key");
+        def.poh = aeon_types::poh::PohBlock {
+            enabled: true,
+            max_recent_entries: 1024,
+            signing_key_ref: Some("${ENV:AEON_POH_REQUIRED_KEY}".into()),
+        };
+        let err = match sup.start(&def).await {
+            Err(e) => e,
+            Ok(_) => panic!("start must refuse without registry"),
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("SecretRegistry"), "got {msg}");
+    }
+
+    #[cfg(feature = "processor-auth")]
+    #[test]
+    fn set_secret_registry_is_once_only() {
+        let sup = PipelineSupervisor::new(Arc::new(ConnectorRegistry::new()));
+        let r1 = Arc::new(aeon_types::SecretRegistry::default_local());
+        sup.set_secret_registry(r1).expect("first install");
+        let r2 = Arc::new(aeon_types::SecretRegistry::default_local());
+        let err = match sup.set_secret_registry(r2) {
+            Err(e) => e,
+            Ok(_) => panic!("second install must fail"),
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("already installed"), "got {msg}");
     }
 
     /// Poll until `cond()` returns true or `max_iters` × 10ms elapse.

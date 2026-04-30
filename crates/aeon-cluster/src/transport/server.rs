@@ -19,7 +19,8 @@ use crate::transport::poh_transfer::{
 use crate::types::{
     JoinRequest, JoinResponse, NodeId, PartitionCutoverRequest, PartitionCutoverResponse,
     PartitionTransferEnd, PartitionTransferRequest, PohChainTransferRequest,
-    PohChainTransferResponse, RemoveNodeRequest, RemoveNodeResponse,
+    PohChainTransferResponse, ProposeForwardRequest, ProposeForwardResponse,
+    RemoveNodeRequest, RemoveNodeResponse,
 };
 
 /// Shared provider slots for source-side CL-6 handlers. The three slots
@@ -185,6 +186,9 @@ async fn handle_stream_slots(
             let coord = slots.current_cutover().await;
             handle_partition_cutover(coord.as_deref(), payload, send).await
         }
+        MessageType::ProposeForwardRequest => {
+            handle_propose_forward(&raft, &payload, &mut send).await
+        }
         _ => {
             tracing::warn!("unexpected message type: {:?}", msg_type);
             Ok(())
@@ -318,6 +322,9 @@ async fn handle_stream(
         }
         MessageType::PartitionCutoverRequest => {
             handle_partition_cutover(cutover_coordinator.as_deref(), payload, send).await
+        }
+        MessageType::ProposeForwardRequest => {
+            handle_propose_forward(&raft, &payload, &mut send).await
         }
         _ => {
             tracing::warn!("unexpected message type: {:?}", msg_type);
@@ -805,6 +812,73 @@ async fn handle_remove_node(
             source: None,
         })?;
     framing::write_frame(send, MessageType::RemoveNodeResponse, &resp_bytes).await?;
+    let _ = send.finish();
+    Ok(())
+}
+
+/// Handle a forwarded Raft proposal.
+///
+/// The follower sent us a bincode-serialized `ClusterRequest`; we
+/// deserialize it, run `raft.client_write` locally, and reply with the
+/// bincode-serialized `ClusterResponse`. If propose fails (this node is
+/// also no longer the leader, or openraft surfaces some other error)
+/// we set `success = false` and stuff the error into `message` so the
+/// caller can decide whether to retry against the new leader.
+async fn handle_propose_forward(
+    raft: &Raft<AeonRaftConfig>,
+    payload: &[u8],
+    send: &mut quinn::SendStream,
+) -> Result<(), aeon_types::AeonError> {
+    let req: ProposeForwardRequest =
+        bincode::deserialize(payload).map_err(|e| aeon_types::AeonError::Serialization {
+            message: format!("deserialize ProposeForwardRequest: {e}"),
+            source: None,
+        })?;
+
+    let cluster_req: crate::types::ClusterRequest =
+        bincode::deserialize(&req.request_bytes).map_err(|e| {
+            aeon_types::AeonError::Serialization {
+                message: format!(
+                    "deserialize forwarded ClusterRequest payload: {e}"
+                ),
+                source: None,
+            }
+        })?;
+
+    let resp = match raft.client_write(cluster_req).await {
+        Ok(write_resp) => {
+            let bytes = bincode::serialize(&write_resp.data).map_err(|e| {
+                aeon_types::AeonError::Serialization {
+                    message: format!("serialize forwarded ClusterResponse: {e}"),
+                    source: None,
+                }
+            })?;
+            ProposeForwardResponse {
+                success: true,
+                response_bytes: bytes,
+                message: String::new(),
+            }
+        }
+        Err(e) => {
+            // Includes the case where this node also stopped being the
+            // leader between dispatch and propose. Surface the openraft
+            // error verbatim — the caller can grep for "ForwardToLeader"
+            // and re-resolve if needed.
+            ProposeForwardResponse {
+                success: false,
+                response_bytes: Vec::new(),
+                message: format!("client_write failed: {e}"),
+            }
+        }
+    };
+
+    let resp_bytes = bincode::serialize(&resp).map_err(|e| {
+        aeon_types::AeonError::Serialization {
+            message: format!("serialize ProposeForwardResponse: {e}"),
+            source: None,
+        }
+    })?;
+    framing::write_frame(send, MessageType::ProposeForwardResponse, &resp_bytes).await?;
     let _ = send.finish();
     Ok(())
 }

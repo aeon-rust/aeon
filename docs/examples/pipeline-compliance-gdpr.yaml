@@ -1,0 +1,107 @@
+# GDPR-regulated pipeline — reference manifest (S4.3).
+#
+# Ingests user-account events from Kafka, runs them through a native
+# processor that emits anonymised analytics output, and sinks the result
+# into a second Kafka topic. Declares `compliance.regime: gdpr` with
+# `strict` enforcement so the pipeline refuses to start unless the S3
+# at-rest encryption, S5 retention, and S6 erasure surfaces are all
+# satisfied.
+#
+# All secrets are sourced via ENV / VAULT interpolation
+# at pipeline apply time — no plaintext secrets live in this file. This
+# follows the env-var-first rule (see docs/DEPLOYMENT.md): Helm / K8s /
+# CI-CD injects the variables, Vault holds the cert/key material.
+
+pipelines:
+  - name: user-events-gdpr
+    partitions: 8
+
+    # S4 compliance declaration — regime + enforcement gate pipeline start.
+    compliance:
+      regime: gdpr
+      enforcement: strict
+
+      # S6.8 — pending-tombstone age cap. Default 24h leaves 29 days of
+      # slack before the GDPR 30-day erasure SLA; tighten for audited
+      # environments.
+      erasure:
+        max_delay_hours: 12
+
+      # PII/PHI selectors. Consumed by S3 at-rest encryption, S5 retention
+      # classification, and S6 erasure extraction. Not evaluated here.
+      selectors:
+        - path: "$.user.email"
+          format: json
+          class: pii
+        - path: "$.user.phone"
+          format: json
+          class: pii
+        - path: "$.billing.iban"
+          format: json
+          class: pii
+
+    # S3 at-rest encryption — required under gdpr/strict.
+    encryption:
+      at_rest: required
+      # KEK resolution path — the S1 secret registry resolves this at
+      # pipeline start (Vault transit key in production, env var in dev).
+      data_context_kek: "${VAULT:kv/aeon/kek/data-user-events}"
+
+    # S5 retention — must be active for any regime except `none`.
+    durability:
+      mode: event_time
+      retention:
+        l2_body:
+          hold_after_ack: 4h
+        l3_ack:
+          max_records: 1000000
+
+    sources:
+      - name: user-events-in
+        type: kafka
+        kind: pull
+        identity:
+          mode: native
+        event_time:
+          mode: broker
+        topic: user-events
+        partitions: [0, 1, 2, 3, 4, 5, 6, 7]
+        # S6.7 — subject-id extractor populates aeon.subject_id metadata
+        # so erasure requests can target specific users.
+        subject_extract:
+          kind: json_path
+          namespace: user
+          path: "$.user.id"
+        # Connector keys live at the source's top level (SourceManifest
+        # uses #[serde(flatten)] on its config BTreeMap).
+        brokers: "${ENV:REDPANDA_BOOTSTRAP}"
+        group_id: "aeon-user-events-gdpr"
+        batch_max: "1024"
+        # S10 outbound auth — mTLS to Kafka with client-cert resolved
+        # from Vault. Cert + key stay in memory only.
+        outbound_auth_mode: "mtls"
+        outbound_auth_mtls_cert_pem: "${VAULT:kv/aeon/mtls/kafka/cert}"
+        outbound_auth_mtls_key_pem: "${VAULT:kv/aeon/mtls/kafka/key}"
+
+    processor:
+      name: anonymise
+      version: "1.4.0"
+      tier: native
+
+    sinks:
+      - name: analytics-out
+        type: kafka
+        eos_tier: t2_transactional_stream
+        topic: analytics-anonymised
+        brokers: "${ENV:REDPANDA_BOOTSTRAP}"
+        strategy: ordered_batch
+        transactional_id: "aeon-analytics-${ENV:HOSTNAME}"
+        outbound_auth_mode: "mtls"
+        outbound_auth_mtls_cert_pem: "${VAULT:kv/aeon/mtls/kafka/cert}"
+        outbound_auth_mtls_key_pem: "${VAULT:kv/aeon/mtls/kafka/key}"
+
+# Apply with:
+#   aeon apply -f docs/examples/pipeline-compliance-gdpr.yaml --dry-run
+#
+# Expected dry-run output:
+#   [dry-run] pipeline 'user-events-gdpr' — would create (1 source(s), 1 sink(s)), compliance: gdpr/strict

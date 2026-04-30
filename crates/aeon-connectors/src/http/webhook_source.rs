@@ -264,6 +264,12 @@ fn log_rejection(source: &str, rejection: &AuthRejection, peer: std::net::IpAddr
         peer = %redacted,
         "inbound request rejected"
     );
+    // S2.5 — dedicated audit channel (not the tracing data-path).
+    aeon_observability::emit_auth_rejected(
+        &format!("http-webhook/{source}"),
+        rejection.reason_tag(),
+        &redacted,
+    );
 }
 
 fn redact_ip(ip: std::net::IpAddr) -> String {

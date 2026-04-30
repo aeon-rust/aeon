@@ -16,8 +16,14 @@ name = "aeon"
 path = "src/main.rs"
 
 [features]
-default = ["native-validate"]
+default = ["native-validate", "processor-auth"]
 native-validate = ["aeon-engine/native-loader"]
+# V5.1 R1: passthrough — aeon-engine ships processor-auth in its defaults,
+# but aeon-cli must declare its own copy so cfg gates inside aeon-cli code
+# (e.g. cmd_serve's `set_secret_registry` install) can detect when the
+# transitive feature is actually compiled in. Without this passthrough the
+# cfg always evaluates false and the install would silently no-op.
+processor-auth = ["aeon-engine/processor-auth"]
 rest-api = ["aeon-engine/rest-api", "aeon-engine/cluster", "dep:tokio", "dep:tracing", "dep:tracing-subscriber", "dep:dashmap", "dep:notify", "dep:aeon-wasm", "dep:aeon-connectors", "dep:uuid", "dep:bytes", "dep:aeon-cluster"]
 
 [dependencies]
@@ -39,7 +45,21 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"], option
 dashmap = { workspace = true, optional = true }
 notify = { workspace = true, optional = true }
 aeon-wasm = { workspace = true, optional = true }
-aeon-connectors = { workspace = true, optional = true, features = ["kafka", "http", "file"] }
+aeon-connectors = { workspace = true, optional = true, features = [
+    "kafka",
+    "http",
+    "file",
+    # P5.c — broader connector set so the aeon-cli binary can load
+    # manifests referencing WebSocket / Redis Streams / NATS / Postgres-CDC /
+    # MySQL-CDC / MongoDB-CDC source+sink types. Each of these uses S10
+    # mTLS / broker-native auth wiring closed 2026-04-24.
+    "websocket",
+    "redis-streams",
+    "nats",
+    "postgres-cdc",
+    "mysql-cdc",
+    "mongodb-cdc",
+] }
 uuid = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
 aeon-cluster = { workspace = true, features = ["auto-tls"], optional = true }

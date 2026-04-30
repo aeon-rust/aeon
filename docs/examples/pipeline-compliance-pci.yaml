@@ -1,0 +1,76 @@
+# PCI-DSS-regulated pipeline — reference manifest (S4.3).
+#
+# Captures card-auth events from Kafka, masks the PAN, writes the masked
+# stream back to Kafka. Declares `compliance.regime: pci` with `warn`
+# enforcement — findings from the S4.2 precondition validator are logged
+# but don't block pipeline start. Tighten to `strict` for audited prod.
+#
+# PCI-DSS needs at-rest encryption (S3) + retention (S5) but does NOT
+# require the GDPR erasure surface (S6); the selectors here classify
+# cardholder data so S3 / S5 treat it correctly.
+
+pipelines:
+  - name: card-auth-pci
+    partitions: 4
+
+    compliance:
+      regime: pci
+      enforcement: warn  # flip to `strict` for audited envs
+      selectors:
+        - path: "$.card.pan"
+          format: json
+          class: pii
+        - path: "$.card.cvv"
+          format: json
+          class: pii
+        - path: "$.card.expiry"
+          format: json
+          class: pii
+
+    encryption:
+      at_rest: required
+      data_context_kek: "${VAULT:kv/aeon/kek/card-auth}"
+
+    durability:
+      mode: event_time
+      retention:
+        l2_body:
+          hold_after_ack: 1h
+        l3_ack:
+          max_records: 500000
+
+    sources:
+      - name: card-auth-in
+        type: kafka
+        kind: pull
+        identity:
+          mode: native
+        event_time:
+          mode: broker
+        topic: card-auth-raw
+        partitions: [0, 1, 2, 3]
+        # Connector keys live at the source's top level (SourceManifest
+        # uses #[serde(flatten)] on its config BTreeMap).
+        brokers: "${ENV:REDPANDA_BOOTSTRAP}"
+        group_id: "aeon-card-auth-pci"
+        batch_max: "512"
+        outbound_auth_mode: "mtls"
+        outbound_auth_mtls_cert_pem: "${VAULT:kv/aeon/mtls/kafka/cert}"
+        outbound_auth_mtls_key_pem: "${VAULT:kv/aeon/mtls/kafka/key}"
+
+    processor:
+      name: mask-pan
+      version: "0.7.2"
+      tier: native
+
+    sinks:
+      - name: card-auth-masked
+        type: kafka
+        eos_tier: t2_transactional_stream
+        topic: card-auth-masked
+        brokers: "${ENV:REDPANDA_BOOTSTRAP}"
+        strategy: ordered_batch
+        transactional_id: "aeon-card-mask-${ENV:HOSTNAME}"
+        outbound_auth_mode: "mtls"
+        outbound_auth_mtls_cert_pem: "${VAULT:kv/aeon/mtls/kafka/cert}"
+        outbound_auth_mtls_key_pem: "${VAULT:kv/aeon/mtls/kafka/key}"

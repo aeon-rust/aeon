@@ -17,12 +17,11 @@
 //!
 //!   Signer credentials win over any embedded in the connection string;
 //!   a warn line is emitted on conflict so the override is visible.
-//! - `Mtls` — warn-and-skip. tokio-postgres takes a separate TLS
-//!   connector argument (`tokio_postgres::connect(cfg, NoTls)`); wiring
-//!   a rustls-based client-auth connector requires the
-//!   `tokio-postgres-rustls` crate, which is not in the workspace. For
-//!   server-auth TLS use `sslmode=require` in the base connection
-//!   string with a TLS connector crate (follow-up).
+//! - `Mtls` — parse the signer's cert/key PEMs into a `rustls::ClientConfig`
+//!   via [`crate::mtls_pem::build_mtls_client_config`] and return it alongside
+//!   the `Config`. The source then hands the rustls config to
+//!   `tokio_postgres_rustls::MakeRustlsConnect::new(tls)` and uses that as the
+//!   TLS connector for `Config::connect`. Inline PEM only; no tempfiles.
 //! - `Bearer` / `Basic` / `ApiKey` / `HmacSign` — warn-and-skip.
 
 use aeon_types::{AeonError, OutboundAuthMode, OutboundAuthSigner};
@@ -30,18 +29,22 @@ use std::str::FromStr;
 use std::sync::Arc;
 use tokio_postgres::Config;
 
-/// Parse `conn_string` into a `tokio_postgres::Config` and apply any
-/// signer-supplied overrides. Returns the config ready to hand to
-/// `Config::connect(NoTls)`.
+/// Parse `conn_string` into a `tokio_postgres::Config`, apply any
+/// signer-supplied overrides, and — when the signer is in `Mtls` mode —
+/// return a ready-to-use `rustls::ClientConfig` carrying the client
+/// identity. The caller wraps the rustls config in a
+/// `tokio_postgres_rustls::MakeRustlsConnect` and passes it to
+/// `Config::connect(...)`; the `None` branch means "use `NoTls`".
 pub(super) fn resolve_config(
     conn_string: &str,
     signer: Option<&Arc<OutboundAuthSigner>>,
-) -> Result<Config, AeonError> {
+) -> Result<(Config, Option<rustls::ClientConfig>), AeonError> {
     let mut config = Config::from_str(conn_string).map_err(|e| {
         AeonError::config(format!("postgres connection string parse failed: {e}"))
     })?;
 
-    let Some(s) = signer else { return Ok(config) };
+    let Some(s) = signer else { return Ok((config, None)) };
+    let mut tls: Option<rustls::ClientConfig> = None;
     match s.mode() {
         OutboundAuthMode::None => { /* pass-through */ }
         OutboundAuthMode::BrokerNative => {
@@ -74,11 +77,17 @@ pub(super) fn resolve_config(
             }
         }
         OutboundAuthMode::Mtls => {
-            tracing::warn!(
-                "Postgres CDC connector: mTLS requires the tokio-postgres-rustls crate \
-                 (not in this build). Inline cert/key PEM can't be wired through tokio-postgres' \
-                 NoTls connector. Use broker_native + sslmode=require for server-auth TLS."
-            );
+            let cert_pem = s.mtls_cert_pem().ok_or_else(|| {
+                AeonError::config(
+                    "postgres CDC mTLS: signer is in Mtls mode but missing cert PEM",
+                )
+            })?;
+            let key_pem = s.mtls_key_pem().ok_or_else(|| {
+                AeonError::config(
+                    "postgres CDC mTLS: signer is in Mtls mode but missing key PEM",
+                )
+            })?;
+            tls = Some(crate::mtls_pem::build_mtls_client_config(cert_pem, key_pem)?);
         }
         OutboundAuthMode::Bearer
         | OutboundAuthMode::Basic
@@ -91,7 +100,7 @@ pub(super) fn resolve_config(
             );
         }
     }
-    Ok(config)
+    Ok((config, tls))
 }
 
 #[cfg(test)]
@@ -104,15 +113,23 @@ mod tests {
         Arc::new(OutboundAuthSigner::build(config).unwrap())
     }
 
+    fn fixture_cert_and_key() -> (String, String) {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        (cert.pem(), key.serialize_pem())
+    }
+
     #[test]
     fn no_signer_uses_string_verbatim() {
-        let cfg = resolve_config(
+        let (cfg, tls) = resolve_config(
             "host=localhost user=aeon password=pw dbname=a",
             None,
         )
         .unwrap();
         assert_eq!(cfg.get_user(), Some("aeon"));
         assert_eq!(cfg.get_dbname(), Some("a"));
+        assert!(tls.is_none(), "no signer must not produce a TLS config");
     }
 
     #[test]
@@ -126,7 +143,7 @@ mod tests {
             broker_native: Some(BrokerNativeConfig { values }),
             ..Default::default()
         });
-        let cfg = resolve_config(
+        let (cfg, tls) = resolve_config(
             "host=localhost user=conn-user password=conn-pw dbname=conn-db",
             Some(&s),
         )
@@ -134,6 +151,7 @@ mod tests {
         assert_eq!(cfg.get_user(), Some("signer-user"));
         assert_eq!(cfg.get_password(), Some(b"signer-pw".as_slice()));
         assert_eq!(cfg.get_dbname(), Some("signer-db"));
+        assert!(tls.is_none());
     }
 
     #[test]
@@ -145,7 +163,7 @@ mod tests {
             broker_native: Some(BrokerNativeConfig { values }),
             ..Default::default()
         });
-        let cfg = resolve_config("host=localhost user=u", Some(&s)).unwrap();
+        let (cfg, _tls) = resolve_config("host=localhost user=u", Some(&s)).unwrap();
         assert_eq!(cfg.get_user(), Some("u"));
         assert_eq!(cfg.get_password(), Some(b"p".as_slice()));
     }
@@ -159,7 +177,7 @@ mod tests {
             broker_native: Some(BrokerNativeConfig { values }),
             ..Default::default()
         });
-        let cfg = resolve_config("host=localhost user=u", Some(&s)).unwrap();
+        let (cfg, _tls) = resolve_config("host=localhost user=u", Some(&s)).unwrap();
         assert_eq!(cfg.get_application_name(), Some("aeon-cdc"));
     }
 
@@ -169,25 +187,41 @@ mod tests {
             mode: OutboundAuthMode::None,
             ..Default::default()
         });
-        let cfg = resolve_config("host=localhost user=u dbname=d", Some(&s)).unwrap();
+        let (cfg, tls) = resolve_config("host=localhost user=u dbname=d", Some(&s)).unwrap();
         assert_eq!(cfg.get_user(), Some("u"));
         assert_eq!(cfg.get_dbname(), Some("d"));
+        assert!(tls.is_none());
     }
 
     #[test]
-    fn mtls_mode_is_warn_and_skip() {
+    fn mtls_mode_produces_rustls_client_config() {
+        let (cert_pem, key_pem) = fixture_cert_and_key();
+        let s = signer(OutboundAuthConfig {
+            mode: OutboundAuthMode::Mtls,
+            mtls: Some(aeon_types::OutboundMtlsConfig { cert_pem, key_pem }),
+            ..Default::default()
+        });
+        let (cfg, tls) = resolve_config("host=localhost user=u", Some(&s)).unwrap();
+        assert_eq!(cfg.get_user(), Some("u"));
+        assert!(
+            tls.is_some(),
+            "mTLS signer must produce a rustls::ClientConfig"
+        );
+    }
+
+    #[test]
+    fn mtls_mode_rejects_malformed_pem() {
         let s = signer(OutboundAuthConfig {
             mode: OutboundAuthMode::Mtls,
             mtls: Some(aeon_types::OutboundMtlsConfig {
-                cert_pem: "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"
-                    .to_string(),
-                key_pem: "-----BEGIN PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----\n"
-                    .to_string(),
+                cert_pem: "not a PEM".to_string(),
+                key_pem: "not a key".to_string(),
             }),
             ..Default::default()
         });
-        let cfg = resolve_config("host=localhost user=u", Some(&s)).unwrap();
-        assert_eq!(cfg.get_user(), Some("u"));
+        let err = resolve_config("host=localhost user=u", Some(&s)).unwrap_err();
+        let msg = format!("{err}").to_lowercase();
+        assert!(msg.contains("mtls") || msg.contains("certificate") || msg.contains("pem"));
     }
 
     #[test]
@@ -199,8 +233,9 @@ mod tests {
             }),
             ..Default::default()
         });
-        let cfg = resolve_config("host=localhost user=u", Some(&s)).unwrap();
+        let (cfg, tls) = resolve_config("host=localhost user=u", Some(&s)).unwrap();
         assert_eq!(cfg.get_user(), Some("u"));
+        assert!(tls.is_none());
     }
 
     #[test]

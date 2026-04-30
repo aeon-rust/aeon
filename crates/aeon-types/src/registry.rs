@@ -280,6 +280,14 @@ pub struct PipelineDefinition {
     /// erasure preconditions (at-rest encryption) are missing.
     #[serde(default)]
     pub compliance: crate::compliance::ComplianceBlock,
+    /// V5 — Proof-of-History posture. Defaults to an inert block
+    /// (`enabled=false`) so pre-V5 serialized forms deserialize
+    /// cleanly. When `enabled`, `pipeline_config_for` translates
+    /// this block onto `PipelineConfig.poh`, the processor task
+    /// records a hash chain of every batch, and the chain head
+    /// becomes accessible via the `/poh-head` REST endpoint.
+    #[serde(default)]
+    pub poh: crate::poh::PohBlock,
 }
 
 impl PipelineDefinition {
@@ -306,6 +314,7 @@ impl PipelineDefinition {
             durability: crate::manifest::DurabilityBlock::default(),
             encryption: crate::encryption::EncryptionBlock::default(),
             compliance: crate::compliance::ComplianceBlock::default(),
+            poh: crate::poh::PohBlock::default(),
         }
     }
 }

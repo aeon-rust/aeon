@@ -302,6 +302,37 @@ pub struct PartitionCutoverResponse {
     pub message: String,
 }
 
+/// Forwarded Raft proposal: a follower wraps a `ClusterRequest` it
+/// would have called `raft.client_write` on directly and ships it to
+/// the current leader. The leader runs `client_write` locally and
+/// returns the resulting `ClusterResponse` (or an error message if
+/// the leader's own propose fails).
+///
+/// `request_bytes` is the bincode-serialized `ClusterRequest` because
+/// `aeon-cluster` types live below the state machine in the dependency
+/// graph and pulling the enum across module boundaries adds friction.
+/// Callers serialize at the call site; the leader-side dispatcher
+/// deserializes back to a `ClusterRequest` before the propose call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProposeForwardRequest {
+    /// Bincode-serialized `ClusterRequest`.
+    pub request_bytes: Vec<u8>,
+}
+
+/// Response to a `ProposeForwardRequest`. On `success == true`,
+/// `response_bytes` is the bincode-serialized `ClusterResponse`
+/// produced by `raft.client_write`. On `success == false`, `message`
+/// describes the failure (leader changed, propose timeout, etc.) and
+/// `response_bytes` is empty.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProposeForwardResponse {
+    pub success: bool,
+    /// Bincode-serialized `ClusterResponse`. Empty on failure.
+    pub response_bytes: Vec<u8>,
+    /// Error context when `success == false`. Empty on happy path.
+    pub message: String,
+}
+
 /// Ownership state of a single partition.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PartitionOwnership {

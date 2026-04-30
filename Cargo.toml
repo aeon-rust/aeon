@@ -97,7 +97,7 @@ tokio-tungstenite = "0.26"
 # For custom rustls ClientConfig passed via `Connector::Rustls`.
 # Only aeon-connectors (websocket feature) pulls this.
 webpki-roots = "1.0"
-redis = { version = "0.27", features = ["tokio-comp", "streams"] }
+redis = { version = "0.27", features = ["tokio-comp", "streams", "tls-rustls", "tokio-rustls-comp", "tls-rustls-webpki-roots"] }
 async-nats = "0.38"
 rumqttc = "0.24"
 lapin = "2"
@@ -105,7 +105,19 @@ lapin = "2"
 # Advanced connectors (Phase 11b)
 wtransport = "0.6"
 tokio-postgres = { version = "0.7", features = ["runtime"] }
-mysql_async = "0.34"
+# S10 mTLS — rustls-based TLS connector for tokio-postgres. Used by
+# postgres-cdc when outbound_auth.mode=mtls so cert/key PEM from the
+# signer can be wired through tokio_postgres::Config::connect(tls) without
+# touching disk.
+tokio-postgres-rustls = "0.13"
+# S10 mTLS — mysql_async's rustls-tls feature enables
+# `SslOpts::with_client_identity` + `ClientIdentity::new(PathOrBuf::Buf(...))`,
+# the inline-PEM path the CDC connector uses so signer-held cert/key never
+# touches disk. Defaults are disabled because upstream `default` forces
+# `native-tls-tls`, which conflicts with `rustls-tls` (two mutually-exclusive
+# TLS backend enums). `default-rustls` is the pre-baked rustls-variant
+# default set.
+mysql_async = { version = "0.34", default-features = false, features = ["default-rustls"] }
 mongodb = "3"
 
 # Observability

@@ -1,0 +1,40 @@
+# HELP aeon_pipeline_events_received_total Events received by a pipeline's source
+# TYPE aeon_pipeline_events_received_total counter
+# HELP aeon_pipeline_events_processed_total Events processed by a pipeline's processor
+# TYPE aeon_pipeline_events_processed_total counter
+# HELP aeon_pipeline_outputs_sent_total Outputs the pipeline handed to its sink
+# TYPE aeon_pipeline_outputs_sent_total counter
+# HELP aeon_pipeline_outputs_acked_total Outputs the downstream system confirmed (broker ack, HTTP 2xx, fsync)
+# TYPE aeon_pipeline_outputs_acked_total counter
+# HELP aeon_pipeline_events_failed_total Events permanently failed (retry-exhausted or skip-to-dlq)
+# TYPE aeon_pipeline_events_failed_total counter
+# HELP aeon_pipeline_events_retried_total Individual retry attempts
+# TYPE aeon_pipeline_events_retried_total counter
+# HELP aeon_pipeline_checkpoints_written_total Checkpoint records appended
+# TYPE aeon_pipeline_checkpoints_written_total counter
+# HELP aeon_pipeline_poh_entries_total PoH chain entries appended (per batch)
+# TYPE aeon_pipeline_poh_entries_total counter
+# HELP aeon_raft_term Current Raft term (monotonic; +1 on each election attempt)
+# TYPE aeon_raft_term gauge
+aeon_raft_term{node_id="2"} 1
+# HELP aeon_raft_last_log_index Most recent Raft log index
+# TYPE aeon_raft_last_log_index gauge
+aeon_raft_last_log_index{node_id="2"} 2
+# HELP aeon_raft_last_applied_index Most recent applied log index
+# TYPE aeon_raft_last_applied_index gauge
+aeon_raft_last_applied_index{node_id="2"} 2
+# HELP aeon_raft_leader_id Current Raft leader NodeId (0 if unknown)
+# TYPE aeon_raft_leader_id gauge
+aeon_raft_leader_id{node_id="2"} 3
+# HELP aeon_raft_is_leader 1 if this node is the current leader, 0 otherwise
+# TYPE aeon_raft_is_leader gauge
+aeon_raft_is_leader{node_id="2"} 0
+# HELP aeon_raft_state Raft server state (0=Learner,1=Follower,2=Candidate,3=Leader)
+# TYPE aeon_raft_state gauge
+aeon_raft_state{node_id="2"} 1
+# HELP aeon_cluster_membership_size Number of voters in the current membership
+# TYPE aeon_cluster_membership_size gauge
+aeon_cluster_membership_size{node_id="2"} 3
+# HELP aeon_cluster_node_id This node's configured NodeId
+# TYPE aeon_cluster_node_id gauge
+aeon_cluster_node_id 2

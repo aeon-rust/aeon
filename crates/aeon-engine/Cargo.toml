@@ -27,6 +27,10 @@ debug-payload-logging = []
 
 [dependencies]
 aeon-types = { workspace = true }
+# S2.5 audit — supervisor emits compliance refusals on the dedicated
+# audit sink. Promoted from dev-dep because call-site wiring lives in
+# production code now.
+aeon-observability = { path = "../aeon-observability" }
 bytes = { workspace = true }
 rtrb = { workspace = true }
 tokio = { workspace = true }

@@ -1001,21 +1001,107 @@ mod inner {
         /// submitting, so callers (including REST `create_pipeline` issued
         /// seconds after `aeon server` start) don't see a transient
         /// "has to forward request to: None, None" 500.
+        ///
+        /// 2026-04-25 — when this node is a *follower*, `client_write` returns
+        /// `ForwardToLeader { Some(leader_id), Some(leader_node) }` rather
+        /// than auto-forwarding the proposal. Callers in driver loops
+        /// (partition-driver `CompleteTransfer` / `AbortTransfer`) hit this
+        /// every time the source pod isn't also the leader. We catch that
+        /// shape here and re-issue the proposal as a
+        /// `MessageType::ProposeForwardRequest` over the existing cluster
+        /// QUIC transport so the leader runs `client_write` locally and
+        /// returns the same `ClusterResponse` shape. One hop only — if the
+        /// leader's own propose returns ForwardToLeader (leadership
+        /// changed mid-flight) the caller sees an error and retries.
         pub async fn propose(&self, request: ClusterRequest) -> Result<ClusterResponse, AeonError> {
             if self.raft.metrics().borrow().current_leader.is_none() {
                 let _ = self.wait_for_leader(self.leader_wait_budget()).await;
             }
 
-            let response =
-                self.raft
-                    .client_write(request)
-                    .await
-                    .map_err(|e| AeonError::Cluster {
+            match self.raft.client_write(request.clone()).await {
+                Ok(response) => Ok(response.data),
+                Err(e) => {
+                    // openraft's client_write returns
+                    // `RaftError<NID, ClientWriteError<NID, N>>`. Reach
+                    // for the ForwardToLeader inside.
+                    if let Some(ftl) = e.forward_to_leader() {
+                        if let (Some(leader_id), Some(leader_node)) =
+                            (ftl.leader_id, ftl.leader_node.as_ref())
+                        {
+                            return self
+                                .forward_propose_to_leader(
+                                    leader_id,
+                                    leader_node,
+                                    request,
+                                )
+                                .await;
+                        }
+                    }
+                    Err(AeonError::Cluster {
                         message: format!("Raft proposal failed: {e}"),
                         source: None,
-                    })?;
+                    })
+                }
+            }
+        }
 
-            Ok(response.data)
+        /// Re-issue a `ClusterRequest` against the named leader via the
+        /// `MessageType::ProposeForwardRequest` RPC. Helper for
+        /// [`propose`] — split out so the call-site stays readable and
+        /// the test surface is narrow.
+        async fn forward_propose_to_leader(
+            &self,
+            leader_id: NodeId,
+            leader_node: &NodeAddress,
+            request: ClusterRequest,
+        ) -> Result<ClusterResponse, AeonError> {
+            let request_bytes = bincode::serialize(&request).map_err(|e| {
+                AeonError::Serialization {
+                    message: format!(
+                        "forward_propose: serialize ClusterRequest: {e}"
+                    ),
+                    source: None,
+                }
+            })?;
+
+            let endpoint = self.endpoint.as_ref().ok_or_else(|| AeonError::Cluster {
+                message: "forward_propose: no QUIC endpoint installed (single-node mode?)"
+                    .to_string(),
+                source: None,
+            })?;
+
+            let req = crate::types::ProposeForwardRequest { request_bytes };
+            let resp = crate::transport::network::send_propose_forward(
+                endpoint,
+                leader_id,
+                leader_node,
+                &req,
+            )
+            .await
+            .map_err(|e| AeonError::Cluster {
+                message: format!("forward_propose RPC to leader {leader_id} failed: {e}"),
+                source: None,
+            })?;
+
+            if !resp.success {
+                return Err(AeonError::Cluster {
+                    message: format!(
+                        "forward_propose: leader {leader_id} rejected proposal: {}",
+                        resp.message
+                    ),
+                    source: None,
+                });
+            }
+
+            let cluster_resp: ClusterResponse = bincode::deserialize(&resp.response_bytes)
+                .map_err(|e| AeonError::Serialization {
+                    message: format!(
+                        "forward_propose: deserialize ClusterResponse from leader: {e}"
+                    ),
+                    source: None,
+                })?;
+
+            Ok(cluster_resp)
         }
 
         /// Budget for waiting on self-election / leader-discovery before a

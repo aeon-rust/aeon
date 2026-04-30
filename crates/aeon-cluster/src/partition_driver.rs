@@ -346,7 +346,20 @@ impl PartitionTransferDriver {
                 return Err(e);
             }
         };
-        if let Err(e) = self.poh_installer.install(&poh_req, poh_bytes) {
+        // Empty response is the source-side sentinel for "this pipeline
+        // has no PoH leg on this partition" — see
+        // `aeon_engine::engine_providers::PohChainExportProvider::export_state`.
+        // Skip the install call in that case; the target has nothing to
+        // seed a local chain from, and installing an empty payload would
+        // just surface a decode error. Non-empty payloads go through as
+        // before.
+        if poh_bytes.is_empty() {
+            tracing::debug!(
+                partition = partition.as_u16(),
+                source = ?source,
+                "partition-driver: source signalled no PoH leg for this partition; skipping install"
+            );
+        } else if let Err(e) = self.poh_installer.install(&poh_req, poh_bytes) {
             self.abort_with_reason(
                 partition,
                 source,
@@ -375,51 +388,52 @@ impl PartitionTransferDriver {
         };
 
         // Raft commit: propose CompleteTransfer so every node observes
-        // the ownership flip. On Raft failure we still abort to keep
-        // the cluster consistent — the source is still frozen from the
-        // cutover handshake above, so we must revert ownership to free
-        // it (the source's write gate auto-releases on the abort-flip
-        // via the engine's ClusterRegistryApplier).
+        // the ownership flip. Uses propose_with_forward so a follower
+        // node (the source pod when it isn't also the Raft leader) can
+        // still complete the proposal — the helper detects
+        // ForwardToLeader and re-issues over the QUIC transport. On
+        // Raft failure we still abort to keep the cluster consistent —
+        // the source is still frozen from the cutover handshake above,
+        // so we must revert ownership to free it (the source's write
+        // gate auto-releases on the abort-flip via the engine's
+        // ClusterRegistryApplier).
         let propose_result = self
-            .raft
-            .client_write(ClusterRequest::CompleteTransfer {
+            .propose_with_forward(ClusterRequest::CompleteTransfer {
                 partition,
                 new_owner: target,
             })
             .await;
 
         match propose_result {
-            Ok(resp) => match resp.data {
-                ClusterResponse::Ok => {
-                    self.transition_complete(partition).await;
-                    Ok(())
-                }
-                ClusterResponse::Error(msg) => {
-                    self.abort_with_reason(
-                        partition,
-                        source,
-                        format!("CompleteTransfer rejected by state-machine: {msg}"),
-                    )
-                    .await;
-                    Err(AeonError::Cluster {
-                        message: format!(
-                            "partition-driver: CompleteTransfer rejected: {msg}"
-                        ),
-                        source: None,
-                    })
-                }
-                ClusterResponse::Registry(_) => {
-                    self.abort_with_reason(
-                        partition,
-                        source,
-                        "unexpected Registry response to CompleteTransfer".to_string(),
-                    )
-                    .await;
-                    Err(AeonError::state(
-                        "partition-driver: unexpected Registry response to CompleteTransfer",
-                    ))
-                }
-            },
+            Ok(ClusterResponse::Ok) => {
+                self.transition_complete(partition).await;
+                Ok(())
+            }
+            Ok(ClusterResponse::Error(msg)) => {
+                self.abort_with_reason(
+                    partition,
+                    source,
+                    format!("CompleteTransfer rejected by state-machine: {msg}"),
+                )
+                .await;
+                Err(AeonError::Cluster {
+                    message: format!(
+                        "partition-driver: CompleteTransfer rejected: {msg}"
+                    ),
+                    source: None,
+                })
+            }
+            Ok(ClusterResponse::Registry(_)) => {
+                self.abort_with_reason(
+                    partition,
+                    source,
+                    "unexpected Registry response to CompleteTransfer".to_string(),
+                )
+                .await;
+                Err(AeonError::state(
+                    "partition-driver: unexpected Registry response to CompleteTransfer",
+                ))
+            }
             Err(e) => {
                 let msg = format!("CompleteTransfer propose failed: {e}");
                 self.abort_with_reason(partition, source, msg.clone()).await;
@@ -494,7 +508,7 @@ impl PartitionTransferDriver {
             partition,
             revert_to: source,
         };
-        if let Err(e) = self.raft.client_write(abort).await {
+        if let Err(e) = self.propose_with_forward(abort).await {
             tracing::warn!(
                 partition = partition.as_u16(),
                 source,
@@ -509,6 +523,94 @@ impl PartitionTransferDriver {
                 "partition-driver: transfer aborted, ownership reverted"
             );
         }
+    }
+
+    /// Propose a `ClusterRequest` and, when this node is a follower,
+    /// forward the proposal to the leader via the
+    /// `MessageType::ProposeForwardRequest` RPC. Mirrors
+    /// [`crate::node::ClusterNode::propose`]'s 2026-04-25 fix for the
+    /// driver's own propose call sites (CompleteTransfer / AbortTransfer)
+    /// that previously failed with `ForwardToLeader` whenever the
+    /// transfer source pod wasn't also the Raft leader.
+    ///
+    /// Returns the leader's `ClusterResponse` on either path. One hop
+    /// only — if the leader's own propose returns `ForwardToLeader`
+    /// (mid-flight election) we surface the error and let the caller
+    /// abort the transfer.
+    async fn propose_with_forward(
+        &self,
+        request: ClusterRequest,
+    ) -> Result<ClusterResponse, AeonError> {
+        match self.raft.client_write(request.clone()).await {
+            Ok(response) => Ok(response.data),
+            Err(e) => {
+                if let Some(ftl) = e.forward_to_leader() {
+                    if let (Some(leader_id), Some(leader_node)) =
+                        (ftl.leader_id, ftl.leader_node.as_ref())
+                    {
+                        return self
+                            .forward_propose(leader_id, leader_node, request)
+                            .await;
+                    }
+                }
+                Err(AeonError::Cluster {
+                    message: format!("Raft proposal failed: {e}"),
+                    source: None,
+                })
+            }
+        }
+    }
+
+    /// RPC the proposal to the named leader. Companion of
+    /// [`Self::propose_with_forward`]. Kept as a method so tests can
+    /// stub the endpoint dial behavior without re-exporting the whole
+    /// transport surface.
+    async fn forward_propose(
+        &self,
+        leader_id: NodeId,
+        leader_node: &NodeAddress,
+        request: ClusterRequest,
+    ) -> Result<ClusterResponse, AeonError> {
+        let request_bytes = bincode::serialize(&request).map_err(|e| {
+            AeonError::Serialization {
+                message: format!("forward_propose: serialize ClusterRequest: {e}"),
+                source: None,
+            }
+        })?;
+
+        let req = crate::types::ProposeForwardRequest { request_bytes };
+        let resp = crate::transport::network::send_propose_forward(
+            &self.endpoint,
+            leader_id,
+            leader_node,
+            &req,
+        )
+        .await
+        .map_err(|e| AeonError::Cluster {
+            message: format!(
+                "forward_propose RPC to leader {leader_id} failed: {e}"
+            ),
+            source: None,
+        })?;
+
+        if !resp.success {
+            return Err(AeonError::Cluster {
+                message: format!(
+                    "forward_propose: leader {leader_id} rejected proposal: {}",
+                    resp.message
+                ),
+                source: None,
+            });
+        }
+
+        bincode::deserialize::<ClusterResponse>(&resp.response_bytes).map_err(|e| {
+            AeonError::Serialization {
+                message: format!(
+                    "forward_propose: deserialize ClusterResponse from leader: {e}"
+                ),
+                source: None,
+            }
+        })
     }
 
     /// Watcher loop — polls `shared_state` for `Transferring` entries

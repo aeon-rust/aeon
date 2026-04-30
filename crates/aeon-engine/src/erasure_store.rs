@@ -108,6 +108,21 @@ impl ErasureStore for L3ErasureStore {
         let ops: Vec<BatchEntry> = vec![(BatchOp::Put, key, Some(value))];
         self.l3.write_batch(&ops)?;
         self.l3.flush()?;
+        // S2.5 — audit the admitted erasure. The subject id is the
+        // sensitive bit here; we emit the tombstone uuid + pipeline +
+        // a selector shape tag so the audit log carries enough for
+        // cross-referencing without leaking the full identifier.
+        aeon_observability::emit_audit(
+            &aeon_types::audit::AuditEvent::new(
+                aeon_observability::now_unix_nanos(),
+                aeon_types::audit::AuditCategory::Erasure,
+                "erasure.request.accepted",
+                aeon_types::audit::AuditOutcome::Success,
+            )
+            .with_resource(format!("pipeline/{}", t.pipeline))
+            .with_detail("tombstone_id", t.id.to_string())
+            .with_detail("selector_kind", selector_kind_tag(&t.selector)),
+        );
         Ok(())
     }
 
@@ -150,6 +165,16 @@ impl ErasureStore for L3ErasureStore {
 
     fn pending_count(&self) -> Result<usize, AeonError> {
         Ok(self.list_pending()?.len())
+    }
+}
+
+/// S2.5 — short stable tag for an erasure selector shape, used as an
+/// audit-log detail field. Keeps the subject id itself out of the audit
+/// payload since subject ids are first-class regulated identifiers.
+fn selector_kind_tag(s: &aeon_types::ErasureSelector) -> &'static str {
+    match s {
+        aeon_types::ErasureSelector::Subject(_) => "subject",
+        aeon_types::ErasureSelector::Namespace(_) => "namespace",
     }
 }
 

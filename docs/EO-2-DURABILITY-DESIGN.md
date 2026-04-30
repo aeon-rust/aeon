@@ -541,8 +541,11 @@ pipelines:
         partitions: [0, 1, 2, 3, 4, 5, 6, 7]
         identity: { mode: native }
         event_time: broker
-        config:
-          bootstrap.servers: "redpanda:9092"
+        # Connector-specific keys are flattened onto the source (or sink)
+        # itself — do NOT nest under a literal `config:` block. See the
+        # `source_config_keys_must_be_flat_not_nested` test in
+        # `aeon-types::manifest` for the authoritative shape.
+        bootstrap.servers: "redpanda:9092"
 
       # Push source — random UUIDv7, ack-after-L2
       - name: returns-webhook
@@ -585,9 +588,9 @@ pipelines:
         type: kafka
         eos_tier: t2_transactional_stream
         topic: orders-enriched
-        config:
-          bootstrap.servers: "redpanda:9092"
-          transactional.id: "aeon-orders-enrichment-enriched"
+        # Same flatten rule on SinkManifest — connector keys at the top.
+        bootstrap.servers: "redpanda:9092"
+        transactional.id: "aeon-orders-enrichment-enriched"
 
       - name: cache-redis
         type: redis_streams

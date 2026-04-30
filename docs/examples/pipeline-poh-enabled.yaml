@@ -1,0 +1,80 @@
+# Proof-of-History (PoH) enabled pipeline — reference manifest (V5.1).
+#
+# Per-pipeline opt-in for the SHA-512 hash chain + Merkle tree of payloads
+# the processor task records over each batch. When `poh.enabled` is true,
+# the engine wires `PipelineConfig.poh` at pipeline start and
+# `create_poh_state` constructs a per-partition `PohChain`. The chain head
+# is then queryable via the REST endpoint:
+#
+#   GET /api/v1/pipelines/{name}/partitions/{partition}/poh-head
+#     200 -> { "sequence": <u64>, "current_hash": <hex>, "mmr_root": <hex> }
+#     404 -> pipeline or partition not running with PoH
+#
+# Verifiers (Verify, VerifyWithKey, TrustExtend walks) consume that head
+# alongside the per-batch entries to prove ordering and integrity.
+#
+# PoH is independent of the compliance regime — it works for any pipeline
+# that wants cryptographic ordering proof, whether or not the compliance
+# block is active.
+
+pipelines:
+  - name: orders-poh
+    partitions: 4
+
+    # V5.1 — PoH posture. `enabled: true` is the only required field; the
+    # rest fall to defaults (max_recent_entries: 1024, no signing key).
+    # The signing-key reference is reserved for the V5 signed-Merkle walk
+    # (VerifyWithKey); chain-only verification (Verify, TrustExtend) works
+    # without it.
+    poh:
+      enabled: true
+      max_recent_entries: 4096
+      # V5.1 R1 — opt in to signed Merkle roots (VerifyWithKey walk).
+      # The reference uses the standard secret-resolver syntax
+      # (`${SCHEME:path}`); 32 raw bytes or a 64-char hex string both
+      # decode correctly. Omit to run chain-only verification (Verify,
+      # TrustExtend) without a signing key.
+      # signing_key_ref: "${ENV:AEON_POH_SIGNING_KEY}"
+      # signing_key_ref: "${VAULT:kv/aeon/poh/signing-key}"
+
+    # Durability is independent of PoH — the chain is stored in process
+    # memory + MMR, not in the L2 body store. Set durability per the
+    # pipeline's separate at-least-once / exactly-once needs.
+    durability:
+      mode: none
+
+    sources:
+      - name: orders-in
+        type: kafka
+        kind: pull
+        identity:
+          mode: native
+        event_time:
+          mode: broker
+        topic: orders
+        partitions: [0, 1, 2, 3]
+        brokers: "${ENV:REDPANDA_BOOTSTRAP}"
+        group_id: "aeon-orders-poh"
+        batch_max: "1024"
+
+    processor:
+      name: __identity
+      version: "0.0.0"
+      tier: native
+
+    sinks:
+      - name: orders-out
+        type: kafka
+        eos_tier: t6_fire_and_forget
+        topic: orders-mirror
+        brokers: "${ENV:REDPANDA_BOOTSTRAP}"
+        strategy: ordered_batch
+
+# Apply with:
+#   aeon apply -f docs/examples/pipeline-poh-enabled.yaml --dry-run
+#
+# After the pipeline starts, query the chain head per partition:
+#   curl -s http://localhost:4471/api/v1/pipelines/orders-poh/partitions/0/poh-head
+#
+# Expected shape (after at least one batch has flowed through partition 0):
+#   {"sequence": <u64 >= 1>, "current_hash": "<128 hex chars>", "mmr_root": "<hex>"}

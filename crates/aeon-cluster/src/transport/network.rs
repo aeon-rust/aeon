@@ -19,7 +19,10 @@ use aeon_types::AeonError;
 use crate::raft_config::AeonRaftConfig;
 use crate::transport::endpoint::QuicEndpoint;
 use crate::transport::framing::{self, MessageType};
-use crate::types::{JoinRequest, JoinResponse, NodeAddress, NodeId, RemoveNodeRequest, RemoveNodeResponse};
+use crate::types::{
+    JoinRequest, JoinResponse, NodeAddress, NodeId, ProposeForwardRequest,
+    ProposeForwardResponse, RemoveNodeRequest, RemoveNodeResponse,
+};
 
 /// Factory that creates QUIC-based RaftNetwork connections.
 pub struct QuicNetworkFactory {
@@ -241,6 +244,35 @@ pub async fn send_remove_request(
         leader_addr,
         MessageType::RemoveNodeRequest,
         MessageType::RemoveNodeResponse,
+        request,
+    )
+    .await
+}
+
+/// Forward a Raft `client_write` proposal to the leader over the
+/// existing cluster QUIC transport. Used by [`crate::node::ClusterNode`]
+/// when a propose from a follower returns
+/// `openraft::error::ClientWriteError::ForwardToLeader` — the follower
+/// re-issues the same proposal here against the address openraft hands
+/// it. The leader-side handler runs `raft.client_write(...)` locally and
+/// returns the resulting response, so the caller observes a single
+/// consistent `ClusterResponse` regardless of which node originated it.
+///
+/// This RPC carries opaque bincoded `ClusterRequest` / `ClusterResponse`
+/// payloads to keep the transport free of state-machine type
+/// dependencies.
+pub async fn send_propose_forward(
+    endpoint: &QuicEndpoint,
+    leader_id: NodeId,
+    leader_addr: &NodeAddress,
+    request: &ProposeForwardRequest,
+) -> Result<ProposeForwardResponse, AeonError> {
+    cluster_rpc(
+        endpoint,
+        leader_id,
+        leader_addr,
+        MessageType::ProposeForwardRequest,
+        MessageType::ProposeForwardResponse,
         request,
     )
     .await

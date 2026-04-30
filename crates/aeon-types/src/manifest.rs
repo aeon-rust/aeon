@@ -23,6 +23,7 @@ use crate::durability::DurabilityMode;
 use crate::encryption::EncryptionBlock;
 use crate::error::AeonError;
 use crate::event_time::EventTime;
+use crate::poh::PohBlock;
 use crate::traits::{SinkEosTier, SourceKind};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -49,6 +50,14 @@ pub struct PipelineManifest {
     /// (`at_rest=Off`) so dev pipelines pay zero cost.
     #[serde(default, skip_serializing_if = "encryption_is_default")]
     pub encryption: EncryptionBlock,
+
+    /// V5 — Proof-of-History declaration. Defaults to an inert block
+    /// (`enabled=false`) so pipelines opt in explicitly. When enabled,
+    /// the engine wires a `PipelineConfig.poh` and the PoH chain head
+    /// becomes accessible at
+    /// `/api/v1/pipelines/{name}/partitions/{partition}/poh-head`.
+    #[serde(default, skip_serializing_if = "PohBlock::is_default")]
+    pub poh: PohBlock,
 
     pub sources: Vec<SourceManifest>,
 
@@ -467,6 +476,12 @@ pub fn validate_pipeline_shape(m: &PipelineManifest) -> Result<(), AeonError> {
             )));
         }
     }
+
+    // S4.3 — client-side compliance block sanity check.
+    m.compliance
+        .validate_shape()
+        .map_err(|e| AeonError::state(format!("pipeline '{}': {e}", m.name)))?;
+
     Ok(())
 }
 
@@ -545,6 +560,7 @@ impl PipelineManifest {
             durability: self.durability.clone(),
             encryption: self.encryption.clone(),
             compliance: self.compliance.clone(),
+            poh: self.poh.clone(),
         }
     }
 }
@@ -582,6 +598,7 @@ mod tests {
             durability: DurabilityBlock::default(),
             compliance: ComplianceBlock::default(),
             encryption: EncryptionBlock::default(),
+            poh: PohBlock::default(),
             sources: vec![sample_source()],
             processor: ProcessorManifest {
                 name: "p".into(),
@@ -752,6 +769,29 @@ mod tests {
         assert!(validate_pipeline_shape(&sample_manifest()).is_ok());
     }
 
+    #[test]
+    fn pipeline_shape_rejects_malformed_compliance_block() {
+        use crate::compliance::{
+            ComplianceRegime, DataClass, EnforcementLevel, ErasureConfig, PayloadFormat,
+            PiiSelector,
+        };
+        let mut m = sample_manifest();
+        m.compliance = ComplianceBlock {
+            regime: ComplianceRegime::Pci,
+            enforcement: EnforcementLevel::Warn,
+            selectors: vec![PiiSelector {
+                path: "".into(), // empty — validate_shape should reject
+                format: PayloadFormat::Json,
+                class: DataClass::Pii,
+            }],
+            erasure: ErasureConfig::default(),
+        };
+        let err = validate_pipeline_shape(&m).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("selectors[0].path"), "expected selector error: {msg}");
+        assert!(msg.contains("'orders'"), "expected pipeline name prefix: {msg}");
+    }
+
     // ── YAML-adjacent round-trips via serde_json ────────────────────────
 
     #[test]
@@ -787,6 +827,60 @@ mod tests {
         .unwrap();
         let back: IdentityConfig = serde_json::from_str(&j).unwrap();
         matches!(back, IdentityConfig::Compound { .. });
+    }
+
+    /// Empirical proof that `#[serde(flatten)]` + `BTreeMap<String, Value>`
+    /// on `SourceManifest::config` requires connector keys at the **source
+    /// top level**, NOT nested under a literal `config:` block. Nesting
+    /// collapses the whole sub-object as a single entry `("config", …)`
+    /// and downstream factory lookups miss every field.
+    ///
+    /// Found the hard way during the 2026-04-24 Gate 2 Pre-Session-B
+    /// T0 run — the `count: "0"` unbounded escape didn't reach the
+    /// Memory source because the fixture used the aspirational
+    /// nested-block shape from `docs/EO-2-DURABILITY-DESIGN.md`.
+    /// This test locks the actual wiring in place so anyone writing
+    /// fresh fixtures against the design doc sees the regression
+    /// here first.
+    #[test]
+    fn source_config_keys_must_be_flat_not_nested() {
+        // Use JSON (aeon-types ships serde_json, not serde_yaml) — the
+        // flatten behaviour is format-agnostic, YAML parses through the
+        // same code path.
+        let nested = r#"{
+            "name": "test",
+            "type": "memory",
+            "kind": "push",
+            "config": {
+                "count": "0",
+                "payload_size": "256"
+            }
+        }"#;
+        let flat = r#"{
+            "name": "test",
+            "type": "memory",
+            "kind": "push",
+            "count": "0",
+            "payload_size": "256"
+        }"#;
+        let n: SourceManifest = serde_json::from_str(nested).unwrap();
+        let f: SourceManifest = serde_json::from_str(flat).unwrap();
+
+        // Nested: one entry keyed `"config"` holding the sub-object.
+        assert_eq!(n.config.len(), 1);
+        assert!(n.config.contains_key("config"));
+        assert!(!n.config.contains_key("count"));
+
+        // Flat: two entries, both reachable by their intended keys.
+        assert_eq!(f.config.len(), 2);
+        assert_eq!(
+            f.config.get("count").and_then(|v| v.as_str()),
+            Some("0")
+        );
+        assert_eq!(
+            f.config.get("payload_size").and_then(|v| v.as_str()),
+            Some("256")
+        );
     }
 
     #[test]
@@ -881,6 +975,33 @@ mod tests {
         let m = sample_manifest();
         let def = m.to_pipeline_definition();
         assert!(def.sinks[0].config.get("eos_tier").unwrap().contains("T2"));
+    }
+
+    // ── V5.1 PohBlock carry-through ────────────────────────────────────
+
+    #[test]
+    fn to_pipeline_definition_default_poh_block_round_trips_inert() {
+        let m = sample_manifest();
+        let def = m.to_pipeline_definition();
+        assert!(def.poh.is_default());
+        assert!(!def.poh.enabled);
+    }
+
+    #[test]
+    fn to_pipeline_definition_carries_enabled_poh_through() {
+        let mut m = sample_manifest();
+        m.poh = crate::poh::PohBlock {
+            enabled: true,
+            max_recent_entries: 8192,
+            signing_key_ref: Some("data-context/v1".into()),
+        };
+        let def = m.to_pipeline_definition();
+        assert!(def.poh.enabled);
+        assert_eq!(def.poh.max_recent_entries, 8192);
+        assert_eq!(
+            def.poh.signing_key_ref.as_deref(),
+            Some("data-context/v1")
+        );
     }
 
     // ── S6.7 SubjectExtractConfig ──────────────────────────────────────

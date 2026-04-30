@@ -204,8 +204,21 @@ impl KekHandle {
     /// Unwrap a DEK, dispatching to active or previous KEK based on the
     /// `kek_id` carried in `wrapped`. Fails if neither matches (i.e. the
     /// wrapped DEK was produced by a KEK this handle no longer tracks).
+    ///
+    /// S2.5 — every failure path emits an audit event on the dedicated
+    /// audit sink (domain mismatch, unknown kek id, decrypt failure).
+    /// Success paths are intentionally quiet: successful unwrap is
+    /// hot-path and every encrypted L2 segment or L3 checkpoint triggers
+    /// one; auditing every success would flood the channel.
     pub fn unwrap_dek(&self, wrapped: &WrappedDek) -> Result<DekBytes, AeonError> {
         if wrapped.kek_domain != self.domain {
+            emit_kek_audit(
+                "kek.unwrap.denied",
+                aeon_types::audit::AuditOutcome::Denied,
+                self.domain.as_str(),
+                &self.active_id,
+                Some("domain_mismatch"),
+            );
             return Err(AeonError::Crypto {
                 message: format!(
                     "wrapped DEK belongs to {} domain, handle is {}",
@@ -217,15 +230,43 @@ impl KekHandle {
         }
         if wrapped.kek_id == self.active_id {
             let kek = self.active_bytes()?;
-            return decrypt_dek(kek.expose_bytes(), &wrapped.nonce, &wrapped.ciphertext);
+            let r = decrypt_dek(kek.expose_bytes(), &wrapped.nonce, &wrapped.ciphertext);
+            if r.is_err() {
+                emit_kek_audit(
+                    "kek.unwrap.failed",
+                    aeon_types::audit::AuditOutcome::Failure,
+                    self.domain.as_str(),
+                    &self.active_id,
+                    Some("aead_decrypt_failed"),
+                );
+            }
+            return r;
         }
         if let Some(prev_id) = &self.previous_id {
             if prev_id == &wrapped.kek_id {
                 if let Some(kek) = self.previous_bytes()? {
-                    return decrypt_dek(kek.expose_bytes(), &wrapped.nonce, &wrapped.ciphertext);
+                    let r =
+                        decrypt_dek(kek.expose_bytes(), &wrapped.nonce, &wrapped.ciphertext);
+                    if r.is_err() {
+                        emit_kek_audit(
+                            "kek.unwrap.failed",
+                            aeon_types::audit::AuditOutcome::Failure,
+                            self.domain.as_str(),
+                            prev_id,
+                            Some("aead_decrypt_failed_previous"),
+                        );
+                    }
+                    return r;
                 }
             }
         }
+        emit_kek_audit(
+            "kek.unwrap.denied",
+            aeon_types::audit::AuditOutcome::Denied,
+            self.domain.as_str(),
+            &wrapped.kek_id,
+            Some("unknown_kek_id"),
+        );
         Err(AeonError::Crypto {
             message: format!(
                 "no KEK available for id '{}' in {} domain (active='{}', previous={:?})",
@@ -237,6 +278,30 @@ impl KekHandle {
             source: None,
         })
     }
+}
+
+/// S2.5 helper — emit an audit event on the Key channel. Kept local so
+/// the call sites above stay terse and so rotation / unwrap / rotate
+/// operations share one format.
+fn emit_kek_audit(
+    action: &'static str,
+    outcome: aeon_types::audit::AuditOutcome,
+    domain: &str,
+    kek_id: &str,
+    reason_tag: Option<&'static str>,
+) {
+    let mut event = aeon_types::audit::AuditEvent::new(
+        aeon_observability::now_unix_nanos(),
+        aeon_types::audit::AuditCategory::Key,
+        action,
+        outcome,
+    )
+    .with_resource(format!("kek/{domain}/{kek_id}"))
+    .with_detail("domain", domain.to_string());
+    if let Some(tag) = reason_tag {
+        event = event.with_detail("reason_tag", tag.to_string());
+    }
+    aeon_observability::emit_audit(&event);
 }
 
 fn ensure_kek_len(b: &SecretBytes, domain: KekDomain, id: &str) -> Result<(), AeonError> {

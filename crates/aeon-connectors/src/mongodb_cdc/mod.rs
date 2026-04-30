@@ -12,6 +12,7 @@
 //! - Schema change handling (new fields are captured automatically)
 
 mod auth;
+mod mtls_tempfile;
 mod source;
 
 pub use source::{MongoDbCdcSource, MongoDbCdcSourceConfig};

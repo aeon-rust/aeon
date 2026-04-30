@@ -147,6 +147,11 @@ async fn quic_accept_loop(
                     peer_ip = ?rejection.redacted_peer_ip(),
                     "quic auth rejected"
                 );
+                aeon_observability::emit_auth_rejected(
+                    &format!("quic/{source_name}"),
+                    rejection.reason_tag(),
+                    &peer_ip.to_string(),
+                );
                 incoming.refuse();
                 continue;
             }

@@ -156,12 +156,19 @@ pub struct MongoDbCdcSource {
     rx: PushBufferRx,
     poll_timeout: Duration,
     _reader_handle: tokio::task::JoinHandle<()>,
+    /// S10 mTLS — signer-held cert+key materialised as a process-owned
+    /// tempfile (0600 perms on Unix). Kept alive for the source's
+    /// lifetime so the mongodb driver's TLS config has a valid path,
+    /// and so any driver-side re-reads on reconnect still find it.
+    /// `None` when the signer is in non-mTLS modes.
+    _mtls_tempfile: Option<super::mtls_tempfile::SecureMtlsTempFile>,
 }
 
 impl MongoDbCdcSource {
     /// Connect to MongoDB and open a change stream.
     pub async fn new(config: MongoDbCdcSourceConfig) -> Result<Self, AeonError> {
-        let client = super::auth::resolve_client(&config.uri, config.auth.as_ref()).await?;
+        let (client, mtls_tempfile) =
+            super::auth::resolve_client(&config.uri, config.auth.as_ref()).await?;
 
         let db = client.database(&config.database);
 
@@ -238,6 +245,7 @@ impl MongoDbCdcSource {
             rx,
             poll_timeout: config.poll_timeout,
             _reader_handle: handle,
+            _mtls_tempfile: mtls_tempfile,
         })
     }
 }

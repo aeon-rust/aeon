@@ -115,10 +115,14 @@ impl PartitionTransferProvider for L2SegmentTransferProvider {
 /// WriteGate has flipped to `FreezeRequested`/`Frozen`), and exports
 /// the current `PohChainState` as bincode bytes.
 ///
-/// A missing entry surfaces as `AeonError::State` — the source node
-/// never owned this partition (or PoH was disabled). The cluster
-/// transport propagates the error message back to the requester so
-/// the failure is observable.
+/// When no chain is registered for `(pipeline, partition)`, returns
+/// `Ok(Vec::new())` — the sentinel the partition driver interprets as
+/// "this pipeline has no PoH leg, skip install". Before
+/// [2026-04-25] this returned `AeonError::State`, which aborted the
+/// whole partition transfer for every pipeline that did not opt into
+/// PoH (which is all of them today — no fixture enables PoH yet).
+/// Breaking-change surface is narrow: only the partition-transfer
+/// wire contract grows an "empty response means skip" rule.
 pub struct PohChainExportProvider {
     registry: Arc<LivePohChainRegistry>,
 }
@@ -136,13 +140,18 @@ impl PohChainProvider for PohChainExportProvider {
     ) -> Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, AeonError>> + Send + 'a>>
     {
         Box::pin(async move {
-            let chain = self.registry.get(&req.pipeline, req.partition).ok_or_else(|| {
-                AeonError::state(format!(
-                    "poh-export: no live chain registered for pipeline '{}' partition {}",
-                    req.pipeline,
-                    req.partition.as_u16()
-                ))
-            })?;
+            let Some(chain) = self.registry.get(&req.pipeline, req.partition) else {
+                // Pipeline has no PoH leg registered for this partition.
+                // Signal "skip the install step" to the target driver
+                // with an empty response rather than aborting the whole
+                // partition transfer. See struct doc for the rationale.
+                tracing::debug!(
+                    pipeline = %req.pipeline,
+                    partition = req.partition.as_u16(),
+                    "poh-export: no live chain, returning empty-response sentinel"
+                );
+                return Ok(Vec::new());
+            };
             let state = chain.lock().await.export_state();
             state.to_bytes().map_err(|e| AeonError::Serialization {
                 message: format!("poh-export: serialize PohChainState: {e}"),
@@ -296,14 +305,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn poh_export_unregistered_partition_errors() {
+    async fn poh_export_unregistered_partition_returns_empty_sentinel() {
+        // 2026-04-25: flipped from Err("no live chain") to Ok(empty
+        // bytes) so partition transfer doesn't abort on pipelines
+        // without a PoH leg. The partition-driver interprets an empty
+        // response as "skip the install step" — see
+        // `aeon_cluster::partition_driver::drive_one` where
+        // `poh_bytes.is_empty()` short-circuits the installer call.
         let registry = Arc::new(LivePohChainRegistry::new());
         let provider = PohChainExportProvider::new(Arc::clone(&registry));
         let req = PohChainTransferRequest {
             pipeline: "pl".to_string(),
             partition: PartitionId::new(0),
         };
-        let err = provider.export_state(&req).await.unwrap_err();
-        assert!(err.to_string().contains("no live chain"), "got: {err}");
+        let bytes = provider.export_state(&req).await.unwrap();
+        assert!(
+            bytes.is_empty(),
+            "unregistered partition must yield empty-bytes sentinel, got {} bytes",
+            bytes.len()
+        );
     }
 }
