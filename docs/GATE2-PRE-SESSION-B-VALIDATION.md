@@ -632,9 +632,20 @@ next-session scope.
    100K events received / processed / sent on each pod, zero
    failures, L2 segment 35,368,556 bytes per pod (size-equal;
    SHA256 differs because memory source uses `identity: random`).
-   PerEvent / WAL-fallback rows 🟡 still pending — need either a
-   Kafka source for natural flow control or a smaller `count`
-   to avoid the 2GiB pod memory limit while doing fsync-per-event.
+   **PerEvent row** ✅ closed 2026-04-30 (N2): new
+   `pipeline-v3-native-perevent.yaml` runs `mode: per_event` +
+   `count: 10000` + native processor, 10K events end-to-end
+   with 0 failures, L2 segment 3,529,628 bytes on disk per pod
+   under fsync amplification. **WAL-fallback row**: covered by
+   5 unit tests + 1 integration test in `aeon-engine`; live
+   cluster trigger needs deliberate L3 fault injection (Chaos
+   Mesh or chmod -w mid-flight) which is out of scope for a
+   YAML fixture and tracked as a separate atom.
+   **Pre-existing observation flagged in the closure:**
+   `aeon_pipeline_checkpoints_written_total=0` for both
+   ordered_batch + per_event runs even though the L2 body store
+   grows on disk — metric-vs-disk-state divergence, not a
+   regression introduced by N1/N2.
 
 ### What a green Session B looks like
 
