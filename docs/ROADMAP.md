@@ -4551,3 +4551,20 @@ the StatefulSet via `kubectl set env`, /poh-head reported
 `signer_public_key = a09aa5f...3455a4f0` byte-identical to the
 public key derived offline from `SigningKey::from_bytes(&[0x22; 32])`,
 on all 3 pods at `sequence=98`. **V5 closed end-to-end.**
+
+**V1 independent verifier CLI (2026-04-30):** new
+`aeon verify-poh --pipeline <name> --partition N
+[--api <url>] [--expected-public-key <hex>]` subcommand. Pulls
+`/poh-head`, decodes hex-encoded `merkle_root` /
+`signature` / `signer_public_key` into native types, calls
+`SignedRoot::verify()` (re-hydrates VerifyingKey from embedded
+pubkey) and `verify_with_key()` for belt-and-braces. Optional
+`--expected-public-key` does byte-equality first to catch
+accidental key rotation / wrong-pipeline confusion before any
+crypto runs. Exits non-zero on every failure path so it's
+useful in CI / smoke checks. Live walk on the same `aeon:v53`
+cluster green across 4 cases: success no-pin (exit 0), success
++ correct pin (exit 0), wrong pin (exit 1, "expected public key
+mismatch"), non-existent partition (exit 1, HTTP 404). Tightens
+V5 by independently re-running the signature against a binary
+that has zero shared state with the running aeon process.

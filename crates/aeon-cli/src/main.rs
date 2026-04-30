@@ -98,6 +98,32 @@ enum Commands {
         #[arg(long, default_value_t = default_api())]
         api: String,
     },
+    /// Verify a per-partition PoH chain head against its embedded
+    /// signature (and optionally a pinned operator-supplied public key).
+    ///
+    /// Pulls `/api/v1/pipelines/{name}/partitions/{partition}/poh-head`,
+    /// validates the Ed25519 signature in `latest_signed_root` using the
+    /// embedded `signer_public_key`, and asserts byte-equality against
+    /// `--expected-public-key` if supplied. Exits non-zero on any failure
+    /// path so it's useful as a CI / smoke-test gate.
+    VerifyPoh {
+        /// Pipeline name.
+        #[arg(long)]
+        pipeline: String,
+        /// Partition id to verify.
+        #[arg(long)]
+        partition: u16,
+        /// Aeon REST API base URL (auto-discovered default keeps host
+        /// integration cheap; override for cluster-pinning).
+        #[arg(long, default_value_t = default_api())]
+        api: String,
+        /// Optional pinned public key (hex, 64 chars). When set, the
+        /// verifier asserts the chain's `signer_public_key` matches
+        /// byte-for-byte before validating the signature. Catches
+        /// accidental key rotation or wrong-pipeline confusion.
+        #[arg(long)]
+        expected_public_key: Option<String>,
+    },
     /// Apply a YAML manifest (declarative processors + pipelines)
     Apply {
         /// Path to manifest YAML file
@@ -503,6 +529,12 @@ fn run(cli: Cli) -> Result<()> {
         }) => cmd_deploy(&artifact, &pipeline, &processor, &version, &api),
         Some(Commands::Top { api }) => cmd_top(&api),
         Some(Commands::Verify { target, api }) => cmd_verify(&target, &api),
+        Some(Commands::VerifyPoh {
+            pipeline,
+            partition,
+            api,
+            expected_public_key,
+        }) => cmd_verify_poh(&pipeline, partition, &api, expected_public_key.as_deref()),
         Some(Commands::Apply { file, api, dry_run }) => cmd_apply(&file, &api, dry_run),
         Some(Commands::Export { file, api }) => cmd_export(file.as_deref(), &api),
         Some(Commands::Diff { file, api }) => cmd_diff(&file, &api),
@@ -2383,6 +2415,163 @@ fn cmd_verify(target: &str, api: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+// ── aeon verify-poh — independent VerifyWithKey walk ──────────────────
+
+/// V1 — independent PoH verification harness.
+///
+/// Pulls `/poh-head` for one (pipeline, partition), validates the
+/// Ed25519 signature in `latest_signed_root` using the embedded
+/// `signer_public_key`, and asserts byte-equality against an optional
+/// pinned operator key. Returns a typed error on any failure so
+/// the process exits non-zero — useful as a CI / smoke-test gate
+/// independent of the running aeon binary's own `aeon verify`
+/// self-test (which exercises local crypto modules in isolation).
+fn cmd_verify_poh(
+    pipeline: &str,
+    partition: u16,
+    api: &str,
+    expected_public_key: Option<&str>,
+) -> Result<()> {
+    use aeon_crypto::signing::{Signature, SignedRoot, VerifyingKey};
+
+    println!("Aeon /poh-head independent verification");
+    println!("{}", "=".repeat(60));
+    println!("Pipeline:  {pipeline}");
+    println!("Partition: {partition}");
+    println!("API:       {api}");
+    if let Some(pk) = expected_public_key {
+        println!("Expected:  {pk}");
+    }
+    println!();
+
+    let url = format!("{api}/api/v1/pipelines/{pipeline}/partitions/{partition}/poh-head");
+    let resp = ureq::get(&url)
+        .call()
+        .with_context(|| format!("GET {url} failed"))?;
+    let body: serde_json::Value =
+        resp.into_json().context("invalid JSON from /poh-head")?;
+
+    let poh_active = body["poh_active"].as_bool().unwrap_or(false);
+    if !poh_active {
+        bail!("poh_active=false — pipeline did not opt in or partition not owned");
+    }
+
+    let chain = body
+        .get("chain")
+        .ok_or_else(|| anyhow::anyhow!("response missing `chain` block"))?;
+    let sequence = chain["sequence"].as_u64().unwrap_or(0);
+    println!("Chain head:");
+    println!("  sequence:     {sequence}");
+    if let Some(h) = chain["current_hash"].as_str() {
+        println!("  current_hash: {}..", &h[..32.min(h.len())]);
+    }
+    if let Some(m) = chain["mmr_root"].as_str() {
+        println!("  mmr_root:     {}..", &m[..32.min(m.len())]);
+    }
+    println!();
+
+    let signed = match body.get("latest_signed_root").and_then(|v| {
+        if v.is_null() {
+            None
+        } else {
+            Some(v)
+        }
+    }) {
+        Some(s) => s,
+        None => bail!(
+            "latest_signed_root is null — pipeline ran without a signing \
+             key (chain-only Verify mode), or no batches have been processed yet"
+        ),
+    };
+
+    let merkle_root_hex = signed["merkle_root"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("latest_signed_root.merkle_root missing"))?;
+    let signature_hex = signed["signature"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("latest_signed_root.signature missing"))?;
+    let signer_pk_hex = signed["signer_public_key"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("latest_signed_root.signer_public_key missing"))?;
+    let signed_at = signed["signed_at_nanos"].as_i64().unwrap_or(0);
+
+    // Decode hex into the raw types the SignedRoot struct expects.
+    let merkle_root = hex_to_hash512(merkle_root_hex)
+        .context("decoding latest_signed_root.merkle_root")?;
+    let signature_bytes: [u8; 64] = hex_to_array::<64>(signature_hex)
+        .context("decoding latest_signed_root.signature")?;
+    let signer_pk_bytes: [u8; 32] = hex_to_array::<32>(signer_pk_hex)
+        .context("decoding latest_signed_root.signer_public_key")?;
+
+    println!("Latest signed root:");
+    println!("  signer:       {signer_pk_hex}");
+    println!("  signed_at_ns: {signed_at}");
+    println!("  signature:    {}..", &signature_hex[..32.min(signature_hex.len())]);
+    println!();
+
+    // Pinned-key check (optional).
+    if let Some(expected) = expected_public_key {
+        let expected_bytes: [u8; 32] = hex_to_array::<32>(expected)
+            .context("decoding --expected-public-key")?;
+        if expected_bytes != signer_pk_bytes {
+            bail!(
+                "expected public key mismatch:\n  expected: {}\n  surfaced: {}",
+                expected,
+                signer_pk_hex
+            );
+        }
+        println!("Pinned key match:    OK");
+    }
+
+    // Reconstruct the SignedRoot and run the embedded-key verify path.
+    // `verify()` re-hydrates the VerifyingKey from `signer_public_key`,
+    // so this catches both bad signatures and pubkeys that don't match
+    // the raw bytes the bytes serialisation accepts.
+    let signed_root = SignedRoot {
+        root: merkle_root,
+        signature: Signature::from_bytes(signature_bytes),
+        signer_public_key: signer_pk_bytes,
+        signed_at,
+    };
+    let sig_ok = signed_root
+        .verify()
+        .context("Ed25519 verification raised an error")?;
+    if !sig_ok {
+        bail!("Ed25519 signature did NOT verify against the embedded public key");
+    }
+    println!("Signature verify:    OK");
+
+    // Belt-and-braces: also exercise verify_with_key on the parsed key.
+    let vk = VerifyingKey::from_bytes(&signer_pk_bytes)
+        .context("VerifyingKey::from_bytes for the embedded signer_public_key")?;
+    if !signed_root.verify_with_key(&vk) {
+        bail!("verify_with_key against embedded key failed (internal contradiction)");
+    }
+    println!("verify_with_key:     OK");
+
+    println!();
+    println!("Result: OK — chain head signature verified end-to-end.");
+    Ok(())
+}
+
+fn hex_to_hash512(s: &str) -> Result<aeon_crypto::hash::Hash512> {
+    let bytes: [u8; 64] = hex_to_array::<64>(s)?;
+    Ok(aeon_crypto::hash::Hash512(bytes))
+}
+
+fn hex_to_array<const N: usize>(s: &str) -> Result<[u8; N]> {
+    if s.len() != N * 2 {
+        bail!("hex string length {} != expected {}", s.len(), N * 2);
+    }
+    let v = hex::decode(s).context("hex decode failed")?;
+    if v.len() != N {
+        bail!("decoded byte length {} != expected {}", v.len(), N);
+    }
+    let mut arr = [0u8; N];
+    arr.copy_from_slice(&v);
+    Ok(arr)
 }
 
 // ── aeon apply / export / diff ─────────────────────────────────────────

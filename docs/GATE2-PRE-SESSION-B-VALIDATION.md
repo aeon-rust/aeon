@@ -610,6 +610,14 @@ next-session scope.
      `signer_public_key = a09aa5f4...3455a4f0` byte-identical to
      the offline-derived pubkey for secret `[0x22; 32]`, on all 3
      pods at sequence=98.
+   - V1 independent verifier (2026-04-30): new
+     `aeon verify-poh --pipeline N --partition N` subcommand
+     decodes the `/poh-head` response and runs both
+     `SignedRoot::verify()` and `verify_with_key()` against a
+     CLI binary with zero shared state with the running aeon
+     process. 4-case live walk green: success no-pin / success
+     correct-pin / wrong-pin (exit 1) / non-existent-partition
+     (exit 1, HTTP 404).
 6. **V3 native processor + per-event rows** — 🟡 still pending. Native
    `.so` artifact needs to be built from `samples/processors/rust-native`
    and registered. PerEvent rows need either a Kafka source for
