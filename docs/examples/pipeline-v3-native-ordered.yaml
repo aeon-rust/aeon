@@ -1,0 +1,57 @@
+# V3 native processor validation — JsonEnrichProcessor + ordered_batch.
+#
+# Counterpart to pipeline-v3-wasm-ordered.yaml: same memory source +
+# blackhole sink shape, but `processor.tier = native`. The supervisor
+# sees the tier and dlopens
+# `/app/processors/<processor.name>.so` (Linux) /
+# `<name>.dll` (Windows) / `<name>.dylib` (macOS), bundled into the
+# aeon image by the Dockerfile (cdylib companion crate
+# `aeon-sample-rust-native-cdylib`).
+#
+# Success signals:
+# - aeon_pipeline_events_received_total{pipeline="v3-native-ordered"}
+#   == count per pod
+# - aeon_l2_body_bytes_written counter non-zero (L2 spine engaged
+#   under DurabilityMode::OrderedBatch)
+# - aeon_pipeline_checkpoints_written_total non-zero
+# - events_failed_total == 0
+# - Supervisor log: "supervisor: loaded native processor"
+
+pipelines:
+  - name: v3-native-ordered
+    partitions: 4
+
+    durability:
+      mode: ordered_batch
+      checkpoint:
+        backend: state_store
+        interval: 250ms
+
+    sources:
+      - name: memory-synth
+        type: memory
+        kind: push
+        identity:
+          mode: random
+        event_time:
+          mode: aeon_ingest
+        count: "100000"
+        # JsonEnrichProcessor extracts user_id from a JSON envelope, so
+        # generate JSON-shaped payloads not opaque bytes. Memory source
+        # `payload_template` synthesises this when set; absent template
+        # falls back to repeating fixed bytes which the processor will
+        # pass through unchanged (still a valid throughput signal).
+        payload_size: "256"
+        batch_size: "1024"
+
+    processor:
+      # Must match the cdylib's bundled filename
+      # (/app/processors/rust-native-v1.so).
+      name: rust-native-v1
+      version: "0.1.0"
+      tier: native
+
+    sinks:
+      - name: blackhole-discard
+        type: blackhole
+        eos_tier: t6_fire_and_forget

@@ -209,6 +209,14 @@ pub struct ProcessorRef {
     /// Per-pipeline connection overrides (T3/T4 only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connection: Option<ProcessorConnectionConfig>,
+    /// V3 — execution tier (`"native"`, `"wasm"`, etc.). When set, the
+    /// supervisor's `build_processor` switches on this to load the right
+    /// artifact from the runtime's processors directory. Carried over
+    /// from `ProcessorManifest.tier` by the manifest bridge. `None`
+    /// resolves to the legacy passthrough path so pre-V3-native
+    /// pipelines and tests stay byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<String>,
 }
 
 impl ProcessorRef {
@@ -219,7 +227,14 @@ impl ProcessorRef {
             version: version.into(),
             binding: ProcessorBinding::default(),
             connection: None,
+            tier: None,
         }
+    }
+
+    /// Set the execution tier (`"native"`, `"wasm"`, etc.).
+    pub fn with_tier(mut self, tier: impl Into<String>) -> Self {
+        self.tier = Some(tier.into());
+        self
     }
 }
 

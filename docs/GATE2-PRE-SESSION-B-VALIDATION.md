@@ -618,11 +618,23 @@ next-session scope.
      process. 4-case live walk green: success no-pin / success
      correct-pin / wrong-pin (exit 1) / non-existent-partition
      (exit 1, HTTP 404).
-6. **V3 native processor + per-event rows** — 🟡 still pending. Native
-   `.so` artifact needs to be built from `samples/processors/rust-native`
-   and registered. PerEvent rows need either a Kafka source for
-   natural flow control or a smaller `count` to avoid the 2GiB pod
-   memory limit while doing fsync-per-event (high amplification).
+6. **V3 native processor + per-event rows** — native row ✅
+   **closed 2026-04-30 (N1, image `aeon:v54`)**: new cdylib
+   companion crate `samples/processors/rust-native-cdylib/`
+   exports `JsonEnrichProcessor` via
+   `aeon_native_sdk::export_processor!`; Dockerfile bundles it
+   at `/app/processors/rust-native-v1.so`; supervisor's
+   `build_processor` now switches on `processor.tier` (carried
+   through `ProcessorRef.tier` after a manifest-bridge update)
+   and routes `tier: native` to
+   `NativeProcessor::load`. Live cluster proof: supervisor logged
+   `loaded native processor … artifact=/app/processors/rust-native-v1.so`,
+   100K events received / processed / sent on each pod, zero
+   failures, L2 segment 35,368,556 bytes per pod (size-equal;
+   SHA256 differs because memory source uses `identity: random`).
+   PerEvent / WAL-fallback rows 🟡 still pending — need either a
+   Kafka source for natural flow control or a smaller `count`
+   to avoid the 2GiB pod memory limit while doing fsync-per-event.
 
 ### What a green Session B looks like
 

@@ -285,6 +285,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "aeon-sample-rust-native-cdylib"
+version = "0.1.0"
+dependencies = [
+ "aeon-native-sdk",
+ "aeon-sample-rust-native",
+]
+
+[[package]]
 name = "aeon-secrets"
 version = "0.1.0"
 dependencies = [

@@ -425,7 +425,11 @@ impl PipelineSupervisor {
         let source = self.connectors.build_source(source_cfg_ref)?;
         let mut sink = self.connectors.build_sink(sink_cfg)?;
 
-        let processor = build_processor(&def.processor.name, &name)?;
+        let processor = build_processor(
+            &def.processor.name,
+            &name,
+            def.processor.tier.as_deref(),
+        )?;
 
         // G2/CL-6: install a write-freeze gate for this pipeline's owned
         // partition. T0 supervisor is single-partition (partition 0);
@@ -725,17 +729,56 @@ impl PipelineSupervisor {
 fn build_processor(
     processor_name: &str,
     pipeline_name: &str,
+    processor_tier: Option<&str>,
 ) -> Result<Box<dyn aeon_types::Processor + Send + Sync>, AeonError> {
-    // T0: every name resolves to PassthroughProcessor. Real Wasm/native
-    // instantiation is layered on top of this in the next phase via the
-    // existing `ProcessorRegistry::load_artifact` path; until then the
-    // explicit `__identity` sentinel documents intent and keeps the matrix
-    // self-consistent.
+    // V3 native row: when the manifest declares `processor.tier = "native"`,
+    // load the cdylib artifact at `${AEON_PROCESSORS_DIR}/{name}.so` (or
+    // `.dll` / `.dylib` per platform). The tier is carried through from
+    // `ProcessorManifest.tier` via `ProcessorRef.tier`; absent or any
+    // other value falls back to the legacy passthrough path. Wasm tier is
+    // intentionally still passthrough-on-supervisor: the in-process Wasm
+    // path lands in a follow-up atom (different fixture, different load
+    // boundary).
+    if processor_tier.map(|t| t.eq_ignore_ascii_case("native")) == Some(true) {
+        let dir = std::env::var("AEON_PROCESSORS_DIR")
+            .unwrap_or_else(|_| "/app/processors".to_string());
+        let ext = if cfg!(target_os = "windows") {
+            "dll"
+        } else if cfg!(target_os = "macos") {
+            "dylib"
+        } else {
+            "so"
+        };
+        let path = std::path::PathBuf::from(&dir).join(format!("{processor_name}.{ext}"));
+        if !path.exists() {
+            return Err(AeonError::state(format!(
+                "supervisor: native processor artifact not found at {} \
+                 (manifest declares processor.tier=native; bundle the \
+                 cdylib into the runtime image or override the directory \
+                 via AEON_PROCESSORS_DIR)",
+                path.display()
+            )));
+        }
+        let proc = crate::native_loader::NativeProcessor::load(&path, &[])
+            .map_err(|e| AeonError::state(format!(
+                "supervisor: failed to load native processor from {}: {e}",
+                path.display()
+            )))?;
+        tracing::info!(
+            pipeline = pipeline_name,
+            processor = processor_name,
+            artifact = %path.display(),
+            "supervisor: loaded native processor"
+        );
+        return Ok(Box::new(proc));
+    }
+
     if processor_name != IDENTITY_PROCESSOR {
         tracing::debug!(
             pipeline = pipeline_name,
             processor = processor_name,
-            "supervisor: T0 path resolves all processor names to PassthroughProcessor"
+            tier = processor_tier.unwrap_or("<none>"),
+            "supervisor: passthrough path (tier not yet wired or absent)"
         );
     }
     Ok(Box::new(PassthroughProcessor::new(Arc::from("output"))))

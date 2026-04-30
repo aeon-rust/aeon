@@ -20,6 +20,7 @@ members = [
     "crates/aeon-processor-client",
     "crates/aeon-cli",
     "samples/processors/rust-native",
+    "samples/processors/rust-native-cdylib",
     "samples/e2e-pipeline",
     "xtask",
 ]
