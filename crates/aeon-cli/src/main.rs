@@ -696,6 +696,30 @@ fn cmd_serve(addr: &str, artifact_dir: &str) -> Result<()> {
             );
         }
 
+        // V5.1 R1: install the node-wide SecretRegistry so pipelines
+        // that declare `poh.signing_key_ref` can resolve their keys at
+        // start. `default_local()` wires Env + DotEnv + Literal — the
+        // three providers that need no heavy deps. Vault / KMS / SM
+        // providers will register on top once `aeon-secrets` lands;
+        // this single install point is shared across them.
+        // Pipelines without `signing_key_ref` are unaffected.
+        #[cfg(feature = "processor-auth")]
+        {
+            let registry = Arc::new(aeon_types::SecretRegistry::default_local());
+            if let Err(e) = supervisor.set_secret_registry(registry) {
+                tracing::warn!(
+                    error = %e,
+                    "supervisor secret registry install failed (already set?) — \
+                     pipelines that declare poh.signing_key_ref will refuse to start"
+                );
+            } else {
+                tracing::info!(
+                    "supervisor secret registry installed (env / dotenv / literal); \
+                     poh.signing_key_ref resolution active"
+                );
+            }
+        }
+
         // Cluster initialization — detect K8s environment
         let cluster_enabled = std::env::var("AEON_CLUSTER_ENABLED")
             .map(|v| v.to_lowercase() == "true")

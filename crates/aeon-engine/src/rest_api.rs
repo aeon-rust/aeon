@@ -2219,6 +2219,26 @@ async fn poh_head(
             let chain: tokio::sync::MutexGuard<'_, aeon_crypto::poh::PohChain> =
                 chain_arc.lock().await;
             let chain_state = chain.export_state();
+            // V5.1 R1 / W2: surface the most-recent signed root when the
+            // pipeline declared a `poh.signing_key_ref` and at least one
+            // batch has flowed through. Verifiers consume `signature` +
+            // `signer_public_key` to validate that the chain is owned by
+            // the expected key — the VerifyWithKey walk per
+            // `aeon_crypto::poh::PohVerifyMode::VerifyWithKey`.
+            // `null` when no key is configured (chain-only verification),
+            // or when no batches have been processed yet.
+            let latest_signed_root = chain
+                .recent_entries()
+                .last()
+                .and_then(|entry| entry.signed_root.as_ref())
+                .map(|sr| {
+                    serde_json::json!({
+                        "merkle_root": hex::encode(sr.root),
+                        "signature": hex::encode(sr.signature.as_bytes()),
+                        "signer_public_key": hex::encode(sr.signer_public_key),
+                        "signed_at_nanos": sr.signed_at,
+                    })
+                });
             let json = serde_json::json!({
                 "pipeline": name,
                 "partition": partition,
@@ -2228,6 +2248,7 @@ async fn poh_head(
                     "current_hash": hex::encode(chain_state.current_hash),
                     "mmr_root": hex::encode(chain.mmr_root()),
                 },
+                "latest_signed_root": latest_signed_root,
             });
             (StatusCode::OK, Json(json)).into_response()
         }

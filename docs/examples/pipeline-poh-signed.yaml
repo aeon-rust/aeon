@@ -1,0 +1,83 @@
+# Signed Proof-of-History pipeline — V5.1 R1 cluster validation.
+#
+# Same shape as `pipeline-poh-memory.yaml` but with `signing_key_ref`
+# set to a `$${ENV:...}` reference (literal — the leading double-dollar
+# escape keeps the CLI interpolator from treating this comment as a real
+# secret token). Exercises the full V5.1 + R1 path:
+# manifest → PipelineDefinition → PipelineSupervisor::set_secret_registry
+# → resolve_poh_signing_key → PohConfig.signing_key →
+# `chain.append_batch(..., Some(&signing_key))` → SignedRoot per entry
+# → `/poh-head` response surfaces `latest_signed_root`.
+#
+# The test value is documented inline so verifiers know which public
+# key to expect; production secrets must come from Vault / KMS / SM
+# providers (set by the `aeon-secrets` adapter crate).
+
+pipelines:
+  - name: poh-signed
+    partitions: 4
+
+    poh:
+      enabled: true
+      max_recent_entries: 4096
+      # Test secret: 0x22 * 32 bytes, 64 hex chars.
+      # Expected verifying public key (Ed25519):
+      #   a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0
+      signing_key_ref: "${ENV:AEON_TEST_POH_SIG}"
+
+    durability:
+      mode: none
+
+    sources:
+      - name: memory-synth
+        type: memory
+        kind: push
+        identity:
+          mode: random
+        event_time:
+          mode: aeon_ingest
+        count: "100000"
+        payload_size: "256"
+        batch_size: "1024"
+
+    processor:
+      name: __identity
+      version: "0.0.0"
+      tier: native
+
+    sinks:
+      - name: blackhole-discard
+        type: blackhole
+        eos_tier: t6_fire_and_forget
+
+# Validation steps:
+#
+#   # set the env var on the running pods
+#   kubectl -n aeon set env statefulset/aeon \
+#     AEON_TEST_POH_SIG=2222222222222222222222222222222222222222222222222222222222222222
+#
+#   # roll if the env var was added after pod start
+#   kubectl -n aeon rollout status statefulset/aeon
+#
+#   # apply + start
+#   kubectl -n aeon cp docs/examples/pipeline-poh-signed.yaml \
+#     aeon-0:/tmp/pipeline-poh-signed.yaml
+#   kubectl -n aeon exec aeon-0 -- aeon apply -f /tmp/pipeline-poh-signed.yaml
+#   curl -X POST http://<pod>:4471/api/v1/pipelines/poh-signed/start
+#
+#   # verify
+#   curl -s http://<pod>:4471/api/v1/pipelines/poh-signed/partitions/0/poh-head
+#
+# Expected (after at least one batch):
+#   {
+#     "pipeline": "poh-signed",
+#     "partition": 0,
+#     "poh_active": true,
+#     "chain": { "sequence": <u64>, "current_hash": <hex>, "mmr_root": <hex> },
+#     "latest_signed_root": {
+#       "merkle_root": <hex>,
+#       "signature": <hex 128 chars>,
+#       "signer_public_key": "a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0",
+#       "signed_at_nanos": <i64>
+#     }
+#   }

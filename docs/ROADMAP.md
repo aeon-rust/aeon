@@ -4408,7 +4408,7 @@ independently once tests are green.
 | 5     | **V1** cluster baseline on RD     | ✅ shipped 2026-04-24 | Existing 3-pod `aeon` StS + Redpanda on Rancher Desktop k3s re-verified: all pods `1/1 Running`, `aeon-0.1.0` Helm chart at revision 2, `/metrics` serving full EO-2 counter set, `/api/v1/cluster/status` shows 3-node Raft membership (leader node 3, term 2), 12 partitions balanced 4/4/4 across owners. |
 | 5     | **V2** T0/T2/T3/T4 on RD          | ✅ closed 2026-04-25 | T0 baseline 2 runs (~3.67M evt/s session0, ~3.35M evt/s on rebuilt image — within noise). T3 drain + rebalance fully green after a three-fix series (PoH empty-bytes sentinel, cutover sentinel offsets, ProposeForward RPC). T4 manual `transfer-partition` migrated partition 0 from node 1 to node 3 cleanly. T2 STS scale 3→5 surfaced G10 seed-join code path working (membership advanced to `{1, 2, 3, 4, 5}`); follow-on rebalance gated on RD-specific STS pod-DNS lag (NOT an Aeon bug — DOKS/EKS with proper `publishNotReadyAddresses` should resolve). T5/T6 still deferred to DOKS re-spin. See V6 report § V2 for run-by-run detail. |
 | 5     | **V3** Processor validation       | ✅ closed 2026-04-25 | Wasm passthrough + `DurabilityMode::OrderedBatch` validated end-to-end on `aeon:b0d0d41`. Per pod: 500K events received / processed / sent, zero failures, `checkpoints_written_total=1`, **L2 segment 177,372,652 bytes byte-identical across all 3 pods** at `/app/artifacts/l2body/v3-wasm-ordered/p00000/00000000000000000000.l2b`. Closure required three sequential bug-fixes — see "Live cluster validation tranche" below. Native processor + per-event / WAL-fallback rows still need fixtures + a runtime PoH config knob (post-V5). |
-| 5     | **V5** Crypto chain E2E           | 🟡 endpoint live 2026-04-25; manifest unblocked 2026-04-29 | `GET /api/v1/pipelines/{name}/partitions/{partition}/poh-head` shipped (commit `d87ec2a`) and verified live on `aeon:e68ce68` — both 404 arms emit the expected handler text, exact 200-with-`{sequence, current_hash, mmr_root}` shape on a partition with PoH wired. **V5.1 PoH manifest wiring closed 2026-04-29** (issue #83): new `aeon-types::poh::PohBlock` peer block on `PipelineManifest` + `PipelineDefinition` (`enabled`, `max_recent_entries`, `signing_key_ref`); `PipelineManifest::to_pipeline_definition()` clones it through; `pipeline_supervisor::pipeline_config_for` translates `def.poh.enabled` onto `PipelineConfig.poh` with the manifest's `max_recent_entries`; `start()` mirrors the supervisor-stamped `partition_id` onto `poh.partition` so the chain genesises on the right partition; example fixture at `docs/examples/pipeline-poh-enabled.yaml`. The `Verify` / `TrustExtend` walks now run end-to-end against a YAML-deployed PoH-enabled pipeline; the `VerifyWithKey` walk awaits a separate signing-key resolver atom (the schema preserves `signing_key_ref` today but the engine ignores it). 6 new poh-module tests + 2 manifest-bridge tests + 2 `pipeline_config_for` tests; clippy clean. |
+| 5     | **V5** Crypto chain E2E           | ✅ closed 2026-04-30 | `GET /api/v1/pipelines/{name}/partitions/{partition}/poh-head` shipped (commit `d87ec2a`) and verified live on `aeon:e68ce68`. **V5 fully closed 2026-04-30**: `Verify` and `TrustExtend` walks shipped via V5.1 manifest wiring (2026-04-29); `VerifyWithKey` walk shipped via V5.1 R1 + W1/W2 (2026-04-30). Live cluster proof on `aeon:v53` — applied `pipeline-poh-signed.yaml` with `signing_key_ref: "${ENV:AEON_TEST_POH_SIG}"` (test secret `0x22 * 32`), `/poh-head` returns `latest_signed_root.signer_public_key = a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0` byte-identical to the offline-derived public key, on all 3 pods at sequence=98 (= 100K events / 1024 batch_size). **V5.1 PoH manifest wiring closed 2026-04-29** (issue #83): new `aeon-types::poh::PohBlock` peer block on `PipelineManifest` + `PipelineDefinition` (`enabled`, `max_recent_entries`, `signing_key_ref`); `PipelineManifest::to_pipeline_definition()` clones it through; `pipeline_supervisor::pipeline_config_for` translates `def.poh.enabled` onto `PipelineConfig.poh` with the manifest's `max_recent_entries`; `start()` mirrors the supervisor-stamped `partition_id` onto `poh.partition` so the chain genesises on the right partition; example fixture at `docs/examples/pipeline-poh-enabled.yaml`. The `Verify` / `TrustExtend` walks now run end-to-end against a YAML-deployed PoH-enabled pipeline; the `VerifyWithKey` walk awaits a separate signing-key resolver atom (the schema preserves `signing_key_ref` today but the engine ignores it). 6 new poh-module tests + 2 manifest-bridge tests + 2 `pipeline_config_for` tests; clippy clean. |
 | 5     | **V6** Consolidated report        | ✅ closed 2026-04-24 | `docs/GATE2-PRE-SESSION-B-VALIDATION.md` shipped — V1 signed off (cluster baseline), V2/V3/V5 run plans captured with explicit commands, T5/T6-on-RD gap carried forward to DOKS re-spin with Chaos Mesh, Session-B readiness checklist + 4-item gap list populated. **Update 2026-04-25**: report grew V2 T3/T4 closure detail, V3 final L2 segment numbers, three L2-body-spine bug-and-fix entries, and the ForwardToLeader / cutover / PoH sentinel fix history. Back-propagates the DOKS token-rotation + Block-Storage teardown warnings from memory. Issue #84. |
 
 **Phase order:** 1 → 2 → 3 → 4 → 5. Within Phase 2, the five mTLS wirings are
@@ -4502,7 +4502,9 @@ peer `poh:` block on `PipelineManifest`, mirroring the existing
 The `Verify` and `TrustExtend` walks now run end-to-end against
 a YAML-deployed PoH-enabled pipeline.
 
-**V5.1 R1 closed 2026-04-29 (signing-key resolver):** new
+**V5.1 R1 closed 2026-04-29 (signing-key resolver) + W1/W2 closed
+2026-04-30 (cmd_serve install + /poh-head signed-root surface):**
+new
 `aeon-engine::poh_probe::resolve_poh_signing_key(block, registry)`
 translates `PohBlock.signing_key_ref` against the
 `aeon-types::SecretRegistry` and stamps an `Arc<SigningKey>` onto
@@ -4519,4 +4521,33 @@ KMS providers. The supervisor grew a peer
 resolution errors as a `start()` refusal — same shape as the
 encryption probe's `Required` path. 9 new probe tests + 2 new
 supervisor tests (refuse-without-registry, install-once-only).
-The `VerifyWithKey` walk now resolves end-to-end.
+
+**W1 cmd_serve install (2026-04-30, image `aeon:v53`):**
+`aeon-cli::cmd_serve` now calls
+`PipelineSupervisor::set_secret_registry(Arc::new(SecretRegistry::default_local()))`
+right after the L2 root install. Pipelines that declare
+`poh.signing_key_ref` resolve at start without any extra bootstrap.
+Required a passthrough `processor-auth = ["aeon-engine/processor-auth"]`
+feature on `aeon-cli` so the cfg gate inside `cmd_serve` actually
+fires (caught by a v52 test run that silently no-op'd). Vault / KMS
+/ SM providers will register on top of this single install point
+once `aeon-secrets` lands. Refusal path verified live on `aeon:v52`
+(no install): leader's cluster_applier surfaced
+`poh probe: signing_key_ref is set but no SecretRegistry is installed`
+exactly as the probe spec dictates.
+
+**W2 /poh-head signed-root surface (2026-04-30):** REST handler
+`poh_head` now reads `chain.recent_entries().last().signed_root`
+and surfaces it as a `latest_signed_root` object alongside the
+existing `chain` block:
+`{ merkle_root, signature (hex 128), signer_public_key (hex 64),
+signed_at_nanos }`. `null` when no signing key is configured
+(chain-only Verify mode) or no batches have flowed.
+
+**Live VerifyWithKey walk (2026-04-30, `aeon:v53`):** applied
+`docs/examples/pipeline-poh-signed.yaml`,
+`AEON_TEST_POH_SIG=22..22` (64-char hex of `[0x22; 32]`) set on
+the StatefulSet via `kubectl set env`, /poh-head reported
+`signer_public_key = a09aa5f...3455a4f0` byte-identical to the
+public key derived offline from `SigningKey::from_bytes(&[0x22; 32])`,
+on all 3 pods at `sequence=98`. **V5 closed end-to-end.**

@@ -583,22 +583,33 @@ next-session scope.
    Returns `{sequence, current_hash, mmr_root}` per partition; 404
    when the partition isn't owned on the target node. Feature-gated
    on `processor-auth + cluster`, mirroring the registry.
-5. **V5 PoH manifest wiring (V5.1)** — ✅ **closed 2026-04-29
-   (issue #83)**: new `aeon-types::poh::PohBlock` peer block on
-   `PipelineManifest` and `PipelineDefinition` (`enabled`,
-   `max_recent_entries`, `signing_key_ref`);
-   `PipelineManifest::to_pipeline_definition()` clones it through;
-   `pipeline_supervisor::pipeline_config_for` translates
-   `def.poh.enabled` onto `PipelineConfig.poh` with the manifest's
-   `max_recent_entries`; `start()` mirrors the supervisor-stamped
-   `partition_id` onto `poh.partition`; example fixture at
-   `docs/examples/pipeline-poh-enabled.yaml`. The `Verify` and
-   `TrustExtend` walks now run end-to-end against a YAML-deployed
-   PoH-enabled pipeline. `VerifyWithKey` awaits a separate
-   signing-key resolver atom (the schema preserves `signing_key_ref`
-   today but the engine ignores it). 6 new poh-module tests + 2
-   manifest-bridge tests + 2 `pipeline_config_for` tests; clippy
-   clean.
+5. **V5 PoH manifest wiring (V5.1) + signing-key resolver (R1) +
+   cmd_serve install (W1) + signed-root REST surface (W2)** — ✅
+   **fully closed 2026-04-30**: V5 ships end-to-end across all three
+   `PohVerifyMode` walks. Cumulative atoms:
+   - V5.1 a/b/c/d (2026-04-29, issue #83): `aeon-types::poh::PohBlock`
+     peer block, `to_pipeline_definition()` carry-through,
+     `pipeline_config_for` translation, example fixture
+     `pipeline-poh-enabled.yaml`. Closes `Verify` + `TrustExtend`.
+   - V5.1 R1 (2026-04-29): `aeon-engine::poh_probe::resolve_poh_signing_key`
+     resolves `signing_key_ref` against `SecretRegistry`, stamps
+     `Arc<SigningKey>` onto `PipelineConfig.poh.signing_key`. Hex
+     fallback makes `${ENV:NAME}` work directly with the default
+     env-only registry; raw-byte path covers Vault-transit / KMS.
+     9 probe tests + 2 supervisor tests.
+   - W1 (2026-04-30): `aeon-cli::cmd_serve` calls
+     `set_secret_registry(default_local())` after the L2 root
+     install. Required a passthrough `processor-auth` feature on
+     `aeon-cli` so the cfg gate fires.
+   - W2 (2026-04-30): `/poh-head` REST response now carries
+     `latest_signed_root: { merkle_root, signature, signer_public_key,
+     signed_at_nanos }`. `null` when no key is configured.
+   - Live VerifyWithKey walk (2026-04-30, `aeon:v53`):
+     `pipeline-poh-signed.yaml` applied, `AEON_TEST_POH_SIG` set
+     on the StatefulSet, `/poh-head` reports
+     `signer_public_key = a09aa5f4...3455a4f0` byte-identical to
+     the offline-derived pubkey for secret `[0x22; 32]`, on all 3
+     pods at sequence=98.
 6. **V3 native processor + per-event rows** — 🟡 still pending. Native
    `.so` artifact needs to be built from `samples/processors/rust-native`
    and registered. PerEvent rows need either a Kafka source for
