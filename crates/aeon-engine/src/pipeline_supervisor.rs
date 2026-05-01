@@ -889,6 +889,26 @@ fn pipeline_config_for(def: &PipelineDefinition) -> PipelineConfig {
         CheckpointBackendDecl::Wal => crate::delivery::CheckpointBackend::Wal,
         CheckpointBackendDecl::None => crate::delivery::CheckpointBackend::None,
     };
+    // Q1: propagate the manifest's `durability.checkpoint.interval` onto
+    // `delivery.flush.interval`. Pre-Q1 this string field was parsed
+    // and round-tripped through the registry but never reached the
+    // runtime, so blocking-strategy pipelines stuck at the 1-second
+    // default cadence regardless of what the manifest declared. Bad
+    // syntax falls back to the existing default with a warn log so a
+    // typoed unit doesn't block startup.
+    if let Some(interval_str) = def.durability.checkpoint.interval.as_deref() {
+        match crate::retention_probe::parse_hold_duration(interval_str) {
+            Ok(d) => cfg.delivery.flush.interval = d,
+            Err(e) => {
+                tracing::warn!(
+                    pipeline = %def.name,
+                    interval = %interval_str,
+                    error = %e,
+                    "ignoring malformed durability.checkpoint.interval; using default"
+                );
+            }
+        }
+    }
     if matches!(def.durability.mode, DurabilityMode::None) {
         // Strip whatever backend the manifest declared so the
         // at-least-once baseline isn't paying for unrelated FS work
