@@ -903,18 +903,77 @@ fn cmd_serve(addr: &str, artifact_dir: &str) -> Result<()> {
                     // G10 — branch on bootstrap vs join. bootstrap_multi()
                     // runs `raft.initialize(members)`; join() seed-contacts an
                     // existing leader and lets it `add_learner → change_membership`.
+                    //
+                    // FT-1 + FT-2: open a separate redb store at
+                    // `${artifact_dir}/raft.redb` (NOT the same file as the
+                    // M2 checkpoint store — different access patterns: Raft
+                    // log is append-heavy with frequent fsync, checkpoints
+                    // are appended only at flush_interval). On pod restart,
+                    // reopening this file recovers term + log + applied
+                    // state, so the cluster doesn't have to re-elect from
+                    // term=1 — which under MemLogStore caused split-brain
+                    // when one pod restarted while others were still at the
+                    // pre-restart term. If the redb open fails, fall back to
+                    // the legacy in-memory variant with a warn log so dev /
+                    // test clusters still bootstrap.
+                    let raft_path = std::path::PathBuf::from(&dir).join("raft.redb");
+                    let raft_l3: Option<Arc<dyn aeon_types::L3Store>> = match
+                        aeon_state::RedbStore::open(aeon_state::RedbConfig {
+                            path: raft_path.clone(),
+                            sync_writes: true,
+                        })
+                    {
+                        Ok(s) => {
+                            tracing::info!(
+                                path = %raft_path.display(),
+                                "FT-1 + FT-2: Raft log + state machine backed by redb"
+                            );
+                            Some(Arc::new(s) as Arc<dyn aeon_types::L3Store>)
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                path = %raft_path.display(),
+                                error = %e,
+                                "Raft redb open failed; falling back to in-memory log + state — \
+                                 cluster will lose state across pod restarts"
+                            );
+                            None
+                        }
+                    };
+
                     let poh_mode_str = config.poh_verify_mode.clone();
-                    let node = if scale_up {
-                        aeon_cluster::ClusterNode::join(config, Arc::clone(&endpoint))
+                    let node = match (scale_up, raft_l3.as_ref()) {
+                        (true, Some(l3)) => {
+                            aeon_cluster::ClusterNode::join_persistent(
+                                config,
+                                Arc::clone(&endpoint),
+                                Arc::clone(l3),
+                            )
                             .await
-                            .map_err(|e| anyhow::anyhow!("Cluster seed-join failed: {e}"))?
-                    } else {
-                        aeon_cluster::ClusterNode::bootstrap_multi(
-                            config,
-                            Arc::clone(&endpoint),
-                        )
-                        .await
-                        .map_err(|e| anyhow::anyhow!("Cluster bootstrap failed: {e}"))?
+                            .map_err(|e| anyhow::anyhow!("Cluster seed-join (persistent) failed: {e}"))?
+                        }
+                        (true, None) => {
+                            aeon_cluster::ClusterNode::join(config, Arc::clone(&endpoint))
+                                .await
+                                .map_err(|e| anyhow::anyhow!("Cluster seed-join failed: {e}"))?
+                        }
+                        (false, Some(l3)) => {
+                            aeon_cluster::ClusterNode::bootstrap_multi_persistent(
+                                config,
+                                Arc::clone(&endpoint),
+                                Arc::clone(l3),
+                            )
+                            .await
+                            .map_err(|e| anyhow::anyhow!("Cluster bootstrap (persistent) failed: {e}"))?
+                        }
+                        (false, None) => {
+                            aeon_cluster::ClusterNode::bootstrap_multi(
+                                config,
+                                Arc::clone(&endpoint),
+                            )
+                            .await
+                            .map_err(|e| anyhow::anyhow!("Cluster bootstrap failed: {e}"))?
+                        }
                     };
 
                     let node = Arc::new(node);
