@@ -25,6 +25,22 @@
 #     3. THEN delete the chaos resource — clean unmount.
 #   `duration: 5m` keeps the fault active long enough that the pipeline
 #   completes inside the window without auto-removal.
+#
+# Known toda limitation on k3s (Rancher Desktop 2026-05-01):
+#   `errno: 13` (EACCES) is the configured fault but in practice toda
+#   degrades to ENOTCONN ("Transport endpoint is not connected") after
+#   a few write attempts. This means the fault doesn't propagate to the
+#   engine as a controlled `Result::Err` — instead the FUSE proxy
+#   wedges and every subsequent fs op fails the same way regardless of
+#   the chaos config. As a result, `FallbackCheckpointStore::engage_fallback`
+#   doesn't fire predictably under this setup. The unit-test path
+#   (`eo2_recovery::tests::primary_error_engages_fallback`) remains the
+#   authoritative coverage for the fallback contract; this fixture is
+#   useful for verifying chaos targeting + lifecycle but not for
+#   end-to-end fallback validation. A more stable approach (StressChaos
+#   on the chaos-daemon, manual chmod -w via `kubectl exec`, or
+#   network-level fault on a remote L3 backend) would close the live
+#   trigger gap.
 
 apiVersion: chaos-mesh.org/v1alpha1
 kind: IOChaos

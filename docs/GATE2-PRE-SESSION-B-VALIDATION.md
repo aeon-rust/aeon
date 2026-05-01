@@ -668,6 +668,24 @@ next-session scope.
    `try_recover_primary` unit test; live-trigger of that path
    remains a follow-up atom.
 
+   **Update 2026-05-01b — toda EACCES injection on k3s is not
+   reliable:** under Rancher Desktop k3s, the toda FUSE proxy
+   that Chaos Mesh's IOChaos uses degrades to `ENOTCONN`
+   ("Transport endpoint is not connected") on writes after a
+   few attempts, instead of the configured `errno: 13`
+   (EACCES). The fault doesn't reach the engine as a controlled
+   `Result::Err`, so `FallbackCheckpointStore::engage_fallback`
+   doesn't fire predictably. Direct probe via
+   `kubectl exec aeon-1 -- sh -c 'echo test > /app/artifacts/probe'`
+   confirmed the toda mount returns ENOTCONN universally, not
+   EACCES selectively. The unit-test path
+   (`eo2_recovery::tests::primary_error_engages_fallback`)
+   remains the authoritative coverage for the fallback
+   contract. A more stable live-trigger approach (manual
+   `chmod -w` via kubectl exec, network-level fault on a
+   remote L3 backend, or StressChaos targeting fsync) would
+   close the gap; tracked as a separate follow-up atom.
+
 ### What a green Session B looks like
 
 - AWS EKS `us-east-1a` cluster up, pre-flight spot price within cap,
