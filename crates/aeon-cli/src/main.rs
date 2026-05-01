@@ -752,6 +752,47 @@ fn cmd_serve(addr: &str, artifact_dir: &str) -> Result<()> {
             }
         }
 
+        // M2 / FT-3: install the L3 checkpoint store so pipelines that
+        // declare `durability.checkpoint.backend: state_store` get a
+        // real `L3CheckpointStore` instead of silently falling through
+        // to a None writer. Backed by a redb file at
+        // `${artifact_dir}/l3-checkpoints.redb` (sync_writes: true so
+        // checkpoint records survive an unclean shutdown). Wrapped in
+        // `FallbackCheckpointStore` downstream by `build_sink_task_ctx`
+        // so an L3 write error transparently degrades to the WAL
+        // sidecar at `${checkpoint_dir}/fallback.wal`.
+        let l3_path = std::path::PathBuf::from(&dir).join("l3-checkpoints.redb");
+        match aeon_state::RedbStore::open(aeon_state::RedbConfig {
+            path: l3_path.clone(),
+            sync_writes: true,
+        }) {
+            Ok(store) => {
+                let l3: Arc<dyn aeon_types::L3Store> = Arc::new(store);
+                if let Err(e) = supervisor.set_l3_checkpoint_store(l3) {
+                    tracing::warn!(
+                        error = %e,
+                        "supervisor L3 checkpoint store install failed"
+                    );
+                } else {
+                    tracing::info!(
+                        path = %l3_path.display(),
+                        "supervisor L3 checkpoint store installed (state_store \
+                         backend pipelines will now record \
+                         aeon_pipeline_checkpoints_written_total)"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    path = %l3_path.display(),
+                    error = %e,
+                    "L3 checkpoint redb open failed; pipelines declaring \
+                     checkpoint.backend=state_store will run without a \
+                     checkpoint writer (legacy behaviour)"
+                );
+            }
+        }
+
         // Cluster initialization — detect K8s environment
         let cluster_enabled = std::env::var("AEON_CLUSTER_ENABLED")
             .map(|v| v.to_lowercase() == "true")

@@ -24,7 +24,7 @@ native-validate = ["aeon-engine/native-loader"]
 # transitive feature is actually compiled in. Without this passthrough the
 # cfg always evaluates false and the install would silently no-op.
 processor-auth = ["aeon-engine/processor-auth"]
-rest-api = ["aeon-engine/rest-api", "aeon-engine/cluster", "dep:tokio", "dep:tracing", "dep:tracing-subscriber", "dep:dashmap", "dep:notify", "dep:aeon-wasm", "dep:aeon-connectors", "dep:uuid", "dep:bytes", "dep:aeon-cluster"]
+rest-api = ["aeon-engine/rest-api", "aeon-engine/cluster", "dep:tokio", "dep:tracing", "dep:tracing-subscriber", "dep:dashmap", "dep:notify", "dep:aeon-wasm", "dep:aeon-connectors", "dep:uuid", "dep:bytes", "dep:aeon-cluster", "dep:aeon-state"]
 
 [dependencies]
 aeon-types = { workspace = true }
@@ -63,6 +63,14 @@ aeon-connectors = { workspace = true, optional = true, features = [
 uuid = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
 aeon-cluster = { workspace = true, features = ["auto-tls"], optional = true }
+# M2 — L3 RedbStore for the supervisor's checkpoint backend.
+# `cmd_serve` opens a redb file at $artifact_dir/l3-checkpoints.redb and
+# installs it onto PipelineSupervisor::set_l3_checkpoint_store, which the
+# build_sink_task_ctx then consumes when a manifest declares
+# `durability.checkpoint.backend: state_store`. Without this, the
+# StateStore path silently no-ops and `aeon_pipeline_checkpoints_written_total`
+# stays at 0 forever even though the L2 body store grows on disk.
+aeon-state = { workspace = true, optional = true, features = ["redb"] }
 ipnet = { workspace = true }
 
 [dev-dependencies]

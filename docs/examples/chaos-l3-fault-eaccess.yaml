@@ -1,0 +1,55 @@
+# Chaos Mesh IOChaos — inject EACCES on the L3 checkpoint store.
+#
+# Used by C2 to deliberately trigger the FallbackCheckpointStore on
+# the leader pod mid-flight. Targets writes to the redb file under
+# /app/artifacts. The chaos resource is meant to stay applied for the
+# entire pipeline lifecycle — see "lifecycle discipline" below.
+#
+# Apply with:
+#   kubectl apply -f docs/examples/chaos-l3-fault-eaccess.yaml
+# Remove with:
+#   kubectl delete -f docs/examples/chaos-l3-fault-eaccess.yaml
+#
+# Expected log on the targeted pod when fallback engages:
+#   "L3 checkpoint store failed; falling back to WAL"
+#   (aeon-engine::eo2_recovery::FallbackCheckpointStore::engage_fallback)
+#
+# Lifecycle discipline (learned 2026-05-01 during initial C2 run):
+#   IOChaos uses a `toda` FUSE proxy mounted at the volumePath. Deleting
+#   the chaos resource unmounts toda; if any process holds open file
+#   descriptors through that mount, the kernel returns ENOTCONN and the
+#   pod becomes wedged with `Transport endpoint is not connected` on
+#   every subsequent fs op. Discipline:
+#     1. Apply chaos BEFORE pipeline start.
+#     2. Stop + delete the pipeline (closes redb / WAL handles).
+#     3. THEN delete the chaos resource — clean unmount.
+#   `duration: 5m` keeps the fault active long enough that the pipeline
+#   completes inside the window without auto-removal.
+
+apiVersion: chaos-mesh.org/v1alpha1
+kind: IOChaos
+metadata:
+  name: aeon-l3-eaccess
+  namespace: aeon
+spec:
+  action: fault
+  mode: one
+  selector:
+    namespaces:
+      - aeon
+    labelSelectors:
+      "statefulset.kubernetes.io/pod-name": "aeon-1"
+  # Inject EACCES (errno 13) on every write under the artifact dir.
+  # That's where the supervisor opens the redb file
+  # (`/app/artifacts/l3-checkpoints.redb`).
+  volumePath: /app/artifacts
+  path: /app/artifacts/l3-checkpoints.redb
+  errno: 13
+  methods:
+    - write
+    - flush
+    - fsync
+  percent: 100
+  duration: 5m
+  containerNames:
+    - aeon

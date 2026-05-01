@@ -1687,6 +1687,32 @@ async fn run_sink_task<K: Sink + Send + 'static>(
                     );
                 }
 
+                // M2: blocking strategies (PerEvent/OrderedBatch) deliver +
+                // ack synchronously, so they never enter the
+                // `!is_blocking()` periodic-flush block below — meaning
+                // `write_checkpoint` only ever fired at shutdown via the
+                // post-loop path (and even then only if the loop had
+                // exited). For a long-running pipeline, that left
+                // `aeon_pipeline_checkpoints_written_total` at 0 even
+                // though events flowed and the L3 store was installed.
+                // Mirror the non-blocking path's flush-interval cadence
+                // so blocking strategies also produce checkpoint records
+                // during steady-state operation.
+                if delivery_strategy.is_blocking()
+                    && delivered_since_checkpoint > 0
+                    && last_flush.elapsed() >= flush_interval
+                {
+                    write_checkpoint(
+                        &mut checkpoint_writer,
+                        &sink_ledger,
+                        &metrics_sink,
+                        &mut delivered_since_checkpoint,
+                        &mut failed_since_checkpoint,
+                        ack_tracker.as_ref(),
+                    );
+                    last_flush = Instant::now();
+                }
+
                 // In Batched mode, track pending and flush at intervals
                 if !delivery_strategy.is_blocking() {
                     pending_count += count;

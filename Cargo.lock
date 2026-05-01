@@ -35,6 +35,7 @@ dependencies = [
  "aeon-connectors",
  "aeon-crypto",
  "aeon-engine",
+ "aeon-state",
  "aeon-types",
  "aeon-wasm",
  "anyhow",

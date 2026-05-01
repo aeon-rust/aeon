@@ -638,14 +638,35 @@ next-session scope.
    with 0 failures, L2 segment 3,529,628 bytes on disk per pod
    under fsync amplification. **WAL-fallback row**: covered by
    5 unit tests + 1 integration test in `aeon-engine`; live
-   cluster trigger needs deliberate L3 fault injection (Chaos
-   Mesh or chmod -w mid-flight) which is out of scope for a
-   YAML fixture and tracked as a separate atom.
-   **Pre-existing observation flagged in the closure:**
-   `aeon_pipeline_checkpoints_written_total=0` for both
-   ordered_batch + per_event runs even though the L2 body store
-   grows on disk — metric-vs-disk-state divergence, not a
-   regression introduced by N1/N2.
+   cluster trigger via Chaos Mesh IOChaos closed 2026-05-01
+   (C1+C2) — see "Update 2026-05-01" below.
+
+   **Update 2026-05-01 (M1+M2+C1+C2, image `aeon:v57`):**
+   the longstanding `aeon_pipeline_checkpoints_written_total=0`
+   divergence is closed. Three layered gaps resolved:
+   (a) `aeon-cli::cmd_serve` opens
+   `${artifact_dir}/l3-checkpoints.redb` and installs it on
+   `PipelineSupervisor::set_l3_checkpoint_store`;
+   (b) `pipeline_config_for` translates the manifest's
+   `checkpoint.backend` declaration (was silently defaulted to
+   `Wal`); (c) periodic `write_checkpoint` added to the
+   blocking-strategy path in `run_sink_task` (was gated to
+   non-blocking only). Live proof: `state_store` manifests
+   trigger `Checkpoint L3 store initialized` log; OrderedBatch
+   run reports `checkpoints_written_total=2`, PerEvent reports
+   `=30`. Chaos Mesh installed (C1) via helm in namespace
+   `chaos-mesh`; new `docs/examples/chaos-l3-fault-eaccess.yaml`
+   verified `AllInjected: True` against the leader pod via
+   `toda` FUSE proxy. Lifecycle discipline (apply chaos → run
+   pipeline → stop pipeline → delete chaos) documented inline
+   to avoid `ENOTCONN` mount-tear-down on open file handles.
+   Pre-existing FT-1/FT-2 caveat: cluster bootstrap still uses
+   `MemLogStore` (Raft state non-persistent), so force-deleting
+   pods can leave orphaned redb file locks — `rm -f
+   /app/artifacts/l3-checkpoints.redb` clears them. Full WAL→L3
+   drain on chaos recovery is covered by the
+   `try_recover_primary` unit test; live-trigger of that path
+   remains a follow-up atom.
 
 ### What a green Session B looks like
 
