@@ -156,6 +156,21 @@ pub struct PipelineSupervisor {
     /// benches that don't exercise checkpointing leave this unset;
     /// `CheckpointBackend::Wal` and `None` paths are unaffected.
     l3_checkpoint_store: OnceLock<Arc<dyn aeon_types::L3Store>>,
+    /// O1 / EO-2 P8: node-wide `Eo2Metrics` registry. Always-on (no
+    /// install step) — same pattern as `poh_live_chains`. `start()`
+    /// stamps a clone onto every pipeline's
+    /// `PipelineConfig.eo2_metrics` so the L2 body store, sink ack
+    /// tracker, fallback checkpoint store, and capacity gate all
+    /// publish into the same registry. The REST `/metrics` handler
+    /// appends `render_prometheus()` so operators see
+    /// `aeon_l2_bytes`, `aeon_l2_segments`, `aeon_l2_gc_lag_seq`,
+    /// `aeon_l2_pressure`, `aeon_sink_ack_seq`, and
+    /// `aeon_checkpoint_fallback_wal_total` alongside the per-pipeline
+    /// counters. Pre-O1, these metrics ticked in-process but were
+    /// invisible to Prometheus scrapers — engage_fallback's counter
+    /// fires inside the FallbackCheckpointStore but the only path to
+    /// observe it was unit tests.
+    eo2_metrics: Arc<crate::eo2_metrics::Eo2Metrics>,
 }
 
 impl PipelineSupervisor {
@@ -176,7 +191,16 @@ impl PipelineSupervisor {
             #[cfg(feature = "processor-auth")]
             secret_registry: OnceLock::new(),
             l3_checkpoint_store: OnceLock::new(),
+            eo2_metrics: Arc::new(crate::eo2_metrics::Eo2Metrics::new()),
         }
+    }
+
+    /// O1 / EO-2 P8: shared Eo2Metrics registry. Cloned onto every
+    /// pipeline's `PipelineConfig.eo2_metrics` at start so all
+    /// pipelines publish into the same place. The REST `/metrics`
+    /// handler reads from this for its `render_prometheus()` splice.
+    pub fn eo2_metrics(&self) -> Arc<crate::eo2_metrics::Eo2Metrics> {
+        Arc::clone(&self.eo2_metrics)
     }
 
     /// M2 / FT-3: install the node-wide L3 store used as the checkpoint
@@ -553,6 +577,13 @@ impl PipelineSupervisor {
         if let Some(l3) = self.l3_checkpoint_store.get() {
             pipeline_config.l3_checkpoint_store = Some(Arc::clone(l3));
         }
+        // O1 / EO-2 P8: stamp the shared Eo2Metrics registry onto every
+        // pipeline so L2/sink/ack/fallback counters all publish into one
+        // place. REST /metrics reads from `self.eo2_metrics` for its
+        // render_prometheus splice. Without this clone, in-process
+        // increments at sites like `FallbackCheckpointStore::engage_fallback`
+        // are dead because pipeline_config.eo2_metrics stays None.
+        pipeline_config.eo2_metrics = Some(Arc::clone(&self.eo2_metrics));
         // G11.c: share the process-wide PoH-chain install registry so
         // `create_poh_state` can resume a chain a recent partition-transfer
         // installed on this node instead of genesising fresh.

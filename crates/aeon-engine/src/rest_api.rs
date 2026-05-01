@@ -690,6 +690,15 @@ async fn metrics_prometheus(State(state): State<Arc<AppState>>) -> impl IntoResp
         ));
     }
 
+    // O1 / EO-2 P8: splice the supervisor's shared Eo2Metrics so
+    // `aeon_l2_bytes`, `aeon_l2_segments`, `aeon_l2_gc_lag_seq`,
+    // `aeon_l2_pressure`, `aeon_sink_ack_seq`, and
+    // `aeon_checkpoint_fallback_wal_total` all surface to operators.
+    // Pre-O1, these counters ticked in-process but never reached
+    // the scrape endpoint — engage_fallback's increment was only
+    // observable via unit tests.
+    out.push_str(&state.supervisor.eo2_metrics().render_prometheus());
+
     // Cluster-level Raft metrics (CL-4)
     #[cfg(feature = "cluster")]
     if let Some(node) = state.cluster_node.as_ref() {

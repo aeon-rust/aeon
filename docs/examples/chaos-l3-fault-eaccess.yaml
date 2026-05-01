@@ -54,7 +54,7 @@ spec:
     namespaces:
       - aeon
     labelSelectors:
-      "statefulset.kubernetes.io/pod-name": "aeon-1"
+      "statefulset.kubernetes.io/pod-name": "aeon-2"
   # Inject EACCES (errno 13) on every write under the artifact dir.
   # That's where the supervisor opens the redb file
   # (`/app/artifacts/l3-checkpoints.redb`).
