@@ -1786,6 +1786,31 @@ async fn run_sink_task<K: Sink + Send + 'static>(
                         }
                     }
                 }
+                // P1: blocking strategies (PerEvent/OrderedBatch) deliver
+                // synchronously, so when the source goes idle there are no
+                // pending events to credit — but `delivered_since_checkpoint`
+                // may still hold uncommitted-checkpoint deltas from the last
+                // batch. Without this idle-path tick, a long-running pipeline
+                // that drains its source and then waits for more input writes
+                // exactly one final-shutdown checkpoint regardless of how
+                // many batches flowed through. Mirroring the non-blocking
+                // idle-path logic here keeps the metric cadence consistent
+                // across strategy choices.
+                if delivery_strategy.is_blocking()
+                    && delivered_since_checkpoint > 0
+                    && last_flush.elapsed() >= flush_interval
+                {
+                    write_checkpoint(
+                        &mut checkpoint_writer,
+                        &sink_ledger,
+                        &metrics_sink,
+                        &mut delivered_since_checkpoint,
+                        &mut failed_since_checkpoint,
+                        ack_tracker.as_ref(),
+                    );
+                    last_flush = Instant::now();
+                }
+
                 // In Batched mode, flush pending even while idle
                 if !delivery_strategy.is_blocking() && pending_count > 0 {
                     let effective_interval = flush_tuner
