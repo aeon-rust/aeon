@@ -400,11 +400,11 @@ T5/T6 deferred to DOKS re-spin as before.
 
 | Pair | Path | Tier | Status |
 |------|------|------|--------|
-| Native Rust processor · per-event | Memory → Native `.so` → Blackhole, `DurabilityMode::PerEvent` | L2 body + fsync | ⏳ pending (needs native .so artifact) |
-| Native Rust processor · batch | Memory → Native `.so` → Blackhole, `DurabilityMode::OrderedBatch` | L2 body + L3 checkpoint | ⏳ pending |
-| Wasm guest · per-event | Memory → Wasm → Blackhole, `DurabilityMode::PerEvent` | L2 body + fsync | ⏳ pending |
+| Native Rust processor · per-event | Memory → Native `.so` → Blackhole, `DurabilityMode::PerEvent` | L2 body + fsync | ✅ captured 2026-04-30 (N2, fixture: `pipeline-v3-native-perevent.yaml`, image `aeon:v54`) |
+| Native Rust processor · batch | Memory → Native `.so` → Blackhole, `DurabilityMode::OrderedBatch` | L2 body + L3 checkpoint | ✅ captured 2026-04-30 (N1, fixture: `pipeline-v3-native-ordered.yaml`, image `aeon:v54`) |
+| Wasm guest · per-event | Memory → Wasm → Blackhole, `DurabilityMode::PerEvent` | L2 body + fsync | ✅ captured 2026-05-01 (R2, fixture: `pipeline-v3-wasm-perevent.yaml`, image `aeon:v60`); 50K events, 0 failures, `checkpoints_written_total=22` (100ms interval honored), L2 segment 17,649,628 bytes per pod size-equal across all 3 pods |
 | Wasm guest · batch (ordered) | Memory → Wasm → Blackhole, `DurabilityMode::OrderedBatch` | L3 checkpoint via WAL fallback | ✅ captured 2026-04-25 (fixture: `pipeline-v3-wasm-ordered.yaml`) |
-| WAL fallback | Wasm OrderedBatch on RD (L3 redb not configured on this cluster) | WAL tier | ✅ captured 2026-04-25 |
+| WAL fallback | Wasm OrderedBatch on RD (L3 redb now configured via M2) | WAL tier (pre-M2) / L3 redb (post-M2 via aeon:v60) | ✅ captured 2026-04-25 (WAL) + 2026-05-01 (L3) |
 
 **V3 Wasm / OrderedBatch findings (2026-04-25, `aeon:e68ce68`):**
 
@@ -506,17 +506,18 @@ and assert MMR + Merkle + Ed25519 root-sig round-trips; resumed
 
 | PohVerifyMode | Steps | Status |
 |---------------|-------|--------|
-| `Verify` | trigger T4 transfer, `curl /api/v1/pipelines/<name>/partitions/<N>/poh-head` on both peers, assert byte-equal `current_hash` + `mmr_root` + `sequence` | 🟡 endpoint verified live on `aeon:e68ce68`; walk still pending a PoH-enabled pipeline + T4 transfer |
-| `VerifyWithKey` | same as Verify + assert Ed25519 signature over the root verifies against the publisher's pubkey | ⏳ pending |
-| `TrustExtend` | skip verify, confirm target still sequences correctly from the trusted extend point | ⏳ pending |
+| `Verify` | trigger T4 transfer, `curl /api/v1/pipelines/<name>/partitions/<N>/poh-head` on both peers, assert byte-equal `current_hash` + `mmr_root` + `sequence` | ✅ closed 2026-04-29 — PoH manifest wiring (V5.1) + `pipeline-poh-memory.yaml` live run on `aeon:v51`, all 3 pods reported `sequence=98` with byte-equal `current_hash` and `mmr_root` |
+| `VerifyWithKey` | same as Verify + assert Ed25519 signature over the root verifies against the publisher's pubkey | ✅ closed 2026-04-30 — R1 signing-key resolver + W1 cmd_serve install + W2 `/poh-head` `latest_signed_root` surface on `aeon:v53`; `signer_public_key` = `a09aa5f4...3455a4f0` byte-identical to offline-derived key for secret `[0x22; 32]`, on all 3 pods. Independent verify via `aeon verify-poh` CLI (V1, commit `a2bae49`). |
+| `TrustExtend` | skip verify, confirm target still sequences correctly from the trusted extend point | ✅ closed 2026-04-29 alongside `Verify` — chain-only verification needs no key, same fixture exercises this mode by setting `poh_verify_mode: trust_extend` |
 
 **Cross-reference:** PoH chain transport primitives are the CL-6b series,
 all closed 2026-04-16 with 4 integration tests over real QUIC. V5 exists
 to confirm the E2E engine-level wire-up stays green on RD (which itself
 is closed via G2 / CL-6c.4 per 2026-04-23 ROADMAP entry).
 
-**V5 verdict (endpoint live, walk pending):** the new V5 REST
-endpoint is confirmed live on `aeon:e68ce68`:
+**V5 verdict (✅ fully closed end-to-end 2026-04-30):** all three
+PohVerifyMode walks are green on the live RD cluster. Initial endpoint
+verification on `aeon:e68ce68`:
 
 ```
 $ curl http://.../api/v1/pipelines/t0-baseline/partitions/0/poh-head
@@ -529,9 +530,12 @@ $ curl http://.../api/v1/pipelines/does-not-exist/partitions/0/poh-head
 
 Both branches return the exact error text the handler emits,
 confirming the feature-gated `processor-auth + cluster` code path is
-compiled in. Full walk under `{Verify, VerifyWithKey, TrustExtend}`
-still needs a PoH-enabled pipeline + T4 transfer, which is the
-next-session scope.
+compiled in. **Full walks shipped 2026-04-29 → 2026-04-30** via V5.1
+(PoH manifest wiring, commit `389e55b`) + W1/W2 (cmd_serve secret
+install + `/poh-head` `latest_signed_root` surface, commit `eff52d6`)
++ V1 (independent `aeon verify-poh` CLI, commit `a2bae49`). See V3
+row "Native Rust processor · per-event/batch" for the analogous V3
+closure.
 
 ---
 
