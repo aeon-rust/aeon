@@ -41,6 +41,44 @@
 #   on the chaos-daemon, manual chmod -w via `kubectl exec`, or
 #   network-level fault on a remote L3 backend) would close the live
 #   trigger gap.
+#
+# 2026-05-02 follow-up — alternative chaos approaches all blocked on
+# the same root cause: redb opens the file with `O_RDWR` + mmap, so
+# typed write errors don't propagate from the FS layer to the Rust
+# code. Specifically:
+#
+#   * `kubectl exec ... chmod 000 /app/artifacts/l3-checkpoints.redb`
+#     — chmod on an already-open `O_RDWR` fd has no effect on
+#     subsequent writes. redb keeps writing happily.
+#   * `kubectl exec ... truncate -s 1024 /app/artifacts/l3-checkpoints.redb`
+#     — truncates the on-disk file to 1 KiB, but redb's mmap'd pages
+#     in the running process aren't invalidated; writes succeed
+#     against the in-memory pages, then re-grow the file on fsync.
+#     Side effect: corrupts the file's open-time integrity check, so
+#     the next pod restart fails to reopen the L3 store (silent
+#     pipeline-init failure observed). Don't do this on a live cluster.
+#   * `kubectl exec ... rm /app/artifacts/l3-checkpoints.redb`
+#     — Linux unlink on an open fd doesn't break writes (file
+#     unlinked from the directory but the inode stays alive until the
+#     last fd closes). No effect.
+#   * IOChaos with `delay` action — adds latency without breaking the
+#     FUSE, but redb's `begin_write` / `txn.commit` have no internal
+#     timeout, so `write_checkpoint` just blocks for the delay
+#     duration without erroring. No fault injected.
+#   * Filling the disk via `dd` — would work in principle, but the
+#     RD `local-path` PVC is backed by the host's ext4 (1 TB on this
+#     laptop), so a `dd` would consume the whole laptop disk.
+#
+# Honest conclusion: triggering FallbackCheckpointStore live under
+# k3s + local-path + redb with mmap'd open fds requires either a
+# cgroup quota (next iteration), a remote L3 backend with
+# network-level chaos, or a debug CLI (`aeon test inject-l3-fault`)
+# that toggles a fault flag inside the running supervisor. The
+# fault → fallback → metric path itself IS covered end-to-end by
+# `eo2_recovery::tests::fallback_transition_bumps_metrics_counter`
+# (unit) plus the O1 commit `8c8dbb5` (live `/metrics` exposure
+# verified) — it's the chaos-tooling integration that's blocked,
+# not the aeon code path.
 
 apiVersion: chaos-mesh.org/v1alpha1
 kind: IOChaos
