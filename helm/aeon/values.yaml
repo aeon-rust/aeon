@@ -3,7 +3,13 @@
 replicaCount: 1
 
 image:
-  repository: aeonrust/aeon
+  # Container registry for published Aeon images.
+  # Decision 2026-05-02: GHCR (GitHub Container Registry) instead of Docker Hub.
+  # GHCR is free for public images, reuses the existing aeon-rust GitHub org,
+  # and surfaces images on the Packages tab of github.com/aeon-rust/aeon.
+  # Override in values-local.yaml with `image.repository: aeon` for local nerdctl
+  # builds (Rancher Desktop k8s.io namespace).
+  repository: ghcr.io/aeon-rust/aeon
   tag: latest
   pullPolicy: IfNotPresent
 

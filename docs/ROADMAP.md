@@ -927,11 +927,18 @@ placeholders). Test counts updated to reflect current state.
    All code, Helm templates, and single-node validation done locally first
    to avoid unplanned cloud costs.
 
-   **P4a — Containerize Aeon** (done, 2026-04-10):
+   **P4a — Containerize Aeon** (done, 2026-04-10; registry decision revised 2026-05-02):
    - Multi-stage Dockerfile (rust-builder + wasm-builder + runtime)
    - Build aeon-cli binary with `--features rest-api`, 173MB image
-   - Published to `aeonrust/aeon:latest`
-   - Validated: `docker run aeonrust/aeon --version` → `aeon 0.1.0`
+   - Original plan: publish to Docker Hub `aeonrust/aeon:latest` —
+     **abandoned 2026-05-02** because Docker Hub no longer offers free
+     organisations to new accounts ($11/user/month for the Team plan).
+   - **Current registry: `ghcr.io/aeon-rust/aeon`** (GitHub Container
+     Registry). Free for public images, reuses the existing
+     `aeon-rust` GitHub org, surfaces on the Packages tab of the repo.
+   - Validated locally: `nerdctl --namespace k8s.io build` produces the
+     image; smoke-tested on RD against `aeon:vNN` tags through v64
+     (commit `d74d72c`).
 
    **P4b — Wire QuicNetworkFactory into ClusterNode** (done, 2026-04-10):
    - `ClusterNode::bootstrap_multi()` uses `QuicNetworkFactory`
@@ -1160,7 +1167,9 @@ on the user-visible startup path or a background reconnect loop — use
 
 - **Pre-cloud audit fixes**:
   - HPA guard: prevents HPA from targeting nonexistent Deployment when `cluster.enabled=true`
-  - Helm `image.repository` default fixed to `aeonrust/aeon`
+  - Helm `image.repository` default fixed to `aeonrust/aeon` (later
+    superseded 2026-05-02 — current default is `ghcr.io/aeon-rust/aeon`,
+    see Tier 3 publish actions below for the registry decision)
   - MULTI-NODE doc: P4b/c/d marked Done in Section 3.2, added new items to 3.1
   - Gate 2 label clarified: "code-complete" (multi-node acceptance testing deferred to cloud)
   - Phase 15c final acceptance criterion ✅: linear scaling proven by Run 5b (FileSink 8p=5.29x)
@@ -3628,9 +3637,9 @@ is low-priority deferred items, CI/CD scaffolding, and multi-node cloud validati
 | # | Action | Where |
 |---|--------|-------|
 | 1 | Reserve crate names on crates.io (`cargo publish --dry-run` for all 13) | Terminal |
-| 2 | Create Docker Hub org `aeonrust` | hub.docker.com |
-| 3 | Set GitHub repo secrets (`CARGO_REGISTRY_TOKEN`, `DOCKERHUB_*`) | GitHub Settings |
-| 4 | Verify Docker multi-platform build (linux/amd64 + linux/arm64) | CI or local buildx |
+| 2 | ~~Create Docker Hub org `aeonrust`~~ — **superseded 2026-05-02**: use GHCR (`ghcr.io/aeon-rust/aeon`) on the existing `aeon-rust` GitHub org. No org-creation step needed. Docker Hub free orgs were discontinued. | github.com (no action) |
+| 3 | Set GitHub repo secrets (`CARGO_REGISTRY_TOKEN`, ~~`DOCKERHUB_*`~~ — replaced by `GHCR_PAT` with `write:packages` scope, or rely on the per-workflow `GITHUB_TOKEN` for CI pushes) | GitHub Settings |
+| 4 | Verify multi-platform build (linux/amd64 + linux/arm64) on GHCR via `nerdctl --platform` or `docker buildx` | CI or local buildx |
 | 5 | Publish crates in dependency order per `PUBLISHING.md` | Terminal |
 
 ### Summary Counts
