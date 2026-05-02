@@ -565,6 +565,9 @@ where
 /// - **FailBatch**: Return an error immediately, aborting the pipeline.
 /// - **SkipToDlq**: Count failures in metrics, mark in ledger, continue processing.
 ///   (Actual DLQ sink routing is Phase 15b — for now, failures are tracked but not routed.)
+// Justified — splitting the failure-handling args into a struct adds a layer
+// of indirection without buying anything; this function is the sole call site
+// for each arg combo, and the policy / retry / metrics / ledger names self-document.
 #[allow(clippy::too_many_arguments)]
 async fn handle_batch_failures<K: Sink>(
     sink: &mut K,
@@ -2097,6 +2100,26 @@ enum UpgradeAction {
     Rollback,
 }
 
+/// Control plane for a managed pipeline.
+///
+/// The `Mutex<Option<…>>` slots below carry rare, control-plane events
+/// (drain-and-swap, blue-green cutover, canary promotion, rollback) from
+/// `PipelineControl`'s public API to the running source/processor/sink
+/// tasks. They are explicitly **not** on the per-event hot path:
+/// each lock is acquired once per pipeline-management action (typically
+/// seconds-to-minutes apart in production), not per batch and certainly
+/// not per event.
+///
+/// **Future tracing item:** the supervisor's per-pipeline-start hand-off
+/// touches ~10 of these slots in sequence (registry stamp + processor
+/// load + source spawn + sink spawn + L2 wrap + ack-tracker register +
+/// fault-injector handle + L3 store install + Eo2 metrics splice + …).
+/// None of those acquire under contention because pipeline start is
+/// serialised by `PipelineSupervisor::running` (a tokio Mutex), but the
+/// p99 of cumulative lock-hold time across that hand-off is unmeasured.
+/// If start latency ever shows up as a Gate 2 / Session B regression,
+/// adding a `tracing::span!` around each `lock().await` would let
+/// operators see which slot is the slow one without code changes.
 pub struct PipelineControl {
     /// When true, the source task stops polling and returns empty batches.
     paused: AtomicBool,
@@ -2299,6 +2322,9 @@ impl PipelineControl {
 /// The per-batch dynamic dispatch overhead (~2ns vtable lookup) is negligible
 /// compared to actual processing time. Use `run_buffered` for pipelines that
 /// never need hot-swap (benchmarks, tests, static pipelines).
+// Justified — a Builder around these would add an init-time allocation per
+// pipeline start without any hot-path benefit. The supervisor calls this
+// once per pipeline, with each arg either documented or self-named.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_buffered_managed<S, K>(
     source: S,
@@ -2688,6 +2714,10 @@ where
 }
 
 #[cfg(test)]
+// Justified at module scope — the test setup pattern (`PipelineConfig::default()`
+// then individual `.field = ...` overrides) reads more clearly than a Builder
+// for the dozens of test fixtures here, and the lint's auto-suggestion to use
+// struct-update syntax doesn't compose well with PipelineConfig's many fields.
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
