@@ -52,6 +52,29 @@ persistence:
   accessModes:
     - ReadWriteOnce
   size: 10Gi
+  # Q1 / W3 follow-up — swap the artifacts volumeClaimTemplate for a
+  # sized in-memory tmpfs (emptyDir.medium: Memory). Used to drive
+  # real ENOSPC faults into the L3 redb store without modifying the
+  # host filesystem:
+  #
+  #   1. helm upgrade aeon ./helm/aeon \
+  #        --set persistence.artifactsTmpfs.enabled=true \
+  #        --set persistence.artifactsTmpfs.sizeLimit=100Mi
+  #   2. kubectl exec aeon-0 -- dd if=/dev/zero \
+  #        of=/app/artifacts/filler bs=1M count=99
+  #   3. start a per_event pipeline targeting partition-0
+  #   4. watch /metrics — `aeon_checkpoint_fallback_wal_total` ticks
+  #      when the next checkpoint write hits ENOSPC.
+  #   5. cleanup: kubectl exec aeon-0 -- rm /app/artifacts/filler
+  #
+  # Pod restart wipes the tmpfs (Memory medium isn't durable) — that's
+  # the trade-off vs the production PVC. NOT for production. The
+  # debug-fault REST endpoint (commit b8c03c8) is the cleaner
+  # synthetic test path; this exists only when you specifically want
+  # a real-disk-fills-up trigger that hits redb's actual write path.
+  artifactsTmpfs:
+    enabled: false
+    sizeLimit: 100Mi
 
 # Processor artifacts via ConfigMap (for .wasm files)
 processors:

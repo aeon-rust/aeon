@@ -192,6 +192,16 @@ spec:
               readOnly: true
             {{- end }}
       volumes:
+        {{- if .Values.persistence.artifactsTmpfs.enabled }}
+        # Q1: tmpfs-backed artifacts mount for ENOSPC chaos. Pairs
+        # with the `if not artifactsTmpfs.enabled` guard around the
+        # PVC volumeClaimTemplate above — exactly one of the two
+        # backs the /app/artifacts mount per release.
+        - name: artifacts
+          emptyDir:
+            medium: Memory
+            sizeLimit: {{ .Values.persistence.artifactsTmpfs.sizeLimit | quote }}
+        {{- end }}
         {{- if .Values.processors.configMap }}
         - name: processors
           configMap:
@@ -236,6 +246,10 @@ spec:
         resources:
           requests:
             storage: {{ .Values.persistence.size }}
+    {{- if not .Values.persistence.artifactsTmpfs.enabled }}
+    # Q1: skip the persistent VCT when artifactsTmpfs.enabled=true —
+    # the volumes block then mounts an emptyDir at the same path so
+    # operators can drive ENOSPC chaos against a sized tmpfs.
     - metadata:
         name: artifacts
       spec:
@@ -247,4 +261,5 @@ spec:
         resources:
           requests:
             storage: 5Gi
+    {{- end }}
 {{- end }}
