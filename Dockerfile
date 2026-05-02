@@ -113,6 +113,16 @@ RUN cd rust-wasm && \
 # ─── Stage 3: Runtime image ─────────────────────────────────────────
 FROM debian:bookworm-slim AS runtime
 
+# OCI image labels. `org.opencontainers.image.source` is the one GHCR
+# reads to link the published package to the source repo (surfaces the
+# image on the Packages tab of github.com/aeon-rust/aeon). The rest are
+# the standard descriptive labels the OCI spec defines.
+LABEL org.opencontainers.image.source="https://github.com/aeon-rust/aeon" \
+      org.opencontainers.image.url="https://github.com/aeon-rust/aeon" \
+      org.opencontainers.image.title="aeon" \
+      org.opencontainers.image.description="Aeon real-time data processing engine" \
+      org.opencontainers.image.licenses="Apache-2.0"
+
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     libssl3 \
