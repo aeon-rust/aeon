@@ -77,6 +77,35 @@ cluster:
   tls:
     enabled: false
     secretName: aeon-tls  # K8s Secret with tls.crt, tls.key, ca.crt
+  # V5.1 R1 — PoH signing-key wiring. Manifests reference the env var
+  # via `signing_key_ref: "${ENV:AEON_TEST_POH_SIG}"` (or whatever
+  # name the operator picks). Two delivery shapes:
+  #
+  #   poh:
+  #     signingKey:
+  #       envVar: AEON_TEST_POH_SIG
+  #       # Production: pull from a k8s Secret created out-of-band
+  #       # (`kubectl create secret generic aeon-poh --from-literal=...`).
+  #       valueFromSecretKeyRef:
+  #         name: aeon-poh
+  #         key: signing-key-hex
+  #
+  #   poh:
+  #     signingKey:
+  #       envVar: AEON_TEST_POH_SIG
+  #       # Dev only — literal value goes through plain env. Discouraged
+  #       # for anything past local validation. Use the SecretKeyRef form
+  #       # for staging / production. The value is a 64-char hex string
+  #       # (Ed25519 secret scalar, 32 bytes hex-encoded).
+  #       value: "2222222222222222222222222222222222222222222222222222222222222222"
+  #
+  # Leave `envVar` empty (default) to skip the env var entirely;
+  # pipelines that don't reference signing keys are unaffected.
+  poh:
+    signingKey:
+      envVar: ""
+      value: ""
+      valueFromSecretKeyRef: {}
   # G14 — Raft timing overrides. Leave all three empty (or omit) to use the
   # binary default (500/1500/3000 ms). Set all three for a custom preset;
   # validation rejects partial overrides and values that violate

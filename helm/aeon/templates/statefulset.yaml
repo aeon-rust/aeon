@@ -31,6 +31,7 @@ spec:
         - name: aeon
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["serve"]
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
           env:
@@ -75,6 +76,36 @@ spec:
             {{- if .Values.cluster.l2Root }}
             - name: AEON_L2_ROOT
               value: {{ .Values.cluster.l2Root | quote }}
+            {{- end }}
+            {{- with .Values.cluster.poh }}
+            {{- if and .signingKey .signingKey.envVar }}
+            # V5.1 R1 — PoH signing-key env var. Pipelines reference
+            # this name via `signing_key_ref: "${ENV:<envVar>}"`.
+            # Three delivery shapes:
+            #   1. valueFromSecretKeyRef — production. K8s Secret holds
+            #      the 64-char hex Ed25519 secret scalar; chart renders
+            #      the standard valueFrom.secretKeyRef block.
+            #   2. value (literal) — dev only. The whole value is
+            #      visible in `kubectl describe pod`; do NOT use for
+            #      anything past local validation.
+            #   3. neither set — env var rendered with empty string;
+            #      manifests that reference the var get
+            #      "env var ... not set" at apply time, surfacing the
+            #      misconfig rather than silently running unsigned.
+            - name: {{ .signingKey.envVar | quote }}
+              {{- if .signingKey.valueFromSecretKeyRef }}
+              {{- if .signingKey.valueFromSecretKeyRef.name }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .signingKey.valueFromSecretKeyRef.name | quote }}
+                  key: {{ .signingKey.valueFromSecretKeyRef.key | quote }}
+              {{- else }}
+              value: {{ .signingKey.value | default "" | quote }}
+              {{- end }}
+              {{- else }}
+              value: {{ .signingKey.value | default "" | quote }}
+              {{- end }}
+            {{- end }}
             {{- end }}
             {{- if .Values.cluster.raftTiming.heartbeatMs }}
             - name: AEON_RAFT_HEARTBEAT_MS
