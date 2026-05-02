@@ -98,6 +98,21 @@ enum Commands {
         #[arg(long, default_value_t = default_api())]
         api: String,
     },
+    /// W3 — debug: arm the supervisor's L3 fault injector to fail
+    /// the next N write operations. Drives the `FallbackCheckpointStore`
+    /// engagement path live without requiring chaos-mesh-style
+    /// filesystem-layer faults that don't propagate through redb's
+    /// mmap'd open fds. After N writes fail, the wrapper resumes
+    /// passthrough and `try_recover_primary` heals the L3 store on
+    /// the sink task's next periodic recovery attempt.
+    InjectL3Fault {
+        /// Number of write operations to fail. Default: 1.
+        #[arg(long, default_value_t = 1)]
+        count: u64,
+        /// Aeon REST API base URL.
+        #[arg(long, default_value_t = default_api())]
+        api: String,
+    },
     /// Verify a per-partition PoH chain head against its embedded
     /// signature (and optionally a pinned operator-supplied public key).
     ///
@@ -529,6 +544,7 @@ fn run(cli: Cli) -> Result<()> {
         }) => cmd_deploy(&artifact, &pipeline, &processor, &version, &api),
         Some(Commands::Top { api }) => cmd_top(&api),
         Some(Commands::Verify { target, api }) => cmd_verify(&target, &api),
+        Some(Commands::InjectL3Fault { count, api }) => cmd_inject_l3_fault(count, &api),
         Some(Commands::VerifyPoh {
             pipeline,
             partition,
@@ -767,18 +783,34 @@ fn cmd_serve(addr: &str, artifact_dir: &str) -> Result<()> {
             sync_writes: true,
         }) {
             Ok(store) => {
-                let l3: Arc<dyn aeon_types::L3Store> = Arc::new(store);
-                if let Err(e) = supervisor.set_l3_checkpoint_store(l3) {
+                // W3 / F1: wrap the redb store in a FaultyL3Wrapper so
+                // the REST `POST /api/v1/test/inject-l3-fault` endpoint
+                // can drive the FallbackCheckpointStore engagement
+                // path live. The wrapper is a no-op when its fault
+                // counter is 0 (default), so this is safe to leave on
+                // in all builds. Production hardening (feature gate
+                // the install) is a separate atom.
+                let raw: Arc<dyn aeon_types::L3Store> = Arc::new(store);
+                let wrapper = aeon_engine::debug_fault::FaultyL3Wrapper::new(raw);
+                let wrapper_for_l3: Arc<dyn aeon_types::L3Store> =
+                    Arc::new(wrapper.clone());
+                if let Err(e) = supervisor.set_l3_checkpoint_store(wrapper_for_l3) {
                     tracing::warn!(
                         error = %e,
                         "supervisor L3 checkpoint store install failed"
                     );
+                } else if let Err(e) = supervisor.set_fault_injector(wrapper) {
+                    tracing::warn!(
+                        error = %e,
+                        "supervisor fault injector install failed"
+                    );
                 } else {
                     tracing::info!(
                         path = %l3_path.display(),
-                        "supervisor L3 checkpoint store installed (state_store \
-                         backend pipelines will now record \
-                         aeon_pipeline_checkpoints_written_total)"
+                        "supervisor L3 checkpoint store installed (wrapped in \
+                         FaultyL3Wrapper for /api/v1/test/inject-l3-fault); \
+                         state_store backend pipelines will now record \
+                         aeon_pipeline_checkpoints_written_total"
                     );
                 }
             }
@@ -2528,6 +2560,46 @@ fn cmd_verify(target: &str, api: &str) -> Result<()> {
 /// the process exits non-zero — useful as a CI / smoke-test gate
 /// independent of the running aeon binary's own `aeon verify`
 /// self-test (which exercises local crypto modules in isolation).
+/// W3 — call the debug L3 fault injection endpoint.
+fn cmd_inject_l3_fault(count: u64, api: &str) -> Result<()> {
+    println!("Aeon L3 fault injection");
+    println!("{}", "=".repeat(60));
+    println!("API:     {api}");
+    println!("Count:   {count}");
+    println!();
+
+    let url = format!("{api}/api/v1/test/inject-l3-fault?count={count}");
+    let resp = ureq::post(&url)
+        .send_string("")
+        .with_context(|| format!("POST {url} failed"))?;
+
+    let body: serde_json::Value =
+        resp.into_json().context("invalid JSON from inject-l3-fault")?;
+    println!(
+        "Status:               {}",
+        body["status"].as_str().unwrap_or("?")
+    );
+    println!(
+        "Previous remaining:   {}",
+        body["previous_remaining"].as_u64().unwrap_or(0)
+    );
+    println!(
+        "New remaining:        {}",
+        body["new_remaining"].as_u64().unwrap_or(0)
+    );
+    println!(
+        "Fault total at start: {}",
+        body["fault_total_since_start"].as_u64().unwrap_or(0)
+    );
+    println!();
+    println!(
+        "Watch /metrics for `aeon_checkpoint_fallback_wal_total` to tick \
+         within ~one flush_interval as the next checkpoint write hits \
+         the injected fault and engages the WAL fallback."
+    );
+    Ok(())
+}
+
 fn cmd_verify_poh(
     pipeline: &str,
     partition: u16,

@@ -32,6 +32,7 @@ pub mod engine_providers;
 pub mod batch_tuner;
 pub mod batch_wire;
 pub mod checkpoint;
+pub mod debug_fault;
 pub mod circuit_breaker;
 pub mod compliance_validator;
 pub mod connector_registry;

@@ -1238,9 +1238,21 @@ fn build_sink_task_ctx(config: &PipelineConfig, core: Option<usize>) -> SinkTask
             if mode != aeon_types::DurabilityMode::None =>
         {
             let wal_path = checkpoint_dir().join("fallback.wal");
-            Some(Box::new(crate::eo2_recovery::FallbackCheckpointStore::new(
+            // O1 / F1: chain `.with_metrics(...)` so engage_fallback's
+            // `inc_checkpoint_fallback_wal` actually ticks the
+            // supervisor-shared `Eo2Metrics`. Without this, the fault
+            // → fallback engagement happens but the counter stays at
+            // 0 in the supervisor's registry — and therefore at 0 on
+            // /metrics. Discovered 2026-05-02 during F3 live cluster
+            // proof: 7 checkpoint writes + 100 armed faults produced
+            // engage_fallback calls but no metric ticks.
+            let mut store = crate::eo2_recovery::FallbackCheckpointStore::new(
                 p, wal_path,
-            )) as Box<dyn CheckpointPersist>)
+            );
+            if let Some(m) = config.eo2_metrics.as_ref() {
+                store = store.with_metrics(Arc::clone(m));
+            }
+            Some(Box::new(store) as Box<dyn CheckpointPersist>)
         }
         (other, _, _) => other,
     };

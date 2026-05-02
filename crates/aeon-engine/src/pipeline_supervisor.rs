@@ -156,6 +156,12 @@ pub struct PipelineSupervisor {
     /// benches that don't exercise checkpointing leave this unset;
     /// `CheckpointBackend::Wal` and `None` paths are unaffected.
     l3_checkpoint_store: OnceLock<Arc<dyn aeon_types::L3Store>>,
+    /// W3 / F1: side-channel clone of the `FaultyL3Wrapper` that wraps
+    /// the installed L3 store. The trait-object `Arc<dyn L3Store>`
+    /// can't be downcast directly (no Any supertrait), so cmd_serve
+    /// installs the wrapper twice: once as the L3 store proper, once
+    /// here for the REST fault-injection endpoint to reach.
+    fault_injector_handle: OnceLock<crate::debug_fault::FaultyL3Wrapper>,
     /// O1 / EO-2 P8: node-wide `Eo2Metrics` registry. Always-on (no
     /// install step) — same pattern as `poh_live_chains`. `start()`
     /// stamps a clone onto every pipeline's
@@ -191,6 +197,7 @@ impl PipelineSupervisor {
             #[cfg(feature = "processor-auth")]
             secret_registry: OnceLock::new(),
             l3_checkpoint_store: OnceLock::new(),
+            fault_injector_handle: OnceLock::new(),
             eo2_metrics: Arc::new(crate::eo2_metrics::Eo2Metrics::new()),
         }
     }
@@ -219,6 +226,34 @@ impl PipelineSupervisor {
         self.l3_checkpoint_store.set(store).map_err(|_| {
             AeonError::state(
                 "PipelineSupervisor: L3 checkpoint store already installed",
+            )
+        })
+    }
+
+    /// W3 / F1: if the installed L3 checkpoint store is a
+    /// `FaultyL3Wrapper`, return a clone (shared atomic counter). The
+    /// REST handler `inject_l3_fault` calls this to arm faults from
+    /// outside the engine. Returns `None` when the wrapper isn't
+    /// installed — production builds + tests / benches that don't
+    /// configure fault injection get a clean "not enabled" surface.
+    pub fn fault_injector(&self) -> Option<crate::debug_fault::FaultyL3Wrapper> {
+        // The wrapper is the outermost L3Store but `Arc<dyn L3Store>`
+        // can't downcast directly (no Any supertrait), so cmd_serve
+        // installs a side-channel handle via `set_fault_injector`.
+        self.fault_injector_handle.get().cloned()
+    }
+
+    /// W3 / F1: install the side-channel handle to the
+    /// `FaultyL3Wrapper` that wraps the installed L3 store. Called by
+    /// `cmd_serve` right after `set_l3_checkpoint_store(wrapper)`.
+    /// Once-only.
+    pub fn set_fault_injector(
+        &self,
+        injector: crate::debug_fault::FaultyL3Wrapper,
+    ) -> Result<(), AeonError> {
+        self.fault_injector_handle.set(injector).map_err(|_| {
+            AeonError::state(
+                "PipelineSupervisor: fault injector already installed",
             )
         })
     }
