@@ -1758,6 +1758,34 @@ async fn delete_processor_version(
     State(state): State<Arc<AppState>>,
     Path((name, version)): Path<(String, String)>,
 ) -> impl IntoResponse {
+    // G9.b follow-up — replicate via Raft so every node's local
+    // ProcessorRegistry converges. Pre-fix this handler called
+    // `registry.delete_version()` directly, leaving the deleted
+    // version present on every other pod. Pipelines running on those
+    // pods could still try to load the now-stale version, eventually
+    // erroring at runtime. The cluster_write_forwarder middleware
+    // already routes follower-bound DELETEs to the leader; this
+    // change ensures the leader itself replicates the delete.
+    #[cfg(feature = "cluster")]
+    if let Some(node) = state.cluster_node.as_ref() {
+        let cmd = aeon_types::RegistryCommand::DeleteVersion {
+            name: name.clone(),
+            version: version.clone(),
+        };
+        return match node.propose_registry(cmd).await {
+            Ok(aeon_types::RegistryResponse::Error { message }) => {
+                api_error(StatusCode::BAD_REQUEST, message).into_response()
+            }
+            Ok(_) => (
+                StatusCode::OK,
+                Json(serde_json::json!({"status": "deleted", "replicated": true})),
+            )
+                .into_response(),
+            Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        };
+    }
+
+    // Standalone mode — local-only delete is correct.
     match state.registry.delete_version(&name, &version).await {
         Ok(_) => (
             StatusCode::OK,
