@@ -46360,6 +46360,132 @@ claude's response:
   Next: you push commits ce7d688 and c05e8da to GitHub from your remote-configured shell.
 
 =====
+inputs to claude:
+
+ pushed to github using github for windows
+
+====
+claude's response:
+
+Confirmed. GitHub now has c05e8da and ce7d688, and GHCR has the matching aeon:v66 / :c05e8da / :latest images plus the aeon-rust/aeon repo linkage from
+  the OCI labels — code, perf doc, and image are all in sync.
+
+  Anything else you want to tackle in this session, or wrap here?
+
+====
+inputs to claude:
+
+ is documentation fully updated and ready, to guide developers, to try building from source or to use docker image from ghcr.io, to run Aeon as
+  single-node cluster or multi-node cluster, with any of the supported source connectors and sink connectors in the pipeline configuration? This is to
+  guide developers with step by step guidance, as a sample kind of...
+
+=====
+claude's response:
+
+Good question — let me audit the docs end-to-end to see if a developer can actually get from "git clone" to "running pipeline with Kafka source /
+  Postgres-CDC source / Redis sink / etc." without piecing it together. Spawning a focused review.
+
+  Listed 1 directory (ctrl+o to expand)
+
+Short answer: mostly, but with three real gaps. A motivated dev could piece things together, but a step-by-step "follow this and it works" path doesn't
+  exist for all your scenarios.
+
+  Scenario: A. Build from source
+  Verdict: ⚠️ Mostly covered — docs/BUILD-FROM-SOURCE.md is solid (prereqs, cargo build, features, verify). Minor: doesn't tell dev to add target/release/
+  to
+    PATH; CLI verb naming is inconsistent across docs (aeon serve vs aeon start --config vs aeon run -f).
+  ────────────────────────────────────────
+  Scenario: B. Use GHCR Docker image
+  Verdict: ❌ Missing. No doc anywhere says docker pull ghcr.io/aeon-rust/aeon:latest. README.md has zero ghcr.io reference. BUILD-FROM-SOURCE.md:267 still
+    uses aeonrust/aeon:latest (Docker Hub naming, contradicts our 2026-05-02 GHCR decision). INSTALLATION.md only covers building your own image.
+  ────────────────────────────────────────
+  Scenario: C. Single-node
+  Verdict: ✅ Covered. CLUSTERING.md §3 has the minimal manifest, start command, and verification curl.
+  ────────────────────────────────────────
+  Scenario: D. Multi-node cluster
+  Verdict: ⚠️ Partially. CLUSTERING.md §4 walks 3-node bootstrap with mTLS. No quick 3-node loopback recipe; the only multi-node Helm overlay shipped is
+    values-doks.yaml. No example showing "apply pipeline that spans partitions across the 3 nodes" with the partition-to-node mapping made explicit.
+  ────────────────────────────────────────
+  Scenario: E. Connector cookbook
+  Verdict: ⚠️ CONNECTORS.md describes all 16 connectors with Rust-API examples, but only 4 of 16 have manifest YAML fixtures in docs/examples/ (Memory,
+    Blackhole, Kafka/Redpanda, plus the V-matrix internals). Stdout, File, HTTP polling, HTTP sink, HTTP webhook, WebSocket, WebTransport, Redis Streams,
+    NATS, MQTT, RabbitMQ, PostgreSQL CDC, MySQL CDC, MongoDB CDC — zero fixtures. Worse: CLUSTERING.md §6-7 examples use the legacy nested config: { ... }
+    schema that's a known foot-gun (per the serde(flatten) memory note) — they'll silently break.
+
+  Top 3 gaps to close
+
+  1. Add a "Use the published image" section (README.md + INSTALLATION.md): docker pull ghcr.io/aeon-rust/aeon:latest, run flags, port mapping, env vars.
+  Fix the aeonrust/aeon references in BUILD-FROM-SOURCE.md.
+  2. Ship a connector cookbook (docs/CONNECTOR-COOKBOOK.md) — one copy-pasteable manifest fragment per connector using the flat schema (source + sink where
+  applicable, required env vars/secrets), plus add 12 missing example YAMLs in docs/examples/.
+  3. Reconcile CLI-verb + manifest-schema drift across CLUSTERING.md / INSTALLATION.md / BUILD-FROM-SOURCE.md so a new dev doesn't follow a contradictory
+  recipe.
+
+  Want me to take all three on as a documentation pass? It's a meaningful chunk (~12 new YAML fixtures + the cookbook + the README/INSTALLATION updates +
+  the CLI/schema reconciliation sweep) — probably 60-90 minutes of work. Or pick a subset (just gap 1 is fastest, ~10 min).
+
+✻ Brewed for 3m 8s · 4 shells still running
+
+※ recap: You're confirming the docs can guide a new developer through build-from-source or GHCR pull, single-node or multi-node, with any connector. The
+  audit found three gaps (no GHCR pull instructions, only 4 of 16 connectors have example YAMLs, CLI-verb drift). Next: tell me whether to fix all three or
+  just the GHCR section.
+
+======
+inputs to claude:
+
+ please proceed and complete this
+
+====
+claude's response:
+
+Committed as 23aee85. Final state:
+
+  Done — developer onboarding docs are now end-to-end
+
+  ┌──────────────────────┬─────────────────────────────────────────┬───────────────────────────────────────────────────────────────────────────────────┐
+  │       Scenario       │                 Before                  │                                       After                                       │
+  ├──────────────────────┼─────────────────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────┤
+  │ A. Build from source │ ⚠️ CLI verbs inconsistent,              │ ✅ BUILD-FROM-SOURCE.md fixed; cross-links to GHCR for "I just want to run it"    │
+  │                      │ aeonrust/aeon references                │                                                                                   │
+  ├──────────────────────┼─────────────────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────┤
+  │ B. Use GHCR Docker   │ ❌ No doc anywhere                      │ ✅ README "Quickstart A" + INSTALLATION.md §3.1 lead with docker pull             │
+  │ image                │                                         │ ghcr.io/aeon-rust/aeon:latest                                                     │
+  ├──────────────────────┼─────────────────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────┤
+  │ C. Run as            │ ✅ Already covered                      │ ✅ Still good                                                                     │
+  │ single-node          │                                         │                                                                                   │
+  ├──────────────────────┼─────────────────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────┤
+  │ D. Multi-node        │ ⚠️ No quick recipe, fake CLI flags      │ ✅ README "Quickstart C" + CLUSTERING.md §3.2 fixed to use aeon serve + env vars  │
+  │ cluster              │                                         │                                                                                   │
+  ├──────────────────────┼─────────────────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────┤
+  │ E. Connector         │ ⚠️ 4 of 16 had fixtures, schema drift   │ ✅ All 14 YAML-callable connectors covered: 11 new fixtures + new                 │
+  │ cookbook             │                                         │ docs/CONNECTOR-COOKBOOK.md (344 lines)                                            │
+  └──────────────────────┴─────────────────────────────────────────┴───────────────────────────────────────────────────────────────────────────────────┘
+
+  What landed
+
+  - README.md — three Quickstart paths (GHCR / source / Helm cluster), corrected connector table reflecting the 11 sources + 8 sinks actually wired into the
+   registry, removed MQTT/RabbitMQ/QUIC/WebTransport overclaims that aren't YAML-callable yet
+  - docs/INSTALLATION.md — §3.1 leads with the GHCR pre-built image, §3.5 Helm covers single-node Deployment + 3-node StatefulSet
+  - docs/BUILD-FROM-SOURCE.md — §5 redirects "just want to run?" readers to GHCR, fixed aeonrust/aeon → ghcr.io/aeon-rust/aeon, added GHCR push recipe
+  - docs/CLUSTERING.md — bare-VM 3-node bootstrap now uses aeon serve + env vars (not the nonexistent aeon start --config), with aeon cluster status
+  verification
+  - docs/CONNECTOR-COOKBOOK.md — new 344-line single source of truth for connector wiring; per-connector required/optional keys + link to runnable example
+  - docs/examples/ — 11 new fixtures (stdout-sink, file-source-sink, http-polling, http-sink, http-webhook, websocket, redis-streams, nats, postgres-cdc,
+  mysql-cdc, mongodb-cdc)
+  - All 11 new fixtures verified clean via aeon apply --dry-run against a live engine
+
+  Commit
+
+  23aee85 — 16 files changed, 1,137 insertions / 83 deletions. Ready to push when you are.
+
+✻ Sautéed for 15m 8s · 4 shells still running
+
+※ recap: Documentation onboarding pass is complete and committed as 23aee85: GHCR quickstart, connector cookbook with 11 verified fixtures, and CLI-verb
+  reconciliation. Next action: push 23aee85 to GitHub when you're ready.
+
+======
+inputs to claude:
+
 
 
 

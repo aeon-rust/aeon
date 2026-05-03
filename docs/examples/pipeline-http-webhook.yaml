@@ -1,0 +1,52 @@
+# HTTP webhook source — axum HTTP server that receives POST events.
+#
+# Push source: events arrive at an unpredictable rate, so the connector
+# stages them through the shared three-phase push buffer
+# (`channel_capacity` Phase 1 bounded mpsc → Phase 2 await on full →
+# Phase 3 returns HTTP 503 once `spill_threshold`, default 4096, is
+# crossed). Use `aeon doctor` to confirm the bind port is free.
+#
+# Send a test event:
+#   curl -X POST http://localhost:8080/webhook \
+#     -H 'Content-Type: application/json' \
+#     -d '{"event":"order.created","amount":42}'
+#
+# S9 inbound auth: configure `inbound_auth_*` keys to require
+# IP-allow-list / API-key / HMAC / mTLS on the receiver side.
+
+pipelines:
+  - name: webhook-receiver
+    partitions: 1
+
+    durability:
+      mode: per_event
+      checkpoint:
+        interval: "100ms"
+
+    sources:
+      - name: ingress
+        type: http-webhook
+        kind: push
+        identity: { mode: random }
+        event_time: { mode: aeon_ingest }
+        bind_addr: "0.0.0.0:8080"
+        path: /webhook
+        source_name: external-webhook
+        channel_capacity: "8192"
+        batch_size: "256"
+        poll_timeout_ms: "1000"
+        # S9 — require an API key on incoming requests
+        inbound_auth_mode: api_key
+        inbound_auth_api_key_header: X-Api-Key
+        inbound_auth_api_key_value: "${ENV:WEBHOOK_API_KEY}"
+
+    processor:
+      name: __identity
+      version: "0.0.0"
+
+    sinks:
+      - name: archive
+        type: file
+        eos_tier: t3_atomic_rename_file
+        path: /var/lib/aeon/webhook-archive.jsonl
+        append: "true"

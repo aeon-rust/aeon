@@ -260,31 +260,36 @@ cargo fmt --all -- --check
 
 ## 5. Docker Build
 
+> **Just want to run a published image?** Skip this section and use the
+> pre-built image: `docker pull ghcr.io/aeon-rust/aeon:latest`. See
+> [INSTALLATION.md §3.1](INSTALLATION.md) for the published-image quickstart.
+> The instructions below are for building your own image from source.
+
 ### 5.1 Build the Image
 
 ```bash
-# Standard build
-docker build -t aeonrust/aeon:latest .
+# Standard build (tag with whatever name you want — local-only)
+docker build -t aeon:dev .
 
 # With custom profile
-docker build -t aeonrust/aeon:latest --build-arg PROFILE=release .
+docker build -t aeon:dev --build-arg PROFILE=release .
 ```
 
 The Dockerfile is a multi-stage build:
 1. **rust-builder**: compiles `aeon` CLI with `--features rest-api`
 2. **wasm-builder**: compiles sample Rust Wasm processor
-3. **runtime**: minimal Debian image (~173 MB) with binary + Wasm artifacts
+3. **runtime**: minimal Debian image (~160 MB) with binary + Wasm artifacts
 
 ### 5.2 Run the Container
 
 ```bash
 # Basic run
-docker run -p 4471:4471 aeonrust/aeon:latest
+docker run -p 4471:4471 aeon:dev
 
 # With artifact volume
 docker run -p 4471:4471 \
   -v ./my-processors:/app/artifacts \
-  aeonrust/aeon:latest
+  aeon:dev
 
 # Verify
 curl http://localhost:4471/health
@@ -292,14 +297,22 @@ curl http://localhost:4471/health
 
 ### 5.3 Multi-Platform Build (for Publishing)
 
+The published image lives at `ghcr.io/aeon-rust/aeon` (GitHub Container
+Registry — chosen 2026-05-02; see ROADMAP.md §P4a). To publish a
+multi-platform release from source:
+
 ```bash
 # Create builder (one-time)
 docker buildx create --name aeon-builder --use
 
-# Build for both architectures
+# Authenticate to GHCR (PAT with write:packages scope)
+echo "$GHCR_PAT" | docker login ghcr.io -u <gh-username> --password-stdin
+
+# Build and push both architectures
 docker buildx build \
   --platform linux/amd64,linux/arm64 \
-  -t aeonrust/aeon:latest \
+  -t ghcr.io/aeon-rust/aeon:latest \
+  -t ghcr.io/aeon-rust/aeon:v<NN> \
   --push .
 ```
 

@@ -1,0 +1,32 @@
+# Stdout sink — debug print every Output payload to stdout.
+#
+# Useful when validating a new processor: feed it a small Memory burst,
+# pipe the engine's stdout through `jq` or `grep` to inspect outputs
+# without spinning up a real broker. Not for hot-path benchmarks
+# (write(2) per event dominates).
+
+pipelines:
+  - name: stdout-debug
+    partitions: 1
+
+    durability:
+      mode: none
+
+    sources:
+      - name: synth
+        type: memory
+        kind: push
+        identity: { mode: random }
+        event_time: { mode: aeon_ingest }
+        count: "100"
+        payload_size: "64"
+        batch_size: "32"
+
+    processor:
+      name: __identity
+      version: "0.0.0"
+
+    sinks:
+      - name: console
+        type: stdout
+        eos_tier: t6_fire_and_forget

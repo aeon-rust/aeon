@@ -1,0 +1,49 @@
+# File source + File sink — replay a newline-delimited file through
+# Aeon and write the processed outputs to a second file.
+#
+# Useful for log replay, JSONL transforms, CSV → JSON migrations,
+# etc. The source reads lazily so a 10 GiB file does not sit in
+# memory — only `batch_size` lines at a time. The sink opens the
+# output path lazily on first write_batch().
+#
+# Pre-requisites:
+#   echo '{"k":"alice","v":1}' >  /tmp/aeon-input.jsonl
+#   echo '{"k":"bob","v":2}'   >> /tmp/aeon-input.jsonl
+#   echo '{"k":"carol","v":3}' >> /tmp/aeon-input.jsonl
+#
+# After running, /tmp/aeon-output.jsonl will hold the same lines
+# (passthrough processor). Swap `__identity` for a real processor
+# to do the transform.
+
+pipelines:
+  - name: file-replay
+    partitions: 1
+
+    durability:
+      mode: ordered_batch
+      checkpoint:
+        interval: "200ms"
+
+    sources:
+      - name: input-jsonl
+        type: file
+        kind: pull
+        identity: { mode: native }
+        event_time: { mode: aeon_ingest }
+        path: /tmp/aeon-input.jsonl
+        batch_size: "1024"
+
+    processor:
+      name: __identity
+      version: "0.0.0"
+
+    sinks:
+      - name: output-jsonl
+        type: file
+        eos_tier: t3_atomic_rename_file
+        path: /tmp/aeon-output.jsonl
+        # `append: true` to APPEND on each batch (default truncates the
+        # file once on first write); `strategy: ordered_batch` matches
+        # the durability mode above.
+        append: "false"
+        strategy: ordered_batch

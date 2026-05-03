@@ -1,0 +1,50 @@
+# MySQL CDC source — binlog-polling change data capture.
+#
+# Streams INSERT / UPDATE / DELETE events from MySQL's binary log
+# (ROW format). Each Event is one row change, in binlog order.
+#
+# Pre-requisites (MySQL 8+ / MariaDB 10+):
+#   1. binlog_format = ROW (my.cnf, requires restart)
+#   2. binlog_row_image = FULL
+#   3. log_bin = ON
+#   4. The connection user needs REPLICATION CLIENT + REPLICATION SLAVE.
+#   5. `server_id` MUST be unique across every replica reading the same
+#      master — pick a value that does not collide with existing replicas.
+
+pipelines:
+  - name: mysql-cdc
+    partitions: 1
+
+    durability:
+      mode: ordered_batch
+      checkpoint:
+        interval: "1s"
+
+    sources:
+      - name: mysql-changes
+        type: mysql-cdc
+        kind: pull
+        identity: { mode: native }
+        event_time:
+          # event_time variants: broker | aeon_ingest | header. The
+          # binlog timestamp surfaces as a record header on the wire.
+          mode: header
+          name: binlog_ts
+        url: "mysql://aeon:${ENV:MYSQL_PASSWORD}@localhost:3306/app"
+        server_id: "1042"
+        # Optional comma-separated allow-list (default: all tables).
+        tables: "orders,customers,line_items"
+        batch_size: "256"
+        source_name: mysql-cdc
+
+    processor:
+      name: __identity
+      version: "0.0.0"
+
+    sinks:
+      - name: cdc-out
+        type: kafka
+        eos_tier: t2_transactional_stream
+        topic: mysql-cdc-events
+        brokers: "redpanda:9092"
+        strategy: ordered_batch

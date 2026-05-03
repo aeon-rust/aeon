@@ -47,17 +47,67 @@ Aeon is never the bottleneck. Infrastructure (Redpanda, network, disk) determine
 
 ## Quick Start
 
-### Prerequisites
+Pick the path that fits your situation:
+
+- **Just want to run Aeon?** → [§ Quickstart A — pre-built image from GHCR](#quickstart-a--pre-built-image-from-ghcr) (no build, no Rust toolchain).
+- **Want to build from source?** → [§ Quickstart B — build from source](#quickstart-b--build-from-source).
+- **Want a multi-node Raft cluster?** → [§ Quickstart C — multi-node cluster (Helm)](#quickstart-c--multi-node-cluster-helm).
+- **Want a worked example for a specific connector?** → [docs/CONNECTOR-COOKBOOK.md](docs/CONNECTOR-COOKBOOK.md).
+
+### Quickstart A — pre-built image from GHCR
+
+```bash
+# Pull and run a single-node engine
+docker run -d --name aeon -p 4471:4471 \
+  -v aeon-data:/app/artifacts \
+  ghcr.io/aeon-rust/aeon:latest
+
+# Verify
+curl http://localhost:4471/health
+# → {"status":"ok","version":"0.1.0"}
+
+# Apply a pipeline manifest (sample: Memory source → Blackhole sink)
+docker exec -i aeon /usr/local/bin/aeon apply -f - <<'EOF'
+pipelines:
+  - name: hello-aeon
+    partitions: 1
+    sources:
+      - name: synth
+        type: memory
+        kind: push
+        identity: { mode: random }
+        event_time: { mode: aeon_ingest }
+        count: "10000"
+        payload_size: "256"
+        batch_size: "256"
+    processor:
+      name: __identity
+      version: "0.0.0"
+    sinks:
+      - name: discard
+        type: blackhole
+        eos_tier: t6_fire_and_forget
+EOF
+
+# Watch metrics tick
+curl -s http://localhost:4471/metrics | grep aeon_pipeline_outputs
+```
+
+Tags published per release: `:latest` (rolling), `:v66` / `:vNN` (session), `:<short-sha>` (commit). See [INSTALLATION.md §3.1](docs/INSTALLATION.md) for full env-var + volume layout.
+
+### Quickstart B — build from source
+
+#### Prerequisites
 
 - Rust 1.85+ (`rustup update`)
-- Docker / Rancher Desktop (for infrastructure services)
+- Docker / Rancher Desktop (for infrastructure services like Redpanda)
 - Node.js 18+ (only if building AssemblyScript processors)
 - `wasm32-unknown-unknown` target (only if building Rust-Wasm processors):
   ```bash
   rustup target add wasm32-unknown-unknown
   ```
 
-### 1. Configure Environment
+#### 1. Configure Environment
 
 ```bash
 # Copy the environment template
@@ -71,7 +121,7 @@ cp .env.example .env
 #   AEON_API_TOKEN (enables REST API authentication)
 ```
 
-### 2. Start Infrastructure
+#### 2. Start Infrastructure
 
 ```bash
 # Minimal: just Redpanda (for Kafka-compatible streaming)
@@ -84,7 +134,7 @@ docker compose up -d
 docker exec aeon-redpanda rpk topic list
 ```
 
-### 3. Run Tests
+#### 3. Run Tests
 
 ```bash
 # All workspace tests
@@ -97,7 +147,7 @@ cargo test -p aeon-wasm
 cargo test -p aeon-connectors   # Requires Redpanda running
 ```
 
-### 4. Run Benchmarks
+#### 4. Run Benchmarks
 
 ```bash
 # Blackhole benchmark (in-memory pipeline ceiling)
@@ -113,7 +163,7 @@ cargo bench -p aeon-engine --bench redpanda_bench
 cargo bench -p aeon-sample-rust-native --bench multi_runtime
 ```
 
-### 5. Run an E2E Pipeline
+#### 5. Run an E2E Pipeline
 
 ```bash
 # Build a Wasm processor first
@@ -139,30 +189,53 @@ cargo run --release --bin aeon-producer -- \
 
 Use Redpanda Console at `http://localhost:8080` to inspect messages.
 
-### 6. Manage via CLI
+#### 6. Manage via CLI
 
 ```bash
-# Register a processor
+# Start the engine (binds REST API on 0.0.0.0:4471 by default)
+aeon serve --addr 0.0.0.0:4471 --artifact-dir ./data
+
+# In another shell — register a processor
 aeon processor register my-processor --version 1.0.0 \
-  --artifact path/to/processor.wasm --runtime wasm
+  --artifact path/to/processor.wasm --platform wasm32
 
-# Create a pipeline
-aeon pipeline create my-pipeline \
-  --source kafka --source-topic input-events \
-  --sink kafka --sink-topic output-events \
-  --processor my-processor --processor-version 1.0.0
-
-# Start the pipeline
-aeon pipeline start my-pipeline
-
-# Apply a declarative manifest
+# Apply a declarative manifest (preferred — describes processors + pipelines together)
 aeon apply -f pipeline.yaml
+
+# Imperative pipeline ops
+aeon pipeline list
+aeon pipeline start my-pipeline
+aeon pipeline status my-pipeline
 
 # Real-time monitoring
 aeon top
 ```
 
-### 7. Develop a Processor
+> **Authoritative CLI verbs** (see `crates/aeon-cli/src/main.rs`):
+> `aeon serve` starts the engine; `aeon apply -f <manifest.yaml>` is the
+> declarative entry point; `aeon pipeline / processor / cluster / tls /
+> doctor / dev / verify-poh / inject-l3-fault / top / export / diff` are
+> the subcommand groups. Older docs that mention `aeon start --config`
+> or `aeon run -f` are out of date.
+
+### Quickstart C — multi-node cluster (Helm)
+
+```bash
+# Three-node Raft cluster on Rancher Desktop / k3s / minikube
+helm install aeon ./helm/aeon \
+  -f helm/aeon/values-local.yaml \
+  -n aeon --create-namespace
+
+kubectl rollout status sts/aeon -n aeon
+kubectl exec -n aeon aeon-0 -- /usr/local/bin/aeon cluster status
+# → leader present, members [{id:1},{id:2},{id:3}]
+
+kubectl exec -i -n aeon aeon-0 -- /usr/local/bin/aeon apply -f - < pipeline.yaml
+```
+
+For multi-host (DOKS / EKS / GKE) cluster, mTLS, and PVC sizing see [docs/CLUSTERING.md](docs/CLUSTERING.md). For helm chart values see `helm/aeon/values.yaml` (defaults to `ghcr.io/aeon-rust/aeon:latest`).
+
+### Develop a processor
 
 Aeon supports **4 processor tiers** — choose based on your performance and language needs:
 
@@ -177,26 +250,34 @@ See [docs/PROCESSOR-GUIDE.md](docs/PROCESSOR-GUIDE.md) for the Rust processor gu
 
 ## Connectors
 
-| Type | Source | Sink | Feature Flag |
-|------|--------|------|-------------|
-| Kafka / Redpanda | KafkaSource | KafkaSink | `kafka` |
-| HTTP | HttpPollingSource, HttpWebhookSource | -- | `http` |
-| WebSocket | WebSocketSource | WebSocketSink | `websocket` |
-| Redis Streams | RedisSource | RedisSink | `redis-streams` |
-| NATS JetStream | NatsSource | NatsSink | `nats` |
-| MQTT | MqttSource | MqttSink | `mqtt` |
-| RabbitMQ | RabbitMqSource | RabbitMqSink | `rabbitmq` |
-| PostgreSQL CDC | PostgresCdcSource | -- | `postgres-cdc` |
-| MySQL CDC | MysqlCdcSource | -- | `mysql-cdc` |
-| MongoDB CDC | MongoDbCdcSource | -- | `mongodb-cdc` |
-| QUIC | QuicSource | QuicSink | `quic` |
-| WebTransport | WebTransportSource | WebTransportSink | `webtransport` |
-| File | FileSource | FileSink | `file` |
-| Memory | MemorySource | MemorySink | `memory` (default) |
-| Blackhole | -- | BlackholeSink | `blackhole` (default) |
-| Stdout | -- | StdoutSink | `stdout` (default) |
+The CLI registry wires **11 sources + 8 sinks** by default — these are
+the connector `type:` keys you can use in pipeline manifests today:
 
-See [docs/CONNECTORS.md](docs/CONNECTORS.md) for detailed connector documentation.
+| Type key | Source? | Sink? | Required keys |
+|---|---|---|---|
+| `memory` | ✅ | — | (none — synthetic generator) |
+| `kafka` | ✅ | ✅ | `topic`, `brokers` |
+| `http-webhook` | ✅ (push) | — | `bind_addr` |
+| `http-polling` | ✅ (pull) | — | `url` |
+| `http` | — | ✅ | `url` |
+| `file` | ✅ | ✅ | `path` |
+| `websocket` | ✅ | ✅ | `url` |
+| `redis-streams` | ✅ | ✅ | source: `url`+`stream_key`+`group`+`consumer`; sink: `url`+`stream_key` |
+| `nats` | ✅ | ✅ | source: `url`+`stream`+`subject`; sink: `url`+`subject` |
+| `postgres-cdc` | ✅ | — | `connection_string`, `slot_name`, `publication` |
+| `mysql-cdc` | ✅ | — | `url` |
+| `mongodb-cdc` | ✅ | — | `uri`, `database` |
+| `blackhole` | — | ✅ | (none — discards every output) |
+| `stdout` | — | ✅ | (none — debug print) |
+
+**Per-connector copy-pasteable manifest fragments:** see
+[docs/CONNECTOR-COOKBOOK.md](docs/CONNECTOR-COOKBOOK.md) and the
+matching example fixtures under `docs/examples/`.
+
+**Implemented but not yet CLI-registered** (Rust API only, awaiting the
+P5.c follow-up wiring): MQTT, RabbitMQ, QUIC, WebTransport. See
+[docs/CONNECTORS.md](docs/CONNECTORS.md) for the per-connector status
+matrix and Rust-API examples.
 
 ## Delivery Strategies
 

@@ -1,0 +1,46 @@
+# NATS source + sink — JetStream durable consumer + publisher.
+#
+# JetStream is the default; flip `jetstream: false` on the sink to use
+# core NATS (fire-and-forget, no persistence).
+#
+# Pre-requisites (against a running NATS 2.10+ with JetStream enabled,
+# `nats-server -js`):
+#   nats stream add ORDERS --subjects orders.>
+#   nats stream add ORDERS_PROCESSED --subjects orders.processed.>
+
+pipelines:
+  - name: nats-bridge
+    partitions: 1
+
+    durability:
+      mode: ordered_batch
+      checkpoint:
+        interval: "500ms"
+
+    sources:
+      - name: orders-in
+        type: nats
+        kind: pull
+        identity: { mode: native }
+        event_time: { mode: aeon_ingest }
+        url: nats://localhost:4222
+        stream: ORDERS
+        subject: "orders.*"
+        consumer: aeon-orders
+        batch_size: "256"
+        source_name: orders
+
+    processor:
+      name: __identity
+      version: "0.0.0"
+
+    sinks:
+      - name: orders-out
+        type: nats
+        eos_tier: t5_idempotency_key
+        url: nats://localhost:4222
+        subject: orders.processed.v1
+        # JetStream with msg-id deduplication for idempotency.
+        jetstream: "true"
+        dedup: "true"
+        strategy: ordered_batch
