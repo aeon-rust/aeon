@@ -565,6 +565,9 @@ where
 /// - **FailBatch**: Return an error immediately, aborting the pipeline.
 /// - **SkipToDlq**: Count failures in metrics, mark in ledger, continue processing.
 ///   (Actual DLQ sink routing is Phase 15b — for now, failures are tracked but not routed.)
+// Justified — splitting the failure-handling args into a struct adds a layer
+// of indirection without buying anything; this function is the sole call site
+// for each arg combo, and the policy / retry / metrics / ledger names self-document.
 #[allow(clippy::too_many_arguments)]
 async fn handle_batch_failures<K: Sink>(
     sink: &mut K,
@@ -1238,9 +1241,21 @@ fn build_sink_task_ctx(config: &PipelineConfig, core: Option<usize>) -> SinkTask
             if mode != aeon_types::DurabilityMode::None =>
         {
             let wal_path = checkpoint_dir().join("fallback.wal");
-            Some(Box::new(crate::eo2_recovery::FallbackCheckpointStore::new(
+            // O1 / F1: chain `.with_metrics(...)` so engage_fallback's
+            // `inc_checkpoint_fallback_wal` actually ticks the
+            // supervisor-shared `Eo2Metrics`. Without this, the fault
+            // → fallback engagement happens but the counter stays at
+            // 0 in the supervisor's registry — and therefore at 0 on
+            // /metrics. Discovered 2026-05-02 during F3 live cluster
+            // proof: 7 checkpoint writes + 100 armed faults produced
+            // engage_fallback calls but no metric ticks.
+            let mut store = crate::eo2_recovery::FallbackCheckpointStore::new(
                 p, wal_path,
-            )) as Box<dyn CheckpointPersist>)
+            );
+            if let Some(m) = config.eo2_metrics.as_ref() {
+                store = store.with_metrics(Arc::clone(m));
+            }
+            Some(Box::new(store) as Box<dyn CheckpointPersist>)
         }
         (other, _, _) => other,
     };
@@ -1687,6 +1702,32 @@ async fn run_sink_task<K: Sink + Send + 'static>(
                     );
                 }
 
+                // M2: blocking strategies (PerEvent/OrderedBatch) deliver +
+                // ack synchronously, so they never enter the
+                // `!is_blocking()` periodic-flush block below — meaning
+                // `write_checkpoint` only ever fired at shutdown via the
+                // post-loop path (and even then only if the loop had
+                // exited). For a long-running pipeline, that left
+                // `aeon_pipeline_checkpoints_written_total` at 0 even
+                // though events flowed and the L3 store was installed.
+                // Mirror the non-blocking path's flush-interval cadence
+                // so blocking strategies also produce checkpoint records
+                // during steady-state operation.
+                if delivery_strategy.is_blocking()
+                    && delivered_since_checkpoint > 0
+                    && last_flush.elapsed() >= flush_interval
+                {
+                    write_checkpoint(
+                        &mut checkpoint_writer,
+                        &sink_ledger,
+                        &metrics_sink,
+                        &mut delivered_since_checkpoint,
+                        &mut failed_since_checkpoint,
+                        ack_tracker.as_ref(),
+                    );
+                    last_flush = Instant::now();
+                }
+
                 // In Batched mode, track pending and flush at intervals
                 if !delivery_strategy.is_blocking() {
                     pending_count += count;
@@ -1760,6 +1801,31 @@ async fn run_sink_task<K: Sink + Send + 'static>(
                         }
                     }
                 }
+                // P1: blocking strategies (PerEvent/OrderedBatch) deliver
+                // synchronously, so when the source goes idle there are no
+                // pending events to credit — but `delivered_since_checkpoint`
+                // may still hold uncommitted-checkpoint deltas from the last
+                // batch. Without this idle-path tick, a long-running pipeline
+                // that drains its source and then waits for more input writes
+                // exactly one final-shutdown checkpoint regardless of how
+                // many batches flowed through. Mirroring the non-blocking
+                // idle-path logic here keeps the metric cadence consistent
+                // across strategy choices.
+                if delivery_strategy.is_blocking()
+                    && delivered_since_checkpoint > 0
+                    && last_flush.elapsed() >= flush_interval
+                {
+                    write_checkpoint(
+                        &mut checkpoint_writer,
+                        &sink_ledger,
+                        &metrics_sink,
+                        &mut delivered_since_checkpoint,
+                        &mut failed_since_checkpoint,
+                        ack_tracker.as_ref(),
+                    );
+                    last_flush = Instant::now();
+                }
+
                 // In Batched mode, flush pending even while idle
                 if !delivery_strategy.is_blocking() && pending_count > 0 {
                     let effective_interval = flush_tuner
@@ -2034,6 +2100,26 @@ enum UpgradeAction {
     Rollback,
 }
 
+/// Control plane for a managed pipeline.
+///
+/// The `Mutex<Option<…>>` slots below carry rare, control-plane events
+/// (drain-and-swap, blue-green cutover, canary promotion, rollback) from
+/// `PipelineControl`'s public API to the running source/processor/sink
+/// tasks. They are explicitly **not** on the per-event hot path:
+/// each lock is acquired once per pipeline-management action (typically
+/// seconds-to-minutes apart in production), not per batch and certainly
+/// not per event.
+///
+/// **Future tracing item:** the supervisor's per-pipeline-start hand-off
+/// touches ~10 of these slots in sequence (registry stamp + processor
+/// load + source spawn + sink spawn + L2 wrap + ack-tracker register +
+/// fault-injector handle + L3 store install + Eo2 metrics splice + …).
+/// None of those acquire under contention because pipeline start is
+/// serialised by `PipelineSupervisor::running` (a tokio Mutex), but the
+/// p99 of cumulative lock-hold time across that hand-off is unmeasured.
+/// If start latency ever shows up as a Gate 2 / Session B regression,
+/// adding a `tracing::span!` around each `lock().await` would let
+/// operators see which slot is the slow one without code changes.
 pub struct PipelineControl {
     /// When true, the source task stops polling and returns empty batches.
     paused: AtomicBool,
@@ -2236,6 +2322,9 @@ impl PipelineControl {
 /// The per-batch dynamic dispatch overhead (~2ns vtable lookup) is negligible
 /// compared to actual processing time. Use `run_buffered` for pipelines that
 /// never need hot-swap (benchmarks, tests, static pipelines).
+// Justified — a Builder around these would add an init-time allocation per
+// pipeline start without any hot-path benefit. The supervisor calls this
+// once per pipeline, with each arg either documented or self-named.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_buffered_managed<S, K>(
     source: S,
@@ -2625,6 +2714,10 @@ where
 }
 
 #[cfg(test)]
+// Justified at module scope — the test setup pattern (`PipelineConfig::default()`
+// then individual `.field = ...` overrides) reads more clearly than a Builder
+// for the dozens of test fixtures here, and the lint's auto-suggestion to use
+// struct-update syntax doesn't compose well with PipelineConfig's many fields.
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;

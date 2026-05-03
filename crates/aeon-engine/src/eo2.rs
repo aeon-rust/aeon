@@ -3,6 +3,23 @@
 //! path wiring is incremental and individually testable.
 //!
 //! Phase P4 of `docs/EO-2-DURABILITY-DESIGN.md`.
+//!
+//! ## Clone discipline (per CLAUDE.md rule 3 "zero-copy first")
+//!
+//! Every `.clone()` in this file falls into one of three permitted buckets,
+//! none of which copy event payloads:
+//!
+//! | Site                                    | What's cloned          | Cost              | Path  |
+//! |-----------------------------------------|------------------------|-------------------|-------|
+//! | `register_l2()` line ~82                | `Arc<Mutex<L2BodyStore>>` | refcount bump | cold-init |
+//! | `register_l2()` line ~88, 97            | `PathBuf` / `Option<Arc<KekHandle>>` | one PathBuf alloc, refcount | cold-init |
+//! | `MaybeL2Wrapped::wrap()` line ~300, 304 | `PipelineL2Registry`, `PipelineCapacity` | refcount (Arc-internal) | cold-init |
+//! | `AckSeqTracker::snapshot()` line ~430   | `HashMap<String, u64>` | per-checkpoint deep copy | cold-checkpoint (every flush_interval) |
+//! | `tests` clone of `reg`                  | `PipelineL2Registry` | refcount | test-only |
+//!
+//! Per-event clones: **none**. The `Event` and `Output` types own `Bytes`
+//! payloads which are `Arc<Vec<u8>>` slices; the hot path moves them
+//! by value or by reference, never duplicates.
 
 use crate::delivery::L2BodyStoreConfig;
 use crate::l2_body::{L2BodyConfig, L2BodyStore};
@@ -186,6 +203,11 @@ impl<S: Source> L2WritingSource<S> {
     }
 }
 
+// Manual `impl Future` (not `async fn`) so the future captures `&mut self`
+// with the explicit `+ Send` bound the `Source` trait requires across the
+// SPSC boundary. The `async fn` desugaring infers a non-Send future when
+// `self.inner` holds non-Send guards, which breaks the supervisor's
+// `tokio::spawn`. Same pattern in MaybeL2Wrapped below.
 #[allow(clippy::manual_async_fn)]
 impl<S: Source> Source for L2WritingSource<S> {
     fn next_batch(
@@ -314,6 +336,9 @@ impl<S: Source> MaybeL2Wrapped<S> {
     }
 }
 
+// Same `+ Send` bound rationale as L2WritingSource above — manual
+// `impl Future` is required for the trait-object compatibility the
+// supervisor's spawn boundary depends on.
 #[allow(clippy::manual_async_fn)]
 impl<S: Source> Source for MaybeL2Wrapped<S> {
     fn next_batch(

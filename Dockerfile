@@ -43,6 +43,7 @@ COPY crates/aeon-wasm-sdk/Cargo.toml crates/aeon-wasm-sdk/Cargo.toml
 COPY crates/aeon-processor-client/Cargo.toml crates/aeon-processor-client/Cargo.toml
 COPY crates/aeon-cli/Cargo.toml crates/aeon-cli/Cargo.toml
 COPY samples/processors/rust-native/Cargo.toml samples/processors/rust-native/Cargo.toml
+COPY samples/processors/rust-native-cdylib/Cargo.toml samples/processors/rust-native-cdylib/Cargo.toml
 COPY samples/e2e-pipeline/Cargo.toml samples/e2e-pipeline/Cargo.toml
 COPY xtask/Cargo.toml xtask/Cargo.toml
 
@@ -61,6 +62,7 @@ RUN mkdir -p crates/aeon-types/src && echo "pub fn stub(){}" > crates/aeon-types
     mkdir -p crates/aeon-processor-client/src && echo "pub fn stub(){}" > crates/aeon-processor-client/src/lib.rs && \
     mkdir -p crates/aeon-cli/src && echo "fn main(){}" > crates/aeon-cli/src/main.rs && \
     mkdir -p samples/processors/rust-native/src && echo "pub fn stub(){}" > samples/processors/rust-native/src/lib.rs && \
+    mkdir -p samples/processors/rust-native-cdylib/src && echo "pub fn stub(){}" > samples/processors/rust-native-cdylib/src/lib.rs && \
     mkdir -p samples/e2e-pipeline/src && echo "fn main(){}" > samples/e2e-pipeline/src/pipeline.rs && \
     echo "fn main(){}" > samples/e2e-pipeline/src/producer.rs && \
     mkdir -p xtask/src && echo "fn main(){}" > xtask/src/main.rs
@@ -72,6 +74,7 @@ RUN cargo build --profile ${PROFILE} -p aeon-cli --features rest-api 2>/dev/null
 # Copy real source code
 COPY crates/ crates/
 COPY samples/processors/rust-native/ samples/processors/rust-native/
+COPY samples/processors/rust-native-cdylib/ samples/processors/rust-native-cdylib/
 COPY samples/e2e-pipeline/ samples/e2e-pipeline/
 COPY xtask/ xtask/
 
@@ -87,6 +90,14 @@ RUN cargo build --profile ${PROFILE} -p aeon-e2e-pipeline && \
     cp target/${PROFILE}/aeon-pipeline /build/aeon-pipeline && \
     cp target/${PROFILE}/aeon-producer /build/aeon-producer
 
+# V3 native row: build the rust-native cdylib companion so the runtime
+# image carries an `aeon_processor_create`-exporting `.so` for the
+# supervisor's native_loader to dlopen. Bundled at
+# `/app/processors/rust-native-v1.so`; manifests reference it via
+# `processor: { name: rust-native-v1, tier: native }`.
+RUN cargo build --profile ${PROFILE} -p aeon-sample-rust-native-cdylib && \
+    cp target/${PROFILE}/libaeon_sample_rust_native_cdylib.so /build/rust-native-v1.so
+
 # ─── Stage 2: Rust-Wasm processor builder (optional) ────────────────
 FROM rust:1.88-bookworm AS wasm-builder
 
@@ -101,6 +112,16 @@ RUN cd rust-wasm && \
 
 # ─── Stage 3: Runtime image ─────────────────────────────────────────
 FROM debian:bookworm-slim AS runtime
+
+# OCI image labels. `org.opencontainers.image.source` is the one GHCR
+# reads to link the published package to the source repo (surfaces the
+# image on the Packages tab of github.com/aeon-rust/aeon). The rest are
+# the standard descriptive labels the OCI spec defines.
+LABEL org.opencontainers.image.source="https://github.com/aeon-rust/aeon" \
+      org.opencontainers.image.url="https://github.com/aeon-rust/aeon" \
+      org.opencontainers.image.title="aeon" \
+      org.opencontainers.image.description="Aeon real-time data processing engine" \
+      org.opencontainers.image.licenses="Apache-2.0"
 
 RUN apt-get update && apt-get install -y \
     ca-certificates \
@@ -121,6 +142,10 @@ COPY --from=rust-builder /build/aeon-producer /usr/local/bin/aeon-producer
 
 # Copy sample wasm processor
 COPY --from=wasm-builder /build/rust-processor.wasm /app/processors/rust-processor.wasm
+
+# V3 native row: ship the cdylib companion alongside the wasm sample so
+# `processor.tier=native` manifests resolve without an extra mount.
+COPY --from=rust-builder /build/rust-native-v1.so /app/processors/rust-native-v1.so
 
 # Create data and artifact directories
 RUN mkdir -p /app/data /app/artifacts /app/processors && \

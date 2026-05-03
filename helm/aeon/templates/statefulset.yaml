@@ -77,6 +77,36 @@ spec:
             - name: AEON_L2_ROOT
               value: {{ .Values.cluster.l2Root | quote }}
             {{- end }}
+            {{- with .Values.cluster.poh }}
+            {{- if and .signingKey .signingKey.envVar }}
+            # V5.1 R1 — PoH signing-key env var. Pipelines reference
+            # this name via `signing_key_ref: "${ENV:<envVar>}"`.
+            # Three delivery shapes:
+            #   1. valueFromSecretKeyRef — production. K8s Secret holds
+            #      the 64-char hex Ed25519 secret scalar; chart renders
+            #      the standard valueFrom.secretKeyRef block.
+            #   2. value (literal) — dev only. The whole value is
+            #      visible in `kubectl describe pod`; do NOT use for
+            #      anything past local validation.
+            #   3. neither set — env var rendered with empty string;
+            #      manifests that reference the var get
+            #      "env var ... not set" at apply time, surfacing the
+            #      misconfig rather than silently running unsigned.
+            - name: {{ .signingKey.envVar | quote }}
+              {{- if .signingKey.valueFromSecretKeyRef }}
+              {{- if .signingKey.valueFromSecretKeyRef.name }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .signingKey.valueFromSecretKeyRef.name | quote }}
+                  key: {{ .signingKey.valueFromSecretKeyRef.key | quote }}
+              {{- else }}
+              value: {{ .signingKey.value | default "" | quote }}
+              {{- end }}
+              {{- else }}
+              value: {{ .signingKey.value | default "" | quote }}
+              {{- end }}
+            {{- end }}
+            {{- end }}
             {{- if .Values.cluster.raftTiming.heartbeatMs }}
             - name: AEON_RAFT_HEARTBEAT_MS
               value: {{ .Values.cluster.raftTiming.heartbeatMs | quote }}
@@ -162,6 +192,16 @@ spec:
               readOnly: true
             {{- end }}
       volumes:
+        {{- if .Values.persistence.artifactsTmpfs.enabled }}
+        # Q1: tmpfs-backed artifacts mount for ENOSPC chaos. Pairs
+        # with the `if not artifactsTmpfs.enabled` guard around the
+        # PVC volumeClaimTemplate above — exactly one of the two
+        # backs the /app/artifacts mount per release.
+        - name: artifacts
+          emptyDir:
+            medium: Memory
+            sizeLimit: {{ .Values.persistence.artifactsTmpfs.sizeLimit | quote }}
+        {{- end }}
         {{- if .Values.processors.configMap }}
         - name: processors
           configMap:
@@ -206,6 +246,10 @@ spec:
         resources:
           requests:
             storage: {{ .Values.persistence.size }}
+    {{- if not .Values.persistence.artifactsTmpfs.enabled }}
+    # Q1: skip the persistent VCT when artifactsTmpfs.enabled=true —
+    # the volumes block then mounts an emptyDir at the same path so
+    # operators can drive ENOSPC chaos against a sized tmpfs.
     - metadata:
         name: artifacts
       spec:
@@ -217,4 +261,5 @@ spec:
         resources:
           requests:
             storage: 5Gi
+    {{- end }}
 {{- end }}

@@ -1,0 +1,59 @@
+# V3 per-event durability + WAL-fallback row (N2).
+#
+# Same shape as pipeline-v3-native-ordered.yaml but with
+# `durability.mode: per_event` — every event triggers an L2 body
+# fsync + L3 checkpoint write. Smaller `count` (10000) so the run
+# stays bounded under fsync amplification on the 2 GiB pod memory
+# limit; the throughput here is intentionally modest because
+# PerEvent is the strictest tier (one fsync per event).
+#
+# Success signals:
+# - aeon_pipeline_events_received_total{pipeline="v3-native-perevent"}
+#   == 10000 per pod
+# - aeon_pipeline_events_failed_total == 0
+# - aeon_pipeline_checkpoints_written_total > 0 (one per event under
+#   PerEvent, but checkpoint cadence may coalesce — observe non-zero)
+# - L2 segment grows on disk
+#
+# WAL-fallback observability:
+#   FallbackCheckpointStore engages on L3 primary write error and
+#   bumps `aeon_checkpoint_fallback_wal_total`. Triggering it in a
+#   live pipeline requires fault injection (chmod -w on the L3
+#   directory mid-flight, or an L3 backend disconnect). Not part of
+#   this fixture; covered by aeon-engine::eo2_recovery unit tests
+#   (FallbackCheckpointStore::primary_error_engages_fallback +
+#   primary_recovery_drains_wal).
+
+pipelines:
+  - name: v3-native-perevent
+    partitions: 4
+
+    durability:
+      mode: per_event
+      checkpoint:
+        backend: state_store
+        # Per-event mode flushes every event; this interval just
+        # bounds the periodic-flush fallback path.
+        interval: 100ms
+
+    sources:
+      - name: memory-synth
+        type: memory
+        kind: push
+        identity:
+          mode: random
+        event_time:
+          mode: aeon_ingest
+        count: "200000"
+        payload_size: "256"
+        batch_size: "256"
+
+    processor:
+      name: rust-native-v1
+      version: "0.1.0"
+      tier: native
+
+    sinks:
+      - name: blackhole-discard
+        type: blackhole
+        eos_tier: t6_fire_and_forget

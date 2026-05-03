@@ -1,0 +1,57 @@
+# P2 — idle-path P1 cluster proof.
+#
+# Tiny `count` (one batch_size worth of events) so the source drains
+# almost immediately. After drain, the sink task hits the
+# TryRecvError::Empty branch where my P1 fix (commit d879fb1) lives.
+# With `delivered_since_checkpoint > 0` from the just-processed batch
+# and `last_flush.elapsed() >= 200ms`, the idle-path tick fires and
+# `aeon_pipeline_checkpoints_written_total` advances to 1 within ~200ms
+# of source drain — instead of waiting until pipeline shutdown.
+#
+# Without P1 (pre-d879fb1), this fixture would show
+# `checkpoints_written_total = 0` for the entire idle period and only
+# tick to 1 when the pipeline is stopped (final-flush path at line 1825).
+#
+# Read the metric mid-run (between start and stop) to observe the
+# difference. After the first idle-path tick, `delivered_since_checkpoint`
+# resets to 0, so subsequent idle-path checks find nothing to flush —
+# the metric stays at 1 throughout the idle period.
+
+pipelines:
+  - name: p1-idle-path
+    # Single partition so all events go to one node — simpler to
+    # observe + the metric assertion is unambiguous (no
+    # partition-distribution math).
+    partitions: 1
+
+    durability:
+      mode: per_event
+      checkpoint:
+        backend: state_store
+        interval: 200ms
+
+    sources:
+      - name: memory-synth
+        type: memory
+        kind: push
+        identity:
+          mode: random
+        event_time:
+          mode: aeon_ingest
+        # One batch's worth: drains in <50ms.
+        count: "256"
+        payload_size: "256"
+        batch_size: "256"
+
+    processor:
+      # __identity is the supervisor sentinel that routes to the
+      # built-in PassthroughProcessor — no .so / .wasm needed. We're
+      # exercising the sink-task checkpoint path here, not the
+      # processor itself.
+      name: __identity
+      version: "0.0.0"
+
+    sinks:
+      - name: blackhole-discard
+        type: blackhole
+        eos_tier: t6_fire_and_forget

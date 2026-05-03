@@ -39,7 +39,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use axum::extract::{Path, Request, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::{HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
@@ -114,7 +114,16 @@ pub fn api_router(state: Arc<AppState>) -> Router {
     let health_routes = Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))
-        .route("/metrics", get(metrics_prometheus));
+        .route("/metrics", get(metrics_prometheus))
+        // W3 / F1 — debug L3 fault injection. Sits on the health
+        // sub-router (auth-bypassed) so the test-only CLI can reach
+        // it on dev clusters without mTLS handshakes. Production
+        // builds should gate this behind `--features debug-fault-injection`
+        // (see follow-up).
+        .route(
+            "/api/v1/test/inject-l3-fault",
+            post(inject_l3_fault),
+        );
 
     // API routes — auth required when token is configured
     let api_routes = Router::new()
@@ -605,6 +614,60 @@ async fn ready(State(state): State<Arc<AppState>>) -> (StatusCode, Json<HealthRe
 /// No auth — Prometheus scrapers are typically deployed inside the cluster
 /// boundary. Sits on the health_routes sub-router which bypasses the Bearer
 /// auth middleware.
+/// W3 / F1 — debug-only L3 fault injection.
+///
+/// Arms the supervisor's `FaultyL3Wrapper` (installed by `cmd_serve`
+/// before the L3 store) to fail the next `count` write operations.
+/// Returns the previous remaining-fault count + the new one for
+/// observability. 503 when the wrapper isn't installed (e.g. when
+/// the supervisor's L3 store wasn't wired through it — single-node
+/// dev binary).
+///
+/// Auth-bypassed because this is a test endpoint accessed by the
+/// `aeon test inject-l3-fault` CLI on dev clusters. Production
+/// builds should `--features debug-fault-injection` gate this; for
+/// now the route is always present but does nothing without the
+/// supervisor-side wrapper install.
+#[derive(serde::Deserialize, Default)]
+struct InjectL3FaultQuery {
+    /// Number of write operations to fail. Defaults to 1 if absent.
+    #[serde(default = "default_inject_count")]
+    count: u64,
+}
+
+fn default_inject_count() -> u64 {
+    1
+}
+
+async fn inject_l3_fault(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<InjectL3FaultQuery>,
+) -> impl IntoResponse {
+    match state.supervisor.fault_injector() {
+        Some(injector) => {
+            let prev = injector.fault_remaining();
+            injector.inject_faults(q.count);
+            let total = injector.fault_total();
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": "armed",
+                    "previous_remaining": prev,
+                    "new_remaining": q.count,
+                    "fault_total_since_start": total,
+                })),
+            )
+                .into_response()
+        }
+        None => api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "fault injector not installed (cmd_serve did not wrap the L3 store)"
+                .to_string(),
+        )
+        .into_response(),
+    }
+}
+
 async fn metrics_prometheus(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     use std::sync::atomic::Ordering;
 
@@ -689,6 +752,15 @@ async fn metrics_prometheus(State(state): State<Arc<AppState>>) -> impl IntoResp
             m.poh_entries.load(Ordering::Relaxed)
         ));
     }
+
+    // O1 / EO-2 P8: splice the supervisor's shared Eo2Metrics so
+    // `aeon_l2_bytes`, `aeon_l2_segments`, `aeon_l2_gc_lag_seq`,
+    // `aeon_l2_pressure`, `aeon_sink_ack_seq`, and
+    // `aeon_checkpoint_fallback_wal_total` all surface to operators.
+    // Pre-O1, these counters ticked in-process but never reached
+    // the scrape endpoint — engage_fallback's increment was only
+    // observable via unit tests.
+    out.push_str(&state.supervisor.eo2_metrics().render_prometheus());
 
     // Cluster-level Raft metrics (CL-4)
     #[cfg(feature = "cluster")]

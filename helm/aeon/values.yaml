@@ -3,7 +3,13 @@
 replicaCount: 1
 
 image:
-  repository: aeonrust/aeon
+  # Container registry for published Aeon images.
+  # Decision 2026-05-02: GHCR (GitHub Container Registry) instead of Docker Hub.
+  # GHCR is free for public images, reuses the existing aeon-rust GitHub org,
+  # and surfaces images on the Packages tab of github.com/aeon-rust/aeon.
+  # Override in values-local.yaml with `image.repository: aeon` for local nerdctl
+  # builds (Rancher Desktop k8s.io namespace).
+  repository: ghcr.io/aeon-rust/aeon
   tag: latest
   pullPolicy: IfNotPresent
 
@@ -52,6 +58,29 @@ persistence:
   accessModes:
     - ReadWriteOnce
   size: 10Gi
+  # Q1 / W3 follow-up — swap the artifacts volumeClaimTemplate for a
+  # sized in-memory tmpfs (emptyDir.medium: Memory). Used to drive
+  # real ENOSPC faults into the L3 redb store without modifying the
+  # host filesystem:
+  #
+  #   1. helm upgrade aeon ./helm/aeon \
+  #        --set persistence.artifactsTmpfs.enabled=true \
+  #        --set persistence.artifactsTmpfs.sizeLimit=100Mi
+  #   2. kubectl exec aeon-0 -- dd if=/dev/zero \
+  #        of=/app/artifacts/filler bs=1M count=99
+  #   3. start a per_event pipeline targeting partition-0
+  #   4. watch /metrics — `aeon_checkpoint_fallback_wal_total` ticks
+  #      when the next checkpoint write hits ENOSPC.
+  #   5. cleanup: kubectl exec aeon-0 -- rm /app/artifacts/filler
+  #
+  # Pod restart wipes the tmpfs (Memory medium isn't durable) — that's
+  # the trade-off vs the production PVC. NOT for production. The
+  # debug-fault REST endpoint (commit b8c03c8) is the cleaner
+  # synthetic test path; this exists only when you specifically want
+  # a real-disk-fills-up trigger that hits redb's actual write path.
+  artifactsTmpfs:
+    enabled: false
+    sizeLimit: 100Mi
 
 # Processor artifacts via ConfigMap (for .wasm files)
 processors:
@@ -77,6 +106,35 @@ cluster:
   tls:
     enabled: false
     secretName: aeon-tls  # K8s Secret with tls.crt, tls.key, ca.crt
+  # V5.1 R1 — PoH signing-key wiring. Manifests reference the env var
+  # via `signing_key_ref: "${ENV:AEON_TEST_POH_SIG}"` (or whatever
+  # name the operator picks). Two delivery shapes:
+  #
+  #   poh:
+  #     signingKey:
+  #       envVar: AEON_TEST_POH_SIG
+  #       # Production: pull from a k8s Secret created out-of-band
+  #       # (`kubectl create secret generic aeon-poh --from-literal=...`).
+  #       valueFromSecretKeyRef:
+  #         name: aeon-poh
+  #         key: signing-key-hex
+  #
+  #   poh:
+  #     signingKey:
+  #       envVar: AEON_TEST_POH_SIG
+  #       # Dev only — literal value goes through plain env. Discouraged
+  #       # for anything past local validation. Use the SecretKeyRef form
+  #       # for staging / production. The value is a 64-char hex string
+  #       # (Ed25519 secret scalar, 32 bytes hex-encoded).
+  #       value: "2222222222222222222222222222222222222222222222222222222222222222"
+  #
+  # Leave `envVar` empty (default) to skip the env var entirely;
+  # pipelines that don't reference signing keys are unaffected.
+  poh:
+    signingKey:
+      envVar: ""
+      value: ""
+      valueFromSecretKeyRef: {}
   # G14 — Raft timing overrides. Leave all three empty (or omit) to use the
   # binary default (500/1500/3000 ms). Set all three for a custom preset;
   # validation rejects partial overrides and values that violate

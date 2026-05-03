@@ -1,23 +1,48 @@
 //! ConnectorRegistry — runtime-addressable factory of Source/Sink connectors.
 //!
-//! Each connector crate registers a factory keyed by its `source_type` /
-//! `sink_type` string (e.g. `"kafka"`, `"memory"`, `"blackhole"`). The
-//! supervisor hands a `SourceConfig` / `SinkConfig` to the registry and
-//! receives a concrete connector, type-erased behind `BoxedSourceAdapter` /
-//! `BoxedSinkAdapter` so the supervisor can keep a uniform
-//! `HashMap<String, ...>` without caring which connector implementation
-//! it is running.
+//! ## Dispatch tiers (per CLAUDE.md rule 9)
 //!
-//! The adapters re-implement `Source` / `Sink` so they feed back into the
-//! generic `run_buffered_managed<S: Source, _, _>` pipeline runner. The hot
-//! path stays monomorphized per concrete connector — only the supervisor
-//! boundary carries a vtable (one indirection per `next_batch` /
-//! `write_batch`, negligible vs the batch itself).
+//! Aeon mandates static dispatch on the per-event hot path and accepts
+//! `dyn Trait` only at coarse-grained boundaries. This module is one
+//! such boundary, and the dispatch story across it is:
 //!
-//! The dyn-compatible shim (`DynSource` / `DynSink`) is required because
-//! the `Source`/`Sink` traits use `impl Future` in their method signatures
-//! (Rust 2024 edition native async-in-traits), which is not object-safe on
-//! its own.
+//! 1. **Connector construction** (cold, init-time): YAML manifest →
+//!    `ConnectorRegistry::build_source(&cfg) -> Box<dyn DynSource>`.
+//!    Vtable cost: one per pipeline start, paid once.
+//! 2. **Adapter wrap** (cold, init-time): `BoxedSourceAdapter`
+//!    re-implements `Source` so the trait-object connector can be fed
+//!    into the generic runner. The adapter's `Source::next_batch`
+//!    forwards to the inner `Box<dyn DynSource>::next_batch_dyn`.
+//!    Vtable cost: one per *batch* (not per event) — at typical
+//!    `batch_size = 1024`, this is ~1000× amortised vs per-event.
+//! 3. **Pipeline loop** (hot, per-batch): `run_buffered_managed<S: Source, ...>`
+//!    monomorphizes on `S = BoxedSourceAdapter`. From this point on,
+//!    every per-event op (the inner SPSC ring writes, the per-event
+//!    `L2WritingSource` wrap, the `Output` construction) is static
+//!    dispatch. The trait object lives only inside the adapter,
+//!    invisible to the loop.
+//!
+//! In other words: **one vtable hop per batch; zero per event**.
+//!
+//! ## Why the DynSource shim exists
+//!
+//! The `Source`/`Sink` traits in `aeon-types::traits` use `impl Future`
+//! in their method signatures (Rust 2024 edition native async-in-traits).
+//! This makes them ergonomic for connector authors but not directly
+//! object-safe — `Box<dyn Source>` won't compile because the trait isn't
+//! dyn-compatible. The `DynSource` / `DynSink` shims wrap `next_batch`
+//! to return `Pin<Box<dyn Future<...>>>`, which IS object-safe, at the
+//! cost of one heap allocation per batch (again, amortised against
+//! 256–1024 events per batch).
+//!
+//! ## When to construct directly vs go through the registry
+//!
+//! Production / cluster code MUST use the registry path so config
+//! validation, feature probing, and auth setup all happen uniformly.
+//! Tests and benches MAY construct concrete connector types directly
+//! (e.g. `MemorySource::new(events, batch_size)`) — those types
+//! implement `Source` / `Sink` and feed into `run_buffered<S: Source, ...>`
+//! without any vtable hop at all.
 
 use std::collections::HashMap;
 use std::future::Future;

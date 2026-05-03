@@ -540,10 +540,13 @@ impl PipelineManifest {
             })
             .collect();
 
-        let processor = crate::registry::ProcessorRef::new(
+        let mut processor = crate::registry::ProcessorRef::new(
             &self.processor.name,
             self.processor.version.as_deref().unwrap_or("latest"),
         );
+        if let Some(tier) = self.processor.tier.as_ref() {
+            processor = processor.with_tier(tier.clone());
+        }
 
         crate::registry::PipelineDefinition {
             name: self.name.clone(),

@@ -35,6 +35,7 @@ dependencies = [
  "aeon-connectors",
  "aeon-crypto",
  "aeon-engine",
+ "aeon-state",
  "aeon-types",
  "aeon-wasm",
  "anyhow",
@@ -282,6 +283,14 @@ dependencies = [
  "bytes",
  "criterion",
  "uuid",
+]
+
+[[package]]
+name = "aeon-sample-rust-native-cdylib"
+version = "0.1.0"
+dependencies = [
+ "aeon-native-sdk",
+ "aeon-sample-rust-native",
 ]
 
 [[package]]

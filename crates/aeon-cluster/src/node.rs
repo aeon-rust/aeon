@@ -493,6 +493,153 @@ mod inner {
             Ok(node)
         }
 
+        /// FT-1 + FT-2: persistent variant of [`Self::bootstrap_multi`].
+        ///
+        /// Identical control flow to `bootstrap_multi`, but the Raft log
+        /// and state machine live on a caller-supplied `Arc<dyn L3Store>`
+        /// (typically a `RedbStore` opened at
+        /// `${artifact_dir}/raft.redb`). On pod restart the same backing
+        /// file is reopened and `raft.initialize()` returns
+        /// `InitializeError::NotAllowed` — we treat that as the recovery
+        /// path and skip re-initialization. Without this, every pod
+        /// restart would force a fresh election from term 1, which the
+        /// other still-running pods reject by their higher terms,
+        /// surfacing as the split-brain we hit during M2 testing.
+        ///
+        /// Partition assignment is *not* proposed here for the same
+        /// reason as `bootstrap_multi`: only the elected leader proposes
+        /// `InitialAssignment`, and the caller (cmd_serve) drives that
+        /// after waiting for leader election. On a restart the
+        /// partition_table is already populated in the recovered state
+        /// machine, so the leader's "is the table empty?" check
+        /// short-circuits and no proposal is made.
+        pub async fn bootstrap_multi_persistent(
+            config: ClusterConfig,
+            endpoint: Arc<QuicEndpoint>,
+            log_backend: Arc<dyn L3Store>,
+        ) -> Result<Self, AeonError> {
+            config.validate()?;
+
+            let raft_config = Arc::new(Config {
+                cluster_name: "aeon".to_string(),
+                heartbeat_interval: config.raft_timing.heartbeat_ms,
+                election_timeout_min: config.raft_timing.election_min_ms,
+                election_timeout_max: config.raft_timing.election_max_ms,
+                ..Config::default()
+            });
+
+            let log_store = L3RaftLogStore::open(Arc::clone(&log_backend))
+                .await
+                .map_err(|e| AeonError::Cluster {
+                    message: format!("failed to open persistent Raft log: {e}"),
+                    source: None,
+                })?;
+            let state_machine = StateMachineStore::new_persistent(log_backend)?;
+            let shared_state = state_machine.shared_state();
+            let applier_slot = state_machine.applier_slot();
+            let owned_watch_slot = state_machine.owned_partitions_watch_slot();
+            let network = QuicNetworkFactory::new(Arc::clone(&endpoint));
+
+            let raft = Raft::new(
+                config.node_id,
+                raft_config,
+                network,
+                log_store,
+                state_machine,
+            )
+            .await
+            .map_err(|e| AeonError::Cluster {
+                message: format!("failed to create Raft node: {e}"),
+                source: None,
+            })?;
+
+            let owned_partitions_rx =
+                install_owned_partitions_watch(&owned_watch_slot, config.node_id).await;
+
+            // Start the QUIC RPC server (same as bootstrap_multi).
+            let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let source_provider_slots =
+                crate::transport::server::SourceProviderSlots::new_empty();
+            let server_ep = Arc::clone(&endpoint);
+            let server_raft = raft.clone();
+            let server_node_id = config.node_id;
+            let server_shutdown = Arc::clone(&shutdown);
+            let server_slots = source_provider_slots.clone();
+            tokio::spawn(async move {
+                server::serve_with_slots(
+                    server_ep,
+                    server_raft,
+                    server_node_id,
+                    server_shutdown,
+                    server_slots,
+                )
+                .await;
+            });
+
+            // Build membership identically to bootstrap_multi.
+            let members: BTreeMap<u64, NodeAddress> = if !config.initial_members.is_empty() {
+                config.initial_members.iter().cloned().collect()
+            } else {
+                let local_addr = endpoint.local_addr().map_err(|e| AeonError::Cluster {
+                    message: format!("failed to get local QUIC address: {e}"),
+                    source: None,
+                })?;
+                let mut m = BTreeMap::new();
+                m.insert(
+                    config.node_id,
+                    NodeAddress::new(local_addr.ip().to_string(), local_addr.port()),
+                );
+                for (i, peer) in config.peers.iter().enumerate() {
+                    let peer_id = config.node_id + (i as u64) + 1;
+                    m.insert(peer_id, peer.clone());
+                }
+                m
+            };
+
+            // FT-1 / FT-2 restart-survivability: NotAllowed = "log already
+            // contains init entry from a prior boot" → recover silently
+            // and trust the persisted state. Other init errors are still
+            // hard failures.
+            match raft.initialize(members).await {
+                Ok(()) => {}
+                Err(openraft::error::RaftError::APIError(
+                    openraft::error::InitializeError::NotAllowed(_),
+                )) => {
+                    tracing::info!(
+                        node_id = config.node_id,
+                        "Raft log recovered from persistent store — skipping initialize"
+                    );
+                }
+                Err(e) => {
+                    return Err(AeonError::Cluster {
+                        message: format!("failed to initialize Raft cluster: {e}"),
+                        source: None,
+                    });
+                }
+            }
+
+            let node = Self {
+                raft,
+                config,
+                endpoint: Some(endpoint),
+                shutdown,
+                shared_state,
+                applier_slot,
+                transfer_driver: tokio::sync::RwLock::new(None),
+                source_provider_slots,
+                owned_partitions_rx,
+            };
+
+            tracing::info!(
+                node_id = node.config.node_id,
+                peers = node.config.peers.len(),
+                partitions = node.config.num_partitions,
+                "Multi-node cluster bootstrapped with persistent Raft (FT-1 + FT-2)"
+            );
+
+            Ok(node)
+        }
+
         /// Start as a peer node in a fresh cluster bootstrap.
         ///
         /// Unlike `bootstrap_multi()`, this does NOT call `raft.initialize()`.
@@ -574,6 +721,178 @@ mod inner {
                 source_provider_slots,
                 owned_partitions_rx,
             };
+
+            Ok(node)
+        }
+
+        /// FT-1 + FT-2: persistent variant of [`Self::join`].
+        ///
+        /// Same join handshake (`AddNode` RPC to a seed) but the local
+        /// Raft log + state machine live on a persistent
+        /// `Arc<dyn L3Store>` instead of in-memory. On pod restart the
+        /// persisted log is replayed to recover the node's view of
+        /// cluster membership without re-issuing the join.
+        ///
+        /// `raft.initialize()` is intentionally NOT called here — the
+        /// joining node is a learner first, the seed leader replicates
+        /// the cluster's initial config + ongoing entries via
+        /// AppendEntries. On restart, the recovered log already
+        /// contains those entries, so AppendEntries from the current
+        /// leader picks up cleanly from the last committed index.
+        pub async fn join_persistent(
+            config: ClusterConfig,
+            endpoint: Arc<QuicEndpoint>,
+            log_backend: Arc<dyn L3Store>,
+        ) -> Result<Self, AeonError> {
+            config.validate()?;
+
+            if config.seed_nodes.is_empty() {
+                return Err(AeonError::Config {
+                    message: "join requires at least one seed node".to_string(),
+                });
+            }
+
+            let raft_config = Arc::new(Config {
+                cluster_name: "aeon".to_string(),
+                heartbeat_interval: config.raft_timing.heartbeat_ms,
+                election_timeout_min: config.raft_timing.election_min_ms,
+                election_timeout_max: config.raft_timing.election_max_ms,
+                ..Config::default()
+            });
+
+            let log_store = L3RaftLogStore::open(Arc::clone(&log_backend))
+                .await
+                .map_err(|e| AeonError::Cluster {
+                    message: format!("failed to open persistent Raft log: {e}"),
+                    source: None,
+                })?;
+            let state_machine = StateMachineStore::new_persistent(log_backend)?;
+            let shared_state = state_machine.shared_state();
+            let applier_slot = state_machine.applier_slot();
+            let owned_watch_slot = state_machine.owned_partitions_watch_slot();
+            let network = QuicNetworkFactory::new(Arc::clone(&endpoint));
+
+            let raft = Raft::new(
+                config.node_id,
+                raft_config,
+                network,
+                log_store,
+                state_machine,
+            )
+            .await
+            .map_err(|e| AeonError::Cluster {
+                message: format!("failed to create Raft node: {e}"),
+                source: None,
+            })?;
+
+            let owned_partitions_rx =
+                install_owned_partitions_watch(&owned_watch_slot, config.node_id).await;
+
+            // Start the QUIC RPC server before joining (peers must be
+            // able to reach us when the seed elevates us to voter).
+            let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let source_provider_slots =
+                crate::transport::server::SourceProviderSlots::new_empty();
+            let server_ep = Arc::clone(&endpoint);
+            let server_raft = raft.clone();
+            let server_node_id = config.node_id;
+            let server_shutdown = Arc::clone(&shutdown);
+            let server_slots = source_provider_slots.clone();
+            tokio::spawn(async move {
+                server::serve_with_slots(
+                    server_ep,
+                    server_raft,
+                    server_node_id,
+                    server_shutdown,
+                    server_slots,
+                )
+                .await;
+            });
+
+            // Send the join RPC. Note: a restarted node already has the
+            // membership in its persisted log, so this is a no-op on the
+            // leader's side (member already present); openraft handles
+            // the duplicate-add gracefully.
+            let self_addr = config
+                .advertise_addr
+                .clone()
+                .unwrap_or_else(|| NodeAddress::new(
+                    config.bind.ip().to_string(),
+                    config.bind.port(),
+                ));
+
+            let join_req = JoinRequest {
+                node_id: config.node_id,
+                addr: self_addr,
+            };
+
+            // Mirror the existing `join()` retry loop: try each seed
+            // until one accepts. Restart-path is fine here — openraft
+            // tolerates duplicate AddNode RPCs (member already present).
+            let mut joined = false;
+            for seed in &config.seed_nodes {
+                tracing::info!(
+                    seed = %seed,
+                    "attempting to join (persistent Raft) via seed"
+                );
+                match crate::transport::network::send_join_request(
+                    &endpoint,
+                    0, // placeholder — uncached path does not read this
+                    seed,
+                    &join_req,
+                )
+                .await
+                {
+                    Ok(resp) if resp.success => {
+                        tracing::info!(
+                            node_id = config.node_id,
+                            leader = ?resp.leader_id,
+                            "join_persistent: succeeded via seed {seed}"
+                        );
+                        joined = true;
+                        break;
+                    }
+                    Ok(resp) => {
+                        tracing::warn!(
+                            seed = %seed,
+                            leader = ?resp.leader_id,
+                            msg = %resp.message,
+                            "seed rejected join, will try next"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            seed = %seed,
+                            error = %e,
+                            "failed to contact seed"
+                        );
+                    }
+                }
+            }
+            if !joined {
+                tracing::warn!(
+                    "join_persistent: no seed accepted the AddNode RPC; \
+                     proceeding — restart path may resync via persisted log"
+                );
+            }
+
+            let node = Self {
+                raft,
+                config,
+                endpoint: Some(endpoint),
+                shutdown,
+                shared_state,
+                applier_slot,
+                transfer_driver: tokio::sync::RwLock::new(None),
+                source_provider_slots,
+                owned_partitions_rx,
+            };
+
+            tracing::info!(
+                node_id = node.config.node_id,
+                seeds = node.config.seed_nodes.len(),
+                "Joined cluster with persistent Raft (FT-1 + FT-2)"
+            );
 
             Ok(node)
         }

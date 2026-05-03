@@ -1,0 +1,48 @@
+# V3 Wasm guest · per-event row (R2).
+#
+# Mirrors pipeline-v3-native-perevent.yaml (N2 closure) but with
+# tier=wasm + name=passthrough referencing the bundled
+# /app/processors/rust-processor.wasm.
+#
+# Success signals:
+# - aeon_pipeline_events_received_total{pipeline="v3-wasm-perevent"} == 50000 per pod
+# - aeon_pipeline_events_failed_total == 0
+# - L2 segment grows on disk (per_event = fsync per event)
+# - aeon_pipeline_checkpoints_written_total > 0 (L3 checkpoint writes
+#   at the configured 100ms interval, courtesy of M2 + Q1)
+
+pipelines:
+  - name: v3-wasm-perevent
+    partitions: 4
+
+    durability:
+      mode: per_event
+      checkpoint:
+        backend: state_store
+        interval: 100ms
+
+    sources:
+      - name: memory-synth
+        type: memory
+        kind: push
+        identity:
+          mode: random
+        event_time:
+          mode: aeon_ingest
+        # Smaller count than the 200K used for native-perevent —
+        # Wasm fsync-per-event runs slower, and 50K is enough to
+        # tick the metric a few times at 100ms cadence without
+        # taking forever to drain.
+        count: "50000"
+        payload_size: "256"
+        batch_size: "256"
+
+    processor:
+      name: passthrough
+      version: "1.0.0"
+      tier: wasm
+
+    sinks:
+      - name: blackhole-discard
+        type: blackhole
+        eos_tier: t6_fire_and_forget

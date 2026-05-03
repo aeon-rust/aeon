@@ -1,0 +1,32 @@
+# M2 validation: high checkpoint cadence to prove L3 redb file grows.
+#
+# count=500K + flush.interval=50ms + per_event durability →
+# many checkpoint records over ~30-60s, redb file should grow well
+# past the initial 1,589,248-byte empty-table size.
+pipelines:
+  - name: l3-grow-validate
+    partitions: 4
+    durability:
+      mode: per_event
+      checkpoint:
+        backend: state_store
+        interval: 50ms
+    sources:
+      - name: memory-synth
+        type: memory
+        kind: push
+        identity:
+          mode: random
+        event_time:
+          mode: aeon_ingest
+        count: "500000"
+        payload_size: "256"
+        batch_size: "256"
+    processor:
+      name: rust-native-v1
+      version: "0.1.0"
+      tier: native
+    sinks:
+      - name: blackhole-discard
+        type: blackhole
+        eos_tier: t6_fire_and_forget

@@ -1,0 +1,49 @@
+# G4 — outputs-acked metric exercise via Kafka/Redpanda sink.
+#
+# Memory source → __identity → Kafka sink targeting Redpanda. The
+# Kafka sink implements `Sink::on_ack_callback` (see
+# crates/aeon-connectors/src/kafka/sink.rs:476) — when rdkafka calls
+# back with broker-acked messages, the engine increments
+# `aeon_pipeline_outputs_acked_total`.
+#
+# Pre-G4 (closed in Phase 1 P1.1e–P1.1g per ROADMAP), the metric was
+# wired but every cluster fixture used the Blackhole sink which
+# doesn't ack — so the counter stayed at 0 across all live runs and
+# this row stayed unobserved. This fixture closes that gap by
+# routing through a real broker.
+#
+# Reuses the `aeon-bench-sink` topic (16 partitions, already created
+# on the running Redpanda).
+
+pipelines:
+  - name: g4-kafka-acked
+    partitions: 4
+
+    durability:
+      mode: none
+
+    sources:
+      - name: memory-synth
+        type: memory
+        kind: push
+        identity:
+          mode: random
+        event_time:
+          mode: aeon_ingest
+        count: "10000"
+        payload_size: "256"
+        batch_size: "256"
+
+    processor:
+      name: __identity
+      version: "0.0.0"
+
+    sinks:
+      - name: redpanda-out
+        type: kafka
+        eos_tier: t6_fire_and_forget
+        topic: aeon-bench-sink
+        brokers: "redpanda:9092"
+        # Standard ordered-batch produce so the broker acks each batch
+        # in order; the engine's on_ack_callback fires per acked batch.
+        strategy: ordered_batch

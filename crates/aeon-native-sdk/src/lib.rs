@@ -63,7 +63,7 @@ pub mod prelude {
 macro_rules! export_processor {
     ($create_fn:expr) => {
         /// Create a processor instance from config bytes.
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub extern "C" fn aeon_processor_create(
             config_ptr: *const u8,
             config_len: usize,
@@ -78,7 +78,7 @@ macro_rules! export_processor {
         }
 
         /// Destroy a processor instance.
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub extern "C" fn aeon_processor_destroy(ctx: *mut std::ffi::c_void) {
             if !ctx.is_null() {
                 // SAFETY: ctx was created by aeon_processor_create via Box::into_raw
@@ -91,7 +91,7 @@ macro_rules! export_processor {
         /// Process a single event. Returns 0 on success, non-zero on error.
         ///
         /// Wire format: event bytes in, output bytes out (see `aeon_native_sdk::wire`).
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub extern "C" fn aeon_process(
             ctx: *mut std::ffi::c_void,
             event_ptr: *const u8,
@@ -130,7 +130,7 @@ macro_rules! export_processor {
         }
 
         /// Process a batch of events. Returns 0 on success, non-zero on error.
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub extern "C" fn aeon_process_batch(
             ctx: *mut std::ffi::c_void,
             events_ptr: *const u8,
@@ -168,13 +168,13 @@ macro_rules! export_processor {
         }
 
         /// Return the processor name (null-terminated C string).
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub extern "C" fn aeon_processor_name() -> *const std::ffi::c_char {
             concat!(env!("CARGO_PKG_NAME"), "\0").as_ptr() as *const std::ffi::c_char
         }
 
         /// Return the processor version (null-terminated C string).
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub extern "C" fn aeon_processor_version() -> *const std::ffi::c_char {
             concat!(env!("CARGO_PKG_VERSION"), "\0").as_ptr() as *const std::ffi::c_char
         }

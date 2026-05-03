@@ -1,0 +1,109 @@
+# Chaos Mesh IOChaos — inject EACCES on the L3 checkpoint store.
+#
+# Used by C2 to deliberately trigger the FallbackCheckpointStore on
+# the leader pod mid-flight. Targets writes to the redb file under
+# /app/artifacts. The chaos resource is meant to stay applied for the
+# entire pipeline lifecycle — see "lifecycle discipline" below.
+#
+# Apply with:
+#   kubectl apply -f docs/examples/chaos-l3-fault-eaccess.yaml
+# Remove with:
+#   kubectl delete -f docs/examples/chaos-l3-fault-eaccess.yaml
+#
+# Expected log on the targeted pod when fallback engages:
+#   "L3 checkpoint store failed; falling back to WAL"
+#   (aeon-engine::eo2_recovery::FallbackCheckpointStore::engage_fallback)
+#
+# Lifecycle discipline (learned 2026-05-01 during initial C2 run):
+#   IOChaos uses a `toda` FUSE proxy mounted at the volumePath. Deleting
+#   the chaos resource unmounts toda; if any process holds open file
+#   descriptors through that mount, the kernel returns ENOTCONN and the
+#   pod becomes wedged with `Transport endpoint is not connected` on
+#   every subsequent fs op. Discipline:
+#     1. Apply chaos BEFORE pipeline start.
+#     2. Stop + delete the pipeline (closes redb / WAL handles).
+#     3. THEN delete the chaos resource — clean unmount.
+#   `duration: 5m` keeps the fault active long enough that the pipeline
+#   completes inside the window without auto-removal.
+#
+# Known toda limitation on k3s (Rancher Desktop 2026-05-01):
+#   `errno: 13` (EACCES) is the configured fault but in practice toda
+#   degrades to ENOTCONN ("Transport endpoint is not connected") after
+#   a few write attempts. This means the fault doesn't propagate to the
+#   engine as a controlled `Result::Err` — instead the FUSE proxy
+#   wedges and every subsequent fs op fails the same way regardless of
+#   the chaos config. As a result, `FallbackCheckpointStore::engage_fallback`
+#   doesn't fire predictably under this setup. The unit-test path
+#   (`eo2_recovery::tests::primary_error_engages_fallback`) remains the
+#   authoritative coverage for the fallback contract; this fixture is
+#   useful for verifying chaos targeting + lifecycle but not for
+#   end-to-end fallback validation. A more stable approach (StressChaos
+#   on the chaos-daemon, manual chmod -w via `kubectl exec`, or
+#   network-level fault on a remote L3 backend) would close the live
+#   trigger gap.
+#
+# 2026-05-02 follow-up — alternative chaos approaches all blocked on
+# the same root cause: redb opens the file with `O_RDWR` + mmap, so
+# typed write errors don't propagate from the FS layer to the Rust
+# code. Specifically:
+#
+#   * `kubectl exec ... chmod 000 /app/artifacts/l3-checkpoints.redb`
+#     — chmod on an already-open `O_RDWR` fd has no effect on
+#     subsequent writes. redb keeps writing happily.
+#   * `kubectl exec ... truncate -s 1024 /app/artifacts/l3-checkpoints.redb`
+#     — truncates the on-disk file to 1 KiB, but redb's mmap'd pages
+#     in the running process aren't invalidated; writes succeed
+#     against the in-memory pages, then re-grow the file on fsync.
+#     Side effect: corrupts the file's open-time integrity check, so
+#     the next pod restart fails to reopen the L3 store (silent
+#     pipeline-init failure observed). Don't do this on a live cluster.
+#   * `kubectl exec ... rm /app/artifacts/l3-checkpoints.redb`
+#     — Linux unlink on an open fd doesn't break writes (file
+#     unlinked from the directory but the inode stays alive until the
+#     last fd closes). No effect.
+#   * IOChaos with `delay` action — adds latency without breaking the
+#     FUSE, but redb's `begin_write` / `txn.commit` have no internal
+#     timeout, so `write_checkpoint` just blocks for the delay
+#     duration without erroring. No fault injected.
+#   * Filling the disk via `dd` — would work in principle, but the
+#     RD `local-path` PVC is backed by the host's ext4 (1 TB on this
+#     laptop), so a `dd` would consume the whole laptop disk.
+#
+# Honest conclusion: triggering FallbackCheckpointStore live under
+# k3s + local-path + redb with mmap'd open fds requires either a
+# cgroup quota (next iteration), a remote L3 backend with
+# network-level chaos, or a debug CLI (`aeon test inject-l3-fault`)
+# that toggles a fault flag inside the running supervisor. The
+# fault → fallback → metric path itself IS covered end-to-end by
+# `eo2_recovery::tests::fallback_transition_bumps_metrics_counter`
+# (unit) plus the O1 commit `8c8dbb5` (live `/metrics` exposure
+# verified) — it's the chaos-tooling integration that's blocked,
+# not the aeon code path.
+
+apiVersion: chaos-mesh.org/v1alpha1
+kind: IOChaos
+metadata:
+  name: aeon-l3-eaccess
+  namespace: aeon
+spec:
+  action: fault
+  mode: one
+  selector:
+    namespaces:
+      - aeon
+    labelSelectors:
+      "statefulset.kubernetes.io/pod-name": "aeon-2"
+  # Inject EACCES (errno 13) on every write under the artifact dir.
+  # That's where the supervisor opens the redb file
+  # (`/app/artifacts/l3-checkpoints.redb`).
+  volumePath: /app/artifacts
+  path: /app/artifacts/l3-checkpoints.redb
+  errno: 13
+  methods:
+    - write
+    - flush
+    - fsync
+  percent: 100
+  duration: 5m
+  containerNames:
+    - aeon

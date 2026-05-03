@@ -1,0 +1,18 @@
+[package]
+name = "aeon-sample-rust-native-cdylib"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# V3 native-processor row companion: builds a `.so` / `.dylib` / `.dll`
+# that the engine's `NativeProcessor::load()` can dlopen. Reuses the
+# in-process `JsonEnrichProcessor` from the sibling crate so behaviour
+# parity between dev-mode (cargo test) and runtime-mode (loaded by
+# aeon-engine) is by construction.
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+aeon-native-sdk = { path = "../../../crates/aeon-native-sdk" }
+aeon-sample-rust-native = { path = "../rust-native" }

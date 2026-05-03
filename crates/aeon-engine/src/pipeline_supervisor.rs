@@ -145,6 +145,38 @@ pub struct PipelineSupervisor {
     /// verification) keep working without the bootstrap step.
     #[cfg(feature = "processor-auth")]
     secret_registry: OnceLock<Arc<aeon_types::SecretRegistry>>,
+    /// M2 / FT-3: node-wide L3 store used as the checkpoint backend
+    /// when a manifest declares `durability.checkpoint.backend:
+    /// state_store`. Installed once by `cmd_serve` after the artifact
+    /// directory is known (typically a redb file at
+    /// `${artifact_dir}/l3-checkpoints.redb`). `start()` clones it
+    /// onto `PipelineConfig.l3_checkpoint_store` so
+    /// `build_sink_task_ctx` produces a real `L3CheckpointStore`
+    /// instead of warning and proceeding without a writer. Tests /
+    /// benches that don't exercise checkpointing leave this unset;
+    /// `CheckpointBackend::Wal` and `None` paths are unaffected.
+    l3_checkpoint_store: OnceLock<Arc<dyn aeon_types::L3Store>>,
+    /// W3 / F1: side-channel clone of the `FaultyL3Wrapper` that wraps
+    /// the installed L3 store. The trait-object `Arc<dyn L3Store>`
+    /// can't be downcast directly (no Any supertrait), so cmd_serve
+    /// installs the wrapper twice: once as the L3 store proper, once
+    /// here for the REST fault-injection endpoint to reach.
+    fault_injector_handle: OnceLock<crate::debug_fault::FaultyL3Wrapper>,
+    /// O1 / EO-2 P8: node-wide `Eo2Metrics` registry. Always-on (no
+    /// install step) — same pattern as `poh_live_chains`. `start()`
+    /// stamps a clone onto every pipeline's
+    /// `PipelineConfig.eo2_metrics` so the L2 body store, sink ack
+    /// tracker, fallback checkpoint store, and capacity gate all
+    /// publish into the same registry. The REST `/metrics` handler
+    /// appends `render_prometheus()` so operators see
+    /// `aeon_l2_bytes`, `aeon_l2_segments`, `aeon_l2_gc_lag_seq`,
+    /// `aeon_l2_pressure`, `aeon_sink_ack_seq`, and
+    /// `aeon_checkpoint_fallback_wal_total` alongside the per-pipeline
+    /// counters. Pre-O1, these metrics ticked in-process but were
+    /// invisible to Prometheus scrapers — engage_fallback's counter
+    /// fires inside the FallbackCheckpointStore but the only path to
+    /// observe it was unit tests.
+    eo2_metrics: Arc<crate::eo2_metrics::Eo2Metrics>,
 }
 
 impl PipelineSupervisor {
@@ -164,7 +196,66 @@ impl PipelineSupervisor {
             l2_root: OnceLock::new(),
             #[cfg(feature = "processor-auth")]
             secret_registry: OnceLock::new(),
+            l3_checkpoint_store: OnceLock::new(),
+            fault_injector_handle: OnceLock::new(),
+            eo2_metrics: Arc::new(crate::eo2_metrics::Eo2Metrics::new()),
         }
+    }
+
+    /// O1 / EO-2 P8: shared Eo2Metrics registry. Cloned onto every
+    /// pipeline's `PipelineConfig.eo2_metrics` at start so all
+    /// pipelines publish into the same place. The REST `/metrics`
+    /// handler reads from this for its `render_prometheus()` splice.
+    pub fn eo2_metrics(&self) -> Arc<crate::eo2_metrics::Eo2Metrics> {
+        Arc::clone(&self.eo2_metrics)
+    }
+
+    /// M2 / FT-3: install the node-wide L3 store used as the checkpoint
+    /// backend. Intended to be called once by `cmd_serve` after the
+    /// artifact directory is known. Returns `Err` if already installed —
+    /// startup ordering bug, not a runtime condition. Pipelines whose
+    /// manifest declares `durability.checkpoint.backend: state_store`
+    /// without this installed log a warning and run without a checkpoint
+    /// writer (current behaviour), which is why
+    /// `aeon_pipeline_checkpoints_written_total` stayed at 0 across all
+    /// runs prior to this fix.
+    pub fn set_l3_checkpoint_store(
+        &self,
+        store: Arc<dyn aeon_types::L3Store>,
+    ) -> Result<(), AeonError> {
+        self.l3_checkpoint_store.set(store).map_err(|_| {
+            AeonError::state(
+                "PipelineSupervisor: L3 checkpoint store already installed",
+            )
+        })
+    }
+
+    /// W3 / F1: if the installed L3 checkpoint store is a
+    /// `FaultyL3Wrapper`, return a clone (shared atomic counter). The
+    /// REST handler `inject_l3_fault` calls this to arm faults from
+    /// outside the engine. Returns `None` when the wrapper isn't
+    /// installed — production builds + tests / benches that don't
+    /// configure fault injection get a clean "not enabled" surface.
+    pub fn fault_injector(&self) -> Option<crate::debug_fault::FaultyL3Wrapper> {
+        // The wrapper is the outermost L3Store but `Arc<dyn L3Store>`
+        // can't downcast directly (no Any supertrait), so cmd_serve
+        // installs a side-channel handle via `set_fault_injector`.
+        self.fault_injector_handle.get().cloned()
+    }
+
+    /// W3 / F1: install the side-channel handle to the
+    /// `FaultyL3Wrapper` that wraps the installed L3 store. Called by
+    /// `cmd_serve` right after `set_l3_checkpoint_store(wrapper)`.
+    /// Once-only.
+    pub fn set_fault_injector(
+        &self,
+        injector: crate::debug_fault::FaultyL3Wrapper,
+    ) -> Result<(), AeonError> {
+        self.fault_injector_handle.set(injector).map_err(|_| {
+            AeonError::state(
+                "PipelineSupervisor: fault injector already installed",
+            )
+        })
     }
 
     /// V5.1: install the node-wide `SecretRegistry`. Intended to be
@@ -425,7 +516,11 @@ impl PipelineSupervisor {
         let source = self.connectors.build_source(source_cfg_ref)?;
         let mut sink = self.connectors.build_sink(sink_cfg)?;
 
-        let processor = build_processor(&def.processor.name, &name)?;
+        let processor = build_processor(
+            &def.processor.name,
+            &name,
+            def.processor.tier.as_deref(),
+        )?;
 
         // G2/CL-6: install a write-freeze gate for this pipeline's owned
         // partition. T0 supervisor is single-partition (partition 0);
@@ -506,6 +601,24 @@ impl PipelineSupervisor {
         }
         pipeline_config.encryption_plan = Some(encryption_plan);
         pipeline_config.retention_plan = Some(retention_plan);
+        // M2 / FT-3: hand the supervisor's L3 store to the per-pipeline
+        // config so the sink task's `build_sink_task_ctx` can construct a
+        // real `L3CheckpointStore` when the manifest declares
+        // `checkpoint.backend: state_store`. Without this clone, the
+        // `StateStore` arm logs "no l3_checkpoint_store provided" and
+        // falls through to a `None` writer — the pre-existing root
+        // cause of `aeon_pipeline_checkpoints_written_total` staying
+        // at 0 across all v3-* runs.
+        if let Some(l3) = self.l3_checkpoint_store.get() {
+            pipeline_config.l3_checkpoint_store = Some(Arc::clone(l3));
+        }
+        // O1 / EO-2 P8: stamp the shared Eo2Metrics registry onto every
+        // pipeline so L2/sink/ack/fallback counters all publish into one
+        // place. REST /metrics reads from `self.eo2_metrics` for its
+        // render_prometheus splice. Without this clone, in-process
+        // increments at sites like `FallbackCheckpointStore::engage_fallback`
+        // are dead because pipeline_config.eo2_metrics stays None.
+        pipeline_config.eo2_metrics = Some(Arc::clone(&self.eo2_metrics));
         // G11.c: share the process-wide PoH-chain install registry so
         // `create_poh_state` can resume a chain a recent partition-transfer
         // installed on this node instead of genesising fresh.
@@ -725,17 +838,56 @@ impl PipelineSupervisor {
 fn build_processor(
     processor_name: &str,
     pipeline_name: &str,
+    processor_tier: Option<&str>,
 ) -> Result<Box<dyn aeon_types::Processor + Send + Sync>, AeonError> {
-    // T0: every name resolves to PassthroughProcessor. Real Wasm/native
-    // instantiation is layered on top of this in the next phase via the
-    // existing `ProcessorRegistry::load_artifact` path; until then the
-    // explicit `__identity` sentinel documents intent and keeps the matrix
-    // self-consistent.
+    // V3 native row: when the manifest declares `processor.tier = "native"`,
+    // load the cdylib artifact at `${AEON_PROCESSORS_DIR}/{name}.so` (or
+    // `.dll` / `.dylib` per platform). The tier is carried through from
+    // `ProcessorManifest.tier` via `ProcessorRef.tier`; absent or any
+    // other value falls back to the legacy passthrough path. Wasm tier is
+    // intentionally still passthrough-on-supervisor: the in-process Wasm
+    // path lands in a follow-up atom (different fixture, different load
+    // boundary).
+    if processor_tier.map(|t| t.eq_ignore_ascii_case("native")) == Some(true) {
+        let dir = std::env::var("AEON_PROCESSORS_DIR")
+            .unwrap_or_else(|_| "/app/processors".to_string());
+        let ext = if cfg!(target_os = "windows") {
+            "dll"
+        } else if cfg!(target_os = "macos") {
+            "dylib"
+        } else {
+            "so"
+        };
+        let path = std::path::PathBuf::from(&dir).join(format!("{processor_name}.{ext}"));
+        if !path.exists() {
+            return Err(AeonError::state(format!(
+                "supervisor: native processor artifact not found at {} \
+                 (manifest declares processor.tier=native; bundle the \
+                 cdylib into the runtime image or override the directory \
+                 via AEON_PROCESSORS_DIR)",
+                path.display()
+            )));
+        }
+        let proc = crate::native_loader::NativeProcessor::load(&path, &[])
+            .map_err(|e| AeonError::state(format!(
+                "supervisor: failed to load native processor from {}: {e}",
+                path.display()
+            )))?;
+        tracing::info!(
+            pipeline = pipeline_name,
+            processor = processor_name,
+            artifact = %path.display(),
+            "supervisor: loaded native processor"
+        );
+        return Ok(Box::new(proc));
+    }
+
     if processor_name != IDENTITY_PROCESSOR {
         tracing::debug!(
             pipeline = pipeline_name,
             processor = processor_name,
-            "supervisor: T0 path resolves all processor names to PassthroughProcessor"
+            tier = processor_tier.unwrap_or("<none>"),
+            "supervisor: passthrough path (tier not yet wired or absent)"
         );
     }
     Ok(Box::new(PassthroughProcessor::new(Arc::from("output"))))
@@ -757,9 +909,47 @@ fn pipeline_config_for(def: &PipelineDefinition) -> PipelineConfig {
     // modes still need their L2 registry / capacity / ack tracker wiring to
     // become observable, which lands when the matrix asks for them.
     cfg.delivery.durability = def.durability.mode;
+    // M2 / FT-3: translate the manifest's declared checkpoint backend
+    // (`durability.checkpoint.backend` in YAML) onto the runtime config.
+    // Without this, manifests declaring `state_store` silently fell
+    // through to the engine's default `Wal` backend, defeating the
+    // purpose of `set_l3_checkpoint_store` and leaving the L3 redb
+    // file untouched (writes went to /tmp/aeon-checkpoints/pipeline.wal
+    // instead). Discovered 2026-05-01 during the C2 IOChaos run —
+    // the fault injection on `/app/artifacts/l3-checkpoints.redb`
+    // saw zero traffic because no checkpoint writes ever hit that file.
+    use aeon_types::manifest::CheckpointBackendDecl;
+    cfg.delivery.checkpoint.backend = match def.durability.checkpoint.backend {
+        CheckpointBackendDecl::StateStore => crate::delivery::CheckpointBackend::StateStore,
+        CheckpointBackendDecl::Wal => crate::delivery::CheckpointBackend::Wal,
+        CheckpointBackendDecl::None => crate::delivery::CheckpointBackend::None,
+    };
+    // Q1: propagate the manifest's `durability.checkpoint.interval` onto
+    // `delivery.flush.interval`. Pre-Q1 this string field was parsed
+    // and round-tripped through the registry but never reached the
+    // runtime, so blocking-strategy pipelines stuck at the 1-second
+    // default cadence regardless of what the manifest declared. Bad
+    // syntax falls back to the existing default with a warn log so a
+    // typoed unit doesn't block startup.
+    if let Some(interval_str) = def.durability.checkpoint.interval.as_deref() {
+        match crate::retention_probe::parse_hold_duration(interval_str) {
+            Ok(d) => cfg.delivery.flush.interval = d,
+            Err(e) => {
+                tracing::warn!(
+                    pipeline = %def.name,
+                    interval = %interval_str,
+                    error = %e,
+                    "ignoring malformed durability.checkpoint.interval; using default"
+                );
+            }
+        }
+    }
     if matches!(def.durability.mode, DurabilityMode::None) {
-        // Strip the default WAL checkpoint backend so the at-least-once
-        // baseline isn't paying for unrelated FS work in the matrix.
+        // Strip whatever backend the manifest declared so the
+        // at-least-once baseline isn't paying for unrelated FS work
+        // in the matrix. Honors the design rule that DurabilityMode::None
+        // disables checkpoint persistence regardless of the
+        // `checkpoint.backend` declaration.
         cfg.delivery.checkpoint.backend = crate::delivery::CheckpointBackend::None;
         cfg.delivery.checkpoint.retention = std::time::Duration::ZERO;
     }

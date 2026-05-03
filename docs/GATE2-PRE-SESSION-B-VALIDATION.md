@@ -400,11 +400,11 @@ T5/T6 deferred to DOKS re-spin as before.
 
 | Pair | Path | Tier | Status |
 |------|------|------|--------|
-| Native Rust processor · per-event | Memory → Native `.so` → Blackhole, `DurabilityMode::PerEvent` | L2 body + fsync | ⏳ pending (needs native .so artifact) |
-| Native Rust processor · batch | Memory → Native `.so` → Blackhole, `DurabilityMode::OrderedBatch` | L2 body + L3 checkpoint | ⏳ pending |
-| Wasm guest · per-event | Memory → Wasm → Blackhole, `DurabilityMode::PerEvent` | L2 body + fsync | ⏳ pending |
+| Native Rust processor · per-event | Memory → Native `.so` → Blackhole, `DurabilityMode::PerEvent` | L2 body + fsync | ✅ captured 2026-04-30 (N2, fixture: `pipeline-v3-native-perevent.yaml`, image `aeon:v54`) |
+| Native Rust processor · batch | Memory → Native `.so` → Blackhole, `DurabilityMode::OrderedBatch` | L2 body + L3 checkpoint | ✅ captured 2026-04-30 (N1, fixture: `pipeline-v3-native-ordered.yaml`, image `aeon:v54`) |
+| Wasm guest · per-event | Memory → Wasm → Blackhole, `DurabilityMode::PerEvent` | L2 body + fsync | ✅ captured 2026-05-01 (R2, fixture: `pipeline-v3-wasm-perevent.yaml`, image `aeon:v60`); 50K events, 0 failures, `checkpoints_written_total=22` (100ms interval honored), L2 segment 17,649,628 bytes per pod size-equal across all 3 pods |
 | Wasm guest · batch (ordered) | Memory → Wasm → Blackhole, `DurabilityMode::OrderedBatch` | L3 checkpoint via WAL fallback | ✅ captured 2026-04-25 (fixture: `pipeline-v3-wasm-ordered.yaml`) |
-| WAL fallback | Wasm OrderedBatch on RD (L3 redb not configured on this cluster) | WAL tier | ✅ captured 2026-04-25 |
+| WAL fallback | Wasm OrderedBatch on RD (L3 redb now configured via M2) | WAL tier (pre-M2) / L3 redb (post-M2 via aeon:v60) | ✅ captured 2026-04-25 (WAL) + 2026-05-01 (L3) |
 
 **V3 Wasm / OrderedBatch findings (2026-04-25, `aeon:e68ce68`):**
 
@@ -506,17 +506,18 @@ and assert MMR + Merkle + Ed25519 root-sig round-trips; resumed
 
 | PohVerifyMode | Steps | Status |
 |---------------|-------|--------|
-| `Verify` | trigger T4 transfer, `curl /api/v1/pipelines/<name>/partitions/<N>/poh-head` on both peers, assert byte-equal `current_hash` + `mmr_root` + `sequence` | 🟡 endpoint verified live on `aeon:e68ce68`; walk still pending a PoH-enabled pipeline + T4 transfer |
-| `VerifyWithKey` | same as Verify + assert Ed25519 signature over the root verifies against the publisher's pubkey | ⏳ pending |
-| `TrustExtend` | skip verify, confirm target still sequences correctly from the trusted extend point | ⏳ pending |
+| `Verify` | trigger T4 transfer, `curl /api/v1/pipelines/<name>/partitions/<N>/poh-head` on both peers, assert byte-equal `current_hash` + `mmr_root` + `sequence` | ✅ closed 2026-04-29 — PoH manifest wiring (V5.1) + `pipeline-poh-memory.yaml` live run on `aeon:v51`, all 3 pods reported `sequence=98` with byte-equal `current_hash` and `mmr_root` |
+| `VerifyWithKey` | same as Verify + assert Ed25519 signature over the root verifies against the publisher's pubkey | ✅ closed 2026-04-30 — R1 signing-key resolver + W1 cmd_serve install + W2 `/poh-head` `latest_signed_root` surface on `aeon:v53`; `signer_public_key` = `a09aa5f4...3455a4f0` byte-identical to offline-derived key for secret `[0x22; 32]`, on all 3 pods. Independent verify via `aeon verify-poh` CLI (V1, commit `a2bae49`). |
+| `TrustExtend` | skip verify, confirm target still sequences correctly from the trusted extend point | ✅ closed 2026-04-29 alongside `Verify` — chain-only verification needs no key, same fixture exercises this mode by setting `poh_verify_mode: trust_extend` |
 
 **Cross-reference:** PoH chain transport primitives are the CL-6b series,
 all closed 2026-04-16 with 4 integration tests over real QUIC. V5 exists
 to confirm the E2E engine-level wire-up stays green on RD (which itself
 is closed via G2 / CL-6c.4 per 2026-04-23 ROADMAP entry).
 
-**V5 verdict (endpoint live, walk pending):** the new V5 REST
-endpoint is confirmed live on `aeon:e68ce68`:
+**V5 verdict (✅ fully closed end-to-end 2026-04-30):** all three
+PohVerifyMode walks are green on the live RD cluster. Initial endpoint
+verification on `aeon:e68ce68`:
 
 ```
 $ curl http://.../api/v1/pipelines/t0-baseline/partitions/0/poh-head
@@ -529,9 +530,12 @@ $ curl http://.../api/v1/pipelines/does-not-exist/partitions/0/poh-head
 
 Both branches return the exact error text the handler emits,
 confirming the feature-gated `processor-auth + cluster` code path is
-compiled in. Full walk under `{Verify, VerifyWithKey, TrustExtend}`
-still needs a PoH-enabled pipeline + T4 transfer, which is the
-next-session scope.
+compiled in. **Full walks shipped 2026-04-29 → 2026-04-30** via V5.1
+(PoH manifest wiring, commit `389e55b`) + W1/W2 (cmd_serve secret
+install + `/poh-head` `latest_signed_root` surface, commit `eff52d6`)
++ V1 (independent `aeon verify-poh` CLI, commit `a2bae49`). See V3
+row "Native Rust processor · per-event/batch" for the analogous V3
+closure.
 
 ---
 
@@ -618,11 +622,73 @@ next-session scope.
      process. 4-case live walk green: success no-pin / success
      correct-pin / wrong-pin (exit 1) / non-existent-partition
      (exit 1, HTTP 404).
-6. **V3 native processor + per-event rows** — 🟡 still pending. Native
-   `.so` artifact needs to be built from `samples/processors/rust-native`
-   and registered. PerEvent rows need either a Kafka source for
-   natural flow control or a smaller `count` to avoid the 2GiB pod
-   memory limit while doing fsync-per-event (high amplification).
+6. **V3 native processor + per-event rows** — native row ✅
+   **closed 2026-04-30 (N1, image `aeon:v54`)**: new cdylib
+   companion crate `samples/processors/rust-native-cdylib/`
+   exports `JsonEnrichProcessor` via
+   `aeon_native_sdk::export_processor!`; Dockerfile bundles it
+   at `/app/processors/rust-native-v1.so`; supervisor's
+   `build_processor` now switches on `processor.tier` (carried
+   through `ProcessorRef.tier` after a manifest-bridge update)
+   and routes `tier: native` to
+   `NativeProcessor::load`. Live cluster proof: supervisor logged
+   `loaded native processor … artifact=/app/processors/rust-native-v1.so`,
+   100K events received / processed / sent on each pod, zero
+   failures, L2 segment 35,368,556 bytes per pod (size-equal;
+   SHA256 differs because memory source uses `identity: random`).
+   **PerEvent row** ✅ closed 2026-04-30 (N2): new
+   `pipeline-v3-native-perevent.yaml` runs `mode: per_event` +
+   `count: 10000` + native processor, 10K events end-to-end
+   with 0 failures, L2 segment 3,529,628 bytes on disk per pod
+   under fsync amplification. **WAL-fallback row**: covered by
+   5 unit tests + 1 integration test in `aeon-engine`; live
+   cluster trigger via Chaos Mesh IOChaos closed 2026-05-01
+   (C1+C2) — see "Update 2026-05-01" below.
+
+   **Update 2026-05-01 (M1+M2+C1+C2, image `aeon:v57`):**
+   the longstanding `aeon_pipeline_checkpoints_written_total=0`
+   divergence is closed. Three layered gaps resolved:
+   (a) `aeon-cli::cmd_serve` opens
+   `${artifact_dir}/l3-checkpoints.redb` and installs it on
+   `PipelineSupervisor::set_l3_checkpoint_store`;
+   (b) `pipeline_config_for` translates the manifest's
+   `checkpoint.backend` declaration (was silently defaulted to
+   `Wal`); (c) periodic `write_checkpoint` added to the
+   blocking-strategy path in `run_sink_task` (was gated to
+   non-blocking only). Live proof: `state_store` manifests
+   trigger `Checkpoint L3 store initialized` log; OrderedBatch
+   run reports `checkpoints_written_total=2`, PerEvent reports
+   `=30`. Chaos Mesh installed (C1) via helm in namespace
+   `chaos-mesh`; new `docs/examples/chaos-l3-fault-eaccess.yaml`
+   verified `AllInjected: True` against the leader pod via
+   `toda` FUSE proxy. Lifecycle discipline (apply chaos → run
+   pipeline → stop pipeline → delete chaos) documented inline
+   to avoid `ENOTCONN` mount-tear-down on open file handles.
+   Pre-existing FT-1/FT-2 caveat: cluster bootstrap still uses
+   `MemLogStore` (Raft state non-persistent), so force-deleting
+   pods can leave orphaned redb file locks — `rm -f
+   /app/artifacts/l3-checkpoints.redb` clears them. Full WAL→L3
+   drain on chaos recovery is covered by the
+   `try_recover_primary` unit test; live-trigger of that path
+   remains a follow-up atom.
+
+   **Update 2026-05-01b — toda EACCES injection on k3s is not
+   reliable:** under Rancher Desktop k3s, the toda FUSE proxy
+   that Chaos Mesh's IOChaos uses degrades to `ENOTCONN`
+   ("Transport endpoint is not connected") on writes after a
+   few attempts, instead of the configured `errno: 13`
+   (EACCES). The fault doesn't reach the engine as a controlled
+   `Result::Err`, so `FallbackCheckpointStore::engage_fallback`
+   doesn't fire predictably. Direct probe via
+   `kubectl exec aeon-1 -- sh -c 'echo test > /app/artifacts/probe'`
+   confirmed the toda mount returns ENOTCONN universally, not
+   EACCES selectively. The unit-test path
+   (`eo2_recovery::tests::primary_error_engages_fallback`)
+   remains the authoritative coverage for the fallback
+   contract. A more stable live-trigger approach (manual
+   `chmod -w` via kubectl exec, network-level fault on a
+   remote L3 backend, or StressChaos targeting fsync) would
+   close the gap; tracked as a separate follow-up atom.
 
 ### What a green Session B looks like
 

@@ -1,0 +1,11 @@
+# One-shot label patcher. Layered on top of the existing v64 image so we
+# don't have to recompile to add the GHCR repo-linkage label. Future full
+# builds (Dockerfile in repo root) carry these labels natively.
+FROM ghcr.io/aeon-rust/aeon:v64
+
+LABEL org.opencontainers.image.source="https://github.com/aeon-rust/aeon" \
+      org.opencontainers.image.url="https://github.com/aeon-rust/aeon" \
+      org.opencontainers.image.title="aeon" \
+      org.opencontainers.image.description="Aeon real-time data processing engine" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.revision="6598f98"

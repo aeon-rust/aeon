@@ -98,6 +98,21 @@ enum Commands {
         #[arg(long, default_value_t = default_api())]
         api: String,
     },
+    /// W3 — debug: arm the supervisor's L3 fault injector to fail
+    /// the next N write operations. Drives the `FallbackCheckpointStore`
+    /// engagement path live without requiring chaos-mesh-style
+    /// filesystem-layer faults that don't propagate through redb's
+    /// mmap'd open fds. After N writes fail, the wrapper resumes
+    /// passthrough and `try_recover_primary` heals the L3 store on
+    /// the sink task's next periodic recovery attempt.
+    InjectL3Fault {
+        /// Number of write operations to fail. Default: 1.
+        #[arg(long, default_value_t = 1)]
+        count: u64,
+        /// Aeon REST API base URL.
+        #[arg(long, default_value_t = default_api())]
+        api: String,
+    },
     /// Verify a per-partition PoH chain head against its embedded
     /// signature (and optionally a pinned operator-supplied public key).
     ///
@@ -529,6 +544,7 @@ fn run(cli: Cli) -> Result<()> {
         }) => cmd_deploy(&artifact, &pipeline, &processor, &version, &api),
         Some(Commands::Top { api }) => cmd_top(&api),
         Some(Commands::Verify { target, api }) => cmd_verify(&target, &api),
+        Some(Commands::InjectL3Fault { count, api }) => cmd_inject_l3_fault(count, &api),
         Some(Commands::VerifyPoh {
             pipeline,
             partition,
@@ -752,6 +768,63 @@ fn cmd_serve(addr: &str, artifact_dir: &str) -> Result<()> {
             }
         }
 
+        // M2 / FT-3: install the L3 checkpoint store so pipelines that
+        // declare `durability.checkpoint.backend: state_store` get a
+        // real `L3CheckpointStore` instead of silently falling through
+        // to a None writer. Backed by a redb file at
+        // `${artifact_dir}/l3-checkpoints.redb` (sync_writes: true so
+        // checkpoint records survive an unclean shutdown). Wrapped in
+        // `FallbackCheckpointStore` downstream by `build_sink_task_ctx`
+        // so an L3 write error transparently degrades to the WAL
+        // sidecar at `${checkpoint_dir}/fallback.wal`.
+        let l3_path = std::path::PathBuf::from(&dir).join("l3-checkpoints.redb");
+        match aeon_state::RedbStore::open(aeon_state::RedbConfig {
+            path: l3_path.clone(),
+            sync_writes: true,
+        }) {
+            Ok(store) => {
+                // W3 / F1: wrap the redb store in a FaultyL3Wrapper so
+                // the REST `POST /api/v1/test/inject-l3-fault` endpoint
+                // can drive the FallbackCheckpointStore engagement
+                // path live. The wrapper is a no-op when its fault
+                // counter is 0 (default), so this is safe to leave on
+                // in all builds. Production hardening (feature gate
+                // the install) is a separate atom.
+                let raw: Arc<dyn aeon_types::L3Store> = Arc::new(store);
+                let wrapper = aeon_engine::debug_fault::FaultyL3Wrapper::new(raw);
+                let wrapper_for_l3: Arc<dyn aeon_types::L3Store> =
+                    Arc::new(wrapper.clone());
+                if let Err(e) = supervisor.set_l3_checkpoint_store(wrapper_for_l3) {
+                    tracing::warn!(
+                        error = %e,
+                        "supervisor L3 checkpoint store install failed"
+                    );
+                } else if let Err(e) = supervisor.set_fault_injector(wrapper) {
+                    tracing::warn!(
+                        error = %e,
+                        "supervisor fault injector install failed"
+                    );
+                } else {
+                    tracing::info!(
+                        path = %l3_path.display(),
+                        "supervisor L3 checkpoint store installed (wrapped in \
+                         FaultyL3Wrapper for /api/v1/test/inject-l3-fault); \
+                         state_store backend pipelines will now record \
+                         aeon_pipeline_checkpoints_written_total"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    path = %l3_path.display(),
+                    error = %e,
+                    "L3 checkpoint redb open failed; pipelines declaring \
+                     checkpoint.backend=state_store will run without a \
+                     checkpoint writer (legacy behaviour)"
+                );
+            }
+        }
+
         // Cluster initialization — detect K8s environment
         let cluster_enabled = std::env::var("AEON_CLUSTER_ENABLED")
             .map(|v| v.to_lowercase() == "true")
@@ -862,18 +935,77 @@ fn cmd_serve(addr: &str, artifact_dir: &str) -> Result<()> {
                     // G10 — branch on bootstrap vs join. bootstrap_multi()
                     // runs `raft.initialize(members)`; join() seed-contacts an
                     // existing leader and lets it `add_learner → change_membership`.
+                    //
+                    // FT-1 + FT-2: open a separate redb store at
+                    // `${artifact_dir}/raft.redb` (NOT the same file as the
+                    // M2 checkpoint store — different access patterns: Raft
+                    // log is append-heavy with frequent fsync, checkpoints
+                    // are appended only at flush_interval). On pod restart,
+                    // reopening this file recovers term + log + applied
+                    // state, so the cluster doesn't have to re-elect from
+                    // term=1 — which under MemLogStore caused split-brain
+                    // when one pod restarted while others were still at the
+                    // pre-restart term. If the redb open fails, fall back to
+                    // the legacy in-memory variant with a warn log so dev /
+                    // test clusters still bootstrap.
+                    let raft_path = std::path::PathBuf::from(&dir).join("raft.redb");
+                    let raft_l3: Option<Arc<dyn aeon_types::L3Store>> = match
+                        aeon_state::RedbStore::open(aeon_state::RedbConfig {
+                            path: raft_path.clone(),
+                            sync_writes: true,
+                        })
+                    {
+                        Ok(s) => {
+                            tracing::info!(
+                                path = %raft_path.display(),
+                                "FT-1 + FT-2: Raft log + state machine backed by redb"
+                            );
+                            Some(Arc::new(s) as Arc<dyn aeon_types::L3Store>)
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                path = %raft_path.display(),
+                                error = %e,
+                                "Raft redb open failed; falling back to in-memory log + state — \
+                                 cluster will lose state across pod restarts"
+                            );
+                            None
+                        }
+                    };
+
                     let poh_mode_str = config.poh_verify_mode.clone();
-                    let node = if scale_up {
-                        aeon_cluster::ClusterNode::join(config, Arc::clone(&endpoint))
+                    let node = match (scale_up, raft_l3.as_ref()) {
+                        (true, Some(l3)) => {
+                            aeon_cluster::ClusterNode::join_persistent(
+                                config,
+                                Arc::clone(&endpoint),
+                                Arc::clone(l3),
+                            )
                             .await
-                            .map_err(|e| anyhow::anyhow!("Cluster seed-join failed: {e}"))?
-                    } else {
-                        aeon_cluster::ClusterNode::bootstrap_multi(
-                            config,
-                            Arc::clone(&endpoint),
-                        )
-                        .await
-                        .map_err(|e| anyhow::anyhow!("Cluster bootstrap failed: {e}"))?
+                            .map_err(|e| anyhow::anyhow!("Cluster seed-join (persistent) failed: {e}"))?
+                        }
+                        (true, None) => {
+                            aeon_cluster::ClusterNode::join(config, Arc::clone(&endpoint))
+                                .await
+                                .map_err(|e| anyhow::anyhow!("Cluster seed-join failed: {e}"))?
+                        }
+                        (false, Some(l3)) => {
+                            aeon_cluster::ClusterNode::bootstrap_multi_persistent(
+                                config,
+                                Arc::clone(&endpoint),
+                                Arc::clone(l3),
+                            )
+                            .await
+                            .map_err(|e| anyhow::anyhow!("Cluster bootstrap (persistent) failed: {e}"))?
+                        }
+                        (false, None) => {
+                            aeon_cluster::ClusterNode::bootstrap_multi(
+                                config,
+                                Arc::clone(&endpoint),
+                            )
+                            .await
+                            .map_err(|e| anyhow::anyhow!("Cluster bootstrap failed: {e}"))?
+                        }
                     };
 
                     let node = Arc::new(node);
@@ -2428,6 +2560,46 @@ fn cmd_verify(target: &str, api: &str) -> Result<()> {
 /// the process exits non-zero — useful as a CI / smoke-test gate
 /// independent of the running aeon binary's own `aeon verify`
 /// self-test (which exercises local crypto modules in isolation).
+/// W3 — call the debug L3 fault injection endpoint.
+fn cmd_inject_l3_fault(count: u64, api: &str) -> Result<()> {
+    println!("Aeon L3 fault injection");
+    println!("{}", "=".repeat(60));
+    println!("API:     {api}");
+    println!("Count:   {count}");
+    println!();
+
+    let url = format!("{api}/api/v1/test/inject-l3-fault?count={count}");
+    let resp = ureq::post(&url)
+        .send_string("")
+        .with_context(|| format!("POST {url} failed"))?;
+
+    let body: serde_json::Value =
+        resp.into_json().context("invalid JSON from inject-l3-fault")?;
+    println!(
+        "Status:               {}",
+        body["status"].as_str().unwrap_or("?")
+    );
+    println!(
+        "Previous remaining:   {}",
+        body["previous_remaining"].as_u64().unwrap_or(0)
+    );
+    println!(
+        "New remaining:        {}",
+        body["new_remaining"].as_u64().unwrap_or(0)
+    );
+    println!(
+        "Fault total at start: {}",
+        body["fault_total_since_start"].as_u64().unwrap_or(0)
+    );
+    println!();
+    println!(
+        "Watch /metrics for `aeon_checkpoint_fallback_wal_total` to tick \
+         within ~one flush_interval as the next checkpoint write hits \
+         the injected fault and engages the WAL fallback."
+    );
+    Ok(())
+}
+
 fn cmd_verify_poh(
     pipeline: &str,
     partition: u16,

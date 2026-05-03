@@ -1,0 +1,27 @@
+# F3 fixture — single partition so the test is isolated to one pod.
+pipelines:
+  - name: f3-fault
+    partitions: 1
+    durability:
+      mode: per_event
+      checkpoint:
+        backend: state_store
+        interval: 50ms
+    sources:
+      - name: memory-synth
+        type: memory
+        kind: push
+        identity:
+          mode: random
+        event_time:
+          mode: aeon_ingest
+        count: "10000"
+        payload_size: "256"
+        batch_size: "256"
+    processor:
+      name: __identity
+      version: "0.0.0"
+    sinks:
+      - name: blackhole-discard
+        type: blackhole
+        eos_tier: t6_fire_and_forget
