@@ -82,8 +82,7 @@ pub(super) fn resolve_opts(
             // `From<Vec<u8>> for PathOrBuf<'static>` is the inline-PEM
             // escape hatch — signer's SecretBytes are copied into owned
             // vecs that mysql_async keeps in the Opts. Nothing lands on disk.
-            let identity =
-                ClientIdentity::new(cert_pem.to_vec().into(), key_pem.to_vec().into());
+            let identity = ClientIdentity::new(cert_pem.to_vec().into(), key_pem.to_vec().into());
             let ssl = SslOpts::default().with_client_identity(Some(identity));
             let builder = OptsBuilder::from_opts(opts).ssl_opts(ssl);
             Ok(builder.into())
@@ -131,11 +130,7 @@ mod tests {
             broker_native: Some(BrokerNativeConfig { values }),
             ..Default::default()
         });
-        let opts = resolve_opts(
-            "mysql://url-user:url-pw@127.0.0.1:3306/url-db",
-            Some(&s),
-        )
-        .unwrap();
+        let opts = resolve_opts("mysql://url-user:url-pw@127.0.0.1:3306/url-db", Some(&s)).unwrap();
         assert_eq!(opts.user(), Some("signer-user"));
         assert_eq!(opts.pass(), Some("signer-pw"));
         assert_eq!(opts.db_name(), Some("signer-db"));

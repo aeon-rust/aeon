@@ -27,8 +27,8 @@ use aeon_types::event::Event;
 use aeon_types::{DurabilityMode, PartitionId, SourceKind};
 use bytes::Bytes;
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 fn make_events(n: usize, payload_size: usize) -> Vec<Event> {
@@ -162,35 +162,32 @@ fn l2_append_throughput(c: &mut Criterion) {
         let event_count = 10_000usize;
         group.throughput(Throughput::Elements(event_count as u64));
 
-        group.bench_function(
-            BenchmarkId::new("payload_bytes", payload_size),
-            |b| {
-                b.iter_batched(
-                    || {
-                        let events = make_events(event_count, payload_size);
-                        let tmp = tempfile::tempdir().unwrap();
-                        let dir = tmp.path().join("l2-bench");
-                        std::fs::create_dir_all(&dir).unwrap();
-                        let store = L2BodyStore::open(
-                            dir,
-                            aeon_engine::l2_body::L2BodyConfig {
-                                segment_bytes: 256 * 1024 * 1024,
-                                kek: None,
-                                gc_min_hold: std::time::Duration::ZERO,
-                            },
-                        )
-                        .unwrap();
-                        (events, store, tmp)
-                    },
-                    |(events, mut store, _tmp)| {
-                        for event in &events {
-                            store.append(event).unwrap();
-                        }
-                    },
-                    BatchSize::LargeInput,
-                );
-            },
-        );
+        group.bench_function(BenchmarkId::new("payload_bytes", payload_size), |b| {
+            b.iter_batched(
+                || {
+                    let events = make_events(event_count, payload_size);
+                    let tmp = tempfile::tempdir().unwrap();
+                    let dir = tmp.path().join("l2-bench");
+                    std::fs::create_dir_all(&dir).unwrap();
+                    let store = L2BodyStore::open(
+                        dir,
+                        aeon_engine::l2_body::L2BodyConfig {
+                            segment_bytes: 256 * 1024 * 1024,
+                            kek: None,
+                            gc_min_hold: std::time::Duration::ZERO,
+                        },
+                    )
+                    .unwrap();
+                    (events, store, tmp)
+                },
+                |(events, mut store, _tmp)| {
+                    for event in &events {
+                        store.append(event).unwrap();
+                    }
+                },
+                BatchSize::LargeInput,
+            );
+        });
     }
 
     group.finish();
@@ -291,53 +288,47 @@ fn checkpoint_cadence(c: &mut Criterion) {
     group.throughput(Throughput::Elements(event_count as u64));
 
     for &interval_ms in &[1u64, 10, 100, 500] {
-        group.bench_function(
-            BenchmarkId::new("flush_interval_ms", interval_ms),
-            |b| {
-                b.iter_batched(
-                    || {
-                        let events = make_events(event_count, 256);
-                        let tmp = tempfile::tempdir().unwrap();
-                        let registry = PipelineL2Registry::new(L2BodyStoreConfig {
-                            root: Some(tmp.path().to_path_buf()),
-                            segment_bytes: 64 * 1024 * 1024,
-                        });
+        group.bench_function(BenchmarkId::new("flush_interval_ms", interval_ms), |b| {
+            b.iter_batched(
+                || {
+                    let events = make_events(event_count, 256);
+                    let tmp = tempfile::tempdir().unwrap();
+                    let registry = PipelineL2Registry::new(L2BodyStoreConfig {
+                        root: Some(tmp.path().to_path_buf()),
+                        segment_bytes: 64 * 1024 * 1024,
+                    });
 
-                        let mut config = PipelineConfig::default();
-                        config.pipeline_name = "ckpt-cadence-bench".into();
-                        config.delivery.durability = DurabilityMode::OrderedBatch;
-                        config.l2_registry = Some(registry);
-                        config.delivery.flush.interval =
-                            Duration::from_millis(interval_ms);
-                        (events, config, tmp)
-                    },
-                    |(events, config, _tmp)| {
-                        rt.block_on(async {
-                            let target = events.len() as u64;
-                            let source = OneShotPushSource {
-                                batch: Some(events),
-                            };
-                            let processor = PassthroughProcessor::new(Arc::from("out"));
-                            let sink = BlackholeSink::new();
-                            let metrics = Arc::new(PipelineMetrics::new());
-                            let shutdown = Arc::new(AtomicBool::new(false));
-                            let stopper = shutdown_after_target(
-                                Arc::clone(&metrics),
-                                Arc::clone(&shutdown),
-                                target,
-                            );
-                            run_buffered(
-                                source, processor, sink, config, metrics, shutdown, None,
-                            )
+                    let mut config = PipelineConfig::default();
+                    config.pipeline_name = "ckpt-cadence-bench".into();
+                    config.delivery.durability = DurabilityMode::OrderedBatch;
+                    config.l2_registry = Some(registry);
+                    config.delivery.flush.interval = Duration::from_millis(interval_ms);
+                    (events, config, tmp)
+                },
+                |(events, config, _tmp)| {
+                    rt.block_on(async {
+                        let target = events.len() as u64;
+                        let source = OneShotPushSource {
+                            batch: Some(events),
+                        };
+                        let processor = PassthroughProcessor::new(Arc::from("out"));
+                        let sink = BlackholeSink::new();
+                        let metrics = Arc::new(PipelineMetrics::new());
+                        let shutdown = Arc::new(AtomicBool::new(false));
+                        let stopper = shutdown_after_target(
+                            Arc::clone(&metrics),
+                            Arc::clone(&shutdown),
+                            target,
+                        );
+                        run_buffered(source, processor, sink, config, metrics, shutdown, None)
                             .await
                             .unwrap();
-                            stopper.await.unwrap();
-                        });
-                    },
-                    BatchSize::LargeInput,
-                );
-            },
-        );
+                        stopper.await.unwrap();
+                    });
+                },
+                BatchSize::LargeInput,
+            );
+        });
     }
 
     group.finish();
@@ -379,18 +370,14 @@ fn capacity_tracking_overhead(c: &mut Criterion) {
                     config.delivery.flush.interval = Duration::from_millis(10);
 
                     if with_capacity {
-                        let node =
-                            aeon_engine::eo2_backpressure::NodeCapacity::new(None);
-                        let caps =
-                            aeon_engine::eo2_backpressure::CapacityLimits::from_config(
-                                None,
-                                Some(1024 * 1024 * 1024),
-                                1,
-                            );
+                        let node = aeon_engine::eo2_backpressure::NodeCapacity::new(None);
+                        let caps = aeon_engine::eo2_backpressure::CapacityLimits::from_config(
+                            None,
+                            Some(1024 * 1024 * 1024),
+                            1,
+                        );
                         config.eo2_capacity = Some(
-                            aeon_engine::eo2_backpressure::PipelineCapacity::new(
-                                caps, node,
-                            ),
+                            aeon_engine::eo2_backpressure::PipelineCapacity::new(caps, node),
                         );
                     }
                     (events, config, tmp)
@@ -443,66 +430,58 @@ fn content_hash_dedup(c: &mut Criterion) {
         // First-seen: every call gets a distinct payload, so every call
         // hashes + inserts. Amortised by pre-building a Vec of payloads
         // so only the hash+insert is timed.
-        group.bench_with_input(
-            BenchmarkId::new("first_seen", size),
-            &size,
-            |b, &sz| {
-                b.iter_batched(
-                    || {
-                        // Each iteration gets a fresh dedup and a pool of
-                        // 1 000 distinct payloads. Use the event-index so
-                        // every byte string is unique without hashing cost
-                        // before the measurement starts.
-                        let d = ContentHashDedup::new(
-                            ContentHashAlgorithm::Xxhash3_64,
-                            Duration::from_secs(300),
-                        );
-                        let payloads: Vec<Vec<u8>> = (0..1_000)
-                            .map(|i| {
-                                let mut v = vec![b'x'; sz];
-                                v[..8].copy_from_slice(&(i as u64).to_le_bytes());
-                                v
-                            })
-                            .collect();
-                        (d, payloads)
-                    },
-                    |(d, payloads)| {
-                        for p in &payloads {
-                            let _ = d.check_and_mark(p);
-                        }
-                    },
-                    BatchSize::LargeInput,
-                );
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("first_seen", size), &size, |b, &sz| {
+            b.iter_batched(
+                || {
+                    // Each iteration gets a fresh dedup and a pool of
+                    // 1 000 distinct payloads. Use the event-index so
+                    // every byte string is unique without hashing cost
+                    // before the measurement starts.
+                    let d = ContentHashDedup::new(
+                        ContentHashAlgorithm::Xxhash3_64,
+                        Duration::from_secs(300),
+                    );
+                    let payloads: Vec<Vec<u8>> = (0..1_000)
+                        .map(|i| {
+                            let mut v = vec![b'x'; sz];
+                            v[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                            v
+                        })
+                        .collect();
+                    (d, payloads)
+                },
+                |(d, payloads)| {
+                    for p in &payloads {
+                        let _ = d.check_and_mark(p);
+                    }
+                },
+                BatchSize::LargeInput,
+            );
+        });
 
         // Repeat-lookup: the dedup is pre-warmed with the same payload,
         // so every check_and_mark is a hash + get (duplicate detected).
         // Isolates the read path cost.
-        group.bench_with_input(
-            BenchmarkId::new("repeat_lookup", size),
-            &size,
-            |b, &sz| {
-                b.iter_batched(
-                    || {
-                        let d = ContentHashDedup::new(
-                            ContentHashAlgorithm::Xxhash3_64,
-                            Duration::from_secs(300),
-                        );
-                        let payload = vec![b'x'; sz];
-                        // Pre-warm — first call inserts, benchmark hits repeat path.
+        group.bench_with_input(BenchmarkId::new("repeat_lookup", size), &size, |b, &sz| {
+            b.iter_batched(
+                || {
+                    let d = ContentHashDedup::new(
+                        ContentHashAlgorithm::Xxhash3_64,
+                        Duration::from_secs(300),
+                    );
+                    let payload = vec![b'x'; sz];
+                    // Pre-warm — first call inserts, benchmark hits repeat path.
+                    let _ = d.check_and_mark(&payload);
+                    (d, payload)
+                },
+                |(d, payload)| {
+                    for _ in 0..1_000 {
                         let _ = d.check_and_mark(&payload);
-                        (d, payload)
-                    },
-                    |(d, payload)| {
-                        for _ in 0..1_000 {
-                            let _ = d.check_and_mark(&payload);
-                        }
-                    },
-                    BatchSize::LargeInput,
-                );
-            },
-        );
+                    }
+                },
+                BatchSize::LargeInput,
+            );
+        });
     }
 
     group.finish();

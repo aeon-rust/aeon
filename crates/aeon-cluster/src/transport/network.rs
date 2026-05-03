@@ -20,8 +20,8 @@ use crate::raft_config::AeonRaftConfig;
 use crate::transport::endpoint::QuicEndpoint;
 use crate::transport::framing::{self, MessageType};
 use crate::types::{
-    JoinRequest, JoinResponse, NodeAddress, NodeId, ProposeForwardRequest,
-    ProposeForwardResponse, RemoveNodeRequest, RemoveNodeResponse,
+    JoinRequest, JoinResponse, NodeAddress, NodeId, ProposeForwardRequest, ProposeForwardResponse,
+    RemoveNodeRequest, RemoveNodeResponse,
 };
 
 /// Factory that creates QUIC-based RaftNetwork connections.
@@ -307,11 +307,10 @@ async fn cluster_rpc_uncached<Req: serde::Serialize, Resp: serde::de::Deserializ
         retryable: true,
     })?;
 
-    let payload =
-        bincode::serialize(request).map_err(|e| AeonError::Serialization {
-            message: format!("serialize cluster RPC request: {e}"),
-            source: None,
-        })?;
+    let payload = bincode::serialize(request).map_err(|e| AeonError::Serialization {
+        message: format!("serialize cluster RPC request: {e}"),
+        source: None,
+    })?;
 
     framing::write_frame(&mut send, msg_type, &payload).await?;
     send.finish().map_err(|e| AeonError::Connection {
@@ -333,12 +332,11 @@ async fn cluster_rpc_uncached<Req: serde::Serialize, Resp: serde::de::Deserializ
         });
     }
 
-    let response: Resp = bincode::deserialize(&resp_payload).map_err(|e| {
-        AeonError::Serialization {
+    let response: Resp =
+        bincode::deserialize(&resp_payload).map_err(|e| AeonError::Serialization {
             message: format!("deserialize cluster RPC response: {e}"),
             source: None,
-        }
-    })?;
+        })?;
 
     Ok(response)
 }
@@ -367,11 +365,10 @@ async fn cluster_rpc<Req: serde::Serialize, Resp: serde::de::DeserializeOwned>(
         retryable: true,
     })?;
 
-    let payload =
-        bincode::serialize(request).map_err(|e| AeonError::Serialization {
-            message: format!("serialize cluster RPC request: {e}"),
-            source: None,
-        })?;
+    let payload = bincode::serialize(request).map_err(|e| AeonError::Serialization {
+        message: format!("serialize cluster RPC request: {e}"),
+        source: None,
+    })?;
 
     framing::write_frame(&mut send, msg_type, &payload).await?;
     send.finish().map_err(|e| AeonError::Connection {
@@ -393,12 +390,11 @@ async fn cluster_rpc<Req: serde::Serialize, Resp: serde::de::DeserializeOwned>(
         });
     }
 
-    let response: Resp = bincode::deserialize(&resp_payload).map_err(|e| {
-        AeonError::Serialization {
+    let response: Resp =
+        bincode::deserialize(&resp_payload).map_err(|e| AeonError::Serialization {
             message: format!("deserialize cluster RPC response: {e}"),
             source: None,
-        }
-    })?;
+        })?;
 
     Ok(response)
 }

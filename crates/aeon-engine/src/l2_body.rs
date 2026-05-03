@@ -337,9 +337,7 @@ impl L2BodySegment {
         // recovery is a cold path.
         let data = std::fs::read(path)
             .map_err(|e| AeonError::state(format!("l2-body: read {path:?}: {e}")))?;
-        if data.len() < HEADER_SIZE as usize
-            || &data[0..8] != SEGMENT_MAGIC
-        {
+        if data.len() < HEADER_SIZE as usize || &data[0..8] != SEGMENT_MAGIC {
             return Err(AeonError::state("l2-body: bad header on read"));
         }
         Ok(SegmentRecordIter {
@@ -369,11 +367,7 @@ impl Iterator for SegmentRecordIter {
             self.done = true;
             return None;
         }
-        let seq = u64::from_le_bytes(
-            self.data[self.offset..self.offset + 8]
-                .try_into()
-                .ok()?,
-        );
+        let seq = u64::from_le_bytes(self.data[self.offset..self.offset + 8].try_into().ok()?);
         let crc = u32::from_le_bytes(
             self.data[self.offset + 8..self.offset + 12]
                 .try_into()
@@ -420,9 +414,7 @@ impl Iterator for SegmentRecordIter {
             Ok(e) => e,
             Err(e) => {
                 self.done = true;
-                return Some(Err(AeonError::state(format!(
-                    "l2-body: decode event: {e}"
-                ))));
+                return Some(Err(AeonError::state(format!("l2-body: decode event: {e}"))));
             }
         };
 
@@ -609,10 +601,7 @@ impl L2BodyStore {
                         reclaimed += 1;
                         continue;
                     }
-                    let stamp = *self
-                        .eligible_since
-                        .entry(start_seq)
-                        .or_insert(now);
+                    let stamp = *self.eligible_since.entry(start_seq).or_insert(now);
                     if now.saturating_duration_since(stamp) >= hold {
                         let path = seg.path.clone();
                         std::fs::remove_file(&path)
@@ -659,10 +648,7 @@ impl L2BodyStore {
 
     /// Iterate events from `from_seq` onward. Used on recovery to replay the
     /// body store from the last committed sink ack seq.
-    pub fn iter_from(
-        &self,
-        from_seq: u64,
-    ) -> Result<Vec<(u64, Event)>, AeonError> {
+    pub fn iter_from(&self, from_seq: u64) -> Result<Vec<(u64, Event)>, AeonError> {
         let mut out = Vec::new();
         for seg in &self.segments {
             if let Some(m) = seg.max_seq {
@@ -756,7 +742,11 @@ mod tests {
     fn store_rolls_over_on_segment_bytes() {
         let dir = tmp_dir();
         // Tiny threshold to force rollover after a few events.
-        let cfg = L2BodyConfig { segment_bytes: 64, kek: None, gc_min_hold: std::time::Duration::ZERO };
+        let cfg = L2BodyConfig {
+            segment_bytes: 64,
+            kek: None,
+            gc_min_hold: std::time::Duration::ZERO,
+        };
         let mut store = L2BodyStore::open(&dir, cfg).unwrap();
         for i in 0..8u64 {
             store.append(&ev(i)).unwrap();
@@ -782,7 +772,15 @@ mod tests {
     #[test]
     fn store_iter_from() {
         let dir = tmp_dir();
-        let mut store = L2BodyStore::open(&dir, L2BodyConfig { segment_bytes: 64, kek: None, gc_min_hold: std::time::Duration::ZERO }).unwrap();
+        let mut store = L2BodyStore::open(
+            &dir,
+            L2BodyConfig {
+                segment_bytes: 64,
+                kek: None,
+                gc_min_hold: std::time::Duration::ZERO,
+            },
+        )
+        .unwrap();
         for i in 0..6u64 {
             store.append(&ev(i)).unwrap();
         }
@@ -800,7 +798,15 @@ mod tests {
     #[test]
     fn store_gc_drops_fully_acked_segments() {
         let dir = tmp_dir();
-        let mut store = L2BodyStore::open(&dir, L2BodyConfig { segment_bytes: 64, kek: None, gc_min_hold: std::time::Duration::ZERO }).unwrap();
+        let mut store = L2BodyStore::open(
+            &dir,
+            L2BodyConfig {
+                segment_bytes: 64,
+                kek: None,
+                gc_min_hold: std::time::Duration::ZERO,
+            },
+        )
+        .unwrap();
         for i in 0..10u64 {
             store.append(&ev(i)).unwrap();
         }
@@ -818,7 +824,15 @@ mod tests {
     #[test]
     fn store_gc_respects_ack_cursor() {
         let dir = tmp_dir();
-        let mut store = L2BodyStore::open(&dir, L2BodyConfig { segment_bytes: 64, kek: None, gc_min_hold: std::time::Duration::ZERO }).unwrap();
+        let mut store = L2BodyStore::open(
+            &dir,
+            L2BodyConfig {
+                segment_bytes: 64,
+                kek: None,
+                gc_min_hold: std::time::Duration::ZERO,
+            },
+        )
+        .unwrap();
         for i in 0..10u64 {
             store.append(&ev(i)).unwrap();
         }
@@ -946,15 +960,19 @@ mod tests {
     /// not race on shared state.
     fn test_kek() -> Arc<KekHandle> {
         use aeon_crypto::kek::KekDomain;
-        use aeon_types::{SecretBytes, SecretError, SecretProvider, SecretRef, SecretRegistry, SecretScheme};
+        use aeon_types::{
+            SecretBytes, SecretError, SecretProvider, SecretRef, SecretRegistry, SecretScheme,
+        };
         use std::sync::atomic::{AtomicU64, Ordering};
 
         struct HexEnv;
         impl SecretProvider for HexEnv {
-            fn scheme(&self) -> SecretScheme { SecretScheme::Env }
+            fn scheme(&self) -> SecretScheme {
+                SecretScheme::Env
+            }
             fn resolve(&self, path: &str) -> Result<SecretBytes, SecretError> {
-                let v = std::env::var(path)
-                    .map_err(|_| SecretError::EnvNotSet(path.to_string()))?;
+                let v =
+                    std::env::var(path).map_err(|_| SecretError::EnvNotSet(path.to_string()))?;
                 let bytes: Vec<u8> = (0..v.len())
                     .step_by(2)
                     .map(|i| u8::from_str_radix(&v[i..i + 2], 16).unwrap_or(0))
@@ -995,7 +1013,10 @@ mod tests {
         }
 
         // Sidecar must exist.
-        assert!(meta_path_for(&path).exists(), "encrypted segment must write sidecar");
+        assert!(
+            meta_path_for(&path).exists(),
+            "encrypted segment must write sidecar"
+        );
 
         // Raw bytes on disk must not contain the plaintext payload —
         // sanity check that AES-GCM actually ran.

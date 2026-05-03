@@ -169,8 +169,14 @@ mod tests {
                 "mongodb+srv://u:p@cluster0.example.net/db?authSource=admin",
                 "mongodb+srv://***@cluster0.example.net/db?authSource=admin",
             ),
-            ("wss://user:token@api.example.com/stream", "wss://***@api.example.com/stream"),
-            ("https://admin:secret@dashboard.example/", "https://***@dashboard.example/"),
+            (
+                "wss://user:token@api.example.com/stream",
+                "wss://***@api.example.com/stream",
+            ),
+            (
+                "https://admin:secret@dashboard.example/",
+                "https://***@dashboard.example/",
+            ),
         ];
         for (input, expected) in cases {
             let c = redact_uri(input);
@@ -235,15 +241,12 @@ mod tests {
             "content-type",
             "x-request-id",
             "trace-id",
-            "aeon.subjectId",   // wrong casing
-            "aeon_subject_id",  // wrong separator
-            "subject_id",       // missing namespace prefix
+            "aeon.subjectId",  // wrong casing
+            "aeon_subject_id", // wrong separator
+            "subject_id",      // missing namespace prefix
             "",
         ] {
-            assert!(
-                !is_redacted_metadata_key(k),
-                "should NOT be denied: {k:?}"
-            );
+            assert!(!is_redacted_metadata_key(k), "should NOT be denied: {k:?}");
         }
     }
 

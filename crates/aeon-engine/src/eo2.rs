@@ -134,11 +134,7 @@ impl PipelineL2Registry {
     /// deterministically — it does not require the store to be opened.
     /// Used by CL-6c.4's `L2SegmentTransferProvider` to walk segments
     /// even when the partition is currently quiesced.
-    pub fn partition_dir(
-        &self,
-        pipeline: &str,
-        partition: PartitionId,
-    ) -> Option<PathBuf> {
+    pub fn partition_dir(&self, pipeline: &str, partition: PartitionId) -> Option<PathBuf> {
         self.root
             .as_ref()
             .map(|r| r.join(pipeline).join(format!("p{:05}", partition.as_u16())))
@@ -276,7 +272,8 @@ impl<S: Source> Source for L2WritingSource<S> {
         pull_offsets: &HashMap<PartitionId, i64>,
         replay_from_l2_seq: u64,
     ) -> impl std::future::Future<Output = Result<(), AeonError>> + Send {
-        self.inner.on_recovery_plan(pull_offsets, replay_from_l2_seq)
+        self.inner
+            .on_recovery_plan(pull_offsets, replay_from_l2_seq)
     }
 
     fn broker_coordinated_partitions(&self) -> bool {
@@ -311,12 +308,7 @@ impl<S: Source> MaybeL2Wrapped<S> {
     ) -> Self {
         match registry {
             Some(reg) if mode.requires_l2_body_store() => {
-                let mut l2 = L2WritingSource::new(
-                    source,
-                    pipeline_name,
-                    reg.clone(),
-                    mode,
-                );
+                let mut l2 = L2WritingSource::new(source, pipeline_name, reg.clone(), mode);
                 if let Some(c) = capacity {
                     l2 = l2.with_capacity(c.clone());
                 }
@@ -506,7 +498,8 @@ mod tests {
             batches: vec![vec![ev(0, 0), ev(0, 1)]].into_iter(),
             kind: SourceKind::Pull,
         };
-        let mut adapter = L2WritingSource::new(src, "pipe", reg.clone(), DurabilityMode::OrderedBatch);
+        let mut adapter =
+            L2WritingSource::new(src, "pipe", reg.clone(), DurabilityMode::OrderedBatch);
         assert!(adapter.is_passthrough());
         let batch = adapter.next_batch().await.unwrap();
         assert_eq!(batch.len(), 2);

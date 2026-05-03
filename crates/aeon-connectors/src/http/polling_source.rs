@@ -144,9 +144,8 @@ impl HttpPollingSource {
                         pem.push(b'\n');
                     }
                     pem.extend_from_slice(key);
-                    let identity = reqwest::Identity::from_pem(&pem).map_err(|e| {
-                        AeonError::config(format!("http poll mtls identity: {e}"))
-                    })?;
+                    let identity = reqwest::Identity::from_pem(&pem)
+                        .map_err(|e| AeonError::config(format!("http poll mtls identity: {e}")))?;
                     builder = builder.identity(identity);
                 }
                 OutboundAuthMode::BrokerNative => {

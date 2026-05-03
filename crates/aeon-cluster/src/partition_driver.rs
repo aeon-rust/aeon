@@ -50,8 +50,7 @@ use crate::transport::partition_transfer::request_partition_transfer;
 use crate::transport::poh_transfer::request_poh_chain_transfer;
 use crate::types::{
     ClusterRequest, ClusterResponse, NodeAddress, NodeId, PartitionCutoverRequest,
-    PartitionOwnership, PartitionTransferEnd, PartitionTransferRequest,
-    PohChainTransferRequest,
+    PartitionOwnership, PartitionTransferEnd, PartitionTransferRequest, PohChainTransferRequest,
 };
 
 /// Target-side installer for L2 segment bytes received during a
@@ -97,11 +96,8 @@ pub trait SegmentInstaller: Send + Sync {
 /// returned; the installer decodes it and wires it into the node-local
 /// `PohChain` for the partition.
 pub trait PohChainInstaller: Send + Sync {
-    fn install(
-        &self,
-        req: &PohChainTransferRequest,
-        state_bytes: Vec<u8>,
-    ) -> Result<(), AeonError>;
+    fn install(&self, req: &PohChainTransferRequest, state_bytes: Vec<u8>)
+    -> Result<(), AeonError>;
 }
 
 /// Maps a `NodeId` to the `NodeAddress` the driver should connect to
@@ -278,9 +274,7 @@ impl PartitionTransferDriver {
             .connect(source, &source_addr)
             .await
             .map_err(|e| AeonError::Cluster {
-                message: format!(
-                    "partition-driver: connect to source {source}@{source_addr}: {e}"
-                ),
+                message: format!("partition-driver: connect to source {source}@{source_addr}: {e}"),
                 source: None,
             })?;
 
@@ -317,12 +311,8 @@ impl PartitionTransferDriver {
         .await;
 
         if let Err(e) = bulk_result {
-            self.abort_with_reason(
-                partition,
-                source,
-                format!("bulk sync failed: {e}"),
-            )
-            .await;
+            self.abort_with_reason(partition, source, format!("bulk sync failed: {e}"))
+                .await;
             return Err(e);
         }
 
@@ -360,12 +350,8 @@ impl PartitionTransferDriver {
                 "partition-driver: source signalled no PoH leg for this partition; skipping install"
             );
         } else if let Err(e) = self.poh_installer.install(&poh_req, poh_bytes) {
-            self.abort_with_reason(
-                partition,
-                source,
-                format!("poh-chain install failed: {e}"),
-            )
-            .await;
+            self.abort_with_reason(partition, source, format!("poh-chain install failed: {e}"))
+                .await;
             return Err(e);
         }
 
@@ -377,12 +363,8 @@ impl PartitionTransferDriver {
         let _offsets = match request_partition_cutover(&conn, &cutover_req).await {
             Ok(o) => o,
             Err(e) => {
-                self.abort_with_reason(
-                    partition,
-                    source,
-                    format!("cutover handshake failed: {e}"),
-                )
-                .await;
+                self.abort_with_reason(partition, source, format!("cutover handshake failed: {e}"))
+                    .await;
                 return Err(e);
             }
         };
@@ -417,9 +399,7 @@ impl PartitionTransferDriver {
                 )
                 .await;
                 Err(AeonError::Cluster {
-                    message: format!(
-                        "partition-driver: CompleteTransfer rejected: {msg}"
-                    ),
+                    message: format!("partition-driver: CompleteTransfer rejected: {msg}"),
                     source: None,
                 })
             }
@@ -458,9 +438,9 @@ impl PartitionTransferDriver {
                 partition.as_u16()
             ))
         })?;
-        tracker.begin(source, target).map_err(|e| {
-            AeonError::state(format!("partition-driver: tracker.begin: {e}"))
-        })
+        tracker
+            .begin(source, target)
+            .map_err(|e| AeonError::state(format!("partition-driver: tracker.begin: {e}")))
     }
 
     async fn transition_begin_cutover(
@@ -475,9 +455,9 @@ impl PartitionTransferDriver {
                 partition.as_u16()
             ))
         })?;
-        tracker.begin_cutover().map_err(|e| {
-            AeonError::state(format!("partition-driver: tracker.begin_cutover: {e}"))
-        })
+        tracker
+            .begin_cutover()
+            .map_err(|e| AeonError::state(format!("partition-driver: tracker.begin_cutover: {e}")))
     }
 
     async fn transition_complete(&self, partition: PartitionId) {
@@ -492,12 +472,7 @@ impl PartitionTransferDriver {
     /// to `Owned(source)`. Best-effort on the Raft side — if the
     /// propose fails we log and surface the original error; the Raft
     /// apply path will re-converge on the next committed entry.
-    async fn abort_with_reason(
-        &self,
-        partition: PartitionId,
-        source: NodeId,
-        reason: String,
-    ) {
+    async fn abort_with_reason(&self, partition: PartitionId, source: NodeId, reason: String) {
         {
             let mut trackers = self.trackers.lock().await;
             if let Some(tracker) = trackers.get_mut(&partition) {
@@ -548,9 +523,7 @@ impl PartitionTransferDriver {
                     if let (Some(leader_id), Some(leader_node)) =
                         (ftl.leader_id, ftl.leader_node.as_ref())
                     {
-                        return self
-                            .forward_propose(leader_id, leader_node, request)
-                            .await;
+                        return self.forward_propose(leader_id, leader_node, request).await;
                     }
                 }
                 Err(AeonError::Cluster {
@@ -571,11 +544,9 @@ impl PartitionTransferDriver {
         leader_node: &NodeAddress,
         request: ClusterRequest,
     ) -> Result<ClusterResponse, AeonError> {
-        let request_bytes = bincode::serialize(&request).map_err(|e| {
-            AeonError::Serialization {
-                message: format!("forward_propose: serialize ClusterRequest: {e}"),
-                source: None,
-            }
+        let request_bytes = bincode::serialize(&request).map_err(|e| AeonError::Serialization {
+            message: format!("forward_propose: serialize ClusterRequest: {e}"),
+            source: None,
         })?;
 
         let req = crate::types::ProposeForwardRequest { request_bytes };
@@ -587,9 +558,7 @@ impl PartitionTransferDriver {
         )
         .await
         .map_err(|e| AeonError::Cluster {
-            message: format!(
-                "forward_propose RPC to leader {leader_id} failed: {e}"
-            ),
+            message: format!("forward_propose RPC to leader {leader_id} failed: {e}"),
             source: None,
         })?;
 
@@ -605,9 +574,7 @@ impl PartitionTransferDriver {
 
         bincode::deserialize::<ClusterResponse>(&resp.response_bytes).map_err(|e| {
             AeonError::Serialization {
-                message: format!(
-                    "forward_propose: deserialize ClusterResponse from leader: {e}"
-                ),
+                message: format!("forward_propose: deserialize ClusterResponse from leader: {e}"),
                 source: None,
             }
         })
@@ -640,8 +607,7 @@ impl PartitionTransferDriver {
                     .iter()
                     .filter_map(|(p, own)| match own {
                         PartitionOwnership::Transferring { source, target }
-                            if *target == self.my_id
-                                && !in_flight.contains_key(p) =>
+                            if *target == self.my_id && !in_flight.contains_key(p) =>
                         {
                             Some((*p, *source, *target))
                         }
@@ -673,9 +639,9 @@ mod tests {
     use super::*;
     use crate::transport::cutover::{CutoverCoordinator, CutoverOffsets};
     use crate::transport::endpoint::QuicEndpoint;
+    use crate::transport::framing::{self, MessageType};
     use crate::transport::partition_transfer::{ChunkIter, PartitionTransferProvider};
     use crate::transport::poh_transfer::PohChainProvider;
-    use crate::transport::framing::{self, MessageType};
     use crate::transport::tls::dev_quic_configs_insecure;
 
     use aeon_types::{SegmentEntry, SegmentManifest};
@@ -815,8 +781,7 @@ mod tests {
         fn drain_and_freeze<'a>(
             &'a self,
             _req: &'a PartitionCutoverRequest,
-        ) -> Pin<Box<dyn Future<Output = Result<CutoverOffsets, AeonError>> + Send + 'a>>
-        {
+        ) -> Pin<Box<dyn Future<Output = Result<CutoverOffsets, AeonError>> + Send + 'a>> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             let offsets = self.offsets;
             Box::pin(async move { Ok(offsets) })
@@ -973,14 +938,13 @@ mod tests {
         let poh_provider: Arc<dyn PohChainProvider> = Arc::new(FixedPohProvider {
             payload: b"poh-chain-state-bytes".to_vec(),
         });
-        let cutover_coord: Arc<dyn CutoverCoordinator> =
-            Arc::new(FixedCutoverCoordinator {
-                offsets: CutoverOffsets {
-                    final_source_offset: 42,
-                    final_poh_sequence: 7,
-                },
-                calls: AtomicU32::new(0),
-            });
+        let cutover_coord: Arc<dyn CutoverCoordinator> = Arc::new(FixedCutoverCoordinator {
+            offsets: CutoverOffsets {
+                final_source_offset: 42,
+                final_poh_sequence: 7,
+            },
+            calls: AtomicU32::new(0),
+        });
         let src_shutdown = Arc::new(AtomicBool::new(false));
         let src_task = tokio::spawn(run_source_endpoint(
             Arc::clone(&source_ep),
@@ -993,9 +957,10 @@ mod tests {
         // Target-side: single-node Raft (immediate leader) + a
         // separate QUIC endpoint for outbound connections.
         let (node, target_ep) = new_test_node().await;
-        let resolver: Arc<dyn NodeResolver> = Arc::new(StubResolver(
-            NodeAddress::new("127.0.0.1", source_addr.port()),
-        ));
+        let resolver: Arc<dyn NodeResolver> = Arc::new(StubResolver(NodeAddress::new(
+            "127.0.0.1",
+            source_addr.port(),
+        )));
         let segment_installer = Arc::new(RecordingSegmentInstaller::default());
         let poh_installer = Arc::new(RecordingPohInstaller::default());
 
@@ -1033,11 +998,7 @@ mod tests {
 
         // Segment installer must have observed the manifest + both chunks + end.
         assert!(
-            segment_installer
-                .manifest
-                .lock()
-                .expect("lock")
-                .is_some(),
+            segment_installer.manifest.lock().expect("lock").is_some(),
             "segment installer never saw manifest"
         );
         assert_eq!(
@@ -1092,19 +1053,17 @@ mod tests {
             .expect("bind source"),
         );
         let source_addr = source_ep.local_addr().expect("local_addr");
-        let bulk_provider: Arc<dyn PartitionTransferProvider> =
-            Arc::new(FailingBulkProvider);
+        let bulk_provider: Arc<dyn PartitionTransferProvider> = Arc::new(FailingBulkProvider);
         let poh_provider: Arc<dyn PohChainProvider> = Arc::new(FixedPohProvider {
             payload: Vec::new(),
         });
-        let cutover_coord: Arc<dyn CutoverCoordinator> =
-            Arc::new(FixedCutoverCoordinator {
-                offsets: CutoverOffsets {
-                    final_source_offset: 0,
-                    final_poh_sequence: 0,
-                },
-                calls: AtomicU32::new(0),
-            });
+        let cutover_coord: Arc<dyn CutoverCoordinator> = Arc::new(FixedCutoverCoordinator {
+            offsets: CutoverOffsets {
+                final_source_offset: 0,
+                final_poh_sequence: 0,
+            },
+            calls: AtomicU32::new(0),
+        });
         let src_shutdown = Arc::new(AtomicBool::new(false));
         let src_task = tokio::spawn(run_source_endpoint(
             Arc::clone(&source_ep),
@@ -1115,9 +1074,10 @@ mod tests {
         ));
 
         let (node, target_ep) = new_test_node().await;
-        let resolver: Arc<dyn NodeResolver> = Arc::new(StubResolver(
-            NodeAddress::new("127.0.0.1", source_addr.port()),
-        ));
+        let resolver: Arc<dyn NodeResolver> = Arc::new(StubResolver(NodeAddress::new(
+            "127.0.0.1",
+            source_addr.port(),
+        )));
         let segment_installer = Arc::new(RecordingSegmentInstaller::default());
         let poh_installer = Arc::new(RecordingPohInstaller::default());
 
@@ -1194,11 +1154,10 @@ mod tests {
 
         // Simulate a first drive that has already acquired the tracker
         // slot (by inserting directly — same module has field access).
-        driver
-            .trackers
-            .lock()
-            .await
-            .insert(PartitionId::new(0), TransferTracker::new(PartitionId::new(0)));
+        driver.trackers.lock().await.insert(
+            PartitionId::new(0),
+            TransferTracker::new(PartitionId::new(0)),
+        );
 
         let err = driver
             .drive_one(PartitionId::new(0), 2, 1)

@@ -1237,7 +1237,9 @@ mod tests {
     #[tokio::test]
     async fn reconfigure_sink_cross_type_rejected() {
         let mgr = PipelineManager::new();
-        mgr.create(make_pipeline("reconf-sink-cross")).await.unwrap();
+        mgr.create(make_pipeline("reconf-sink-cross"))
+            .await
+            .unwrap();
         mgr.start("reconf-sink-cross", "test").await.unwrap();
 
         let new_sink = SinkConfig {
@@ -1270,9 +1272,6 @@ mod tests {
         let history = mgr.history("reconf-hist").await;
         // created + started + reconfigured
         assert_eq!(history.len(), 3);
-        assert_eq!(
-            history.last().unwrap().action,
-            PipelineAction::Reconfigured
-        );
+        assert_eq!(history.last().unwrap().action, PipelineAction::Reconfigured);
     }
 }

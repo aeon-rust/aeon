@@ -76,9 +76,8 @@ impl PohChainProvider for LivePohProvider {
     fn export_state<'a>(
         &'a self,
         _req: &'a PohChainTransferRequest,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Vec<u8>, AeonError>> + Send + 'a>,
-    > {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, AeonError>> + Send + 'a>>
+    {
         Box::pin(async move {
             let chain = self
                 .chain
@@ -165,43 +164,30 @@ async fn run_handover_server(
                     };
                     match mt {
                         MessageType::PartitionTransferRequest => {
-                            let req: PartitionTransferRequest =
-                                match bincode::deserialize(&payload) {
-                                    Ok(r) => r,
-                                    Err(_) => return,
-                                };
-                            let _ = serve_partition_transfer_with_request(
-                                &*transfer,
-                                send,
-                                &req,
-                            )
-                            .await;
+                            let req: PartitionTransferRequest = match bincode::deserialize(&payload)
+                            {
+                                Ok(r) => r,
+                                Err(_) => return,
+                            };
+                            let _ =
+                                serve_partition_transfer_with_request(&*transfer, send, &req).await;
                         }
                         MessageType::PohChainTransferRequest => {
-                            let req: PohChainTransferRequest =
-                                match bincode::deserialize(&payload) {
-                                    Ok(r) => r,
-                                    Err(_) => return,
-                                };
-                            let _ = serve_poh_chain_transfer_with_request(
-                                &*poh,
-                                send,
-                                &req,
-                            )
-                            .await;
+                            let req: PohChainTransferRequest = match bincode::deserialize(&payload)
+                            {
+                                Ok(r) => r,
+                                Err(_) => return,
+                            };
+                            let _ = serve_poh_chain_transfer_with_request(&*poh, send, &req).await;
                         }
                         MessageType::PartitionCutoverRequest => {
-                            let req: PartitionCutoverRequest =
-                                match bincode::deserialize(&payload) {
-                                    Ok(r) => r,
-                                    Err(_) => return,
-                                };
-                            let _ = serve_partition_cutover_with_request(
-                                &*cutover,
-                                send,
-                                &req,
-                            )
-                            .await;
+                            let req: PartitionCutoverRequest = match bincode::deserialize(&payload)
+                            {
+                                Ok(r) => r,
+                                Err(_) => return,
+                            };
+                            let _ =
+                                serve_partition_cutover_with_request(&*cutover, send, &req).await;
                         }
                         _ => {
                             let _ = send.finish();
@@ -329,7 +315,10 @@ async fn full_handover_walks_bulksync_poh_and_cutover_over_real_quic() {
     assert!(
         matches!(
             tracker.state,
-            TransferState::Cutover { source: 11, target: 22 }
+            TransferState::Cutover {
+                source: 11,
+                target: 22
+            }
         ),
         "tracker must be Cutover{{11,22}} after bulk sync, got {:?}",
         tracker.state
@@ -369,7 +358,10 @@ async fn full_handover_walks_bulksync_poh_and_cutover_over_real_quic() {
     assert!(
         matches!(
             tracker.state,
-            TransferState::Cutover { source: 11, target: 22 }
+            TransferState::Cutover {
+                source: 11,
+                target: 22
+            }
         ),
         "tracker must remain Cutover after handshake, got {:?}",
         tracker.state

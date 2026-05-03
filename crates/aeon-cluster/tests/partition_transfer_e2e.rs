@@ -29,8 +29,8 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use aeon_cluster::raft_config::AeonRaftConfig;
@@ -44,9 +44,8 @@ use aeon_cluster::transport::server;
 use aeon_cluster::transport::tls::dev_quic_configs_insecure;
 use aeon_cluster::{
     ClusterRequest, ClusterResponse, NodeAddress, NodeResolver, PartitionCutoverRequest,
-    PartitionOwnership, PartitionTransferDriver, PartitionTransferEnd,
-    PartitionTransferRequest, PohChainInstaller, PohChainTransferRequest, RaftNodeResolver,
-    SegmentInstaller,
+    PartitionOwnership, PartitionTransferDriver, PartitionTransferEnd, PartitionTransferRequest,
+    PohChainInstaller, PohChainTransferRequest, RaftNodeResolver, SegmentInstaller,
 };
 use aeon_types::{AeonError, PartitionId, SegmentChunk, SegmentEntry, SegmentManifest};
 use bytes::Bytes;
@@ -400,9 +399,9 @@ async fn three_node_partition_transfer_walks_cl6_and_flips_ownership() {
         let bp = Arc::clone(&bulk_provider);
         let pp = Arc::clone(&poh_provider);
         let cc = Arc::clone(&cutover_dyn);
-        tokio::spawn(async move {
-            server::serve(ep, r, 2, sd, Some(bp), Some(pp), Some(cc)).await
-        });
+        tokio::spawn(
+            async move { server::serve(ep, r, 2, sd, Some(bp), Some(pp), Some(cc)).await },
+        );
     }
     {
         let ep = Arc::clone(&n3.endpoint);
@@ -593,9 +592,9 @@ async fn three_node_watcher_picks_up_transferring_entry_and_completes() {
         let bp = Arc::clone(&bulk_provider);
         let pp = Arc::clone(&poh_provider);
         let cc = Arc::clone(&cutover_dyn);
-        tokio::spawn(async move {
-            server::serve(ep, r, 2, sd, Some(bp), Some(pp), Some(cc)).await
-        });
+        tokio::spawn(
+            async move { server::serve(ep, r, 2, sd, Some(bp), Some(pp), Some(cc)).await },
+        );
     }
     {
         let ep = Arc::clone(&n3.endpoint);

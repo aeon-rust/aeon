@@ -16,8 +16,8 @@ use crate::checkpoint::{CheckpointPersist, CheckpointRecord, WalCheckpointStore}
 use aeon_types::{AeonError, PartitionId, SourceKind};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // ── FallbackCheckpointStore ─────────────────────────────────────────────
 
@@ -47,10 +47,7 @@ pub struct FallbackCheckpointStore {
 impl FallbackCheckpointStore {
     /// Build a fallback store over `primary`, with a WAL file at `wal_path`
     /// used only when the primary errors.
-    pub fn new(
-        primary: Box<dyn CheckpointPersist>,
-        wal_path: impl Into<PathBuf>,
-    ) -> Self {
+    pub fn new(primary: Box<dyn CheckpointPersist>, wal_path: impl Into<PathBuf>) -> Self {
         Self {
             primary,
             wal_path: wal_path.into(),
@@ -63,10 +60,7 @@ impl FallbackCheckpointStore {
 
     /// Attach an `Eo2Metrics` registry so the first L3 → WAL transition
     /// bumps `aeon_checkpoint_fallback_wal_total`.
-    pub fn with_metrics(
-        mut self,
-        metrics: Arc<crate::eo2_metrics::Eo2Metrics>,
-    ) -> Self {
+    pub fn with_metrics(mut self, metrics: Arc<crate::eo2_metrics::Eo2Metrics>) -> Self {
         self.metrics = Some(metrics);
         self
     }
@@ -269,12 +263,7 @@ impl RecoveryPlan {
 
         // min across registered sinks. If no sink acked yet, start at 0
         // (replay everything the L2 store holds).
-        let l2_replay_start_seq = r
-            .per_sink_ack_seq
-            .values()
-            .min()
-            .copied()
-            .unwrap_or(0);
+        let l2_replay_start_seq = r.per_sink_ack_seq.values().min().copied().unwrap_or(0);
 
         Self {
             pull_seek_offsets,
@@ -486,8 +475,8 @@ mod tests {
         per_sink.insert("kafka".to_string(), 100u64);
         per_sink.insert("webhook".to_string(), 42u64);
         per_sink.insert("redis".to_string(), 300u64);
-        let rec = CheckpointRecord::new(0, HashMap::new(), vec![], 0, 0)
-            .with_per_sink_ack_seq(per_sink);
+        let rec =
+            CheckpointRecord::new(0, HashMap::new(), vec![], 0, 0).with_per_sink_ack_seq(per_sink);
 
         let plan = RecoveryPlan::from_last(Some(&rec));
         match plan.action_for(SourceKind::Push) {

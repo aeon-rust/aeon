@@ -123,24 +123,36 @@ mod tests {
 
     #[test]
     fn parse_seconds() {
-        assert_eq!(parse_hold_duration("300s").unwrap(), Duration::from_secs(300));
+        assert_eq!(
+            parse_hold_duration("300s").unwrap(),
+            Duration::from_secs(300)
+        );
         assert_eq!(parse_hold_duration("0s").unwrap(), Duration::ZERO);
     }
 
     #[test]
     fn parse_minutes_and_hours() {
         assert_eq!(parse_hold_duration("5m").unwrap(), Duration::from_secs(300));
-        assert_eq!(parse_hold_duration("1h").unwrap(), Duration::from_secs(3600));
+        assert_eq!(
+            parse_hold_duration("1h").unwrap(),
+            Duration::from_secs(3600)
+        );
     }
 
     #[test]
     fn parse_millis() {
-        assert_eq!(parse_hold_duration("250ms").unwrap(), Duration::from_millis(250));
+        assert_eq!(
+            parse_hold_duration("250ms").unwrap(),
+            Duration::from_millis(250)
+        );
     }
 
     #[test]
     fn trimmed_leading_and_trailing_whitespace() {
-        assert_eq!(parse_hold_duration("  5m  ").unwrap(), Duration::from_secs(300));
+        assert_eq!(
+            parse_hold_duration("  5m  ").unwrap(),
+            Duration::from_secs(300)
+        );
     }
 
     #[test]

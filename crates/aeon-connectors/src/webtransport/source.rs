@@ -194,8 +194,7 @@ async fn wt_accept_loop(
                             .map(|c| CertificateStore::parse_cert_subjects(c.der()))
                     })
                     .unwrap_or_default();
-                let subjects_refs: Vec<&str> =
-                    cert_subjects.iter().map(|s| s.as_str()).collect();
+                let subjects_refs: Vec<&str> = cert_subjects.iter().map(|s| s.as_str()).collect();
 
                 let now_unix = SystemTime::now()
                     .duration_since(UNIX_EPOCH)

@@ -140,12 +140,12 @@ impl WebSocketSource {
         // - HTTP-style modes: handled by `build_ws_request` as headers.
         let mtls_tls_config: Option<Arc<rustls::ClientConfig>> = match config.auth.as_deref() {
             Some(signer) if matches!(signer.mode(), OutboundAuthMode::Mtls) => {
-                let cert_pem = signer.mtls_cert_pem().ok_or_else(|| {
-                    AeonError::config("websocket mTLS: signer missing cert pem")
-                })?;
-                let key_pem = signer.mtls_key_pem().ok_or_else(|| {
-                    AeonError::config("websocket mTLS: signer missing key pem")
-                })?;
+                let cert_pem = signer
+                    .mtls_cert_pem()
+                    .ok_or_else(|| AeonError::config("websocket mTLS: signer missing cert pem"))?;
+                let key_pem = signer
+                    .mtls_key_pem()
+                    .ok_or_else(|| AeonError::config("websocket mTLS: signer missing key pem"))?;
                 Some(build_mtls_client_config_arc(cert_pem, key_pem)?)
             }
             Some(signer) if matches!(signer.mode(), OutboundAuthMode::BrokerNative) => {
@@ -469,7 +469,10 @@ mod tests {
             ..Default::default()
         });
         let req = build_ws_request("ws://127.0.0.1:8080/ws", Some(&signer), "/ws").unwrap();
-        assert_eq!(req.headers().get("x-aeon-key").unwrap().as_bytes(), b"k-xyz");
+        assert_eq!(
+            req.headers().get("x-aeon-key").unwrap().as_bytes(),
+            b"k-xyz"
+        );
         // And no Authorization fallback on api_key mode.
         assert!(req.headers().get("authorization").is_none());
     }
@@ -523,5 +526,4 @@ mod tests {
         assert!(req.headers().get("x-aeon-ts").is_some());
         assert!(req.headers().get("x-aeon-sig").is_some());
     }
-
 }

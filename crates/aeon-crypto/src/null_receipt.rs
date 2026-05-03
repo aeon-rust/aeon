@@ -142,9 +142,7 @@ pub fn salted_subject_hash(salt: &[u8], subject: &SubjectId) -> Hash512 {
     let canonical = subject.to_canonical();
     let canonical_bytes = canonical.as_bytes();
 
-    let mut buf = Vec::with_capacity(
-        DOMAIN.len() + 4 + salt.len() + 4 + canonical_bytes.len(),
-    );
+    let mut buf = Vec::with_capacity(DOMAIN.len() + 4 + salt.len() + 4 + canonical_bytes.len());
     buf.extend_from_slice(DOMAIN);
     buf.extend_from_slice(&(salt.len() as u32).to_le_bytes());
     buf.extend_from_slice(salt);
@@ -335,8 +333,7 @@ mod tests {
 
     #[test]
     fn wildcard_selector_roundtrips() {
-        let r = NullReceiptBuilder::new(Uuid::now_v7(), "tenant-a/*")
-            .finalize(1_000);
+        let r = NullReceiptBuilder::new(Uuid::now_v7(), "tenant-a/*").finalize(1_000);
         let bytes = r.to_chain_bytes().unwrap();
         let back = NullReceipt::from_chain_bytes(&bytes).unwrap();
         assert_eq!(back.selector_canonical, "tenant-a/*");

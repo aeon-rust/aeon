@@ -25,9 +25,7 @@
 //!   meaningful to the Redis RESP protocol).
 
 use aeon_types::{AeonError, OutboundAuthMode, OutboundAuthSigner};
-use redis::{
-    Client, ClientTlsConfig, ConnectionInfo, IntoConnectionInfo, TlsCertificates,
-};
+use redis::{Client, ClientTlsConfig, ConnectionInfo, IntoConnectionInfo, TlsCertificates};
 use std::sync::Arc;
 
 /// Resolve the address string plus an optional outbound-auth signer into a
@@ -47,9 +45,8 @@ pub(super) fn resolve_client(
         OutboundAuthMode::BrokerNative => {
             let mut info = parse_info(url)?;
             apply_broker_native(&mut info, s)?;
-            Client::open(info).map_err(|e| {
-                AeonError::connection(format!("redis client create failed: {e}"))
-            })
+            Client::open(info)
+                .map_err(|e| AeonError::connection(format!("redis client create failed: {e}")))
         }
         OutboundAuthMode::Mtls => build_mtls_client(url, s),
         OutboundAuthMode::Bearer
@@ -72,7 +69,8 @@ fn parse_info(url: &str) -> Result<ConnectionInfo, AeonError> {
 
 fn open_non_tls(url: &str) -> Result<Client, AeonError> {
     let info = parse_info(url)?;
-    Client::open(info).map_err(|e| AeonError::connection(format!("redis client create failed: {e}")))
+    Client::open(info)
+        .map_err(|e| AeonError::connection(format!("redis client create failed: {e}")))
 }
 
 fn apply_broker_native(
@@ -98,9 +96,7 @@ fn apply_broker_native(
         })?;
     }
     if had_userinfo && signer_had_creds {
-        tracing::warn!(
-            "Redis URL embedded userinfo; outbound-auth signer credentials override it"
-        );
+        tracing::warn!("Redis URL embedded userinfo; outbound-auth signer credentials override it");
     }
     Ok(())
 }
@@ -191,8 +187,7 @@ mod tests {
             broker_native: Some(BrokerNativeConfig { values }),
             ..Default::default()
         });
-        let c =
-            resolve_client("redis://url-user:url-pass@127.0.0.1:6379/0", Some(&s)).unwrap();
+        let c = resolve_client("redis://url-user:url-pass@127.0.0.1:6379/0", Some(&s)).unwrap();
         assert_eq!(
             c.get_connection_info().redis.username.as_deref(),
             Some("aeon-signer")
@@ -278,7 +273,12 @@ mod tests {
         let c = resolve_client("rediss://127.0.0.1:6380", Some(&s)).unwrap();
         // Connection info remembers the TCP+TLS addr.
         match &c.get_connection_info().addr {
-            redis::ConnectionAddr::TcpTls { host, port, tls_params, .. } => {
+            redis::ConnectionAddr::TcpTls {
+                host,
+                port,
+                tls_params,
+                ..
+            } => {
                 assert_eq!(host, "127.0.0.1");
                 assert_eq!(*port, 6380);
                 assert!(tls_params.is_some(), "TLS params must be attached for mTLS");
@@ -320,7 +320,10 @@ mod tests {
         let msg = format!("{err}");
         // redis crate surfaces an underlying key-extraction or cert-parse error.
         assert!(
-            msg.contains("mTLS") || msg.contains("redis") || msg.contains("key") || msg.contains("cert"),
+            msg.contains("mTLS")
+                || msg.contains("redis")
+                || msg.contains("key")
+                || msg.contains("cert"),
             "expected mTLS failure message, got: {msg}"
         );
     }

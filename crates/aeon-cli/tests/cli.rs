@@ -26,10 +26,25 @@ fn version_prints_package_version() {
 
 #[test]
 fn help_lists_core_subcommands() {
-    let assert = Command::cargo_bin("aeon").unwrap().arg("--help").assert().success();
+    let assert = Command::cargo_bin("aeon")
+        .unwrap()
+        .arg("--help")
+        .assert()
+        .success();
     let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
-    for expected in ["new", "build", "validate", "processor", "pipeline", "apply", "doctor"] {
-        assert!(out.contains(expected), "expected `{expected}` in --help output");
+    for expected in [
+        "new",
+        "build",
+        "validate",
+        "processor",
+        "pipeline",
+        "apply",
+        "doctor",
+    ] {
+        assert!(
+            out.contains(expected),
+            "expected `{expected}` in --help output"
+        );
     }
 }
 
@@ -48,7 +63,10 @@ fn new_scaffolds_wasm_rust_project() {
     let root = tmp.path().join("myproc");
     assert!(root.join("Cargo.toml").is_file(), "Cargo.toml missing");
     assert!(root.join("src/lib.rs").is_file(), "src/lib.rs missing");
-    assert!(root.join(".cargo/config.toml").is_file(), ".cargo/config.toml missing");
+    assert!(
+        root.join(".cargo/config.toml").is_file(),
+        ".cargo/config.toml missing"
+    );
 
     let cargo = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
     assert!(cargo.contains("crate-type = [\"cdylib\"]"));
@@ -176,11 +194,17 @@ impl Mock {
             sock.flush().ok();
         });
 
-        Mock { url, body_rx: rx, _handle: handle }
+        Mock {
+            url,
+            body_rx: rx,
+            _handle: handle,
+        }
     }
 
     fn captured(&self) -> (String, String) {
-        self.body_rx.recv_timeout(Duration::from_secs(5)).expect("mock received no request")
+        self.body_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("mock received no request")
     }
 }
 
@@ -212,7 +236,10 @@ fn processor_register_sends_kebab_case_type_and_available_status() {
         .success();
 
     let (request_line, body) = mock.captured();
-    assert!(request_line.starts_with("POST /api/v1/processors"), "got: {request_line}");
+    assert!(
+        request_line.starts_with("POST /api/v1/processors"),
+        "got: {request_line}"
+    );
     let json: serde_json::Value = serde_json::from_str(&body).expect("body must be JSON");
 
     // ZD-2 regression guard: processor_type must be kebab-case, not PascalCase.

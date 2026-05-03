@@ -125,10 +125,7 @@ mod tests {
 
     fn kek_for(domain: KekDomain) -> Arc<KekHandle> {
         static N: AtomicU64 = AtomicU64::new(0);
-        let var = format!(
-            "AEON_TEST_PROBE_KEK_{}",
-            N.fetch_add(1, Ordering::Relaxed)
-        );
+        let var = format!("AEON_TEST_PROBE_KEK_{}", N.fetch_add(1, Ordering::Relaxed));
         let hex: String = (0..32).map(|_| "42".to_string()).collect();
         // SAFETY: test-only env mutation, unique var per call.
         unsafe { std::env::set_var(&var, &hex) };
@@ -221,7 +218,10 @@ mod tests {
             },
             Some(kek_for(KekDomain::LogContext)),
         );
-        assert!(err.is_err(), "log-context KEK must not be accepted for at-rest");
+        assert!(
+            err.is_err(),
+            "log-context KEK must not be accepted for at-rest"
+        );
     }
 
     #[test]

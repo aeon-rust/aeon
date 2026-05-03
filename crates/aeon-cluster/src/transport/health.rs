@@ -67,8 +67,7 @@ pub struct HealthStats {
 impl HealthStats {
     /// Returns true if `last_seen_ns` is older than `staleness` relative to `now_ns`.
     pub fn is_stale(&self, now_ns: u128, staleness: Duration) -> bool {
-        self.last_seen_ns == 0
-            || now_ns.saturating_sub(self.last_seen_ns) > staleness.as_nanos()
+        self.last_seen_ns == 0 || now_ns.saturating_sub(self.last_seen_ns) > staleness.as_nanos()
     }
 }
 
@@ -233,22 +232,20 @@ pub async fn handle_health_ping(
     payload: &[u8],
     send: &mut quinn::SendStream,
 ) -> Result<(), AeonError> {
-    let ping: HealthPing =
-        bincode::deserialize(payload).map_err(|e| AeonError::Serialization {
-            message: format!("deserialize HealthPing: {e}"),
-            source: None,
-        })?;
+    let ping: HealthPing = bincode::deserialize(payload).map_err(|e| AeonError::Serialization {
+        message: format!("deserialize HealthPing: {e}"),
+        source: None,
+    })?;
 
     let pong = HealthPong {
         node_id: self_id,
         timestamp_ns: ping.timestamp_ns,
     };
 
-    let resp =
-        bincode::serialize(&pong).map_err(|e| AeonError::Serialization {
-            message: format!("serialize HealthPong: {e}"),
-            source: None,
-        })?;
+    let resp = bincode::serialize(&pong).map_err(|e| AeonError::Serialization {
+        message: format!("serialize HealthPong: {e}"),
+        source: None,
+    })?;
 
     framing::write_frame(send, MessageType::HealthPong, &resp).await?;
     let _ = send.finish();
@@ -361,7 +358,10 @@ mod tests {
         let rtt = send_health_ping(&client, 1, 99, &target).await.unwrap();
 
         // Loopback RTT must be well under a second.
-        assert!(rtt < Duration::from_secs(1), "unexpectedly large RTT: {rtt:?}");
+        assert!(
+            rtt < Duration::from_secs(1),
+            "unexpectedly large RTT: {rtt:?}"
+        );
 
         server_task.await.unwrap();
         client.close();

@@ -74,9 +74,7 @@ impl<S: L3Store> EncryptedL3Store<S> {
             if let Some(parent) = meta_path.parent() {
                 if !parent.as_os_str().is_empty() {
                     std::fs::create_dir_all(parent).map_err(|e| {
-                        AeonError::state(format!(
-                            "encrypted-l3: mkdir for sidecar {parent:?}: {e}"
-                        ))
+                        AeonError::state(format!("encrypted-l3: mkdir for sidecar {parent:?}: {e}"))
                     })?;
                 }
             }
@@ -178,8 +176,8 @@ mod tests {
     use aeon_types::{
         SecretBytes, SecretError, SecretProvider, SecretRef, SecretRegistry, SecretScheme,
     };
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     struct HexEnv;
     impl SecretProvider for HexEnv {
@@ -198,10 +196,7 @@ mod tests {
 
     fn test_kek() -> KekHandle {
         static N: AtomicU64 = AtomicU64::new(0);
-        let var = format!(
-            "AEON_TEST_L3_KEK_{}",
-            N.fetch_add(1, Ordering::Relaxed)
-        );
+        let var = format!("AEON_TEST_L3_KEK_{}", N.fetch_add(1, Ordering::Relaxed));
         let hex: String = (0..32).map(|_| "42".to_string()).collect();
         // SAFETY: test-only env mutation, unique var per call.
         unsafe { std::env::set_var(&var, &hex) };
@@ -246,8 +241,14 @@ mod tests {
         store.put(b"key1", b"plaintext-value-1").unwrap();
         store.put(b"key2", b"plaintext-value-2").unwrap();
 
-        assert_eq!(store.get(b"key1").unwrap(), Some(b"plaintext-value-1".to_vec()));
-        assert_eq!(store.get(b"key2").unwrap(), Some(b"plaintext-value-2".to_vec()));
+        assert_eq!(
+            store.get(b"key1").unwrap(),
+            Some(b"plaintext-value-1".to_vec())
+        );
+        assert_eq!(
+            store.get(b"key2").unwrap(),
+            Some(b"plaintext-value-2".to_vec())
+        );
 
         // Sanity: the inner store must not see plaintext — only the
         // sealed blob (nonce || ciphertext || tag).
@@ -308,8 +309,8 @@ mod tests {
         }
 
         let kek_b = test_kek(); // different DEK bytes would be needed; same hex here yields
-                                // same KEK content, so force a mismatch by hand-mangling the
-                                // sidecar ciphertext.
+        // same KEK content, so force a mismatch by hand-mangling the
+        // sidecar ciphertext.
         let mut sidecar: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&meta).unwrap()).unwrap();
         if let Some(ct) = sidecar.get_mut("ciphertext").and_then(|v| v.as_array_mut()) {
@@ -401,7 +402,10 @@ mod tests {
         store.put(b"k", b"same").unwrap();
         let second = store.inner().get(b"k").unwrap().unwrap();
 
-        assert_ne!(first, second, "nonce reuse detected — AES-GCM invariant broken");
+        assert_ne!(
+            first, second,
+            "nonce reuse detected — AES-GCM invariant broken"
+        );
     }
 
     #[test]
@@ -418,6 +422,9 @@ mod tests {
         sealed[last] ^= 0x01;
         store.inner().put(b"k", &sealed).unwrap();
 
-        assert!(store.get(b"k").is_err(), "tampered ciphertext must fail to open");
+        assert!(
+            store.get(b"k").is_err(),
+            "tampered ciphertext must fail to open"
+        );
     }
 }

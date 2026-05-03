@@ -24,12 +24,8 @@ use aeon_connectors::{BlackholeSink, MemorySource};
 use aeon_engine::{
     ConnectorRegistry, DynSink, DynSource, PipelineSupervisor, SinkFactory, SourceFactory,
 };
-use aeon_types::registry::{
-    PipelineDefinition, ProcessorRef, SinkConfig, SourceConfig,
-};
-use aeon_types::{
-    AeonError, BatchResult, Event, Output, PartitionId, Sink,
-};
+use aeon_types::registry::{PipelineDefinition, ProcessorRef, SinkConfig, SourceConfig};
+use aeon_types::{AeonError, BatchResult, Event, Output, PartitionId, Sink};
 use bytes::Bytes;
 
 /// Factory that produces a `MemorySource` preloaded with N identical events.
@@ -68,10 +64,7 @@ struct CountingBlackholeSink {
 }
 
 impl Sink for CountingBlackholeSink {
-    async fn write_batch(
-        &mut self,
-        outputs: Vec<Output>,
-    ) -> Result<BatchResult, AeonError> {
+    async fn write_batch(&mut self, outputs: Vec<Output>) -> Result<BatchResult, AeonError> {
         let len = outputs.len() as u64;
         let result = self.inner.write_batch(outputs).await?;
         self.counter.fetch_add(len, Ordering::Relaxed);

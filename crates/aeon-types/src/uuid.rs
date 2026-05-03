@@ -330,7 +330,10 @@ mod tests {
     fn derive_pull_uuid_ts_ordering() {
         let early = derive_pull_uuid_v7("s", b"id", 1_700_000_000_000, 0);
         let later = derive_pull_uuid_v7("s", b"id", 1_700_000_001_000, 0);
-        assert!(early < later, "ts ordering must be preserved lexicographically");
+        assert!(
+            early < later,
+            "ts ordering must be preserved lexicographically"
+        );
     }
 
     #[test]

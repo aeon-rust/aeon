@@ -156,9 +156,7 @@ impl<S: Sink + 'static> DynSink for S {
 pub struct BoxedSourceAdapter(pub Box<dyn DynSource>);
 
 impl Source for BoxedSourceAdapter {
-    fn next_batch(
-        &mut self,
-    ) -> impl Future<Output = Result<Vec<Event>, AeonError>> + Send {
+    fn next_batch(&mut self) -> impl Future<Output = Result<Vec<Event>, AeonError>> + Send {
         self.0.next_batch_boxed()
     }
 
@@ -290,10 +288,7 @@ impl ConnectorRegistry {
 
     /// Build a source from config. Returns `Config` error if the type is
     /// unknown — the supervisor converts this into a pipeline-start failure.
-    pub fn build_source(
-        &self,
-        cfg: &SourceConfig,
-    ) -> Result<BoxedSourceAdapter, AeonError> {
+    pub fn build_source(&self, cfg: &SourceConfig) -> Result<BoxedSourceAdapter, AeonError> {
         let factory = self.sources.get(&cfg.source_type).ok_or_else(|| {
             AeonError::config(format!(
                 "unknown source type '{}' — registered: [{}]",
@@ -372,10 +367,7 @@ mod tests {
 
     struct DroppingSink;
     impl Sink for DroppingSink {
-        async fn write_batch(
-            &mut self,
-            outputs: Vec<Output>,
-        ) -> Result<BatchResult, AeonError> {
+        async fn write_batch(&mut self, outputs: Vec<Output>) -> Result<BatchResult, AeonError> {
             Ok(BatchResult::all_delivered(
                 outputs.iter().map(|_| uuid::Uuid::nil()).collect(),
             ))
@@ -450,10 +442,7 @@ mod tests {
         cb: Option<SinkAckCallback>,
     }
     impl Sink for AckSpySink {
-        async fn write_batch(
-            &mut self,
-            outputs: Vec<Output>,
-        ) -> Result<BatchResult, AeonError> {
+        async fn write_batch(&mut self, outputs: Vec<Output>) -> Result<BatchResult, AeonError> {
             // Fire the installed callback for every output so the test can
             // observe the count that bubbles up through `BoxedSinkAdapter`.
             if let Some(cb) = self.cb.as_ref() {
@@ -482,8 +471,9 @@ mod tests {
         // Counter shared with the callback so we can verify forwarding.
         let counter = StdArc::new(AtomicUsize::new(0));
         let counter_for_cb = StdArc::clone(&counter);
-        let cb: SinkAckCallback =
-            StdArc::new(move |n| { counter_for_cb.fetch_add(n, AtomicOrdering::Relaxed); });
+        let cb: SinkAckCallback = StdArc::new(move |n| {
+            counter_for_cb.fetch_add(n, AtomicOrdering::Relaxed);
+        });
 
         // Install through the adapter — must reach the inner spy via
         // `DynSink::on_ack_callback_dyn` → `Sink::on_ack_callback`.

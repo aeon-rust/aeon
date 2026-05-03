@@ -37,9 +37,7 @@
 //! Fanning out across every partition owned by a pipeline is the
 //! REST handler's job (S6.5 wiring, separate sub-atom).
 
-use aeon_types::{
-    AeonError, ErasureSelector, Event, SubjectId, collect_subject_ids,
-};
+use aeon_types::{AeonError, ErasureSelector, Event, SubjectId, collect_subject_ids};
 
 use crate::l2_body::{L2BodySegment, L2BodyStore};
 
@@ -74,11 +72,7 @@ impl<'a> SubjectExporter<'a> {
     /// contract used elsewhere in S6. A malformed id should not hide
     /// a matching event from an export because a neighbouring entry
     /// parsed correctly, so we match against whatever *did* parse.
-    pub fn scan<F>(
-        &self,
-        selector: &ErasureSelector,
-        mut on_match: F,
-    ) -> Result<usize, AeonError>
+    pub fn scan<F>(&self, selector: &ErasureSelector, mut on_match: F) -> Result<usize, AeonError>
     where
         F: FnMut(u64, Event) -> Result<(), AeonError>,
     {
@@ -155,10 +149,7 @@ mod tests {
             Bytes::from(format!("payload-{n}")),
         );
         for s in subjects {
-            ev = ev.with_metadata(
-                Arc::from("aeon.subject_id"),
-                Arc::from(*s),
-            );
+            ev = ev.with_metadata(Arc::from("aeon.subject_id"), Arc::from(*s));
         }
         ev
     }

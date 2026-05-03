@@ -535,9 +535,7 @@ pub trait RegistryApplier: Send + Sync {
     fn apply(
         &self,
         cmd: RegistryCommand,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = RegistryResponse> + Send + '_>,
-    >;
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = RegistryResponse> + Send + '_>>;
 }
 
 #[cfg(test)]

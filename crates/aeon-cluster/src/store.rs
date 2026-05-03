@@ -30,9 +30,7 @@ mod inner {
     use crate::partition_manager;
     use crate::raft_config::AeonRaftConfig;
     use crate::snapshot::ClusterSnapshot;
-    use crate::types::{
-        ClusterRequest, ClusterResponse, NodeAddress, NodeId, PartitionOwnership,
-    };
+    use crate::types::{ClusterRequest, ClusterResponse, NodeAddress, NodeId, PartitionOwnership};
     use aeon_types::PartitionId;
 
     // ─── Shared Log Data ──────────────────────────────────────────────
@@ -230,8 +228,7 @@ mod inner {
     /// Cloneable slot for installing an `OwnedPartitionsWatch` after the
     /// state machine has been handed to `Raft::new`. Mirrors
     /// `RegistryApplierSlot`.
-    pub type OwnedPartitionsWatchSlot =
-        Arc<tokio::sync::RwLock<Option<OwnedPartitionsWatch>>>;
+    pub type OwnedPartitionsWatchSlot = Arc<tokio::sync::RwLock<Option<OwnedPartitionsWatch>>>;
 
     // Manual Debug impl to avoid exposing encryption key
     impl Debug for StateMachineStore {
@@ -337,8 +334,8 @@ mod inner {
                 return Ok(()); // no snapshot persisted yet — fresh start
             };
 
-            let meta: SnapshotMeta<u64, NodeAddress> = bincode::deserialize(&meta_bytes)
-                .map_err(|e| aeon_types::AeonError::Cluster {
+            let meta: SnapshotMeta<u64, NodeAddress> =
+                bincode::deserialize(&meta_bytes).map_err(|e| aeon_types::AeonError::Cluster {
                     message: format!("corrupt raft snapshot meta: {e}"),
                     source: None,
                 })?;
@@ -346,12 +343,12 @@ mod inner {
             // Decrypt payload if encryption-at-rest is configured.
             #[cfg(feature = "encryption-at-rest")]
             if let Some(ref k) = self.encryption_key {
-                data_bytes = k.decrypt(&data_bytes).map_err(|e| {
-                    aeon_types::AeonError::Cluster {
-                        message: format!("raft snapshot decryption failed: {e}"),
-                        source: None,
-                    }
-                })?;
+                data_bytes =
+                    k.decrypt(&data_bytes)
+                        .map_err(|e| aeon_types::AeonError::Cluster {
+                            message: format!("raft snapshot decryption failed: {e}"),
+                            source: None,
+                        })?;
             }
 
             let state = ClusterSnapshot::from_bytes(&data_bytes).map_err(|e| {
@@ -476,11 +473,7 @@ mod inner {
                     // Only update if the new offset is ahead of the existing one.
                     for (&partition_u16, &offset) in source_offsets {
                         let pid = aeon_types::PartitionId::new(partition_u16);
-                        let entry = self
-                            .state
-                            .source_anchor_offsets
-                            .entry(pid)
-                            .or_insert(0);
+                        let entry = self.state.source_anchor_offsets.entry(pid).or_insert(0);
                         if offset > *entry as i64 {
                             *entry = offset as u64;
                         }
@@ -602,7 +595,11 @@ mod inner {
         })?;
         let ops = vec![
             (BatchOp::Put, SNAPSHOT_META_KEY.to_vec(), Some(meta_bytes)),
-            (BatchOp::Put, SNAPSHOT_DATA_KEY.to_vec(), Some(data_bytes.to_vec())),
+            (
+                BatchOp::Put,
+                SNAPSHOT_DATA_KEY.to_vec(),
+                Some(data_bytes.to_vec()),
+            ),
         ];
         l3.write_batch(&ops)?;
         l3.flush()?;
@@ -643,9 +640,9 @@ mod inner {
                                         let applier = self.registry_applier.read().await.clone();
                                         if let Some(applier) = applier {
                                             let rresp = applier.apply(cmd).await;
-                                            ClusterResponse::registry(&rresp).unwrap_or_else(
-                                                |e| ClusterResponse::Error(e.to_string()),
-                                            )
+                                            ClusterResponse::registry(&rresp).unwrap_or_else(|e| {
+                                                ClusterResponse::Error(e.to_string())
+                                            })
                                         } else {
                                             // No local applier installed — replicate
                                             // silently. Nodes that wire an applier later
@@ -1115,12 +1112,8 @@ mod inner {
             let sm = StateMachineStore::new();
             let slot = sm.owned_partitions_watch_slot();
 
-            let (sender, mut rx) =
-                tokio::sync::watch::channel(Vec::<PartitionId>::new());
-            *slot.write().await = Some(OwnedPartitionsWatch {
-                node_id: 7,
-                sender,
-            });
+            let (sender, mut rx) = tokio::sync::watch::channel(Vec::<PartitionId>::new());
+            *slot.write().await = Some(OwnedPartitionsWatch { node_id: 7, sender });
 
             // Mutate state so node 7 owns P0 and P2; P1 goes elsewhere.
             let mut sm = sm;
@@ -1131,22 +1124,15 @@ mod inner {
             sm.broadcast_owned_partitions().await;
             assert!(rx.has_changed().unwrap());
             let owned = rx.borrow_and_update().clone();
-            assert_eq!(
-                owned,
-                vec![PartitionId::new(0), PartitionId::new(2)]
-            );
+            assert_eq!(owned, vec![PartitionId::new(0), PartitionId::new(2)]);
         }
 
         #[tokio::test]
         async fn owned_partitions_watch_noop_when_unchanged() {
             let sm = StateMachineStore::new();
             let slot = sm.owned_partitions_watch_slot();
-            let (sender, mut rx) =
-                tokio::sync::watch::channel(Vec::<PartitionId>::new());
-            *slot.write().await = Some(OwnedPartitionsWatch {
-                node_id: 7,
-                sender,
-            });
+            let (sender, mut rx) = tokio::sync::watch::channel(Vec::<PartitionId>::new());
+            *slot.write().await = Some(OwnedPartitionsWatch { node_id: 7, sender });
 
             let mut sm = sm;
             sm.state.partition_table.assign(PartitionId::new(0), 7);

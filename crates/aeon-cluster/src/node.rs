@@ -136,9 +136,8 @@ mod inner {
         /// `propose_partition_transfer` calls `notify()` here so the watcher
         /// wakes immediately instead of polling. None on nodes that don't
         /// run the driver (e.g. single-node dev mode).
-        transfer_driver: tokio::sync::RwLock<
-            Option<Arc<crate::partition_driver::PartitionTransferDriver>>,
-        >,
+        transfer_driver:
+            tokio::sync::RwLock<Option<Arc<crate::partition_driver::PartitionTransferDriver>>>,
         /// CL-6c.4 — source-side provider slots serviced by the QUIC
         /// accept loop. Populated post-bootstrap by `aeon-cli` once the
         /// engine-side installers exist. `install_segment_provider` /
@@ -421,8 +420,7 @@ mod inner {
 
             // Start the QUIC RPC server
             let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let source_provider_slots =
-                crate::transport::server::SourceProviderSlots::new_empty();
+            let source_provider_slots = crate::transport::server::SourceProviderSlots::new_empty();
             let server_ep = Arc::clone(&endpoint);
             let server_raft = raft.clone();
             let server_node_id = config.node_id;
@@ -558,8 +556,7 @@ mod inner {
 
             // Start the QUIC RPC server (same as bootstrap_multi).
             let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let source_provider_slots =
-                crate::transport::server::SourceProviderSlots::new_empty();
+            let source_provider_slots = crate::transport::server::SourceProviderSlots::new_empty();
             let server_ep = Arc::clone(&endpoint);
             let server_raft = raft.clone();
             let server_node_id = config.node_id;
@@ -684,8 +681,7 @@ mod inner {
 
             // Start the QUIC RPC server so the bootstrap leader can reach us
             let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let source_provider_slots =
-                crate::transport::server::SourceProviderSlots::new_empty();
+            let source_provider_slots = crate::transport::server::SourceProviderSlots::new_empty();
             let server_ep = Arc::clone(&endpoint);
             let server_raft = raft.clone();
             let server_node_id = config.node_id;
@@ -791,8 +787,7 @@ mod inner {
             // Start the QUIC RPC server before joining (peers must be
             // able to reach us when the seed elevates us to voter).
             let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let source_provider_slots =
-                crate::transport::server::SourceProviderSlots::new_empty();
+            let source_provider_slots = crate::transport::server::SourceProviderSlots::new_empty();
             let server_ep = Arc::clone(&endpoint);
             let server_raft = raft.clone();
             let server_node_id = config.node_id;
@@ -813,13 +808,9 @@ mod inner {
             // membership in its persisted log, so this is a no-op on the
             // leader's side (member already present); openraft handles
             // the duplicate-add gracefully.
-            let self_addr = config
-                .advertise_addr
-                .clone()
-                .unwrap_or_else(|| NodeAddress::new(
-                    config.bind.ip().to_string(),
-                    config.bind.port(),
-                ));
+            let self_addr = config.advertise_addr.clone().unwrap_or_else(|| {
+                NodeAddress::new(config.bind.ip().to_string(), config.bind.port())
+            });
 
             let join_req = JoinRequest {
                 node_id: config.node_id,
@@ -836,10 +827,8 @@ mod inner {
                     "attempting to join (persistent Raft) via seed"
                 );
                 match crate::transport::network::send_join_request(
-                    &endpoint,
-                    0, // placeholder — uncached path does not read this
-                    seed,
-                    &join_req,
+                    &endpoint, 0, // placeholder — uncached path does not read this
+                    seed, &join_req,
                 )
                 .await
                 {
@@ -946,8 +935,7 @@ mod inner {
 
             // Start the QUIC RPC server so peers can reach us
             let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let source_provider_slots =
-                crate::transport::server::SourceProviderSlots::new_empty();
+            let source_provider_slots = crate::transport::server::SourceProviderSlots::new_empty();
             let server_ep = Arc::clone(&endpoint);
             let server_raft = raft.clone();
             let server_node_id = config.node_id;
@@ -966,13 +954,9 @@ mod inner {
 
             // Use advertise_addr if set; otherwise fall back to bind address.
             // In K8s, advertise_addr should be the pod's DNS name.
-            let self_addr = config
-                .advertise_addr
-                .clone()
-                .unwrap_or_else(|| NodeAddress::new(
-                    config.bind.ip().to_string(),
-                    config.bind.port(),
-                ));
+            let self_addr = config.advertise_addr.clone().unwrap_or_else(|| {
+                NodeAddress::new(config.bind.ip().to_string(), config.bind.port())
+            });
 
             let join_req = JoinRequest {
                 node_id: config.node_id,
@@ -991,10 +975,8 @@ mod inner {
                 tracing::info!(seed = %seed, "attempting to join cluster via seed node");
 
                 match crate::transport::network::send_join_request(
-                    &endpoint,
-                    0, // placeholder — uncached path does not read this
-                    seed,
-                    &join_req,
+                    &endpoint, 0, // placeholder — uncached path does not read this
+                    seed, &join_req,
                 )
                 .await
                 {
@@ -1053,11 +1035,7 @@ mod inner {
         /// 2. Promote to voter — participates in elections and quorum
         ///
         /// Must be called on the current leader. If not leader, returns an error.
-        pub async fn add_node(
-            &self,
-            node_id: NodeId,
-            addr: NodeAddress,
-        ) -> Result<(), AeonError> {
+        pub async fn add_node(&self, node_id: NodeId, addr: NodeAddress) -> Result<(), AeonError> {
             // Step 1: Add as learner (blocking = true → waits for log catch-up)
             self.raft
                 .add_learner(node_id, addr, true)
@@ -1137,10 +1115,7 @@ mod inner {
 
             // Step 2: Remove from cluster entirely
             self.raft
-                .change_membership(
-                    openraft::ChangeMembers::RemoveNodes(to_remove),
-                    false,
-                )
+                .change_membership(openraft::ChangeMembers::RemoveNodes(to_remove), false)
                 .await
                 .map_err(|e| AeonError::Cluster {
                     message: format!("failed to remove node {node_id} from cluster: {e}"),
@@ -1173,14 +1148,9 @@ mod inner {
         }
 
         /// Get the current cluster members (voters and learners).
-        pub async fn members(
-            &self,
-        ) -> Result<BTreeMap<NodeId, NodeAddress>, AeonError> {
+        pub async fn members(&self) -> Result<BTreeMap<NodeId, NodeAddress>, AeonError> {
             let metrics = self.raft.metrics().borrow().clone();
-            let membership = metrics
-                .membership_config
-                .membership()
-                .clone();
+            let membership = metrics.membership_config.membership().clone();
 
             // Collect all nodes (voters + learners)
             let mut result = BTreeMap::new();
@@ -1201,11 +1171,7 @@ mod inner {
         /// Get the current cluster size (number of voters).
         pub async fn voter_count(&self) -> usize {
             let metrics = self.raft.metrics().borrow().clone();
-            metrics
-                .membership_config
-                .membership()
-                .voter_ids()
-                .count()
+            metrics.membership_config.membership().voter_ids().count()
         }
 
         /// Format current Raft + cluster metrics as Prometheus exposition text (CL-4).
@@ -1241,7 +1207,11 @@ mod inner {
             let last_applied = metrics.last_applied.map(|l| l.index).unwrap_or(0);
             let leader = metrics.current_leader.unwrap_or(0);
             let node_id = self.config.node_id;
-            let is_leader: u64 = if metrics.current_leader == Some(node_id) { 1 } else { 0 };
+            let is_leader: u64 = if metrics.current_leader == Some(node_id) {
+                1
+            } else {
+                0
+            };
             let state_code: u64 = match metrics.state {
                 ServerState::Learner => 0,
                 ServerState::Follower => 1,
@@ -1249,11 +1219,7 @@ mod inner {
                 ServerState::Leader => 3,
                 ServerState::Shutdown => 4,
             };
-            let membership_size = metrics
-                .membership_config
-                .membership()
-                .voter_ids()
-                .count() as u64;
+            let membership_size = metrics.membership_config.membership().voter_ids().count() as u64;
 
             let mut out = String::with_capacity(2048);
 
@@ -1263,27 +1229,43 @@ mod inner {
 
             out.push_str("# HELP aeon_raft_last_log_index Most recent Raft log index\n");
             out.push_str("# TYPE aeon_raft_last_log_index gauge\n");
-            out.push_str(&format!("aeon_raft_last_log_index{{node_id=\"{node_id}\"}} {last_log}\n"));
+            out.push_str(&format!(
+                "aeon_raft_last_log_index{{node_id=\"{node_id}\"}} {last_log}\n"
+            ));
 
             out.push_str("# HELP aeon_raft_last_applied_index Most recent applied log index\n");
             out.push_str("# TYPE aeon_raft_last_applied_index gauge\n");
-            out.push_str(&format!("aeon_raft_last_applied_index{{node_id=\"{node_id}\"}} {last_applied}\n"));
+            out.push_str(&format!(
+                "aeon_raft_last_applied_index{{node_id=\"{node_id}\"}} {last_applied}\n"
+            ));
 
             out.push_str("# HELP aeon_raft_leader_id Current Raft leader NodeId (0 if unknown)\n");
             out.push_str("# TYPE aeon_raft_leader_id gauge\n");
-            out.push_str(&format!("aeon_raft_leader_id{{node_id=\"{node_id}\"}} {leader}\n"));
+            out.push_str(&format!(
+                "aeon_raft_leader_id{{node_id=\"{node_id}\"}} {leader}\n"
+            ));
 
-            out.push_str("# HELP aeon_raft_is_leader 1 if this node is the current leader, 0 otherwise\n");
+            out.push_str(
+                "# HELP aeon_raft_is_leader 1 if this node is the current leader, 0 otherwise\n",
+            );
             out.push_str("# TYPE aeon_raft_is_leader gauge\n");
-            out.push_str(&format!("aeon_raft_is_leader{{node_id=\"{node_id}\"}} {is_leader}\n"));
+            out.push_str(&format!(
+                "aeon_raft_is_leader{{node_id=\"{node_id}\"}} {is_leader}\n"
+            ));
 
             out.push_str("# HELP aeon_raft_state Raft server state (0=Learner,1=Follower,2=Candidate,3=Leader)\n");
             out.push_str("# TYPE aeon_raft_state gauge\n");
-            out.push_str(&format!("aeon_raft_state{{node_id=\"{node_id}\"}} {state_code}\n"));
+            out.push_str(&format!(
+                "aeon_raft_state{{node_id=\"{node_id}\"}} {state_code}\n"
+            ));
 
-            out.push_str("# HELP aeon_cluster_membership_size Number of voters in the current membership\n");
+            out.push_str(
+                "# HELP aeon_cluster_membership_size Number of voters in the current membership\n",
+            );
             out.push_str("# TYPE aeon_cluster_membership_size gauge\n");
-            out.push_str(&format!("aeon_cluster_membership_size{{node_id=\"{node_id}\"}} {membership_size}\n"));
+            out.push_str(&format!(
+                "aeon_cluster_membership_size{{node_id=\"{node_id}\"}} {membership_size}\n"
+            ));
 
             out.push_str("# HELP aeon_cluster_node_id This node's configured NodeId\n");
             out.push_str("# TYPE aeon_cluster_node_id gauge\n");
@@ -1348,11 +1330,7 @@ mod inner {
                             (ftl.leader_id, ftl.leader_node.as_ref())
                         {
                             return self
-                                .forward_propose_to_leader(
-                                    leader_id,
-                                    leader_node,
-                                    request,
-                                )
+                                .forward_propose_to_leader(leader_id, leader_node, request)
                                 .await;
                         }
                     }
@@ -1374,14 +1352,11 @@ mod inner {
             leader_node: &NodeAddress,
             request: ClusterRequest,
         ) -> Result<ClusterResponse, AeonError> {
-            let request_bytes = bincode::serialize(&request).map_err(|e| {
-                AeonError::Serialization {
-                    message: format!(
-                        "forward_propose: serialize ClusterRequest: {e}"
-                    ),
+            let request_bytes =
+                bincode::serialize(&request).map_err(|e| AeonError::Serialization {
+                    message: format!("forward_propose: serialize ClusterRequest: {e}"),
                     source: None,
-                }
-            })?;
+                })?;
 
             let endpoint = self.endpoint.as_ref().ok_or_else(|| AeonError::Cluster {
                 message: "forward_propose: no QUIC endpoint installed (single-node mode?)"
@@ -1428,11 +1403,7 @@ mod inner {
         /// floored at 2s and capped at 10s) so a tightened `raft_timing`
         /// preset shortens the wait and a loose one doesn't hang forever.
         fn leader_wait_budget(&self) -> std::time::Duration {
-            let scaled = self
-                .config
-                .raft_timing
-                .election_max_ms
-                .saturating_mul(3);
+            let scaled = self.config.raft_timing.election_max_ms.saturating_mul(3);
             let ms = scaled.clamp(2_000, 10_000);
             std::time::Duration::from_millis(ms)
         }
@@ -1607,7 +1578,10 @@ mod inner {
             } else {
                 format!("/{path_and_query}")
             };
-            Some(format!("{scheme}://{host}:{port}{path}", host = leader_addr.host))
+            Some(format!(
+                "{scheme}://{host}:{port}{path}",
+                host = leader_addr.host
+            ))
         }
 
         /// Initiate a partition handover from the current owner to `target`.
@@ -1688,17 +1662,18 @@ mod inner {
             // Derive node IDs from initial_members (populated during K8s discovery).
             // Falls back to collecting from Raft membership metrics.
             let nodes: Vec<u64> = if !self.config.initial_members.is_empty() {
-                let mut ids: Vec<u64> =
-                    self.config.initial_members.iter().map(|(id, _)| *id).collect();
+                let mut ids: Vec<u64> = self
+                    .config
+                    .initial_members
+                    .iter()
+                    .map(|(id, _)| *id)
+                    .collect();
                 ids.sort();
                 ids
             } else {
                 let metrics = self.raft.metrics().borrow().clone();
-                let mut ids: Vec<u64> = metrics
-                    .membership_config
-                    .membership()
-                    .voter_ids()
-                    .collect();
+                let mut ids: Vec<u64> =
+                    metrics.membership_config.membership().voter_ids().collect();
                 ids.sort();
                 ids
             };
@@ -1723,16 +1698,12 @@ mod inner {
         /// clones this handle and selects on `changed()` so a CL-6 transfer
         /// can re-assign a live source (e.g. KafkaSource's `consumer.assign`)
         /// without tearing down the pipeline task.
-        pub fn watch_owned_partitions(
-            &self,
-        ) -> tokio::sync::watch::Receiver<Vec<PartitionId>> {
+        pub fn watch_owned_partitions(&self) -> tokio::sync::watch::Receiver<Vec<PartitionId>> {
             self.owned_partitions_rx.clone()
         }
 
         /// Get the current partition table from the committed state.
-        pub async fn partition_table_snapshot(
-            &self,
-        ) -> crate::types::PartitionTable {
+        pub async fn partition_table_snapshot(&self) -> crate::types::PartitionTable {
             self.shared_state.read().await.partition_table.clone()
         }
 
@@ -2067,9 +2038,7 @@ mod inner {
 
             // Now node 3 is removed — rebalance to just nodes 1 and 2
             let resp = node
-                .propose(ClusterRequest::RebalancePartitions {
-                    nodes: vec![1, 2],
-                })
+                .propose(ClusterRequest::RebalancePartitions { nodes: vec![1, 2] })
                 .await
                 .unwrap();
             assert_eq!(resp, ClusterResponse::Ok);
@@ -2109,9 +2078,7 @@ mod inner {
 
             // Rebalance with empty nodes list should succeed (no-op)
             let resp = node
-                .propose(ClusterRequest::RebalancePartitions {
-                    nodes: vec![],
-                })
+                .propose(ClusterRequest::RebalancePartitions { nodes: vec![] })
                 .await
                 .unwrap();
             assert_eq!(resp, ClusterResponse::Ok);

@@ -222,7 +222,9 @@ mod tests {
     fn from_config_maps_hours_to_nanos() {
         let p = ErasurePolicy::from_config(&ErasureConfig { max_delay_hours: 1 });
         assert_eq!(p.max_delay_nanos(), 3_600 * 1_000_000_000);
-        let p24 = ErasurePolicy::from_config(&ErasureConfig { max_delay_hours: 24 });
+        let p24 = ErasurePolicy::from_config(&ErasureConfig {
+            max_delay_hours: 24,
+        });
         assert_eq!(p24.max_delay_nanos(), 24 * 3_600 * 1_000_000_000);
     }
 
@@ -254,7 +256,9 @@ mod tests {
         store.append(&tombstone_at(1_000_000_000)).unwrap(); // oldest
         store.append(&tombstone_at(9_000_000_000)).unwrap();
 
-        let p = ErasurePolicy::from_config(&ErasureConfig { max_delay_hours: 24 });
+        let p = ErasurePolicy::from_config(&ErasureConfig {
+            max_delay_hours: 24,
+        });
         let b = p.evaluate(&store, 10_000_000_000).unwrap();
         assert_eq!(b.pending_count, 3);
         assert_eq!(b.oldest_accepted_at_nanos, Some(1_000_000_000));

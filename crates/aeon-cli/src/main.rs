@@ -487,34 +487,52 @@ fn error_hint(err: &anyhow::Error) -> Option<&'static str> {
         );
     }
     if haystack.contains("status code 401") || haystack.contains("unauthorized") {
-        return Some("authentication failed. Check AEON_API_TOKEN or your pipeline identity key (`aeon processor identity list <name>`).");
+        return Some(
+            "authentication failed. Check AEON_API_TOKEN or your pipeline identity key (`aeon processor identity list <name>`).",
+        );
     }
     if haystack.contains("status code 403") || haystack.contains("forbidden") {
-        return Some("access denied. The caller has no permission for this resource — check identity scope (allowed_pipelines).");
+        return Some(
+            "access denied. The caller has no permission for this resource — check identity scope (allowed_pipelines).",
+        );
     }
     if haystack.contains("status code 404") {
-        return Some("resource not found. Run `aeon processor list` / `aeon pipeline list` to see what exists.");
+        return Some(
+            "resource not found. Run `aeon processor list` / `aeon pipeline list` to see what exists.",
+        );
     }
     if haystack.contains("failed to run npm") {
-        return Some("Node.js is required. Install from https://nodejs.org or your OS package manager.");
+        return Some(
+            "Node.js is required. Install from https://nodejs.org or your OS package manager.",
+        );
     }
     if haystack.contains("failed to run cargo build") || haystack.contains("cargo build failed") {
-        return Some("Rust toolchain build failed. Ensure `rustup target add wasm32-unknown-unknown` for Wasm processors.");
+        return Some(
+            "Rust toolchain build failed. Ensure `rustup target add wasm32-unknown-unknown` for Wasm processors.",
+        );
     }
     if haystack.contains("unknown file extension") {
-        return Some("supported artifacts: .wasm (guest) or .so/.dll/.dylib (native). Run `aeon build` to produce one.");
+        return Some(
+            "supported artifacts: .wasm (guest) or .so/.dll/.dylib (native). Run `aeon build` to produce one.",
+        );
     }
     if haystack.contains("wasm validation failed") || haystack.contains("failed to compile wasm") {
-        return Some("artifact is not a valid Aeon Wasm component. Rebuild with `aeon build --release` and re-run `aeon validate`.");
+        return Some(
+            "artifact is not a valid Aeon Wasm component. Rebuild with `aeon build --release` and re-run `aeon validate`.",
+        );
     }
     if haystack.contains("native validation requires the 'native-validate' feature") {
-        return Some("rebuild the CLI with `--features native-validate` (enabled by default in release builds).");
+        return Some(
+            "rebuild the CLI with `--features native-validate` (enabled by default in release builds).",
+        );
     }
     if haystack.contains("directory '") && haystack.contains("already exists") {
         return Some("remove the existing directory or pick a different project name.");
     }
     if haystack.contains("file not found") || haystack.contains("no such file") {
-        return Some("check the path spelling and current working directory. Use an absolute path if unsure.");
+        return Some(
+            "check the path spelling and current working directory. Use an absolute path if unsure.",
+        );
     }
     if haystack.contains("invalid json response") || haystack.contains("expected array") {
         return Some(
@@ -642,13 +660,11 @@ async fn install_partition_transfer_driver(
     // to and incoming PartitionTransferRequest / PohChainTransferRequest /
     // PartitionCutoverRequest frames return immediate failures.
     {
-        let l2_registry_for_export = aeon_engine::eo2::PipelineL2Registry::new(
-            aeon_engine::delivery::L2BodyStoreConfig {
+        let l2_registry_for_export =
+            aeon_engine::eo2::PipelineL2Registry::new(aeon_engine::delivery::L2BodyStoreConfig {
                 root: Some(std::path::PathBuf::from(&l2_root)),
-                segment_bytes: aeon_engine::delivery::L2BodyStoreConfig::default()
-                    .segment_bytes,
-            },
-        );
+                segment_bytes: aeon_engine::delivery::L2BodyStoreConfig::default().segment_bytes,
+            });
         let segment_provider: Arc<
             dyn aeon_cluster::transport::partition_transfer::PartitionTransferProvider,
         > = Arc::new(aeon_engine::L2SegmentTransferProvider::new(
@@ -656,18 +672,15 @@ async fn install_partition_transfer_driver(
         ));
         node.install_segment_provider(segment_provider).await;
 
-        let poh_provider: Arc<
-            dyn aeon_cluster::transport::poh_transfer::PohChainProvider,
-        > = Arc::new(aeon_engine::PohChainExportProvider::new(
-            supervisor.poh_live_chains(),
-        ));
+        let poh_provider: Arc<dyn aeon_cluster::transport::poh_transfer::PohChainProvider> =
+            Arc::new(aeon_engine::PohChainExportProvider::new(
+                supervisor.poh_live_chains(),
+            ));
         node.install_poh_provider(poh_provider).await;
 
-        let cutover_coord: Arc<
-            dyn aeon_cluster::transport::cutover::CutoverCoordinator,
-        > = Arc::new(aeon_engine::EngineCutoverCoordinator::new(
-            supervisor.gate_registry(),
-        ));
+        let cutover_coord: Arc<dyn aeon_cluster::transport::cutover::CutoverCoordinator> = Arc::new(
+            aeon_engine::EngineCutoverCoordinator::new(supervisor.gate_registry()),
+        );
         node.install_cutover_coordinator(cutover_coord).await;
     }
 
@@ -2045,9 +2058,7 @@ fn cmd_pipeline(api: &str, action: &PipelineAction) -> Result<()> {
 
 fn cmd_cluster(api: &str, action: &ClusterAction) -> Result<()> {
     match action {
-        ClusterAction::Status { watch, interval } => {
-            cmd_cluster_status(api, *watch, *interval)
-        }
+        ClusterAction::Status { watch, interval } => cmd_cluster_status(api, *watch, *interval),
         ClusterAction::TransferPartition { partition, target } => {
             let url = format!("{api}/api/v1/cluster/partitions/{partition}/transfer");
             let payload = serde_json::json!({ "target_node_id": target });
@@ -2072,11 +2083,7 @@ fn cmd_cluster(api: &str, action: &ClusterAction) -> Result<()> {
 /// POST a cluster mutation (transfer / drain / rebalance) and pretty-print the
 /// response. Translates 409 Conflict into an operator-friendly "hit a follower,
 /// leader is node N" message using the `X-Leader-Id` header set by the server.
-fn post_cluster_mutation(
-    url: &str,
-    body: Option<serde_json::Value>,
-    op: &str,
-) -> Result<()> {
+fn post_cluster_mutation(url: &str, body: Option<serde_json::Value>, op: &str) -> Result<()> {
     let req = ureq::post(url);
     let result = match body {
         Some(ref json) => req.send_json(json),
@@ -2171,11 +2178,17 @@ fn render_cluster_status(body: &serde_json::Value, interval_secs: f64) -> String
         .and_then(|v| v.as_u64())
         .map(|n| n.to_string())
         .unwrap_or_else(|| "<none>".to_string());
-    let num_partitions = body.get("num_partitions").and_then(|v| v.as_u64()).unwrap_or(0);
+    let num_partitions = body
+        .get("num_partitions")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
 
     let raft = body.get("raft").cloned().unwrap_or(serde_json::Value::Null);
     let raft_state = raft.get("state").and_then(|v| v.as_str()).unwrap_or("?");
-    let term = raft.get("current_term").and_then(|v| v.as_u64()).unwrap_or(0);
+    let term = raft
+        .get("current_term")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
     let last_applied = raft
         .get("last_applied")
         .and_then(|v| v.as_u64())
@@ -2227,9 +2240,7 @@ fn render_cluster_status(body: &serde_json::Value, interval_secs: f64) -> String
         out.push_str(&format!("  P{pid:<3}  {cell}\n"));
     }
 
-    out.push_str(&format!(
-        "\n(every {interval_secs}s, Ctrl-C to exit)\n"
-    ));
+    out.push_str(&format!("\n(every {interval_secs}s, Ctrl-C to exit)\n"));
     out
 }
 
@@ -2573,8 +2584,9 @@ fn cmd_inject_l3_fault(count: u64, api: &str) -> Result<()> {
         .send_string("")
         .with_context(|| format!("POST {url} failed"))?;
 
-    let body: serde_json::Value =
-        resp.into_json().context("invalid JSON from inject-l3-fault")?;
+    let body: serde_json::Value = resp
+        .into_json()
+        .context("invalid JSON from inject-l3-fault")?;
     println!(
         "Status:               {}",
         body["status"].as_str().unwrap_or("?")
@@ -2622,8 +2634,7 @@ fn cmd_verify_poh(
     let resp = ureq::get(&url)
         .call()
         .with_context(|| format!("GET {url} failed"))?;
-    let body: serde_json::Value =
-        resp.into_json().context("invalid JSON from /poh-head")?;
+    let body: serde_json::Value = resp.into_json().context("invalid JSON from /poh-head")?;
 
     let poh_active = body["poh_active"].as_bool().unwrap_or(false);
     if !poh_active {
@@ -2644,13 +2655,10 @@ fn cmd_verify_poh(
     }
     println!();
 
-    let signed = match body.get("latest_signed_root").and_then(|v| {
-        if v.is_null() {
-            None
-        } else {
-            Some(v)
-        }
-    }) {
+    let signed = match body
+        .get("latest_signed_root")
+        .and_then(|v| if v.is_null() { None } else { Some(v) })
+    {
         Some(s) => s,
         None => bail!(
             "latest_signed_root is null — pipeline ran without a signing \
@@ -2670,23 +2678,26 @@ fn cmd_verify_poh(
     let signed_at = signed["signed_at_nanos"].as_i64().unwrap_or(0);
 
     // Decode hex into the raw types the SignedRoot struct expects.
-    let merkle_root = hex_to_hash512(merkle_root_hex)
-        .context("decoding latest_signed_root.merkle_root")?;
-    let signature_bytes: [u8; 64] = hex_to_array::<64>(signature_hex)
-        .context("decoding latest_signed_root.signature")?;
+    let merkle_root =
+        hex_to_hash512(merkle_root_hex).context("decoding latest_signed_root.merkle_root")?;
+    let signature_bytes: [u8; 64] =
+        hex_to_array::<64>(signature_hex).context("decoding latest_signed_root.signature")?;
     let signer_pk_bytes: [u8; 32] = hex_to_array::<32>(signer_pk_hex)
         .context("decoding latest_signed_root.signer_public_key")?;
 
     println!("Latest signed root:");
     println!("  signer:       {signer_pk_hex}");
     println!("  signed_at_ns: {signed_at}");
-    println!("  signature:    {}..", &signature_hex[..32.min(signature_hex.len())]);
+    println!(
+        "  signature:    {}..",
+        &signature_hex[..32.min(signature_hex.len())]
+    );
     println!();
 
     // Pinned-key check (optional).
     if let Some(expected) = expected_public_key {
-        let expected_bytes: [u8; 32] = hex_to_array::<32>(expected)
-            .context("decoding --expected-public-key")?;
+        let expected_bytes: [u8; 32] =
+            hex_to_array::<32>(expected).context("decoding --expected-public-key")?;
         if expected_bytes != signer_pk_bytes {
             bail!(
                 "expected public key mismatch:\n  expected: {}\n  surfaced: {}",
@@ -2891,7 +2902,10 @@ fn cmd_apply(file: &Path, api: &str, dry_run: bool) -> Result<()> {
                 source.kind == aeon_types::SourceKind::Pull,
             )
             .with_context(|| {
-                format!("source '{}' validation failed in pipeline '{name}'", source.name)
+                format!(
+                    "source '{}' validation failed in pipeline '{name}'",
+                    source.name
+                )
             })?;
         }
 
@@ -3081,11 +3095,7 @@ fn cmd_diff(file: &Path, api: &str) -> Result<()> {
         .filter_map(|p| p["name"].as_str().map(String::from))
         .collect();
 
-    let manifest_names: Vec<String> = manifest
-        .pipelines
-        .iter()
-        .map(|p| p.name.clone())
-        .collect();
+    let manifest_names: Vec<String> = manifest.pipelines.iter().map(|p| p.name.clone()).collect();
 
     let mut changes = false;
     for name in &manifest_names {
@@ -3237,7 +3247,7 @@ async fn cmd_dev_watch(artifact: &Path) -> Result<()> {
     use aeon_connectors::StdoutSink;
     use aeon_engine::{PipelineConfig, PipelineControl, PipelineMetrics, run_buffered_managed};
     use aeon_types::{AeonError, Event, Processor, Source};
-    use notify::{RecommendedWatcher, RecursiveMode, Watcher, EventKind};
+    use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -3248,15 +3258,13 @@ async fn cmd_dev_watch(artifact: &Path) -> Result<()> {
 
     // Load the initial processor
     let load_processor = |path: &Path| -> Result<Box<dyn Processor + Send + Sync>> {
-        let bytes = std::fs::read(path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
+        let bytes =
+            std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
         match path.extension().and_then(|e| e.to_str()).unwrap_or("") {
             "wasm" | "wat" => {
-                let module = aeon_wasm::WasmModule::from_bytes(
-                    &bytes,
-                    aeon_wasm::WasmConfig::default(),
-                )
-                .map_err(|e| anyhow::anyhow!("failed to compile Wasm: {e}"))?;
+                let module =
+                    aeon_wasm::WasmModule::from_bytes(&bytes, aeon_wasm::WasmConfig::default())
+                        .map_err(|e| anyhow::anyhow!("failed to compile Wasm: {e}"))?;
                 let proc = aeon_wasm::WasmProcessor::new(Arc::new(module))
                     .map_err(|e| anyhow::anyhow!("failed to instantiate Wasm processor: {e}"))?;
                 Ok(Box::new(proc))
@@ -3378,13 +3386,12 @@ async fn cmd_dev_watch(artifact: &Path) -> Result<()> {
             match rx.recv_timeout(std::time::Duration::from_millis(200)) {
                 Ok(Ok(event)) => {
                     // Only react to Create/Modify for our artifact
-                    let dominated = matches!(
-                        event.kind,
-                        EventKind::Create(_) | EventKind::Modify(_)
-                    );
-                    let is_our_file = event.paths.iter().any(|p| {
-                        p.canonicalize().unwrap_or(p.clone()) == artifact_canonical
-                    });
+                    let dominated =
+                        matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_));
+                    let is_our_file = event
+                        .paths
+                        .iter()
+                        .any(|p| p.canonicalize().unwrap_or(p.clone()) == artifact_canonical);
                     if !dominated || !is_our_file {
                         continue;
                     }
@@ -3621,11 +3628,13 @@ fn cmd_doctor(api: &str, kafka: &str, state_dir: &Path, manifest: Option<&Path>)
     }
 
     // Summary.
-    let (pass, warn, fail) = results.iter().fold((0, 0, 0), |(p, w, f), r| match r.status {
-        CheckStatus::Pass => (p + 1, w, f),
-        CheckStatus::Warn => (p, w + 1, f),
-        CheckStatus::Fail => (p, w, f + 1),
-    });
+    let (pass, warn, fail) = results
+        .iter()
+        .fold((0, 0, 0), |(p, w, f), r| match r.status {
+            CheckStatus::Pass => (p + 1, w, f),
+            CheckStatus::Warn => (p, w + 1, f),
+            CheckStatus::Fail => (p, w, f + 1),
+        });
     println!("\n─────");
     println!("Summary: {pass} pass, {warn} warn, {fail} fail");
 
@@ -3759,7 +3768,10 @@ fn check_state_dir(dir: &Path) -> CheckResult {
         if let Err(e) = std::fs::create_dir_all(dir) {
             return CheckResult::fail(
                 "state dir",
-                format!("{} does not exist and could not be created: {e}", dir.display()),
+                format!(
+                    "{} does not exist and could not be created: {e}",
+                    dir.display()
+                ),
                 "create the directory manually or run with elevated permissions",
             );
         }
@@ -3864,10 +3876,9 @@ fn check_artifact(path: &Path) -> CheckResult {
     }
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     match ext {
-        "wasm" | "so" | "dll" | "dylib" => CheckResult::pass(
-            "artifact",
-            format!("{} (.{ext}) present", path.display()),
-        ),
+        "wasm" | "so" | "dll" | "dylib" => {
+            CheckResult::pass("artifact", format!("{} (.{ext}) present", path.display()))
+        }
         _ => CheckResult::warn(
             "artifact",
             format!("{} has unexpected extension '.{ext}'", path.display()),
@@ -3906,10 +3917,19 @@ mod tests {
     fn render_cluster_body_includes_leader_and_partition_rows_in_id_order() {
         let rendered = render_cluster_status(&sample_cluster_body(), 2.0);
 
-        assert!(rendered.contains("node: 2"), "header missing node id: {rendered}");
-        assert!(rendered.contains("leader: 1"), "header missing leader: {rendered}");
+        assert!(
+            rendered.contains("node: 2"),
+            "header missing node id: {rendered}"
+        );
+        assert!(
+            rendered.contains("leader: 1"),
+            "header missing leader: {rendered}"
+        );
         assert!(rendered.contains("term: 5"), "term missing: {rendered}");
-        assert!(rendered.contains("last_applied: 127"), "last_applied missing");
+        assert!(
+            rendered.contains("last_applied: 127"),
+            "last_applied missing"
+        );
 
         let p0 = rendered.find("P0").expect("P0 row");
         let p1 = rendered.find("P1").expect("P1 row");
@@ -3975,7 +3995,10 @@ mod tests {
         let rendered = render_cluster_status(&body, 2.0);
         let p2 = rendered.find("P2 ").expect("P2");
         let p10 = rendered.find("P10").expect("P10");
-        assert!(p2 < p10, "numeric sort: P2 must come before P10: {rendered}");
+        assert!(
+            p2 < p10,
+            "numeric sort: P2 must come before P10: {rendered}"
+        );
     }
 
     #[test]
@@ -4029,8 +4052,10 @@ mod tests {
         let f = write_temp_yaml(yaml);
         let err = read_and_interpolate_manifest(f.path()).expect_err("missing env");
         let msg = format!("{err:#}");
-        assert!(msg.contains("not set") || msg.contains("EnvNotSet"),
-            "expected missing-env error, got {msg}");
+        assert!(
+            msg.contains("not set") || msg.contains("EnvNotSet"),
+            "expected missing-env error, got {msg}"
+        );
     }
 
     #[test]
@@ -4039,8 +4064,10 @@ mod tests {
         let f = write_temp_yaml(yaml);
         let err = read_and_interpolate_manifest(f.path()).expect_err("unregistered");
         let msg = format!("{err:#}");
-        assert!(msg.contains("not registered") || msg.contains("Vault"),
-            "expected scheme-not-registered error, got {msg}");
+        assert!(
+            msg.contains("not registered") || msg.contains("Vault"),
+            "expected scheme-not-registered error, got {msg}"
+        );
     }
 
     #[test]

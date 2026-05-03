@@ -189,10 +189,7 @@ impl BatchInflight {
     /// disconnect-handling logs so operators see exactly how many events were
     /// retained for replay (or lost, if replay is disabled).
     pub fn inflight_event_count(&self) -> u64 {
-        self.pending
-            .iter()
-            .map(|e| e.value().1.len() as u64)
-            .sum()
+        self.pending.iter().map(|e| e.value().1.len() as u64).sum()
     }
 
     /// Number of permits currently available — i.e., how many additional
@@ -439,9 +436,9 @@ impl Drop for ReplayOrchestrator {
         for key in keys {
             if let Some((_, bucket)) = self.buckets.remove(&key) {
                 for b in bucket.batches {
-                    let _ = b.responder.send(Err(AeonError::connection(
-                        "replay orchestrator shut down",
-                    )));
+                    let _ = b
+                        .responder
+                        .send(Err(AeonError::connection("replay orchestrator shut down")));
                 }
             }
         }
@@ -809,8 +806,7 @@ mod tests {
 
         // Spawn a task that tries to start a third batch — it should block.
         let inflight_clone = Arc::clone(&inflight);
-        let blocked =
-            tokio::spawn(async move { inflight_clone.start_batch(empty_events()).await });
+        let blocked = tokio::spawn(async move { inflight_clone.start_batch(empty_events()).await });
 
         // Give it a moment to prove it is actually blocked.
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -875,7 +871,12 @@ mod tests {
         // When the drained batch's responder is eventually fired by the
         // replay orchestrator, the waiter receives it.
         let outputs = vec![];
-        let _ = drained.into_iter().next().unwrap().responder.send(Ok(outputs));
+        let _ = drained
+            .into_iter()
+            .next()
+            .unwrap()
+            .responder
+            .send(Ok(outputs));
         let result = rx.try_recv().expect("responder fired");
         assert!(result.is_ok());
     }

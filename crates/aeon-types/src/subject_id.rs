@@ -119,10 +119,7 @@ impl SubjectId {
             )));
         }
         let (ns, id) = s.split_once('/').ok_or_else(|| {
-            AeonError::config(
-                "subject_id: expected 'namespace/id' form, no '/' found"
-                    .to_string(),
-            )
+            AeonError::config("subject_id: expected 'namespace/id' form, no '/' found".to_string())
         })?;
         validate_component("namespace", ns)?;
         validate_component("id", id)?;
@@ -167,9 +164,7 @@ pub fn validate_namespace_for_wildcard(ns: &str) -> Result<(), AeonError> {
 
 fn validate_component(name: &'static str, c: &str) -> Result<(), AeonError> {
     if c.is_empty() {
-        return Err(AeonError::config(format!(
-            "subject_id: {name} is empty"
-        )));
+        return Err(AeonError::config(format!("subject_id: {name} is empty")));
     }
     if c.len() > MAX_COMPONENT_LEN {
         return Err(AeonError::config(format!(
@@ -322,10 +317,7 @@ mod tests {
         // canonical form round-trips safely through REST paths and
         // log lines (when redacted as a unit rather than escaped).
         for bad in &["ns/id!", "ns;id/oops", "ns/id?x=1", "ns/id&y", "ns%2Fid/x"] {
-            assert!(
-                SubjectId::parse(bad).is_err(),
-                "should reject {bad:?}"
-            );
+            assert!(SubjectId::parse(bad).is_err(), "should reject {bad:?}");
         }
     }
 

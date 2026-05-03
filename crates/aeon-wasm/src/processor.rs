@@ -749,7 +749,10 @@ mod tests {
         assert_eq!(state.len(), 3);
         assert_eq!(state.get(b"counter".as_ref()).unwrap().as_slice(), b"42");
         assert_eq!(state.get(b"name".as_ref()).unwrap().as_slice(), b"alice");
-        assert_eq!(state.get(b"blob".as_ref()).unwrap().as_slice(), &[0xFF; 128][..]);
+        assert_eq!(
+            state.get(b"blob".as_ref()).unwrap().as_slice(),
+            &[0xFF; 128][..]
+        );
     }
 
     /// TR-2 — restore replaces, does not merge. A key present on the target

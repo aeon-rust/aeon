@@ -119,9 +119,8 @@ impl HttpSink {
                         pem.push(b'\n');
                     }
                     pem.extend_from_slice(key);
-                    let identity = reqwest::Identity::from_pem(&pem).map_err(|e| {
-                        AeonError::config(format!("http sink mtls identity: {e}"))
-                    })?;
+                    let identity = reqwest::Identity::from_pem(&pem)
+                        .map_err(|e| AeonError::config(format!("http sink mtls identity: {e}")))?;
                     builder = builder.identity(identity);
                 }
                 OutboundAuthMode::BrokerNative => {
@@ -375,19 +374,17 @@ mod tests {
 
         let app = axum::Router::new().route(
             "/auth",
-            axum::routing::post(
-                move |headers: axum::http::HeaderMap, _body: Bytes| {
-                    let seen = Arc::clone(&seen_clone);
-                    async move {
-                        if headers.get("authorization").map(|v| v.as_bytes())
-                            == Some(b"Bearer tkn-xyz".as_slice())
-                        {
-                            seen.fetch_add(1, Ordering::Relaxed);
-                        }
-                        "ok"
+            axum::routing::post(move |headers: axum::http::HeaderMap, _body: Bytes| {
+                let seen = Arc::clone(&seen_clone);
+                async move {
+                    if headers.get("authorization").map(|v| v.as_bytes())
+                        == Some(b"Bearer tkn-xyz".as_slice())
+                    {
+                        seen.fetch_add(1, Ordering::Relaxed);
                     }
-                },
-            ),
+                    "ok"
+                }
+            }),
         );
 
         tokio::spawn(async move {
@@ -443,27 +440,25 @@ mod tests {
 
         let app = axum::Router::new().route(
             "/hmac",
-            axum::routing::post(
-                move |headers: axum::http::HeaderMap, _body: Bytes| {
-                    let sig = Arc::clone(&sig_clone);
-                    let ts = Arc::clone(&ts_clone);
-                    async move {
-                        if let Some(v) = headers.get("x-aeon-signature") {
-                            let s = v.to_str().unwrap_or("");
-                            if !s.is_empty() && s.chars().all(|c| c.is_ascii_hexdigit()) {
-                                sig.fetch_add(1, Ordering::Relaxed);
-                            }
+            axum::routing::post(move |headers: axum::http::HeaderMap, _body: Bytes| {
+                let sig = Arc::clone(&sig_clone);
+                let ts = Arc::clone(&ts_clone);
+                async move {
+                    if let Some(v) = headers.get("x-aeon-signature") {
+                        let s = v.to_str().unwrap_or("");
+                        if !s.is_empty() && s.chars().all(|c| c.is_ascii_hexdigit()) {
+                            sig.fetch_add(1, Ordering::Relaxed);
                         }
-                        if let Some(v) = headers.get("x-aeon-timestamp") {
-                            let s = v.to_str().unwrap_or("");
-                            if s.parse::<i64>().is_ok() {
-                                ts.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                        "ok"
                     }
-                },
-            ),
+                    if let Some(v) = headers.get("x-aeon-timestamp") {
+                        let s = v.to_str().unwrap_or("");
+                        if s.parse::<i64>().is_ok() {
+                            ts.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    "ok"
+                }
+            }),
         );
 
         tokio::spawn(async move {
@@ -519,20 +514,18 @@ mod tests {
 
         let app = axum::Router::new().route(
             "/noauth",
-            axum::routing::post(
-                move |headers: axum::http::HeaderMap, _body: Bytes| {
-                    let seen = Arc::clone(&seen_clone);
-                    async move {
-                        if headers.get("authorization").is_none()
-                            && headers.get("x-aeon-api-key").is_none()
-                            && headers.get("x-aeon-signature").is_none()
-                        {
-                            seen.fetch_add(1, Ordering::Relaxed);
-                        }
-                        "ok"
+            axum::routing::post(move |headers: axum::http::HeaderMap, _body: Bytes| {
+                let seen = Arc::clone(&seen_clone);
+                async move {
+                    if headers.get("authorization").is_none()
+                        && headers.get("x-aeon-api-key").is_none()
+                        && headers.get("x-aeon-signature").is_none()
+                    {
+                        seen.fetch_add(1, Ordering::Relaxed);
                     }
-                },
-            ),
+                    "ok"
+                }
+            }),
         );
 
         tokio::spawn(async move {
@@ -583,19 +576,17 @@ mod tests {
 
         let app = axum::Router::new().route(
             "/api",
-            axum::routing::post(
-                move |headers: axum::http::HeaderMap, _body: Bytes| {
-                    let seen = Arc::clone(&seen_clone);
-                    async move {
-                        if headers.get("x-upstream-token").map(|v| v.as_bytes())
-                            == Some(b"k-123".as_slice())
-                        {
-                            seen.fetch_add(1, Ordering::Relaxed);
-                        }
-                        "ok"
+            axum::routing::post(move |headers: axum::http::HeaderMap, _body: Bytes| {
+                let seen = Arc::clone(&seen_clone);
+                async move {
+                    if headers.get("x-upstream-token").map(|v| v.as_bytes())
+                        == Some(b"k-123".as_slice())
+                    {
+                        seen.fetch_add(1, Ordering::Relaxed);
                     }
-                },
-            ),
+                    "ok"
+                }
+            }),
         );
 
         tokio::spawn(async move {

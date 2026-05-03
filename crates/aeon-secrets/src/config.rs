@@ -338,7 +338,10 @@ auth:
                 assert_eq!(v.namespace.as_deref(), Some("aeon-prod"));
                 assert!(v.tls_verify); // default
                 match v.auth {
-                    VaultAuthConfig::AppRole { role_id_ref, secret_id_ref } => {
+                    VaultAuthConfig::AppRole {
+                        role_id_ref,
+                        secret_id_ref,
+                    } => {
                         assert_eq!(role_id_ref, "${ENV:VAULT_ROLE_ID}");
                         assert_eq!(secret_id_ref, "${ENV:VAULT_SECRET_ID}");
                     }

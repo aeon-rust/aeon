@@ -77,10 +77,7 @@ impl WriteGate {
         // is rare. Poisoning is mapped to `Open` defensively — a poisoned
         // gate just means a drain task panicked, and we'd rather keep the
         // pipeline running than wedge it.
-        self.state
-            .read()
-            .map(|s| *s)
-            .unwrap_or(GateState::Open)
+        self.state.read().map(|s| *s).unwrap_or(GateState::Open)
     }
 
     /// Source-side: attempt to enter the fetch path. Returns `Some(guard)`
@@ -128,10 +125,7 @@ impl WriteGate {
         // either committed before us (in_flight reflects them) or will
         // observe the new state and bail.
         {
-            let mut s = self
-                .state
-                .write()
-                .map_err(|_| DrainError::PoisonedState)?;
+            let mut s = self.state.write().map_err(|_| DrainError::PoisonedState)?;
             if matches!(*s, GateState::Open) {
                 *s = GateState::FreezeRequested;
             }
@@ -144,10 +138,7 @@ impl WriteGate {
                 if self.in_flight.load(Ordering::Acquire) == 0 {
                     // Atomically transition to Frozen. Re-check under
                     // write lock to defend against a concurrent reopen.
-                    let mut s = self
-                        .state
-                        .write()
-                        .map_err(|_| DrainError::PoisonedState)?;
+                    let mut s = self.state.write().map_err(|_| DrainError::PoisonedState)?;
                     if matches!(*s, GateState::FreezeRequested) {
                         *s = GateState::Frozen;
                     }
@@ -367,9 +358,7 @@ mod tests {
         let g = Arc::new(WriteGate::new());
         // Take a guard and never drop it.
         let _guard = g.try_enter().expect("open");
-        let res = g
-            .request_freeze_and_drain(Duration::from_millis(50))
-            .await;
+        let res = g.request_freeze_and_drain(Duration::from_millis(50)).await;
         assert!(matches!(res, Err(DrainError::Timeout)));
         // State remains FreezeRequested — caller must reopen() if it
         // wants to abort.
@@ -407,10 +396,12 @@ mod tests {
         let g1 = Arc::clone(&g);
         let g2 = Arc::clone(&g);
         let t1 = tokio::spawn(async move {
-            g1.request_freeze_and_drain(Duration::from_millis(500)).await
+            g1.request_freeze_and_drain(Duration::from_millis(500))
+                .await
         });
         let t2 = tokio::spawn(async move {
-            g2.request_freeze_and_drain(Duration::from_millis(500)).await
+            g2.request_freeze_and_drain(Duration::from_millis(500))
+                .await
         });
         assert!(t1.await.expect("join1").is_ok());
         assert!(t2.await.expect("join2").is_ok());

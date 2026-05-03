@@ -28,9 +28,9 @@
 //! - **L3 value store** — one cipher per store instance (or per table).
 //!   Seal every value before `put()`, open every value after `get()`.
 
+use aeon_types::AeonError;
 use aes_gcm::aead::{Aead, OsRng};
 use aes_gcm::{AeadCore, Aes256Gcm, Key, KeyInit, Nonce};
-use aeon_types::AeonError;
 
 use crate::kek::{DekBytes, KekHandle, WrappedDek};
 
@@ -128,7 +128,9 @@ impl std::fmt::Debug for AtRestCipher {
 mod tests {
     use super::*;
     use crate::kek::KekDomain;
-    use aeon_types::{SecretBytes, SecretError, SecretProvider, SecretRef, SecretRegistry, SecretScheme};
+    use aeon_types::{
+        SecretBytes, SecretError, SecretProvider, SecretRef, SecretRegistry, SecretScheme,
+    };
     use std::sync::Arc;
 
     // Reuse the hex-env-provider pattern from kek.rs tests so we can
@@ -164,12 +166,7 @@ mod tests {
         unsafe { std::env::set_var(var, hex_encode(&kek_bytes)) };
         let mut r = SecretRegistry::empty();
         r.register(Arc::new(HexEnvProvider));
-        KekHandle::new(
-            KekDomain::DataContext,
-            id,
-            SecretRef::env(var),
-            Arc::new(r),
-        )
+        KekHandle::new(KekDomain::DataContext, id, SecretRef::env(var), Arc::new(r))
     }
 
     fn cleanup(var: &str) {
@@ -214,7 +211,10 @@ mod tests {
         let pt = b"same-plaintext";
         let a = cipher.seal(pt).unwrap();
         let b = cipher.seal(pt).unwrap();
-        assert_ne!(a, b, "nonce must differ so identical plaintexts seal differently");
+        assert_ne!(
+            a, b,
+            "nonce must differ so identical plaintexts seal differently"
+        );
         // Nonce prefix differs; ciphertext differs; both open to same pt.
         assert_eq!(cipher.open(&a).unwrap(), pt);
         assert_eq!(cipher.open(&b).unwrap(), pt);

@@ -15,13 +15,13 @@ pub mod transfer;
 pub mod types;
 
 #[cfg(feature = "cluster")]
+pub mod log_store;
+#[cfg(feature = "cluster")]
 pub mod node;
 #[cfg(feature = "cluster")]
 pub mod partition_driver;
 #[cfg(feature = "cluster")]
 pub mod raft_config;
-#[cfg(feature = "cluster")]
-pub mod log_store;
 #[cfg(feature = "cluster")]
 pub mod store;
 #[cfg(feature = "cluster")]
@@ -40,8 +40,7 @@ pub use types::{
 pub use node::ClusterNode;
 #[cfg(feature = "cluster")]
 pub use partition_driver::{
-    NodeResolver, PartitionTransferDriver, PohChainInstaller, RaftNodeResolver,
-    SegmentInstaller,
+    NodeResolver, PartitionTransferDriver, PohChainInstaller, RaftNodeResolver, SegmentInstaller,
 };
 #[cfg(feature = "cluster")]
 pub use store::SharedClusterState;

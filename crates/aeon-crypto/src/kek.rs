@@ -245,8 +245,7 @@ impl KekHandle {
         if let Some(prev_id) = &self.previous_id {
             if prev_id == &wrapped.kek_id {
                 if let Some(kek) = self.previous_bytes()? {
-                    let r =
-                        decrypt_dek(kek.expose_bytes(), &wrapped.nonce, &wrapped.ciphertext);
+                    let r = decrypt_dek(kek.expose_bytes(), &wrapped.nonce, &wrapped.ciphertext);
                     if r.is_err() {
                         emit_kek_audit(
                             "kek.unwrap.failed",
@@ -350,7 +349,10 @@ fn decrypt_dek(kek: &[u8], nonce: &[u8], ciphertext: &[u8]) -> Result<DekBytes, 
     }
     if nonce.len() != GCM_NONCE_LEN {
         return Err(AeonError::Crypto {
-            message: format!("GCM nonce must be {GCM_NONCE_LEN} bytes, got {}", nonce.len()),
+            message: format!(
+                "GCM nonce must be {GCM_NONCE_LEN} bytes, got {}",
+                nonce.len()
+            ),
             source: None,
         });
     }
@@ -364,7 +366,10 @@ fn decrypt_dek(kek: &[u8], nonce: &[u8], ciphertext: &[u8]) -> Result<DekBytes, 
     if plaintext.len() != DEK_LEN {
         plaintext.zeroize();
         return Err(AeonError::Crypto {
-            message: format!("unwrapped DEK is {} bytes; expected {DEK_LEN}", plaintext.len()),
+            message: format!(
+                "unwrapped DEK is {} bytes; expected {DEK_LEN}",
+                plaintext.len()
+            ),
             source: None,
         });
     }
@@ -426,9 +431,8 @@ mod tests {
             aeon_types::SecretScheme::Env
         }
         fn resolve(&self, path: &str) -> Result<SecretBytes, aeon_types::SecretError> {
-            let val = std::env::var(path).map_err(|_| {
-                aeon_types::SecretError::EnvNotSet(path.to_string())
-            })?;
+            let val = std::env::var(path)
+                .map_err(|_| aeon_types::SecretError::EnvNotSet(path.to_string()))?;
             Ok(SecretBytes::new(hex_decode(&val)))
         }
     }
@@ -448,12 +452,7 @@ mod tests {
         registry_with_keks(&[(VAR, kek)]);
         let registry = hex_registry();
 
-        let handle = KekHandle::new(
-            KekDomain::DataContext,
-            "v1",
-            SecretRef::env(VAR),
-            registry,
-        );
+        let handle = KekHandle::new(KekDomain::DataContext, "v1", SecretRef::env(VAR), registry);
         let (dek, wrapped) = handle.wrap_new_dek().unwrap();
         assert_eq!(wrapped.kek_domain, KekDomain::DataContext);
         assert_eq!(wrapped.kek_id, "v1");
@@ -510,12 +509,7 @@ mod tests {
         );
         let (_dek, data_wrapped) = data_handle.wrap_new_dek().unwrap();
 
-        let log_handle = KekHandle::new(
-            KekDomain::LogContext,
-            "v1",
-            SecretRef::env(VAR),
-            registry,
-        );
+        let log_handle = KekHandle::new(KekDomain::LogContext, "v1", SecretRef::env(VAR), registry);
         let err = log_handle.unwrap_dek(&data_wrapped).unwrap_err();
         assert!(matches!(err, AeonError::Crypto { .. }));
         assert!(format!("{err}").contains("domain"));
@@ -549,12 +543,7 @@ mod tests {
         registry_with_keks(&[(VAR, [0x55u8; 32])]);
         let registry = hex_registry();
 
-        let handle = KekHandle::new(
-            KekDomain::DataContext,
-            "v1",
-            SecretRef::env(VAR),
-            registry,
-        );
+        let handle = KekHandle::new(KekDomain::DataContext, "v1", SecretRef::env(VAR), registry);
         let (_dek, mut wrapped) = handle.wrap_new_dek().unwrap();
         // Flip a bit in the ciphertext — GCM tag must reject.
         wrapped.ciphertext[0] ^= 0x01;
@@ -574,12 +563,7 @@ mod tests {
         r.register(Arc::new(HexEnvProvider));
         let registry = Arc::new(r);
 
-        let handle = KekHandle::new(
-            KekDomain::DataContext,
-            "v1",
-            SecretRef::env(VAR),
-            registry,
-        );
+        let handle = KekHandle::new(KekDomain::DataContext, "v1", SecretRef::env(VAR), registry);
         let err = handle.wrap_new_dek().unwrap_err();
         assert!(matches!(err, AeonError::Crypto { .. }));
         assert!(format!("{err}").contains("32"));
@@ -615,12 +599,7 @@ mod tests {
         registry_with_keks(&[(VAR, [0x77u8; 32])]);
         let registry = hex_registry();
 
-        let handle = KekHandle::new(
-            KekDomain::LogContext,
-            "v1",
-            SecretRef::env(VAR),
-            registry,
-        );
+        let handle = KekHandle::new(KekDomain::LogContext, "v1", SecretRef::env(VAR), registry);
         let (dek_before, wrapped) = handle.wrap_new_dek().unwrap();
         let json = serde_json::to_string(&wrapped).unwrap();
         let parsed: WrappedDek = serde_json::from_str(&json).unwrap();

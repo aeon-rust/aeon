@@ -123,7 +123,15 @@ pub fn verify_request(
         if secret.is_empty() {
             continue;
         }
-        if verify_one(algo, secret, method, path, timestamp_unix_secs, body, &expected) {
+        if verify_one(
+            algo,
+            secret,
+            method,
+            path,
+            timestamp_unix_secs,
+            body,
+            &expected,
+        ) {
             return Ok(());
         }
     }
@@ -272,8 +280,15 @@ mod tests {
 
     #[test]
     fn verify_rejects_wrong_body() {
-        let sig =
-            sign_request(HmacAlgorithm::HmacSha256, b"k", b"POST", b"/x", b"1", b"body-a").unwrap();
+        let sig = sign_request(
+            HmacAlgorithm::HmacSha256,
+            b"k",
+            b"POST",
+            b"/x",
+            b"1",
+            b"body-a",
+        )
+        .unwrap();
         let err = verify_request(
             HmacAlgorithm::HmacSha256,
             &[b"k"],
@@ -289,8 +304,7 @@ mod tests {
 
     #[test]
     fn verify_rejects_wrong_method() {
-        let sig =
-            sign_request(HmacAlgorithm::HmacSha256, b"k", b"POST", b"/x", b"1", b"").unwrap();
+        let sig = sign_request(HmacAlgorithm::HmacSha256, b"k", b"POST", b"/x", b"1", b"").unwrap();
         let err = verify_request(
             HmacAlgorithm::HmacSha256,
             &[b"k"],
@@ -306,8 +320,7 @@ mod tests {
 
     #[test]
     fn verify_rejects_wrong_timestamp() {
-        let sig =
-            sign_request(HmacAlgorithm::HmacSha256, b"k", b"POST", b"/x", b"1", b"").unwrap();
+        let sig = sign_request(HmacAlgorithm::HmacSha256, b"k", b"POST", b"/x", b"1", b"").unwrap();
         let err = verify_request(
             HmacAlgorithm::HmacSha256,
             &[b"k"],
@@ -374,14 +387,17 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             err,
-            HmacVerifyError::SignatureWrongLength { got: 4, expected: 64 }
+            HmacVerifyError::SignatureWrongLength {
+                got: 4,
+                expected: 64
+            }
         ));
     }
 
     #[test]
     fn sign_rejects_empty_secret() {
-        let err = sign_request(HmacAlgorithm::HmacSha256, b"", b"POST", b"/x", b"1", b"")
-            .unwrap_err();
+        let err =
+            sign_request(HmacAlgorithm::HmacSha256, b"", b"POST", b"/x", b"1", b"").unwrap_err();
         assert!(matches!(err, HmacSignError::EmptySecret));
     }
 

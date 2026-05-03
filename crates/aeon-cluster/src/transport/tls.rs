@@ -153,7 +153,9 @@ pub fn build_client_config(tls: &TlsConfig) -> Result<rustls::ClientConfig, Aeon
 }
 
 /// Wrap a rustls `ServerConfig` into a `quinn::ServerConfig`.
-fn quic_server_config(rustls_config: rustls::ServerConfig) -> Result<quinn::ServerConfig, AeonError> {
+fn quic_server_config(
+    rustls_config: rustls::ServerConfig,
+) -> Result<quinn::ServerConfig, AeonError> {
     let quic_crypto =
         quinn::crypto::rustls::QuicServerConfig::try_from(rustls_config).map_err(|e| {
             AeonError::Config {
@@ -164,7 +166,9 @@ fn quic_server_config(rustls_config: rustls::ServerConfig) -> Result<quinn::Serv
 }
 
 /// Wrap a rustls `ClientConfig` into a `quinn::ClientConfig`.
-fn quic_client_config(rustls_config: rustls::ClientConfig) -> Result<quinn::ClientConfig, AeonError> {
+fn quic_client_config(
+    rustls_config: rustls::ClientConfig,
+) -> Result<quinn::ClientConfig, AeonError> {
     let quic_crypto =
         quinn::crypto::rustls::QuicClientConfig::try_from(rustls_config).map_err(|e| {
             AeonError::Config {
@@ -436,7 +440,10 @@ mod tests {
         let result = quic_configs_for_cluster(&cfg);
         #[cfg(feature = "auto-tls")]
         {
-            assert!(result.is_ok(), "expected Ok with auto-tls feature, got {result:?}");
+            assert!(
+                result.is_ok(),
+                "expected Ok with auto-tls feature, got {result:?}"
+            );
         }
         #[cfg(not(feature = "auto-tls"))]
         {

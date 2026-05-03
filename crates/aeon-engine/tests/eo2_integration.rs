@@ -248,9 +248,17 @@ async fn crash_recovery_push_source_no_loss_no_duplicates() {
     let shutdown = Arc::new(AtomicBool::new(false));
 
     let stopper = shutdown_after_target(Arc::clone(&metrics), Arc::clone(&shutdown), 50);
-    run_buffered(source, processor, sink, config, metrics.clone(), shutdown, None)
-        .await
-        .unwrap();
+    run_buffered(
+        source,
+        processor,
+        sink,
+        config,
+        metrics.clone(),
+        shutdown,
+        None,
+    )
+    .await
+    .unwrap();
     stopper.await.unwrap();
 
     assert_eq!(metrics.events_received.load(Ordering::Relaxed), 50);
@@ -352,22 +360,24 @@ async fn crash_mid_batch_l2_replay_fills_gap() {
     let shutdown = Arc::new(AtomicBool::new(false));
 
     // The pipeline will error (source returns Err after threshold).
-    let result = run_buffered(source, processor, sink1, config, metrics.clone(), shutdown, None).await;
+    let result = run_buffered(
+        source,
+        processor,
+        sink1,
+        config,
+        metrics.clone(),
+        shutdown,
+        None,
+    )
+    .await;
     assert!(result.is_err(), "pipeline should abort on source error");
 
-    let phase1_delivered: HashSet<uuid::Uuid> = sink1_ids
-        .lock()
-        .unwrap()
-        .iter()
-        .copied()
-        .collect();
+    let phase1_delivered: HashSet<uuid::Uuid> = sink1_ids.lock().unwrap().iter().copied().collect();
 
     // Phase 2: replay ALL events from L2 (from seq 0, simulating a full
     // re-read after crash). The L2 store holds everything the source emitted
     // before aborting.
-    let l2_handle = registry
-        .open("crash-mid", PartitionId::new(0))
-        .unwrap();
+    let l2_handle = registry.open("crash-mid", PartitionId::new(0)).unwrap();
     let l2_events: Vec<Event> = {
         let guard = l2_handle.lock().unwrap();
         guard
@@ -415,21 +425,13 @@ async fn crash_mid_batch_l2_replay_fills_gap() {
     .unwrap();
     stopper2.await.unwrap();
 
-    let phase2_delivered: HashSet<uuid::Uuid> = sink2_ids
-        .lock()
-        .unwrap()
-        .iter()
-        .copied()
-        .collect();
+    let phase2_delivered: HashSet<uuid::Uuid> = sink2_ids.lock().unwrap().iter().copied().collect();
 
     // The union of both phases should cover all events the source emitted
     // before aborting. (Events 25-49 were never emitted by the source in
     // phase 1, so they won't be in L2 either.)
     let l2_ids: HashSet<uuid::Uuid> = l2_events.iter().map(|e| e.id).collect();
-    let union: HashSet<uuid::Uuid> = phase1_delivered
-        .union(&phase2_delivered)
-        .copied()
-        .collect();
+    let union: HashSet<uuid::Uuid> = phase1_delivered.union(&phase2_delivered).copied().collect();
 
     assert_eq!(
         union, l2_ids,
@@ -543,8 +545,7 @@ async fn slow_sink_backpressure_completes_under_capacity() {
             tokio::time::sleep(self.delay).await;
             let n = outputs.len() as u64;
             self.count.fetch_add(n, Ordering::Relaxed);
-            let ids: Vec<uuid::Uuid> =
-                outputs.iter().filter_map(|o| o.source_event_id).collect();
+            let ids: Vec<uuid::Uuid> = outputs.iter().filter_map(|o| o.source_event_id).collect();
             Ok(BatchResult::all_delivered(ids))
         }
         async fn flush(&mut self) -> Result<(), AeonError> {
@@ -556,8 +557,7 @@ async fn slow_sink_backpressure_completes_under_capacity() {
     let (mut config, _registry) = eo2_pipeline_config("slow-sink", &tmp, 256);
 
     let node = aeon_engine::eo2_backpressure::NodeCapacity::new(None);
-    let caps =
-        aeon_engine::eo2_backpressure::CapacityLimits::from_config(None, Some(512), 1);
+    let caps = aeon_engine::eo2_backpressure::CapacityLimits::from_config(None, Some(512), 1);
     let capacity = aeon_engine::eo2_backpressure::PipelineCapacity::new(caps, node);
     config.eo2_capacity = Some(capacity.clone());
 
@@ -575,9 +575,17 @@ async fn slow_sink_backpressure_completes_under_capacity() {
     let shutdown = Arc::new(AtomicBool::new(false));
 
     let stopper = shutdown_after_target(Arc::clone(&metrics), Arc::clone(&shutdown), 30);
-    run_buffered(source, processor, sink, config, metrics.clone(), shutdown, None)
-        .await
-        .unwrap();
+    run_buffered(
+        source,
+        processor,
+        sink,
+        config,
+        metrics.clone(),
+        shutdown,
+        None,
+    )
+    .await
+    .unwrap();
     stopper.await.unwrap();
 
     assert_eq!(metrics.events_received.load(Ordering::Relaxed), 30);
@@ -606,17 +614,23 @@ async fn l2_gc_reclaims_after_full_delivery() {
     let shutdown = Arc::new(AtomicBool::new(false));
 
     let stopper = shutdown_after_target(Arc::clone(&metrics), Arc::clone(&shutdown), 100);
-    run_buffered(source, processor, sink, config, metrics.clone(), shutdown, None)
-        .await
-        .unwrap();
+    run_buffered(
+        source,
+        processor,
+        sink,
+        config,
+        metrics.clone(),
+        shutdown,
+        None,
+    )
+    .await
+    .unwrap();
     stopper.await.unwrap();
 
     assert_eq!(metrics.events_received.load(Ordering::Relaxed), 100);
     assert_eq!(metrics.outputs_sent.load(Ordering::Relaxed), 100);
 
-    let store = registry
-        .open("gc-reclaim", PartitionId::new(0))
-        .unwrap();
+    let store = registry.open("gc-reclaim", PartitionId::new(0)).unwrap();
     let guard = store.lock().unwrap();
 
     // next_seq should be ≥ 100 (one per event appended).
@@ -642,8 +656,7 @@ fn recovery_plan_from_multi_sink_checkpoint() {
     offsets.insert(PartitionId::new(0), 1000i64);
     offsets.insert(PartitionId::new(1), 2000i64);
 
-    let rec = CheckpointRecord::new(42, offsets, vec![], 5000, 0)
-        .with_per_sink_ack_seq(per_sink);
+    let rec = CheckpointRecord::new(42, offsets, vec![], 5000, 0).with_per_sink_ack_seq(per_sink);
 
     let plan = RecoveryPlan::from_last(Some(&rec));
 
@@ -787,13 +800,22 @@ async fn multi_sink_shared_ack_tracker_paces_gc_by_laggard() {
 
     // (b) Shared tracker has both sinks registered.
     let snap = shared_tracker.snapshot();
-    assert!(snap.contains_key("fast"), "fast sink must be in shared tracker: {snap:?}");
-    assert!(snap.contains_key("slow"), "slow sink must be in shared tracker: {snap:?}");
+    assert!(
+        snap.contains_key("fast"),
+        "fast sink must be in shared tracker: {snap:?}"
+    );
+    assert!(
+        snap.contains_key("slow"),
+        "slow sink must be in shared tracker: {snap:?}"
+    );
 
     // (c) min_across_sinks is defined — neither sink is at 0 since both
     //     fully completed and recorded at least one ack.
     let min_ack = shared_tracker.min_across_sinks().expect("both sinks acked");
-    assert!(min_ack > 0, "min_across_sinks should advance past 0 after delivery");
+    assert!(
+        min_ack > 0,
+        "min_across_sinks should advance past 0 after delivery"
+    );
     assert_eq!(
         min_ack,
         *snap.values().min().unwrap(),
@@ -925,7 +947,12 @@ async fn multi_source_interleaving_pull_push_poll_fan_in() {
 
     // (a) All 30 events arrived.
     let ids = delivered.lock().unwrap().clone();
-    assert_eq!(ids.len(), 30, "expected 30 delivered events, got {}", ids.len());
+    assert_eq!(
+        ids.len(),
+        30,
+        "expected 30 delivered events, got {}",
+        ids.len()
+    );
 
     // (c) Each source contributed all its events.
     let delivered_set: HashSet<uuid::Uuid> = ids.iter().copied().collect();

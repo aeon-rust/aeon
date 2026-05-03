@@ -186,9 +186,7 @@ impl VaultAuthClient {
         if let Some(ns) = &self.namespace {
             req = req.header("X-Vault-Namespace", ns);
         }
-        let resp = req
-            .send()
-            .map_err(|e| http_err("approle login send", e))?;
+        let resp = req.send().map_err(|e| http_err("approle login send", e))?;
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().unwrap_or_default();
@@ -227,17 +225,14 @@ pub(crate) fn resolve_auth(
             role_id_ref,
             secret_id_ref,
         } => {
-            let role_id =
-                bytes_to_string(&resolve_ref(bootstrap, role_id_ref)?, "role_id_ref")?;
+            let role_id = bytes_to_string(&resolve_ref(bootstrap, role_id_ref)?, "role_id_ref")?;
             let secret_id =
                 bytes_to_string(&resolve_ref(bootstrap, secret_id_ref)?, "secret_id_ref")?;
             Ok(ResolvedAuth::AppRole { role_id, secret_id })
         }
-        VaultAuthConfig::Kubernetes { .. } => {
-            Err(SecretsAdapterError::BackendNotImplemented {
-                backend: "vault_kubernetes_auth",
-            })
-        }
+        VaultAuthConfig::Kubernetes { .. } => Err(SecretsAdapterError::BackendNotImplemented {
+            backend: "vault_kubernetes_auth",
+        }),
     }
 }
 
@@ -252,10 +247,7 @@ pub(crate) fn resolve_ref(
         .map_err(|e| config_err(format!("resolve '{raw}': {e}")))
 }
 
-pub(crate) fn bytes_to_string(
-    b: &SecretBytes,
-    what: &str,
-) -> Result<String, SecretsAdapterError> {
+pub(crate) fn bytes_to_string(b: &SecretBytes, what: &str) -> Result<String, SecretsAdapterError> {
     let s = b
         .expose_str()
         .map_err(|_| config_err(format!("{what} resolved to non-UTF-8 bytes")))?;

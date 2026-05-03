@@ -152,7 +152,9 @@ impl Eo2Metrics {
             }
         }
 
-        s.push_str("# HELP aeon_sink_ack_seq Highest contiguously-acked delivery sequence per sink\n");
+        s.push_str(
+            "# HELP aeon_sink_ack_seq Highest contiguously-acked delivery sequence per sink\n",
+        );
         s.push_str("# TYPE aeon_sink_ack_seq gauge\n");
         if let Ok(g) = self.sink_ack_seq.lock() {
             for ((pipeline, sink), v) in g.iter() {
@@ -263,12 +265,8 @@ mod tests {
         m.set_sink_ack_seq("orders", "kafka-primary", 99);
         m.set_sink_ack_seq("orders", "webhook-audit", 40);
         let s = m.render_prometheus();
-        assert!(
-            s.contains(r#"aeon_sink_ack_seq{pipeline="orders",sink="kafka-primary"} 99"#)
-        );
-        assert!(
-            s.contains(r#"aeon_sink_ack_seq{pipeline="orders",sink="webhook-audit"} 40"#)
-        );
+        assert!(s.contains(r#"aeon_sink_ack_seq{pipeline="orders",sink="kafka-primary"} 99"#));
+        assert!(s.contains(r#"aeon_sink_ack_seq{pipeline="orders",sink="webhook-audit"} 40"#));
     }
 
     #[test]
@@ -302,8 +300,14 @@ mod tests {
             "aeon_l2_pressure",
             "aeon_sink_ack_seq",
         ] {
-            assert!(s.contains(&format!("# HELP {name} ")), "missing HELP for {name}");
-            assert!(s.contains(&format!("# TYPE {name} gauge")), "missing TYPE gauge for {name}");
+            assert!(
+                s.contains(&format!("# HELP {name} ")),
+                "missing HELP for {name}"
+            );
+            assert!(
+                s.contains(&format!("# TYPE {name} gauge")),
+                "missing TYPE gauge for {name}"
+            );
         }
     }
 

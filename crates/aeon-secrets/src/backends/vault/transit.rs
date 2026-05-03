@@ -110,7 +110,9 @@ impl VaultTransitKekProvider {
             return Err(config_err("vault transit mount must not be empty".into()));
         }
         if cfg.key_name.is_empty() {
-            return Err(config_err("vault transit key_name must not be empty".into()));
+            return Err(config_err(
+                "vault transit key_name must not be empty".into(),
+            ));
         }
         let domain = parse_domain(&cfg.domain)?;
 
@@ -276,9 +278,7 @@ impl VaultTransitKekProvider {
                         attempt += 1;
                         continue;
                     }
-                    return Err(crypto_err(format!(
-                        "vault transit POST {path} send: {e}"
-                    )));
+                    return Err(crypto_err(format!("vault transit POST {path} send: {e}")));
                 }
             };
 
@@ -383,9 +383,8 @@ impl VaultTransitKekProvider {
             )));
         }
 
-        let ciphertext = std::str::from_utf8(&wrapped.ciphertext).map_err(|_| {
-            crypto_err("vault transit ciphertext is not valid UTF-8".into())
-        })?;
+        let ciphertext = std::str::from_utf8(&wrapped.ciphertext)
+            .map_err(|_| crypto_err("vault transit ciphertext is not valid UTF-8".into()))?;
 
         #[derive(Serialize)]
         struct Body<'a> {
@@ -581,7 +580,10 @@ mod tests {
             std::str::from_utf8(&wrapped.ciphertext).unwrap(),
             "vault:v1:opaque-blob"
         );
-        assert!(wrapped.nonce.is_empty(), "transit doesn't use the nonce field");
+        assert!(
+            wrapped.nonce.is_empty(),
+            "transit doesn't use the nonce field"
+        );
         m.assert_async().await;
     }
 
@@ -595,10 +597,7 @@ mod tests {
             })))
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(
-                json!({ "data": { "ciphertext": "vault:v2:wrapped-existing" } })
-                    .to_string(),
-            )
+            .with_body(json!({ "data": { "ciphertext": "vault:v2:wrapped-existing" } }).to_string())
             .create_async()
             .await;
 
@@ -680,9 +679,7 @@ mod tests {
             .mock("POST", "/v1/auth/approle/login")
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(
-                json!({ "auth": { "client_token": "fresh-token" } }).to_string(),
-            )
+            .with_body(json!({ "auth": { "client_token": "fresh-token" } }).to_string())
             .expect(2)
             .create_async()
             .await;

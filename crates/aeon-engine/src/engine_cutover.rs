@@ -50,11 +50,7 @@ pub trait CutoverWatermarkReader: Send + Sync {
     /// Return the final watermarks for `(pipeline, partition)` — called
     /// after the gate has committed `Frozen`, so there is no racing
     /// source fetch in flight.
-    fn read_watermarks(
-        &self,
-        pipeline: &str,
-        partition: PartitionId,
-    ) -> CutoverOffsets;
+    fn read_watermarks(&self, pipeline: &str, partition: PartitionId) -> CutoverOffsets;
 }
 
 /// [`CutoverCoordinator`] impl backed by a [`WriteGateRegistry`] plus an
@@ -82,10 +78,7 @@ impl EngineCutoverCoordinator {
     /// Install a watermark reader. Without one, cutover responses carry
     /// the `-1 / 0` sentinels (correct for push/poll partitions; pull
     /// deployments must set a reader for exactly-once handover).
-    pub fn with_watermarks(
-        mut self,
-        reader: Arc<dyn CutoverWatermarkReader>,
-    ) -> Self {
+    pub fn with_watermarks(mut self, reader: Arc<dyn CutoverWatermarkReader>) -> Self {
         self.watermarks = Some(reader);
         self
     }
@@ -102,8 +95,7 @@ impl CutoverCoordinator for EngineCutoverCoordinator {
     fn drain_and_freeze<'a>(
         &'a self,
         req: &'a PartitionCutoverRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<CutoverOffsets, AeonError>> + Send + 'a>>
-    {
+    ) -> Pin<Box<dyn Future<Output = Result<CutoverOffsets, AeonError>> + Send + 'a>> {
         Box::pin(async move {
             // No write-gate registered for (pipeline, partition) means
             // the pipeline isn't currently running on this node — either
@@ -173,13 +165,8 @@ mod tests {
         seen: Mutex<Option<(String, PartitionId)>>,
     }
     impl CutoverWatermarkReader for FixedReader {
-        fn read_watermarks(
-            &self,
-            pipeline: &str,
-            partition: PartitionId,
-        ) -> CutoverOffsets {
-            *self.seen.lock().expect("lock") =
-                Some((pipeline.to_string(), partition));
+        fn read_watermarks(&self, pipeline: &str, partition: PartitionId) -> CutoverOffsets {
+            *self.seen.lock().expect("lock") = Some((pipeline.to_string(), partition));
             assert_eq!(
                 (pipeline, partition),
                 (self.expected.0.as_str(), self.expected.1),
@@ -225,8 +212,8 @@ mod tests {
             },
             seen: Mutex::new(None),
         });
-        let coord = EngineCutoverCoordinator::new(Arc::clone(&gates))
-            .with_watermarks(reader.clone());
+        let coord =
+            EngineCutoverCoordinator::new(Arc::clone(&gates)).with_watermarks(reader.clone());
 
         let offsets = coord
             .drain_and_freeze(&req("pl", 3))

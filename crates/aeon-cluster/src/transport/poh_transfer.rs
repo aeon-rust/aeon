@@ -29,9 +29,7 @@ pub trait PohChainProvider: Send + Sync {
     fn export_state<'a>(
         &'a self,
         req: &'a PohChainTransferRequest,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Vec<u8>, AeonError>> + Send + 'a>,
-    >;
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, AeonError>> + Send + 'a>>;
 }
 
 /// Client side — request the PoH chain state for a partition and return
@@ -44,15 +42,14 @@ pub async fn request_poh_chain_transfer(
     connection: &quinn::Connection,
     req: &PohChainTransferRequest,
 ) -> Result<Vec<u8>, AeonError> {
-    let (mut send, mut recv) =
-        connection
-            .open_bi()
-            .await
-            .map_err(|e| AeonError::Connection {
-                message: format!("poh-transfer: open_bi: {e}"),
-                source: None,
-                retryable: true,
-            })?;
+    let (mut send, mut recv) = connection
+        .open_bi()
+        .await
+        .map_err(|e| AeonError::Connection {
+            message: format!("poh-transfer: open_bi: {e}"),
+            source: None,
+            retryable: true,
+        })?;
 
     let req_bytes = bincode::serialize(req).map_err(|e| AeonError::Serialization {
         message: format!("serialize PohChainTransferRequest: {e}"),
@@ -103,12 +100,11 @@ where
             retryable: false,
         });
     }
-    let req: PohChainTransferRequest = bincode::deserialize(&payload).map_err(|e| {
-        AeonError::Serialization {
+    let req: PohChainTransferRequest =
+        bincode::deserialize(&payload).map_err(|e| AeonError::Serialization {
             message: format!("deserialize PohChainTransferRequest: {e}"),
             source: None,
-        }
-    })?;
+        })?;
     serve_poh_chain_transfer_with_request(provider, send, &req).await
 }
 

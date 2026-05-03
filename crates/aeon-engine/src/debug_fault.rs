@@ -19,9 +19,9 @@
 //! `docs/examples/chaos-l3-fault-eaccess.yaml` for the chaos
 //! mechanisms tried before this one.
 
-use aeon_types::{AeonError, BatchEntry, KvPairs, L3Store};
 #[cfg(test)]
 use aeon_types::BatchOp;
+use aeon_types::{AeonError, BatchEntry, KvPairs, L3Store};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -144,7 +144,10 @@ mod tests {
             Ok(self.data.lock().unwrap().get(key).cloned())
         }
         fn put(&self, key: &[u8], value: &[u8]) -> Result<(), AeonError> {
-            self.data.lock().unwrap().insert(key.to_vec(), value.to_vec());
+            self.data
+                .lock()
+                .unwrap()
+                .insert(key.to_vec(), value.to_vec());
             Ok(())
         }
         fn delete(&self, key: &[u8]) -> Result<(), AeonError> {

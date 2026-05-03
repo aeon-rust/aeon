@@ -219,8 +219,8 @@ fn assert_apply_posts_compliance(regime: &str, enforcement: &str) {
     let path = tmp.path().join("manifest.yaml");
 
     let mock = Mock::spawn_sequence(vec![
-        ("200 OK", "[]"),                         // existing pipelines
-        ("201 Created", r#"{"status":"ok"}"#),    // POST create
+        ("200 OK", "[]"),                      // existing pipelines
+        ("201 Created", r#"{"status":"ok"}"#), // POST create
     ]);
 
     Command::cargo_bin("aeon")
@@ -237,15 +237,17 @@ fn assert_apply_posts_compliance(regime: &str, enforcement: &str) {
 
     // Drain GET (list) response.
     let (list_req, _) = mock.captured();
-    assert!(list_req.starts_with("GET "), "expected GET first: {list_req}");
+    assert!(
+        list_req.starts_with("GET "),
+        "expected GET first: {list_req}"
+    );
 
     let (post_req, post_body) = mock.captured();
     assert!(
         post_req.starts_with("POST /api/v1/pipelines"),
         "expected pipeline POST: {post_req}"
     );
-    let json: serde_json::Value =
-        serde_json::from_str(&post_body).expect("POST body must be JSON");
+    let json: serde_json::Value = serde_json::from_str(&post_body).expect("POST body must be JSON");
     let compliance = json
         .get("compliance")
         .unwrap_or_else(|| panic!("missing compliance in: {post_body}"));

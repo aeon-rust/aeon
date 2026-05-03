@@ -28,8 +28,8 @@
 //! (`PipelineManager`).
 
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use aeon_crypto::kek::KekHandle;
 use aeon_types::durability::DurabilityMode;
@@ -39,15 +39,13 @@ use aeon_types::traits::Sink;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
-use crate::connector_registry::{ConnectorRegistry, PartitionOwnershipResolver};
 use crate::compliance_validator::validate_compliance;
+use crate::connector_registry::{ConnectorRegistry, PartitionOwnershipResolver};
 use crate::encryption_probe::resolve_encryption_plan;
 use crate::erasure_probe::resolve_erasure_plan;
-use crate::retention_probe::resolve_retention_plan;
-use crate::pipeline::{
-    PipelineConfig, PipelineControl, PipelineMetrics, run_buffered_managed,
-};
+use crate::pipeline::{PipelineConfig, PipelineControl, PipelineMetrics, run_buffered_managed};
 use crate::processor::PassthroughProcessor;
+use crate::retention_probe::resolve_retention_plan;
 use crate::write_gate::WriteGateRegistry;
 use aeon_types::partition::PartitionId;
 
@@ -101,8 +99,7 @@ pub struct PipelineSupervisor {
     /// registry → pipelines always genesis a fresh chain (the T0 /
     /// single-node / test path).
     #[cfg(all(feature = "processor-auth", feature = "cluster"))]
-    poh_installed_chains:
-        OnceLock<Arc<crate::partition_install::InstalledPohChainRegistry>>,
+    poh_installed_chains: OnceLock<Arc<crate::partition_install::InstalledPohChainRegistry>>,
     /// CL-6c.4: shared `LivePohChainRegistry`. Constructed once at
     /// supervisor creation so `start()` can stamp the same Arc onto
     /// every pipeline's `PipelineConfig.poh_live_chains` and the
@@ -189,9 +186,7 @@ impl PipelineSupervisor {
             #[cfg(all(feature = "processor-auth", feature = "cluster"))]
             poh_installed_chains: OnceLock::new(),
             #[cfg(all(feature = "processor-auth", feature = "cluster"))]
-            poh_live_chains: Arc::new(
-                crate::partition_install::LivePohChainRegistry::new(),
-            ),
+            poh_live_chains: Arc::new(crate::partition_install::LivePohChainRegistry::new()),
             data_context_kek: OnceLock::new(),
             l2_root: OnceLock::new(),
             #[cfg(feature = "processor-auth")]
@@ -224,9 +219,7 @@ impl PipelineSupervisor {
         store: Arc<dyn aeon_types::L3Store>,
     ) -> Result<(), AeonError> {
         self.l3_checkpoint_store.set(store).map_err(|_| {
-            AeonError::state(
-                "PipelineSupervisor: L3 checkpoint store already installed",
-            )
+            AeonError::state("PipelineSupervisor: L3 checkpoint store already installed")
         })
     }
 
@@ -251,11 +244,9 @@ impl PipelineSupervisor {
         &self,
         injector: crate::debug_fault::FaultyL3Wrapper,
     ) -> Result<(), AeonError> {
-        self.fault_injector_handle.set(injector).map_err(|_| {
-            AeonError::state(
-                "PipelineSupervisor: fault injector already installed",
-            )
-        })
+        self.fault_injector_handle
+            .set(injector)
+            .map_err(|_| AeonError::state("PipelineSupervisor: fault injector already installed"))
     }
 
     /// V5.1: install the node-wide `SecretRegistry`. Intended to be
@@ -272,11 +263,9 @@ impl PipelineSupervisor {
         &self,
         registry: Arc<aeon_types::SecretRegistry>,
     ) -> Result<(), AeonError> {
-        self.secret_registry.set(registry).map_err(|_| {
-            AeonError::state(
-                "PipelineSupervisor: secret registry already installed",
-            )
-        })
+        self.secret_registry
+            .set(registry)
+            .map_err(|_| AeonError::state("PipelineSupervisor: secret registry already installed"))
     }
 
     /// EO-2: install the node-wide L2 body store root. Intended to be
@@ -288,13 +277,10 @@ impl PipelineSupervisor {
     /// unset; pipelines that declare an L2-requiring mode without a
     /// root installed surface a clear `AeonError::state` at
     /// pipeline start rather than silently passing through.
-    pub fn install_l2_root(
-        &self,
-        root: std::path::PathBuf,
-    ) -> Result<(), AeonError> {
-        self.l2_root.set(root).map_err(|_| {
-            AeonError::state("supervisor: L2 root already installed")
-        })
+    pub fn install_l2_root(&self, root: std::path::PathBuf) -> Result<(), AeonError> {
+        self.l2_root
+            .set(root)
+            .map_err(|_| AeonError::state("supervisor: L2 root already installed"))
     }
 
     /// S3: install the node-wide data-context KEK used to wrap per-
@@ -307,9 +293,9 @@ impl PipelineSupervisor {
     /// `encryption.at_rest = required` will fail to start (by design);
     /// pipelines with `off` / `optional` still start, running plaintext.
     pub fn set_data_context_kek(&self, kek: Arc<KekHandle>) -> Result<(), AeonError> {
-        self.data_context_kek.set(kek).map_err(|_| {
-            AeonError::state("PipelineSupervisor: data-context KEK already installed")
-        })
+        self.data_context_kek
+            .set(kek)
+            .map_err(|_| AeonError::state("PipelineSupervisor: data-context KEK already installed"))
     }
 
     /// Currently-installed data-context KEK, if any. Returns a clone
@@ -331,9 +317,7 @@ impl PipelineSupervisor {
         registry: Arc<crate::partition_install::InstalledPohChainRegistry>,
     ) -> Result<(), AeonError> {
         self.poh_installed_chains.set(registry).map_err(|_| {
-            AeonError::state(
-                "PipelineSupervisor: poh_installed_chains registry already installed",
-            )
+            AeonError::state("PipelineSupervisor: poh_installed_chains registry already installed")
         })
     }
 
@@ -354,9 +338,7 @@ impl PipelineSupervisor {
     /// pipeline's `PipelineConfig.poh_live_chains` so `create_poh_state`
     /// can register the chain it produces.
     #[cfg(all(feature = "processor-auth", feature = "cluster"))]
-    pub fn poh_live_chains(
-        &self,
-    ) -> Arc<crate::partition_install::LivePohChainRegistry> {
+    pub fn poh_live_chains(&self) -> Arc<crate::partition_install::LivePohChainRegistry> {
         Arc::clone(&self.poh_live_chains)
     }
 
@@ -369,9 +351,7 @@ impl PipelineSupervisor {
         resolver: Arc<dyn PartitionOwnershipResolver>,
     ) -> Result<(), AeonError> {
         self.ownership.set(resolver).map_err(|_| {
-            AeonError::state(
-                "PipelineSupervisor: ownership resolver already installed",
-            )
+            AeonError::state("PipelineSupervisor: ownership resolver already installed")
         })
     }
 
@@ -441,15 +421,11 @@ impl PipelineSupervisor {
         // socket or a Kafka consumer. The resolved plan rides on
         // `PipelineConfig.encryption_plan` so the EO-2 L2 registry /
         // L3 wrapper can install the KEK when it constructs them.
-        let encryption_plan = resolve_encryption_plan(
-            &def.encryption,
-            self.data_context_kek.get().cloned(),
-        )
-        .map_err(|e| {
-            AeonError::config(format!(
-                "pipeline '{name}' refused to start: {e}"
-            ))
-        })?;
+        let encryption_plan =
+            resolve_encryption_plan(&def.encryption, self.data_context_kek.get().cloned())
+                .map_err(|e| {
+                    AeonError::config(format!("pipeline '{name}' refused to start: {e}"))
+                })?;
 
         // S6.9: resolve the declared compliance block against the
         // just-resolved encryption plan. A GDPR/Mixed pipeline under
@@ -459,22 +435,14 @@ impl PipelineSupervisor {
         // enforcement logs but starts. Other regimes (PCI / HIPAA /
         // None) and Off enforcement short-circuit to a no-op plan.
         let erasure_plan = resolve_erasure_plan(&def.compliance, &encryption_plan)
-            .map_err(|e| {
-                AeonError::config(format!(
-                    "pipeline '{name}' refused to start: {e}"
-                ))
-            })?;
+            .map_err(|e| AeonError::config(format!("pipeline '{name}' refused to start: {e}")))?;
 
         // S5: resolve the declared retention posture. A malformed
         // `hold_after_ack` string is a hard refusal to start — a
         // pipeline that would silently wait 0 seconds (or crash on
         // first GC sweep) is worse than a clear error at boot.
         let retention_plan = resolve_retention_plan(&def.durability.retention)
-            .map_err(|e| {
-                AeonError::config(format!(
-                    "pipeline '{name}' refused to start: {e}"
-                ))
-            })?;
+            .map_err(|e| AeonError::config(format!("pipeline '{name}' refused to start: {e}")))?;
 
         // S4.2: cross-cut the three resolved plans against the
         // declared compliance regime. PCI / HIPAA require
@@ -508,19 +476,13 @@ impl PipelineSupervisor {
                 .with_detail("regime", format!("{:?}", def.compliance.regime))
                 .with_detail("enforcement", format!("{:?}", def.compliance.enforcement)),
             );
-            AeonError::config(format!(
-                "pipeline '{name}' refused to start: {e}"
-            ))
+            AeonError::config(format!("pipeline '{name}' refused to start: {e}"))
         })?;
 
         let source = self.connectors.build_source(source_cfg_ref)?;
         let mut sink = self.connectors.build_sink(sink_cfg)?;
 
-        let processor = build_processor(
-            &def.processor.name,
-            &name,
-            def.processor.tier.as_deref(),
-        )?;
+        let processor = build_processor(&def.processor.name, &name, def.processor.tier.as_deref())?;
 
         // G2/CL-6: install a write-freeze gate for this pipeline's owned
         // partition. T0 supervisor is single-partition (partition 0);
@@ -529,9 +491,7 @@ impl PipelineSupervisor {
         // `PipelineConfig.write_gate` so the source loop calls `try_enter`
         // before every `next_batch`.
         let partition_id = PartitionId::new(0);
-        let gate = self
-            .gate_registry
-            .get_or_create(&name, partition_id);
+        let gate = self.gate_registry.get_or_create(&name, partition_id);
 
         let mut pipeline_config = pipeline_config_for(def);
         pipeline_config.partition_id = partition_id;
@@ -555,10 +515,7 @@ impl PipelineSupervisor {
         if let Some(poh) = pipeline_config.poh.as_mut() {
             poh.partition = partition_id;
             let registry = self.secret_registry.get().map(|r| r.as_ref());
-            poh.signing_key = crate::poh_probe::resolve_poh_signing_key(
-                &def.poh,
-                registry,
-            )?;
+            poh.signing_key = crate::poh_probe::resolve_poh_signing_key(&def.poh, registry)?;
         }
         // EO-2: build a `PipelineL2Registry` rooted at the supervisor's
         // installed L2 root so `MaybeL2Wrapped::wrap` engages on
@@ -582,13 +539,11 @@ impl PipelineSupervisor {
                     def.durability.mode
                 ))
             })?;
-            let mut registry = crate::eo2::PipelineL2Registry::new(
-                crate::delivery::L2BodyStoreConfig {
+            let mut registry =
+                crate::eo2::PipelineL2Registry::new(crate::delivery::L2BodyStoreConfig {
                     root: Some(root.clone()),
-                    segment_bytes: crate::delivery::L2BodyStoreConfig::default()
-                        .segment_bytes,
-                },
-            );
+                    segment_bytes: crate::delivery::L2BodyStoreConfig::default().segment_bytes,
+                });
             // S5 retention is already resolved via `retention_plan`;
             // forward the hold so segment GC honours it.
             registry = registry.with_gc_min_hold(retention_plan.l2_hold_after_ack);
@@ -624,14 +579,12 @@ impl PipelineSupervisor {
         // installed on this node instead of genesising fresh.
         #[cfg(all(feature = "processor-auth", feature = "cluster"))]
         {
-            pipeline_config.poh_installed_chains =
-                self.poh_installed_chains.get().cloned();
+            pipeline_config.poh_installed_chains = self.poh_installed_chains.get().cloned();
             // CL-6c.4: stamp the shared live-chain registry so
             // `create_poh_state` can register the chain it produces and
             // the source-side `PohChainExportProvider` can find it on
             // the next outbound transfer.
-            pipeline_config.poh_live_chains =
-                Some(Arc::clone(&self.poh_live_chains));
+            pipeline_config.poh_live_chains = Some(Arc::clone(&self.poh_live_chains));
         }
         // P5: if the installed ownership resolver exposes a change-feed,
         // subscribe the pipeline so the source loop can `reassign_partitions`
@@ -772,8 +725,7 @@ impl PipelineSupervisor {
         &self,
         desired: &[(&str, &PipelineDefinition)],
     ) -> Result<(), AeonError> {
-        let want: std::collections::BTreeSet<&str> =
-            desired.iter().map(|(n, _)| *n).collect();
+        let want: std::collections::BTreeSet<&str> = desired.iter().map(|(n, _)| *n).collect();
 
         let to_stop: Vec<String> = {
             let running = self.running.lock().await;
@@ -849,8 +801,8 @@ fn build_processor(
     // path lands in a follow-up atom (different fixture, different load
     // boundary).
     if processor_tier.map(|t| t.eq_ignore_ascii_case("native")) == Some(true) {
-        let dir = std::env::var("AEON_PROCESSORS_DIR")
-            .unwrap_or_else(|_| "/app/processors".to_string());
+        let dir =
+            std::env::var("AEON_PROCESSORS_DIR").unwrap_or_else(|_| "/app/processors".to_string());
         let ext = if cfg!(target_os = "windows") {
             "dll"
         } else if cfg!(target_os = "macos") {
@@ -868,11 +820,12 @@ fn build_processor(
                 path.display()
             )));
         }
-        let proc = crate::native_loader::NativeProcessor::load(&path, &[])
-            .map_err(|e| AeonError::state(format!(
+        let proc = crate::native_loader::NativeProcessor::load(&path, &[]).map_err(|e| {
+            AeonError::state(format!(
                 "supervisor: failed to load native processor from {}: {e}",
                 path.display()
-            )))?;
+            ))
+        })?;
         tracing::info!(
             pipeline = pipeline_name,
             processor = processor_name,
@@ -1027,12 +980,8 @@ mod tests {
         seen: Arc<std::sync::atomic::AtomicU64>,
     }
     impl Sink for CapturingSink {
-        async fn write_batch(
-            &mut self,
-            outputs: Vec<Output>,
-        ) -> Result<BatchResult, AeonError> {
-            self.seen
-                .fetch_add(outputs.len() as u64, Ordering::Relaxed);
+        async fn write_batch(&mut self, outputs: Vec<Output>) -> Result<BatchResult, AeonError> {
+            self.seen.fetch_add(outputs.len() as u64, Ordering::Relaxed);
             Ok(BatchResult::all_delivered(
                 outputs.iter().map(|_| uuid::Uuid::nil()).collect(),
             ))
@@ -1263,14 +1212,11 @@ mod tests {
 
     /// Stub resolver that returns a fixed owned-partitions vec.
     struct StubOwnershipResolver(Option<Vec<u16>>);
-    impl crate::connector_registry::PartitionOwnershipResolver
-        for StubOwnershipResolver
-    {
+    impl crate::connector_registry::PartitionOwnershipResolver for StubOwnershipResolver {
         fn owned_partitions<'a>(
             &'a self,
-        ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Option<Vec<u16>>> + Send + 'a>,
-        > {
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u16>>> + Send + 'a>>
+        {
             let out = self.0.clone();
             Box::pin(async move { out })
         }
@@ -1291,10 +1237,8 @@ mod tests {
         reg.register_sink("capture", Arc::new(CapturingSinkFactory(counter)));
 
         let sup = PipelineSupervisor::new(Arc::new(reg));
-        sup.set_ownership_resolver(Arc::new(StubOwnershipResolver(Some(vec![
-            5, 11, 17,
-        ]))))
-        .expect("install resolver");
+        sup.set_ownership_resolver(Arc::new(StubOwnershipResolver(Some(vec![5, 11, 17]))))
+            .expect("install resolver");
 
         let def = def_for("p1"); // partitions: vec![]
         let _ = sup.start(&def).await.expect("start");
@@ -1328,10 +1272,8 @@ mod tests {
         reg.register_sink("capture", Arc::new(CapturingSinkFactory(counter)));
 
         let sup = PipelineSupervisor::new(Arc::new(reg));
-        sup.set_ownership_resolver(Arc::new(StubOwnershipResolver(Some(vec![
-            99,
-        ]))))
-        .expect("install resolver");
+        sup.set_ownership_resolver(Arc::new(StubOwnershipResolver(Some(vec![99]))))
+            .expect("install resolver");
 
         let mut def = def_for("p1");
         def.sources[0].partitions = vec![1, 2, 3]; // explicit
@@ -1400,7 +1342,10 @@ mod tests {
         // Resolver said "I know nothing" — supervisor falls through,
         // factory sees an empty list and applies its own default.
         let got = seen.lock().expect("lock").clone().expect("called");
-        assert!(got.is_empty(), "None from resolver must not fill partitions");
+        assert!(
+            got.is_empty(),
+            "None from resolver must not fill partitions"
+        );
         sup.stop("p1").await.expect("stop");
     }
 
@@ -1427,8 +1372,7 @@ mod tests {
     /// provider.
     fn test_data_context_kek() -> Arc<aeon_crypto::kek::KekHandle> {
         use aeon_types::{
-            SecretBytes, SecretError, SecretProvider, SecretRef, SecretRegistry,
-            SecretScheme,
+            SecretBytes, SecretError, SecretProvider, SecretRef, SecretRegistry, SecretScheme,
         };
         use std::sync::atomic::AtomicU64;
 
@@ -1438,8 +1382,8 @@ mod tests {
                 SecretScheme::Env
             }
             fn resolve(&self, path: &str) -> Result<SecretBytes, SecretError> {
-                let v = std::env::var(path)
-                    .map_err(|_| SecretError::EnvNotSet(path.to_string()))?;
+                let v =
+                    std::env::var(path).map_err(|_| SecretError::EnvNotSet(path.to_string()))?;
                 let bytes: Vec<u8> = (0..v.len())
                     .step_by(2)
                     .map(|i| u8::from_str_radix(&v[i..i + 2], 16).unwrap_or(0))
@@ -1449,10 +1393,7 @@ mod tests {
         }
 
         static N: AtomicU64 = AtomicU64::new(0);
-        let var = format!(
-            "AEON_SUP_TEST_KEK_{}",
-            N.fetch_add(1, Ordering::Relaxed)
-        );
+        let var = format!("AEON_SUP_TEST_KEK_{}", N.fetch_add(1, Ordering::Relaxed));
         let hex: String = (0..32).map(|_| "42".to_string()).collect();
         // SAFETY: test-only env mutation, unique var per call.
         unsafe { std::env::set_var(&var, &hex) };
@@ -1483,8 +1424,7 @@ mod tests {
             Ok(_) => panic!("required + no KEK must refuse to start"),
         };
         assert!(
-            msg.contains("refused to start")
-                && msg.contains("no data-context KEK"),
+            msg.contains("refused to start") && msg.contains("no data-context KEK"),
             "error must cite the missing KEK, got: {msg}"
         );
         assert!(
@@ -1510,8 +1450,7 @@ mod tests {
         let mut def = def_for("p-req-kek");
         def.encryption.at_rest = aeon_types::AtRestEncryption::Required;
 
-        let (_ctrl, _metrics) =
-            sup.start(&def).await.expect("required + KEK must start");
+        let (_ctrl, _metrics) = sup.start(&def).await.expect("required + KEK must start");
 
         let ok = wait_until(|| counter.load(Ordering::Relaxed) >= 50, 500).await;
         assert!(
@@ -1539,8 +1478,10 @@ mod tests {
         // Explicitly no KEK installed.
 
         let def = def_for("p-off"); // encryption defaults to Off
-        let (_ctrl, _metrics) =
-            sup.start(&def).await.expect("off + no KEK must still start");
+        let (_ctrl, _metrics) = sup
+            .start(&def)
+            .await
+            .expect("off + no KEK must still start");
 
         let ok = wait_until(|| counter.load(Ordering::Relaxed) >= 20, 500).await;
         assert!(ok, "expected 20 outputs on plaintext pipeline");
@@ -1564,8 +1505,7 @@ mod tests {
         let mut def = def_for("p-opt-no-kek");
         def.encryption.at_rest = aeon_types::AtRestEncryption::Optional;
 
-        let (_ctrl, _metrics) =
-            sup.start(&def).await.expect("optional + no KEK must start");
+        let (_ctrl, _metrics) = sup.start(&def).await.expect("optional + no KEK must start");
         let ok = wait_until(|| counter.load(Ordering::Relaxed) >= 15, 500).await;
         assert!(ok, "expected 15 outputs on optional-but-plaintext pipeline");
         sup.stop("p-opt-no-kek").await.expect("stop");
@@ -1582,8 +1522,7 @@ mod tests {
 
         let sup = PipelineSupervisor::new(Arc::new(reg));
         let mut def = def_for("p-bad-hold");
-        def.durability.retention.l2_body.hold_after_ack =
-            Some("notaduration".into());
+        def.durability.retention.l2_body.hold_after_ack = Some("notaduration".into());
 
         let msg = match sup.start(&def).await {
             Err(e) => format!("{e}"),
@@ -1614,12 +1553,12 @@ mod tests {
         def.durability.retention.l2_body.hold_after_ack = Some("30s".into());
         def.durability.retention.l3_ack.max_records = Some(5_000);
 
-        let (_ctrl, _metrics) = sup
-            .start(&def)
-            .await
-            .expect("valid retention must start");
+        let (_ctrl, _metrics) = sup.start(&def).await.expect("valid retention must start");
         let ok = wait_until(|| counter.load(Ordering::Relaxed) >= 10, 500).await;
-        assert!(ok, "expected 10 outputs under retention-configured pipeline");
+        assert!(
+            ok,
+            "expected 10 outputs under retention-configured pipeline"
+        );
         sup.stop("p-ret-ok").await.expect("stop");
     }
 
@@ -1638,8 +1577,7 @@ mod tests {
         let def = def_for("p-ret-inert");
         assert!(def.durability.retention.is_default());
 
-        let (_ctrl, _metrics) =
-            sup.start(&def).await.expect("inert retention must start");
+        let (_ctrl, _metrics) = sup.start(&def).await.expect("inert retention must start");
         let ok = wait_until(|| counter.load(Ordering::Relaxed) >= 7, 500).await;
         assert!(ok, "inert retention must not change behaviour");
         sup.stop("p-ret-inert").await.expect("stop");

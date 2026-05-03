@@ -112,8 +112,7 @@ mod tests {
         // shared helper directly since `build_mtls_rustls_client_config`
         // was folded into `crate::mtls_pem::build_mtls_client_config`.
         let (_cert, key_pem) = fixture_cert_and_key();
-        let err = crate::mtls_pem::build_mtls_client_config(b"", key_pem.as_bytes())
-            .unwrap_err();
+        let err = crate::mtls_pem::build_mtls_client_config(b"", key_pem.as_bytes()).unwrap_err();
         let msg = format!("{err:?}");
         assert!(
             msg.to_lowercase().contains("certificate") || msg.to_lowercase().contains("pem"),

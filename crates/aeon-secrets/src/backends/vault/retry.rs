@@ -65,18 +65,12 @@ mod tests {
 
     #[test]
     fn status_classifies_into_four_buckets() {
-        assert_eq!(
-            classify_status(StatusCode::OK),
-            Classification::Success
-        );
+        assert_eq!(classify_status(StatusCode::OK), Classification::Success);
         assert_eq!(
             classify_status(StatusCode::UNAUTHORIZED),
             Classification::Auth
         );
-        assert_eq!(
-            classify_status(StatusCode::FORBIDDEN),
-            Classification::Auth
-        );
+        assert_eq!(classify_status(StatusCode::FORBIDDEN), Classification::Auth);
         assert_eq!(
             classify_status(StatusCode::TOO_MANY_REQUESTS),
             Classification::Transient

@@ -74,9 +74,7 @@ pub fn validate_compliance(
     // `None`. Both `is_active()` (regime != None AND enforcement != Off)
     // would skip this too, but spelling out `regime == None` here keeps
     // the intent obvious.
-    if !compliance.enforcement.is_active()
-        || matches!(compliance.regime, ComplianceRegime::None)
-    {
+    if !compliance.enforcement.is_active() || matches!(compliance.regime, ComplianceRegime::None) {
         return Ok(Vec::new());
     }
 
@@ -283,28 +281,34 @@ mod tests {
     #[test]
     fn pci_strict_fails_without_encryption() {
         let b = block(ComplianceRegime::Pci, EnforcementLevel::Strict);
-        let err =
-            validate_compliance(&b, &enc_off(), &ret_active(), &era_noop()).unwrap_err();
+        let err = validate_compliance(&b, &enc_off(), &ret_active(), &era_noop()).unwrap_err();
         let msg = format!("{err}");
-        assert!(msg.contains("encryption"), "error must cite encryption: {msg}");
-        assert!(!msg.contains("erasure"), "PCI must not surface an erasure finding: {msg}");
+        assert!(
+            msg.contains("encryption"),
+            "error must cite encryption: {msg}"
+        );
+        assert!(
+            !msg.contains("erasure"),
+            "PCI must not surface an erasure finding: {msg}"
+        );
     }
 
     #[test]
     fn pci_strict_fails_without_retention() {
         let b = block(ComplianceRegime::Pci, EnforcementLevel::Strict);
-        let err =
-            validate_compliance(&b, &enc_active(), &ret_inert(), &era_noop()).unwrap_err();
+        let err = validate_compliance(&b, &enc_active(), &ret_inert(), &era_noop()).unwrap_err();
         assert!(format!("{err}").contains("retention"));
     }
 
     #[test]
     fn pci_strict_reports_multiple_findings() {
         let b = block(ComplianceRegime::Pci, EnforcementLevel::Strict);
-        let err =
-            validate_compliance(&b, &enc_off(), &ret_inert(), &era_noop()).unwrap_err();
+        let err = validate_compliance(&b, &enc_off(), &ret_inert(), &era_noop()).unwrap_err();
         let msg = format!("{err}");
-        assert!(msg.contains("2 unmet preconditions"), "expected '2 unmet preconditions' in: {msg}");
+        assert!(
+            msg.contains("2 unmet preconditions"),
+            "expected '2 unmet preconditions' in: {msg}"
+        );
         assert!(msg.contains("encryption"));
         assert!(msg.contains("retention"));
     }
@@ -314,12 +318,8 @@ mod tests {
     #[test]
     fn hipaa_strict_requires_encryption_and_retention() {
         let b = block(ComplianceRegime::Hipaa, EnforcementLevel::Strict);
-        assert!(
-            validate_compliance(&b, &enc_off(), &ret_active(), &era_noop()).is_err()
-        );
-        assert!(
-            validate_compliance(&b, &enc_active(), &ret_inert(), &era_noop()).is_err()
-        );
+        assert!(validate_compliance(&b, &enc_off(), &ret_active(), &era_noop()).is_err());
+        assert!(validate_compliance(&b, &enc_active(), &ret_inert(), &era_noop()).is_err());
         assert!(
             validate_compliance(&b, &enc_active(), &ret_active(), &era_noop())
                 .unwrap()
@@ -332,8 +332,7 @@ mod tests {
     #[test]
     fn gdpr_strict_full_green() {
         let b = block(ComplianceRegime::Gdpr, EnforcementLevel::Strict);
-        let out =
-            validate_compliance(&b, &enc_active(), &ret_active(), &era_required()).unwrap();
+        let out = validate_compliance(&b, &enc_active(), &ret_active(), &era_required()).unwrap();
         assert!(out.is_empty());
     }
 
@@ -343,16 +342,14 @@ mod tests {
         // passed Off to resolve_erasure_plan somehow). S4.2 must catch
         // the gap independently.
         let b = block(ComplianceRegime::Gdpr, EnforcementLevel::Strict);
-        let err =
-            validate_compliance(&b, &enc_active(), &ret_active(), &era_noop()).unwrap_err();
+        let err = validate_compliance(&b, &enc_active(), &ret_active(), &era_noop()).unwrap_err();
         assert!(format!("{err}").contains("erasure"));
     }
 
     #[test]
     fn gdpr_strict_lists_all_three_concerns_when_all_missing() {
         let b = block(ComplianceRegime::Gdpr, EnforcementLevel::Strict);
-        let err =
-            validate_compliance(&b, &enc_off(), &ret_inert(), &era_noop()).unwrap_err();
+        let err = validate_compliance(&b, &enc_off(), &ret_inert(), &era_noop()).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("3 unmet preconditions"));
         assert!(msg.contains("encryption"));
@@ -370,9 +367,7 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        assert!(
-            validate_compliance(&b, &enc_off(), &ret_active(), &era_required()).is_err()
-        );
+        assert!(validate_compliance(&b, &enc_off(), &ret_active(), &era_required()).is_err());
     }
 
     // ── Warn enforcement ────────────────────────────────────────────
@@ -380,8 +375,7 @@ mod tests {
     #[test]
     fn warn_enforcement_returns_findings_instead_of_err() {
         let b = block(ComplianceRegime::Gdpr, EnforcementLevel::Warn);
-        let findings =
-            validate_compliance(&b, &enc_off(), &ret_inert(), &era_noop()).unwrap();
+        let findings = validate_compliance(&b, &enc_off(), &ret_inert(), &era_noop()).unwrap();
         assert_eq!(findings.len(), 3);
         let concerns: Vec<_> = findings.iter().map(|f| f.concern).collect();
         assert!(concerns.contains(&"encryption"));
@@ -392,8 +386,7 @@ mod tests {
     #[test]
     fn warn_with_clean_state_returns_empty() {
         let b = block(ComplianceRegime::Pci, EnforcementLevel::Warn);
-        let findings =
-            validate_compliance(&b, &enc_active(), &ret_active(), &era_noop()).unwrap();
+        let findings = validate_compliance(&b, &enc_active(), &ret_active(), &era_noop()).unwrap();
         assert!(findings.is_empty());
     }
 
@@ -402,8 +395,7 @@ mod tests {
     #[test]
     fn concern_tags_are_stable_identifiers() {
         let b = block(ComplianceRegime::Gdpr, EnforcementLevel::Warn);
-        let findings =
-            validate_compliance(&b, &enc_off(), &ret_inert(), &era_noop()).unwrap();
+        let findings = validate_compliance(&b, &enc_off(), &ret_inert(), &era_noop()).unwrap();
         for f in &findings {
             assert!(
                 matches!(f.concern, "encryption" | "retention" | "erasure"),

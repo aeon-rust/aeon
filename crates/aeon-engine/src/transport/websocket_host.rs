@@ -335,11 +335,17 @@ impl ProcessorTransport for WebSocketProcessorHost {
             // Arc<Vec<Event>> so a disconnect can drain and replay them.
             // Retention is a refcount bump, not a copy.
             let events = Arc::new(events);
-            let (batch_id, rx) = session.batch_inflight.start_batch(Arc::clone(&events)).await;
+            let (batch_id, rx) = session
+                .batch_inflight
+                .start_batch(Arc::clone(&events))
+                .await;
 
             // Encode batch request, then wrap in data frame with routing header
-            let wire =
-                crate::batch_wire::encode_batch_request(batch_id, events.as_slice(), session.codec)?;
+            let wire = crate::batch_wire::encode_batch_request(
+                batch_id,
+                events.as_slice(),
+                session.codec,
+            )?;
             let frame = build_ws_data_frame(&self.config.pipeline_name, partition, &wire);
 
             // Send as binary WebSocket frame
@@ -600,7 +606,10 @@ async fn ws_replay_batches(
             events, responder, ..
         } = inflight;
 
-        let (new_id, rx) = session.batch_inflight.start_batch(Arc::clone(&events)).await;
+        let (new_id, rx) = session
+            .batch_inflight
+            .start_batch(Arc::clone(&events))
+            .await;
 
         let wire =
             match crate::batch_wire::encode_batch_request(new_id, events.as_slice(), session.codec)
@@ -622,10 +631,9 @@ async fn ws_replay_batches(
         let frame = build_ws_data_frame(pipeline, partition, &wire);
 
         if let Err(e) = socket.send(Message::Binary(frame.into())).await {
-            session.batch_inflight.complete_batch(
-                new_id,
-                Err(AeonError::connection("replay send failed")),
-            );
+            session
+                .batch_inflight
+                .complete_batch(new_id, Err(AeonError::connection("replay send failed")));
             let _ = responder.send(Err(e));
             continue;
         }

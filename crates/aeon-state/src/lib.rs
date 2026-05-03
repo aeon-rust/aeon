@@ -25,9 +25,9 @@ pub use l1::L1Store;
 #[cfg(feature = "mmap")]
 pub use l2::L2Store;
 pub use l3::{BatchEntry, BatchOp, KvPairs, L3Backend, L3Store};
-pub use l3_encrypted::EncryptedL3Store;
 #[cfg(feature = "redb")]
 pub use l3::{RedbConfig, RedbStore};
+pub use l3_encrypted::EncryptedL3Store;
 pub use tiered::{TieredConfig, TieredStore};
 pub use typed::{CounterState, ListState, MapState, ValueState};
 pub use window::{

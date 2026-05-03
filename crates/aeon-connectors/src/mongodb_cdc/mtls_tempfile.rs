@@ -46,9 +46,7 @@ impl SecureMtlsTempFile {
             .suffix(".pem")
             .rand_bytes(12)
             .tempfile()
-            .map_err(|e| {
-                AeonError::config(format!("mongo mTLS: tempfile create failed: {e}"))
-            })?;
+            .map_err(|e| AeonError::config(format!("mongo mTLS: tempfile create failed: {e}")))?;
 
         // 0600 perms on Unix so only the connector process reads the key.
         // Windows: NamedTempFile creates with owner-only ACLs by default.
@@ -58,14 +56,11 @@ impl SecureMtlsTempFile {
             let mut perms = inner
                 .as_file()
                 .metadata()
-                .map_err(|e| {
-                    AeonError::config(format!("mongo mTLS: stat tempfile: {e}"))
-                })?
+                .map_err(|e| AeonError::config(format!("mongo mTLS: stat tempfile: {e}")))?
                 .permissions();
             perms.set_mode(0o600);
-            std::fs::set_permissions(inner.path(), perms).map_err(|e| {
-                AeonError::config(format!("mongo mTLS: chmod tempfile: {e}"))
-            })?;
+            std::fs::set_permissions(inner.path(), perms)
+                .map_err(|e| AeonError::config(format!("mongo mTLS: chmod tempfile: {e}")))?;
         }
 
         inner

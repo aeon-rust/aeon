@@ -239,10 +239,10 @@ impl Sink for RedisSink {
                 // Single-element pipeline is still one round-trip.
                 for output in &outputs {
                     let pipe = build_pipeline(&self.config, std::slice::from_ref(output));
-                    let _: redis::Value =
-                        pipe.query_async(&mut self.conn).await.map_err(|e| {
-                            AeonError::connection(format!("redis XADD failed: {e}"))
-                        })?;
+                    let _: redis::Value = pipe
+                        .query_async(&mut self.conn)
+                        .await
+                        .map_err(|e| AeonError::connection(format!("redis XADD failed: {e}")))?;
                     self.delivered += 1;
                 }
                 self.fire_ack(count);
@@ -364,8 +364,8 @@ mod tests {
 
     #[test]
     fn dedup_key_prefix_override() {
-        let cfg = RedisSinkConfig::new("redis://localhost:6379", "s")
-            .with_dedup_key_prefix("custom:");
+        let cfg =
+            RedisSinkConfig::new("redis://localhost:6379", "s").with_dedup_key_prefix("custom:");
         let id = Uuid::nil();
         assert!(cfg.dedup_key(&id).starts_with("custom:s:"));
     }

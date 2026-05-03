@@ -64,15 +64,14 @@ pub async fn request_partition_cutover(
     connection: &quinn::Connection,
     req: &PartitionCutoverRequest,
 ) -> Result<CutoverOffsets, AeonError> {
-    let (mut send, mut recv) =
-        connection
-            .open_bi()
-            .await
-            .map_err(|e| AeonError::Connection {
-                message: format!("cutover: open_bi: {e}"),
-                source: None,
-                retryable: true,
-            })?;
+    let (mut send, mut recv) = connection
+        .open_bi()
+        .await
+        .map_err(|e| AeonError::Connection {
+            message: format!("cutover: open_bi: {e}"),
+            source: None,
+            retryable: true,
+        })?;
 
     let req_bytes = bincode::serialize(req).map_err(|e| AeonError::Serialization {
         message: format!("serialize PartitionCutoverRequest: {e}"),
@@ -231,8 +230,7 @@ mod tests {
         fn drain_and_freeze<'a>(
             &'a self,
             _req: &'a PartitionCutoverRequest,
-        ) -> Pin<Box<dyn Future<Output = Result<CutoverOffsets, AeonError>> + Send + 'a>>
-        {
+        ) -> Pin<Box<dyn Future<Output = Result<CutoverOffsets, AeonError>> + Send + 'a>> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             let offsets = self.offsets;
             Box::pin(async move { Ok(offsets) })
@@ -244,11 +242,8 @@ mod tests {
         fn drain_and_freeze<'a>(
             &'a self,
             _req: &'a PartitionCutoverRequest,
-        ) -> Pin<Box<dyn Future<Output = Result<CutoverOffsets, AeonError>> + Send + 'a>>
-        {
-            Box::pin(async move {
-                Err(AeonError::state("stub: intentional cutover failure"))
-            })
+        ) -> Pin<Box<dyn Future<Output = Result<CutoverOffsets, AeonError>> + Send + 'a>> {
+            Box::pin(async move { Err(AeonError::state("stub: intentional cutover failure")) })
         }
     }
 
@@ -422,7 +417,10 @@ mod tests {
         tracker.begin_cutover().unwrap();
         assert!(matches!(
             tracker.state,
-            TransferState::Cutover { source: 7, target: 11 }
+            TransferState::Cutover {
+                source: 7,
+                target: 11
+            }
         ));
 
         let req = PartitionCutoverRequest {
@@ -437,7 +435,10 @@ mod tests {
         assert!(
             matches!(
                 tracker.state,
-                TransferState::Cutover { source: 7, target: 11 }
+                TransferState::Cutover {
+                    source: 7,
+                    target: 11
+                }
             ),
             "tracker must remain in Cutover after successful handshake, got {:?}",
             tracker.state
@@ -546,7 +547,10 @@ mod tests {
             partition: P::new(0),
         };
         let err = drive_partition_cutover(&mut tracker, &conn, &req).await;
-        assert!(err.is_err(), "Idle tracker must be rejected by precondition");
+        assert!(
+            err.is_err(),
+            "Idle tracker must be rejected by precondition"
+        );
         let msg = format!("{}", err.unwrap_err());
         assert!(
             msg.contains("must be in Cutover"),
