@@ -292,26 +292,77 @@ connectors:
 
 ## 3. Installation Methods
 
-### 3.1 Single Binary
+### 3.1 Pre-built Docker image (recommended for evaluation)
 
-Aeon is a single static binary. Download, configure, run.
+The fastest path to a running Aeon: pull the published image from GitHub
+Container Registry. No build, no Rust toolchain needed.
 
 ```bash
-# Download
-curl -L https://github.com/aeonflow/aeon/releases/latest/download/aeon-linux-x86_64 -o aeon
-chmod +x aeon
+# Pull the latest published image
+docker pull ghcr.io/aeon-rust/aeon:latest
 
-# Create minimal manifest
-cat > manifest.yaml << 'EOF'
-cluster:
-  node_id: 1
-EOF
+# Pin a specific version (use the v<NN> session tag or the commit SHA)
+docker pull ghcr.io/aeon-rust/aeon:v66
 
-# Run
-./aeon run -f manifest.yaml
+# Run a single-node instance with the REST API exposed on host :4471
+docker run -d \
+  --name aeon \
+  -p 4471:4471 \
+  -v aeon-data:/app/artifacts \
+  ghcr.io/aeon-rust/aeon:latest
+
+# Verify
+curl http://localhost:4471/health
+# → {"status":"ok","version":"0.1.0"}
+
+# Apply a pipeline manifest using the CLI (requires aeon binary on PATH; see §3.3
+# for getting it without building from source, or just exec into the container)
+docker exec -i aeon /usr/local/bin/aeon apply -f - < pipeline.yaml
 ```
 
-### 3.2 Docker (Single Container)
+**Image labels** carry OCI provenance — `org.opencontainers.image.source`
+points at https://github.com/aeon-rust/aeon, so the image surfaces on
+the repo's Packages tab and `docker inspect` can recover the source.
+
+**Tags published per release:**
+- `:latest` — rolling pointer to the newest build
+- `:vNN` — sequential session image tag (e.g. `v66`)
+- `:<short-sha>` — git commit SHA, for reproducibility
+
+**Default ports** inside the container: 4470/UDP (cluster QUIC),
+4471/TCP (REST API + WebSocket + /metrics), 4472/UDP (WebTransport +
+external QUIC). Map whichever ports your scenario needs.
+
+**Default config** comes from env vars (see §2.3). With no env override
+the binary listens on `0.0.0.0:4471` and writes artifacts to
+`/app/artifacts`. See §3.4 for the multi-node Helm install.
+
+### 3.2 Single Binary (build from source)
+
+Aeon is a single static binary. Build it yourself when you need a
+specific feature flag combination, custom commit, or air-gapped install
+where you can't pull from GHCR. Full build steps in
+[BUILD-FROM-SOURCE.md](BUILD-FROM-SOURCE.md).
+
+```bash
+# Clone + build (release profile, default features)
+git clone https://github.com/aeon-rust/aeon.git
+cd aeon
+cargo build --release -p aeon-cli --features rest-api
+
+# Binary lands here
+ls target/release/aeon
+
+# Start it
+./target/release/aeon serve --addr 127.0.0.1:4471 --artifact-dir ./data
+```
+
+> **Note on CLI verbs:** the engine starts with `aeon serve`. Pipelines
+> are loaded into a *running* engine via `aeon apply -f manifest.yaml`
+> (declarative) or `aeon pipeline create ...` (imperative). There is no
+> `aeon run -f` command — older docs that suggested it are out of date.
+
+### 3.3 Docker (build your own image)
 
 ```dockerfile
 # Dockerfile
@@ -331,7 +382,7 @@ EXPOSE 4470/udp 4471/tcp 4472/udp
 VOLUME ["/data", "/processors"]
 
 ENTRYPOINT ["aeon"]
-CMD ["run", "-f", "/etc/aeon/manifest.yaml"]
+CMD ["serve"]
 ```
 
 ```bash
@@ -339,13 +390,15 @@ CMD ["run", "-f", "/etc/aeon/manifest.yaml"]
 docker run -d \
   --name aeon \
   -p 4471:4471 \
-  -v ./manifest.yaml:/etc/aeon/manifest.yaml:ro \
-  -v ./data:/data \
-  -v ./processors:/processors \
-  aeon:latest
+  -v ./data:/app/artifacts \
+  -v ./processors:/app/processors \
+  aeon:dev
+
+# Apply pipelines into the running engine
+docker exec -i aeon /usr/local/bin/aeon apply -f - < pipeline.yaml
 ```
 
-### 3.3 Docker Compose (With Redpanda)
+### 3.4 Docker Compose (With Redpanda)
 
 ```yaml
 # docker-compose.yaml — Aeon + Redpanda (Scenario 1)
@@ -397,16 +450,45 @@ networks:
     driver: bridge
 ```
 
-### 3.4 Kubernetes (Helm)
+### 3.5 Kubernetes (Helm)
+
+The chart lives in-tree at `helm/aeon/`. Image defaults to
+`ghcr.io/aeon-rust/aeon:latest` (see `helm/aeon/values.yaml:12`).
+
+**Single-node (Deployment, no cluster):**
 
 ```bash
-# Install via Helm (Phase 14)
-helm repo add aeon https://charts.aeonflow.io
-helm install my-aeon aeon/aeon \
-  --set cluster.nodeId=1 \
-  --set cluster.numPartitions=16 \
-  --set http.auth.mode=mtls
+helm install aeon ./helm/aeon \
+  --set cluster.enabled=false \
+  --set replicaCount=1 \
+  -n aeon --create-namespace
+
+kubectl port-forward -n aeon svc/aeon 4471:4471 &
+curl http://localhost:4471/health
 ```
+
+**Three-node Raft cluster (StatefulSet):**
+
+```bash
+helm install aeon ./helm/aeon \
+  -f helm/aeon/values-local.yaml \
+  -n aeon --create-namespace
+
+# Wait for all 3 pods Ready
+kubectl rollout status sts/aeon -n aeon
+
+# Verify Raft formed
+kubectl exec -n aeon aeon-0 -- /usr/local/bin/aeon cluster status
+# Expect: leader present, all 3 voters in members list, no learners
+
+# Apply a pipeline
+kubectl exec -i -n aeon aeon-0 -- /usr/local/bin/aeon apply -f - < my-pipeline.yaml
+```
+
+**Multi-host cluster** (DOKS / EKS / GKE): use the relevant overlay
+(`helm/aeon/values-doks.yaml` for DigitalOcean) and a real PVC with at
+least 10 GiB per pod for L2 body segments and L3 checkpoints. See
+[CLUSTERING.md](CLUSTERING.md) §3 for full mTLS + capacity planning.
 
 ---
 
@@ -435,8 +517,10 @@ instance is fully isolated — own binary, own manifest, own data directory, own
 
 ```bash
 # Run both simultaneously — completely independent
-/opt/aeon/v1/bin/aeon run -f /opt/aeon/v1/manifest.yaml &
-/opt/aeon/v2/bin/aeon run -f /opt/aeon/v2/manifest.yaml &
+AEON_API_ADDR=0.0.0.0:4471 AEON_ARTIFACT_DIR=/opt/aeon/v1/data \
+  /opt/aeon/v1/bin/aeon serve &
+AEON_API_ADDR=0.0.0.0:4481 AEON_ARTIFACT_DIR=/opt/aeon/v2/data \
+  /opt/aeon/v2/bin/aeon serve &
 
 # Each has its own REST API
 curl http://localhost:4471/health    # v1

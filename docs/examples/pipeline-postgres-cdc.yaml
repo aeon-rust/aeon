@@ -1,0 +1,53 @@
+# PostgreSQL CDC source — logical-replication-backed change data capture.
+#
+# Streams INSERT / UPDATE / DELETE events from a Postgres logical
+# replication slot. One Event per row change, in commit order. The
+# slot persists progress at the broker, so resume after Aeon restart
+# is automatic.
+#
+# Pre-requisites (Postgres 13+):
+#   1. wal_level = logical (postgresql.conf, requires restart)
+#   2. CREATE PUBLICATION aeon_pub FOR ALL TABLES;
+#   3. The connection user needs REPLICATION + USAGE on the schema.
+#      Aeon creates the slot itself (`create_slot: true` below).
+
+pipelines:
+  - name: pg-cdc
+    partitions: 1
+
+    durability:
+      mode: ordered_batch
+      checkpoint:
+        # CDC is naturally checkpointed at the slot; this only controls
+        # how often we ack progress back to the publisher.
+        interval: "1s"
+
+    sources:
+      - name: pg-changes
+        type: postgres-cdc
+        kind: pull
+        identity: { mode: native }
+        event_time:
+          # event_time variants: broker | aeon_ingest | header. The
+          # publisher's commit timestamp surfaces as a record header on
+          # the wire, so use `header` mode to pick it up.
+          mode: header
+          name: commit_ts
+        connection_string: "host=localhost port=5432 user=aeon dbname=app sslmode=prefer password=${ENV:PG_PASSWORD}"
+        slot_name: aeon_slot
+        publication: aeon_pub
+        create_slot: "true"
+        batch_size: "256"
+        source_name: pg-cdc
+
+    processor:
+      name: __identity
+      version: "0.0.0"
+
+    sinks:
+      - name: events-archive
+        type: kafka
+        eos_tier: t2_transactional_stream
+        topic: pg-cdc-events
+        brokers: "redpanda:9092"
+        strategy: ordered_batch

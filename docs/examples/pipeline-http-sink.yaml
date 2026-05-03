@@ -1,0 +1,43 @@
+# HTTP sink — POST each Output payload to a configured URL.
+#
+# Common pattern: Aeon → serverless fan-out (Lambda, Cloud Functions,
+# generic webhook). Each Output is one POST; the body is the
+# `Output.payload` bytes verbatim, headers from the manifest below.
+# Failed requests retry per the connector's internal backoff.
+#
+# S7 SSRF guard + S10 outbound auth identical to http-polling source.
+
+pipelines:
+  - name: webhook-fanout
+    partitions: 1
+
+    durability:
+      mode: ordered_batch
+      checkpoint:
+        interval: "500ms"
+
+    sources:
+      - name: synth
+        type: memory
+        kind: push
+        identity: { mode: random }
+        event_time: { mode: aeon_ingest }
+        count: "1000"
+        payload_size: "256"
+        batch_size: "100"
+
+    processor:
+      name: __identity
+      version: "0.0.0"
+
+    sinks:
+      - name: lambda-webhook
+        type: http
+        eos_tier: t5_idempotency_key
+        url: https://example.com/webhook
+        timeout_ms: "5000"
+        # Repeatable header.<name> keys.
+        header.Content-Type: application/json
+        header.X-Aeon-Pipeline: webhook-fanout
+        header.Authorization: "Bearer ${ENV:WEBHOOK_TOKEN}"
+        ssrf_allow_loopback: "false"

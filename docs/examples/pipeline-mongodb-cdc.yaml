@@ -1,0 +1,55 @@
+# MongoDB CDC source — change-streams-backed CDC.
+#
+# Streams insert / update / replace / delete events from a MongoDB
+# replica set. Resume tokens are persisted to `resume_token_path` so
+# a restart picks up exactly where it left off.
+#
+# Pre-requisites (MongoDB 4.0+):
+#   1. Replica-set topology REQUIRED — change streams are a no-op on
+#      standalone servers. Single-node replica set works:
+#        mongod --replSet rs0
+#        mongosh --eval 'rs.initiate()'
+#   2. The connection user needs `find` + `changeStream` privileges
+#      on the target database (or cluster-wide).
+#   3. `resume_token_path` should live on a durable volume — losing it
+#      means the next start tails from the current oplog tip.
+
+pipelines:
+  - name: mongo-cdc
+    partitions: 1
+
+    durability:
+      mode: ordered_batch
+      checkpoint:
+        interval: "1s"
+
+    sources:
+      - name: mongo-changes
+        type: mongodb-cdc
+        kind: pull
+        identity: { mode: native }
+        event_time:
+          # event_time variants: broker | aeon_ingest | header. The
+          # change-stream cluster time surfaces as a record header.
+          mode: header
+          name: clusterTime
+        uri: "mongodb://aeon:${ENV:MONGO_PASSWORD}@localhost:27017/?replicaSet=rs0"
+        database: app
+        # Optional — omit to watch every collection in the db.
+        collection: orders
+        batch_size: "256"
+        source_name: mongo-cdc
+        resume_token_path: /var/lib/aeon/mongo-cdc.resume
+
+    processor:
+      name: __identity
+      version: "0.0.0"
+
+    sinks:
+      - name: cdc-out
+        type: nats
+        eos_tier: t5_idempotency_key
+        url: nats://localhost:4222
+        subject: mongo.cdc.orders.v1
+        jetstream: "true"
+        dedup: "true"

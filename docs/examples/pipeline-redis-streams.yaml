@@ -1,0 +1,45 @@
+# Redis Streams source + sink — XREADGROUP consumer, XADD producer.
+#
+# The source uses a consumer group so multiple Aeon nodes (or external
+# consumers) can share the workload. Each Event acks via XACK after the
+# Output is delivered (handled by the connector's ack callback wired
+# into the engine).
+#
+# Pre-requisites (against a running Redis 5+):
+#   redis-cli XADD orders '*' k alice v 1
+#   redis-cli XGROUP CREATE orders aeon-group $ MKSTREAM
+
+pipelines:
+  - name: redis-tick
+    partitions: 1
+
+    durability:
+      mode: ordered_batch
+      checkpoint:
+        interval: "500ms"
+
+    sources:
+      - name: orders-in
+        type: redis-streams
+        kind: pull
+        identity: { mode: native }
+        event_time: { mode: aeon_ingest }
+        url: redis://localhost:6379
+        stream_key: orders
+        group: aeon-group
+        consumer: aeon-1
+        batch_size: "256"
+        block_ms: "1000"
+        source_name: orders
+
+    processor:
+      name: __identity
+      version: "0.0.0"
+
+    sinks:
+      - name: orders-out
+        type: redis-streams
+        eos_tier: t5_idempotency_key
+        url: redis://localhost:6379
+        stream_key: orders-processed
+        strategy: ordered_batch

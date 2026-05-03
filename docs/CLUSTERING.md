@@ -274,17 +274,19 @@ problem worse, not better.
 ### Starting a single-node instance
 
 ```bash
-aeon start --config aeon.yaml
+aeon serve --addr 0.0.0.0:4471 --artifact-dir ./data
 ```
 
-Or with environment variable overrides:
+Or with environment variable overrides (the binary reads cluster shape
+from env on startup; the manifest above is loaded at pipeline-apply
+time, not engine-start time):
 
 ```bash
 AEON_CLUSTER_NODE_ID=1 \
 AEON_CLUSTER_BIND=0.0.0.0:4470 \
 AEON_CLUSTER_NUM_PARTITIONS=16 \
-AEON_HTTP_BIND=0.0.0.0:4471 \
-aeon start
+AEON_API_ADDR=0.0.0.0:4471 \
+aeon serve
 ```
 
 ### Verifying the node is running
@@ -384,14 +386,25 @@ nodes join as learners, receive the Raft log via snapshot, and are promoted to v
 once they are caught up.
 
 ```bash
+# Each node reads its identity + peer list from env vars (or the helm
+# chart's `values-local.yaml` / `values-doks.yaml` which sets them via
+# the StatefulSet template). On a bare-VM bootstrap:
+
 # On node 1 (10.0.0.1)
-aeon start --config /etc/aeon/aeon-node1.yaml
+AEON_CLUSTER_NODE_ID=1 AEON_CLUSTER_PEERS="10.0.0.2:4470,10.0.0.3:4470" \
+  aeon serve --addr 0.0.0.0:4471 --artifact-dir /var/lib/aeon/n1
 
 # On node 2 (10.0.0.2)
-aeon start --config /etc/aeon/aeon-node2.yaml
+AEON_CLUSTER_NODE_ID=2 AEON_CLUSTER_PEERS="10.0.0.1:4470,10.0.0.3:4470" \
+  aeon serve --addr 0.0.0.0:4471 --artifact-dir /var/lib/aeon/n2
 
 # On node 3 (10.0.0.3)
-aeon start --config /etc/aeon/aeon-node3.yaml
+AEON_CLUSTER_NODE_ID=3 AEON_CLUSTER_PEERS="10.0.0.1:4470,10.0.0.2:4470" \
+  aeon serve --addr 0.0.0.0:4471 --artifact-dir /var/lib/aeon/n3
+
+# Confirm Raft formed (run on any node)
+aeon cluster status --api http://10.0.0.1:4471
+# Expect: leader present, members [{id:1},{id:2},{id:3}], term > 0.
 ```
 
 The bootstrap sequence:

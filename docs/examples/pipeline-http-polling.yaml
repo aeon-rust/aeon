@@ -1,0 +1,53 @@
+# HTTP polling source — periodic GET against a JSON endpoint.
+#
+# Pull-source analog to http-webhook. No push buffer needed because
+# `interval_ms` is the natural flow control: the connector emits one
+# Event per response, then sleeps `interval_ms` before the next poll.
+#
+# S7 SSRF guard is on by default — denies loopback / link-local /
+# CGNAT, allows RFC1918 / public. Override per-pipeline below.
+# S10 outbound auth: configure `outbound_auth_*` keys to add
+# Bearer / Basic / API-key / HMAC-sign / mTLS to the request.
+
+pipelines:
+  - name: api-poll
+    partitions: 1
+
+    durability:
+      mode: none
+
+    sources:
+      - name: weather-poll
+        type: http-polling
+        kind: poll
+        identity:
+          mode: compound
+          cursor_path: $.last_seen
+          content_hash:
+            algorithm: blake3
+        event_time:
+          # event_time variants: broker | aeon_ingest | header. The
+          # upstream API doesn't expose a header timestamp, so use the
+          # ingest time (Aeon stamps the Event when it arrives).
+          mode: aeon_ingest
+        url: https://api.open-meteo.com/v1/forecast?latitude=37.7&longitude=-122.4&current_weather=true
+        interval_ms: "60000"
+        timeout_ms: "10000"
+        source_name: open-meteo
+        # Repeatable header.<name> keys — each becomes one request header.
+        # Values support env-var interpolation (see header.X-Api-Key
+        # below for the syntax — the literal token is omitted from this
+        # comment because the interpolator walks comments too).
+        header.User-Agent: "aeon-poll/0.1"
+        header.X-Api-Key: "${ENV:OPENMETEO_API_KEY}"
+        # SSRF guard overrides — enable loopback for local dev.
+        ssrf_allow_loopback: "true"
+
+    processor:
+      name: __identity
+      version: "0.0.0"
+
+    sinks:
+      - name: out
+        type: stdout
+        eos_tier: t6_fire_and_forget

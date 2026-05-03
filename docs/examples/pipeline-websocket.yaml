@@ -1,0 +1,41 @@
+# WebSocket source + sink — connect to a ws/wss endpoint, read each
+# message as one Event, write each Output as one binary message.
+#
+# Both source and sink keep a persistent connection open; the source
+# spools incoming messages through the shared push buffer so spikes
+# don't drop bytes. Reconnects on disconnect with exponential backoff.
+
+pipelines:
+  - name: ws-bridge
+    partitions: 1
+
+    durability:
+      mode: ordered_batch
+      checkpoint:
+        interval: "200ms"
+
+    sources:
+      - name: upstream-ws
+        type: websocket
+        kind: push
+        identity: { mode: random }
+        event_time: { mode: aeon_ingest }
+        url: wss://stream.example.com/ticks
+        source_name: tick-feed
+        channel_capacity: "8192"
+        poll_timeout_ms: "1000"
+        # S10 outbound auth — Bearer token for the upstream WS
+        outbound_auth_mode: bearer
+        outbound_auth_bearer_token: "${ENV:UPSTREAM_TOKEN}"
+
+    processor:
+      name: __identity
+      version: "0.0.0"
+
+    sinks:
+      - name: downstream-ws
+        type: websocket
+        eos_tier: t6_fire_and_forget
+        url: wss://downstream.example.com/ingest
+        outbound_auth_mode: bearer
+        outbound_auth_bearer_token: "${ENV:DOWNSTREAM_TOKEN}"
