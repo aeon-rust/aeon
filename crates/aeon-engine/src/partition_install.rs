@@ -140,16 +140,13 @@ impl SegmentInstaller for L2SegmentInstaller {
         end: PartitionTransferEnd,
     ) -> Result<(), AeonError> {
         let key = self.key_of(&req.pipeline, req.partition);
-        let writer = self
-            .lock_writers()?
-            .remove(&key)
-            .ok_or_else(|| {
-                AeonError::state(format!(
-                    "l2-installer: finish without begin for pipeline={} partition={}",
-                    req.pipeline,
-                    req.partition.as_u16()
-                ))
-            })?;
+        let writer = self.lock_writers()?.remove(&key).ok_or_else(|| {
+            AeonError::state(format!(
+                "l2-installer: finish without begin for pipeline={} partition={}",
+                req.pipeline,
+                req.partition.as_u16()
+            ))
+        })?;
 
         if !end.success {
             // Source aborted mid-stream. Drop the in-flight writer (which
@@ -197,7 +194,12 @@ impl InstalledPohChainRegistry {
         self.inner.lock().ok()?.remove(&key)
     }
 
-    fn insert(&self, pipeline: &str, partition: PartitionId, chain: PohChain) -> Result<(), AeonError> {
+    fn insert(
+        &self,
+        pipeline: &str,
+        partition: PartitionId,
+        chain: PohChain,
+    ) -> Result<(), AeonError> {
         let key = (pipeline.to_owned(), partition.as_u16());
         self.inner
             .lock()
@@ -332,18 +334,16 @@ impl PohChainInstaller for PohChainInstallerImpl {
             return Ok(());
         }
 
-        let state = PohChainState::from_bytes(&state_bytes).map_err(|e| {
-            AeonError::state(format!("poh-installer: decode PohChainState: {e}"))
-        })?;
+        let state = PohChainState::from_bytes(&state_bytes)
+            .map_err(|e| AeonError::state(format!("poh-installer: decode PohChainState: {e}")))?;
 
         match self.verify_mode {
             PohVerifyMode::TrustExtend => {
                 // Skip verification — only safe on authenticated transports.
             }
             PohVerifyMode::Verify | PohVerifyMode::VerifyWithKey => {
-                PohChain::verify_state(&state, req.partition).map_err(|e| {
-                    AeonError::state(format!("poh-installer: verify_state: {e}"))
-                })?;
+                PohChain::verify_state(&state, req.partition)
+                    .map_err(|e| AeonError::state(format!("poh-installer: verify_state: {e}")))?;
                 // VerifyWithKey would additionally check signatures on any
                 // recent entries carried in state. Current `PohChainState`
                 // wire format is MMR-only, so this degrades to `Verify`
@@ -546,8 +546,7 @@ mod tests {
     #[test]
     fn poh_installer_trust_extend_skips_verification() {
         let registry = InstalledPohChainRegistry::new();
-        let installer =
-            PohChainInstallerImpl::new(registry.clone(), PohVerifyMode::TrustExtend);
+        let installer = PohChainInstallerImpl::new(registry.clone(), PohVerifyMode::TrustExtend);
         // Craft a deliberately-wrong state: partition mismatch. Under
         // `TrustExtend` it should still install.
         let state = populated_state(4);
@@ -582,13 +581,20 @@ mod tests {
     #[test]
     fn live_poh_registry_register_get_unregister_roundtrip() {
         let reg = LivePohChainRegistry::new();
-        let chain = Arc::new(tokio::sync::Mutex::new(PohChain::new(PartitionId::new(7), 64)));
-        reg.register("pl", PartitionId::new(7), Arc::clone(&chain)).unwrap();
+        let chain = Arc::new(tokio::sync::Mutex::new(PohChain::new(
+            PartitionId::new(7),
+            64,
+        )));
+        reg.register("pl", PartitionId::new(7), Arc::clone(&chain))
+            .unwrap();
 
         let got = reg
             .get("pl", PartitionId::new(7))
             .expect("registered chain should be retrievable");
-        assert!(Arc::ptr_eq(&chain, &got), "registry must hand back the same Arc");
+        assert!(
+            Arc::ptr_eq(&chain, &got),
+            "registry must hand back the same Arc"
+        );
 
         reg.unregister("pl", PartitionId::new(7));
         assert!(reg.get("pl", PartitionId::new(7)).is_none());
@@ -597,10 +603,18 @@ mod tests {
     #[test]
     fn live_poh_registry_register_replaces_previous() {
         let reg = LivePohChainRegistry::new();
-        let chain1 = Arc::new(tokio::sync::Mutex::new(PohChain::new(PartitionId::new(0), 64)));
-        let chain2 = Arc::new(tokio::sync::Mutex::new(PohChain::new(PartitionId::new(0), 64)));
-        reg.register("pl", PartitionId::new(0), Arc::clone(&chain1)).unwrap();
-        reg.register("pl", PartitionId::new(0), Arc::clone(&chain2)).unwrap();
+        let chain1 = Arc::new(tokio::sync::Mutex::new(PohChain::new(
+            PartitionId::new(0),
+            64,
+        )));
+        let chain2 = Arc::new(tokio::sync::Mutex::new(PohChain::new(
+            PartitionId::new(0),
+            64,
+        )));
+        reg.register("pl", PartitionId::new(0), Arc::clone(&chain1))
+            .unwrap();
+        reg.register("pl", PartitionId::new(0), Arc::clone(&chain2))
+            .unwrap();
         let got = reg.get("pl", PartitionId::new(0)).unwrap();
         assert!(
             Arc::ptr_eq(&chain2, &got),
@@ -618,10 +632,16 @@ mod tests {
     fn live_poh_registry_remove_pipeline_drops_all_partitions() {
         let reg = LivePohChainRegistry::new();
         for p in 0u16..3 {
-            let chain = Arc::new(tokio::sync::Mutex::new(PohChain::new(PartitionId::new(p), 64)));
+            let chain = Arc::new(tokio::sync::Mutex::new(PohChain::new(
+                PartitionId::new(p),
+                64,
+            )));
             reg.register("pl", PartitionId::new(p), chain).unwrap();
         }
-        let other = Arc::new(tokio::sync::Mutex::new(PohChain::new(PartitionId::new(0), 64)));
+        let other = Arc::new(tokio::sync::Mutex::new(PohChain::new(
+            PartitionId::new(0),
+            64,
+        )));
         reg.register("other", PartitionId::new(0), other).unwrap();
 
         reg.remove_pipeline("pl");
@@ -637,10 +657,7 @@ mod tests {
     #[test]
     fn poh_installer_verify_with_key_currently_degrades_to_verify() {
         let registry = InstalledPohChainRegistry::new();
-        let installer = PohChainInstallerImpl::new(
-            registry.clone(),
-            PohVerifyMode::VerifyWithKey,
-        );
+        let installer = PohChainInstallerImpl::new(registry.clone(), PohVerifyMode::VerifyWithKey);
         let state = populated_state(0);
         let bytes = state.to_bytes().unwrap();
         let req = PohChainTransferRequest {

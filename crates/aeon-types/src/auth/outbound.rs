@@ -291,7 +291,8 @@ impl std::fmt::Debug for OutboundAuthSigner {
                 s.field("has_basic", &true);
             }
             CompiledSigner::ApiKey { header_name, .. } => {
-                s.field("api_key_header", header_name).field("has_api_key", &true);
+                s.field("api_key_header", header_name)
+                    .field("has_api_key", &true);
             }
             CompiledSigner::HmacSign(_) => {
                 s.field("has_hmac", &true);
@@ -302,7 +303,8 @@ impl std::fmt::Debug for OutboundAuthSigner {
             CompiledSigner::BrokerNative(bn) => {
                 s.field(
                     "broker_native_keys",
-                    &bn.as_ref().map(|b| b.values.keys().cloned().collect::<Vec<_>>()),
+                    &bn.as_ref()
+                        .map(|b| b.values.keys().cloned().collect::<Vec<_>>()),
                 );
             }
         }
@@ -319,18 +321,22 @@ impl OutboundAuthSigner {
         let inner = match config.mode {
             OutboundAuthMode::None => CompiledSigner::None,
             OutboundAuthMode::Bearer => {
-                let b = config.bearer.ok_or(OutboundAuthBuildError::ModeConfigMissing {
-                    mode: OutboundAuthMode::Bearer,
-                })?;
+                let b = config
+                    .bearer
+                    .ok_or(OutboundAuthBuildError::ModeConfigMissing {
+                        mode: OutboundAuthMode::Bearer,
+                    })?;
                 if b.token.is_empty() {
                     return Err(OutboundAuthBuildError::BearerEmpty);
                 }
                 CompiledSigner::Bearer(SecretBytes::new(b.token.into_bytes()))
             }
             OutboundAuthMode::Basic => {
-                let b = config.basic.ok_or(OutboundAuthBuildError::ModeConfigMissing {
-                    mode: OutboundAuthMode::Basic,
-                })?;
+                let b = config
+                    .basic
+                    .ok_or(OutboundAuthBuildError::ModeConfigMissing {
+                        mode: OutboundAuthMode::Basic,
+                    })?;
                 if b.username.is_empty() {
                     return Err(OutboundAuthBuildError::BasicUsernameEmpty);
                 }
@@ -339,9 +345,11 @@ impl OutboundAuthSigner {
                 CompiledSigner::Basic(SecretBytes::new(encoded.into_bytes()))
             }
             OutboundAuthMode::ApiKey => {
-                let k = config.api_key.ok_or(OutboundAuthBuildError::ModeConfigMissing {
-                    mode: OutboundAuthMode::ApiKey,
-                })?;
+                let k = config
+                    .api_key
+                    .ok_or(OutboundAuthBuildError::ModeConfigMissing {
+                        mode: OutboundAuthMode::ApiKey,
+                    })?;
                 if k.key.is_empty() {
                     return Err(OutboundAuthBuildError::ApiKeyEmpty);
                 }
@@ -351,9 +359,11 @@ impl OutboundAuthSigner {
                 }
             }
             OutboundAuthMode::HmacSign => {
-                let h = config.hmac_sign.ok_or(OutboundAuthBuildError::ModeConfigMissing {
-                    mode: OutboundAuthMode::HmacSign,
-                })?;
+                let h = config
+                    .hmac_sign
+                    .ok_or(OutboundAuthBuildError::ModeConfigMissing {
+                        mode: OutboundAuthMode::HmacSign,
+                    })?;
                 if h.secret.is_empty() {
                     return Err(OutboundAuthBuildError::HmacSecretEmpty);
                 }
@@ -365,9 +375,11 @@ impl OutboundAuthSigner {
                 })
             }
             OutboundAuthMode::Mtls => {
-                let m = config.mtls.ok_or(OutboundAuthBuildError::ModeConfigMissing {
-                    mode: OutboundAuthMode::Mtls,
-                })?;
+                let m = config
+                    .mtls
+                    .ok_or(OutboundAuthBuildError::ModeConfigMissing {
+                        mode: OutboundAuthMode::Mtls,
+                    })?;
                 if m.cert_pem.is_empty() || m.key_pem.is_empty() {
                     return Err(OutboundAuthBuildError::MtlsEmpty);
                 }

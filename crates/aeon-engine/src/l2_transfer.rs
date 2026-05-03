@@ -59,8 +59,7 @@ pub fn read_manifest(partition_dir: &Path) -> Result<SegmentManifest, AeonError>
     for entry in std::fs::read_dir(partition_dir)
         .map_err(|e| AeonError::state(format!("l2-transfer: readdir {partition_dir:?}: {e}")))?
     {
-        let entry = entry
-            .map_err(|e| AeonError::state(format!("l2-transfer: readdir: {e}")))?;
+        let entry = entry.map_err(|e| AeonError::state(format!("l2-transfer: readdir: {e}")))?;
         let path = entry.path();
         if path.extension().and_then(|s| s.to_str()) != Some("l2b") {
             continue;
@@ -207,10 +206,7 @@ impl SegmentWriter {
     ) -> Result<Self, AeonError> {
         let partition_dir = partition_dir.into();
         std::fs::create_dir_all(&partition_dir).map_err(|e| {
-            AeonError::state(format!(
-                "l2-transfer: mkdir {:?}: {}",
-                partition_dir, e
-            ))
+            AeonError::state(format!("l2-transfer: mkdir {:?}: {}", partition_dir, e))
         })?;
         Ok(Self {
             partition_dir,
@@ -255,11 +251,7 @@ impl SegmentWriter {
                     .write(true)
                     .read(true)
                     .open(&path)
-                    .map_err(|e| {
-                        AeonError::state(format!(
-                            "l2-transfer: create {path:?}: {e}"
-                        ))
-                    })?;
+                    .map_err(|e| AeonError::state(format!("l2-transfer: create {path:?}: {e}")))?;
                 v.insert(OpenSegment {
                     file,
                     expected_bytes: entry.size_bytes,
@@ -284,7 +276,9 @@ impl SegmentWriter {
         seg.file
             .write_all(&chunk.data)
             .map_err(|e| AeonError::state(format!("l2-transfer: write: {e}")))?;
-        seg.bytes_received = seg.bytes_received.max(chunk.offset + chunk.data.len() as u64);
+        seg.bytes_received = seg
+            .bytes_received
+            .max(chunk.offset + chunk.data.len() as u64);
 
         if chunk.is_last {
             if seg.bytes_received != seg.expected_bytes {
@@ -293,9 +287,9 @@ impl SegmentWriter {
                     seg.bytes_received, seg.expected_bytes, chunk.start_seq
                 )));
             }
-            seg.file.sync_data().map_err(|e| {
-                AeonError::state(format!("l2-transfer: fsync: {e}"))
-            })?;
+            seg.file
+                .sync_data()
+                .map_err(|e| AeonError::state(format!("l2-transfer: fsync: {e}")))?;
             let actual_crc = file_crc32(&seg.path)?;
             if actual_crc != entry.crc32 {
                 return Err(AeonError::state(format!(
@@ -388,7 +382,15 @@ mod tests {
     fn manifest_lists_segments_sorted_by_start_seq() {
         let dir = tmp_dir();
         // Force multi-segment rollover with a tiny threshold.
-        let mut store = L2BodyStore::open(&dir, L2BodyConfig { segment_bytes: 64, kek: None, gc_min_hold: std::time::Duration::ZERO }).unwrap();
+        let mut store = L2BodyStore::open(
+            &dir,
+            L2BodyConfig {
+                segment_bytes: 64,
+                kek: None,
+                gc_min_hold: std::time::Duration::ZERO,
+            },
+        )
+        .unwrap();
         for i in 0..8u64 {
             store.append(&ev(i)).unwrap();
         }
@@ -454,7 +456,15 @@ mod tests {
         // Source: write a multi-segment store.
         let src = tmp_dir();
         {
-            let mut store = L2BodyStore::open(&src, L2BodyConfig { segment_bytes: 64, kek: None, gc_min_hold: std::time::Duration::ZERO }).unwrap();
+            let mut store = L2BodyStore::open(
+                &src,
+                L2BodyConfig {
+                    segment_bytes: 64,
+                    kek: None,
+                    gc_min_hold: std::time::Duration::ZERO,
+                },
+            )
+            .unwrap();
             for i in 0..10u64 {
                 store.append(&ev(i)).unwrap();
             }
@@ -490,7 +500,15 @@ mod tests {
     fn finish_fails_when_segment_missing() {
         let src = tmp_dir();
         {
-            let mut store = L2BodyStore::open(&src, L2BodyConfig { segment_bytes: 64, kek: None, gc_min_hold: std::time::Duration::ZERO }).unwrap();
+            let mut store = L2BodyStore::open(
+                &src,
+                L2BodyConfig {
+                    segment_bytes: 64,
+                    kek: None,
+                    gc_min_hold: std::time::Duration::ZERO,
+                },
+            )
+            .unwrap();
             for i in 0..6u64 {
                 store.append(&ev(i)).unwrap();
             }
@@ -626,7 +644,15 @@ mod tests {
     fn bytes_received_tracks_validated_segments() {
         let src = tmp_dir();
         {
-            let mut s = L2BodyStore::open(&src, L2BodyConfig { segment_bytes: 64, kek: None, gc_min_hold: std::time::Duration::ZERO }).unwrap();
+            let mut s = L2BodyStore::open(
+                &src,
+                L2BodyConfig {
+                    segment_bytes: 64,
+                    kek: None,
+                    gc_min_hold: std::time::Duration::ZERO,
+                },
+            )
+            .unwrap();
             for i in 0..8u64 {
                 s.append(&ev(i)).unwrap();
             }

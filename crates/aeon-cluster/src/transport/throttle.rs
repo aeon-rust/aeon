@@ -77,13 +77,14 @@ impl TransferThrottle {
 
             let now = Instant::now();
             let elapsed = now.saturating_duration_since(state.last_refill);
-            let refill = (self.bytes_per_sec as u128)
-                .saturating_mul(elapsed.as_nanos())
-                / 1_000_000_000;
+            let refill =
+                (self.bytes_per_sec as u128).saturating_mul(elapsed.as_nanos()) / 1_000_000_000;
             // Cap burst at one second of budget.
             let cap = self.bytes_per_sec as i64;
-            state.budget =
-                (state.budget.saturating_add(refill.min(i64::MAX as u128) as i64)).min(cap);
+            state.budget = (state
+                .budget
+                .saturating_add(refill.min(i64::MAX as u128) as i64))
+            .min(cap);
             state.last_refill = now;
 
             state.budget = state.budget.saturating_sub(bytes as i64);

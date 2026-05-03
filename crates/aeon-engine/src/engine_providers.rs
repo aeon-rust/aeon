@@ -29,13 +29,11 @@
 use std::pin::Pin;
 use std::sync::Arc;
 
-use aeon_cluster::transport::partition_transfer::{
-    ChunkIter, PartitionTransferProvider,
-};
+use aeon_cluster::transport::partition_transfer::{ChunkIter, PartitionTransferProvider};
 use aeon_cluster::transport::poh_transfer::PohChainProvider;
 use aeon_cluster::types::{PartitionTransferRequest, PohChainTransferRequest};
-use aeon_types::l2_transfer::{DEFAULT_CHUNK_BYTES, SegmentChunk, SegmentManifest};
 use aeon_types::AeonError;
+use aeon_types::l2_transfer::{DEFAULT_CHUNK_BYTES, SegmentChunk, SegmentManifest};
 
 use crate::eo2::PipelineL2Registry;
 use crate::l2_transfer::{SegmentReader, read_manifest};
@@ -83,25 +81,23 @@ impl PartitionTransferProvider for L2SegmentTransferProvider {
         let mut segs = entries.into_iter();
         let mut current: Option<SegmentReader> = None;
 
-        let chunks: ChunkIter<'static> = Box::new(move || -> Result<Option<SegmentChunk>, AeonError> {
-            loop {
-                if let Some(reader) = current.as_mut() {
-                    match reader.next_chunk()? {
-                        Some(c) => return Ok(Some(c)),
-                        None => current = None,
+        let chunks: ChunkIter<'static> =
+            Box::new(move || -> Result<Option<SegmentChunk>, AeonError> {
+                loop {
+                    if let Some(reader) = current.as_mut() {
+                        match reader.next_chunk()? {
+                            Some(c) => return Ok(Some(c)),
+                            None => current = None,
+                        }
                     }
+                    let Some(entry) = segs.next() else {
+                        return Ok(None);
+                    };
+                    let reader =
+                        SegmentReader::open(&dir_owned, entry.start_seq, DEFAULT_CHUNK_BYTES)?;
+                    current = Some(reader);
                 }
-                let Some(entry) = segs.next() else {
-                    return Ok(None);
-                };
-                let reader = SegmentReader::open(
-                    &dir_owned,
-                    entry.start_seq,
-                    DEFAULT_CHUNK_BYTES,
-                )?;
-                current = Some(reader);
-            }
-        });
+            });
 
         Ok((manifest, chunks))
     }
@@ -137,8 +133,7 @@ impl PohChainProvider for PohChainExportProvider {
     fn export_state<'a>(
         &'a self,
         req: &'a PohChainTransferRequest,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, AeonError>> + Send + 'a>>
-    {
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, AeonError>> + Send + 'a>> {
         Box::pin(async move {
             let Some(chain) = self.registry.get(&req.pipeline, req.partition) else {
                 // Pipeline has no PoH leg registered for this partition.
@@ -180,9 +175,15 @@ mod tests {
         p
     }
 
-    fn write_one_segment(root: &std::path::Path, pipeline: &str, partition: PartitionId) -> Vec<u8> {
+    fn write_one_segment(
+        root: &std::path::Path,
+        pipeline: &str,
+        partition: PartitionId,
+    ) -> Vec<u8> {
         use aeon_types::Event;
-        let dir = root.join(pipeline).join(format!("p{:05}", partition.as_u16()));
+        let dir = root
+            .join(pipeline)
+            .join(format!("p{:05}", partition.as_u16()));
         std::fs::create_dir_all(&dir).unwrap();
         let store_dir = dir.clone();
         let store = L2BodyStore::open(
@@ -275,10 +276,7 @@ mod tests {
             Ok(_) => panic!("expected error from rootless registry"),
             Err(e) => e,
         };
-        assert!(
-            err.to_string().contains("without a root"),
-            "got: {err}",
-        );
+        assert!(err.to_string().contains("without a root"), "got: {err}",);
     }
 
     #[tokio::test]

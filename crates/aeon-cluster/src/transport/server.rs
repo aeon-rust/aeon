@@ -13,14 +13,12 @@ use crate::transport::health;
 use crate::transport::partition_transfer::{
     PartitionTransferProvider, serve_partition_transfer_with_request,
 };
-use crate::transport::poh_transfer::{
-    PohChainProvider, serve_poh_chain_transfer_with_request,
-};
+use crate::transport::poh_transfer::{PohChainProvider, serve_poh_chain_transfer_with_request};
 use crate::types::{
     JoinRequest, JoinResponse, NodeId, PartitionCutoverRequest, PartitionCutoverResponse,
     PartitionTransferEnd, PartitionTransferRequest, PohChainTransferRequest,
-    PohChainTransferResponse, ProposeForwardRequest, ProposeForwardResponse,
-    RemoveNodeRequest, RemoveNodeResponse,
+    PohChainTransferResponse, ProposeForwardRequest, ProposeForwardResponse, RemoveNodeRequest,
+    RemoveNodeResponse,
 };
 
 /// Shared provider slots for source-side CL-6 handlers. The three slots
@@ -167,9 +165,7 @@ async fn handle_stream_slots(
         MessageType::Vote => handle_vote(&raft, &payload, &mut send).await,
         MessageType::InstallSnapshot => handle_install_snapshot(&raft, &payload, &mut send).await,
         MessageType::FullSnapshot => handle_full_snapshot(&raft, &payload, &mut send).await,
-        MessageType::AddNodeRequest => {
-            handle_add_node(&raft, self_id, &payload, &mut send).await
-        }
+        MessageType::AddNodeRequest => handle_add_node(&raft, self_id, &payload, &mut send).await,
         MessageType::RemoveNodeRequest => {
             handle_remove_node(&raft, self_id, &payload, &mut send).await
         }
@@ -307,9 +303,7 @@ async fn handle_stream(
         MessageType::Vote => handle_vote(&raft, &payload, &mut send).await,
         MessageType::InstallSnapshot => handle_install_snapshot(&raft, &payload, &mut send).await,
         MessageType::FullSnapshot => handle_full_snapshot(&raft, &payload, &mut send).await,
-        MessageType::AddNodeRequest => {
-            handle_add_node(&raft, self_id, &payload, &mut send).await
-        }
+        MessageType::AddNodeRequest => handle_add_node(&raft, self_id, &payload, &mut send).await,
         MessageType::RemoveNodeRequest => {
             handle_remove_node(&raft, self_id, &payload, &mut send).await
         }
@@ -355,11 +349,10 @@ async fn handle_partition_transfer(
                 success: false,
                 message: "node has no partition-transfer provider configured".to_string(),
             };
-            let b =
-                bincode::serialize(&end).map_err(|e| aeon_types::AeonError::Serialization {
-                    message: format!("serialize PartitionTransferEnd: {e}"),
-                    source: None,
-                })?;
+            let b = bincode::serialize(&end).map_err(|e| aeon_types::AeonError::Serialization {
+                message: format!("serialize PartitionTransferEnd: {e}"),
+                source: None,
+            })?;
             framing::write_frame(&mut send, MessageType::PartitionTransferEndFrame, &b).await?;
             let _ = send.finish();
             return Ok(());
@@ -622,10 +615,7 @@ async fn handle_add_node(
         let resp = JoinResponse {
             success: false,
             leader_id,
-            message: format!(
-                "not the leader; current leader is {:?}",
-                leader_id
-            ),
+            message: format!("not the leader; current leader is {:?}", leader_id),
         };
         let resp_bytes =
             bincode::serialize(&resp).map_err(|e| aeon_types::AeonError::Serialization {
@@ -678,7 +668,10 @@ async fn handle_add_node(
         return Ok(());
     }
 
-    tracing::info!(node_id = req.node_id, "node promoted to voter — join complete");
+    tracing::info!(
+        node_id = req.node_id,
+        "node promoted to voter — join complete"
+    );
 
     let resp = JoinResponse {
         success: true,
@@ -835,14 +828,10 @@ async fn handle_propose_forward(
             source: None,
         })?;
 
-    let cluster_req: crate::types::ClusterRequest =
-        bincode::deserialize(&req.request_bytes).map_err(|e| {
-            aeon_types::AeonError::Serialization {
-                message: format!(
-                    "deserialize forwarded ClusterRequest payload: {e}"
-                ),
-                source: None,
-            }
+    let cluster_req: crate::types::ClusterRequest = bincode::deserialize(&req.request_bytes)
+        .map_err(|e| aeon_types::AeonError::Serialization {
+            message: format!("deserialize forwarded ClusterRequest payload: {e}"),
+            source: None,
         })?;
 
     let resp = match raft.client_write(cluster_req).await {
@@ -872,12 +861,11 @@ async fn handle_propose_forward(
         }
     };
 
-    let resp_bytes = bincode::serialize(&resp).map_err(|e| {
-        aeon_types::AeonError::Serialization {
+    let resp_bytes =
+        bincode::serialize(&resp).map_err(|e| aeon_types::AeonError::Serialization {
             message: format!("serialize ProposeForwardResponse: {e}"),
             source: None,
-        }
-    })?;
+        })?;
     framing::write_frame(send, MessageType::ProposeForwardResponse, &resp_bytes).await?;
     let _ = send.finish();
     Ok(())

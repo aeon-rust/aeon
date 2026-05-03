@@ -545,8 +545,14 @@ mod tests {
 
     #[test]
     fn parse_host_port_basic() {
-        assert_eq!(parse_host_port("https://host/x"), Some(("host".into(), 443)));
-        assert_eq!(parse_host_port("http://host:8080/x"), Some(("host".into(), 8080)));
+        assert_eq!(
+            parse_host_port("https://host/x"),
+            Some(("host".into(), 443))
+        );
+        assert_eq!(
+            parse_host_port("http://host:8080/x"),
+            Some(("host".into(), 8080))
+        );
         assert_eq!(parse_host_port("ws://h:9/p?q"), Some(("h".into(), 9)));
         assert_eq!(parse_host_port("amqp://h"), Some(("h".into(), 5672)));
     }
@@ -588,7 +594,9 @@ mod tests {
     fn check_url_resolves_and_denies_imds_hostname() {
         // Operators sometimes use the symbolic IP directly in a URL.
         let p = SsrfPolicy::production();
-        let err = p.check_url("http://169.254.169.254/latest/meta-data/").unwrap_err();
+        let err = p
+            .check_url("http://169.254.169.254/latest/meta-data/")
+            .unwrap_err();
         assert!(matches!(err, SsrfError::AddressDenied { .. }));
     }
 

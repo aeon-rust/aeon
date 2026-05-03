@@ -96,9 +96,7 @@ impl Default for KekRegistry {
 mod tests {
     use super::*;
     use aeon_crypto::kek::KekHandle;
-    use aeon_types::{
-        SecretBytes, SecretProvider, SecretRef, SecretRegistry, SecretScheme,
-    };
+    use aeon_types::{SecretBytes, SecretProvider, SecretRef, SecretRegistry, SecretScheme};
 
     struct HexEnvProvider;
     impl SecretProvider for HexEnvProvider {
@@ -166,7 +164,10 @@ mod tests {
         let err = reg
             .register(make_local_handle(KekDomain::DataContext, V2, "v2"))
             .unwrap_err();
-        assert!(matches!(err, SecretsAdapterError::DuplicateRegistration { .. }));
+        assert!(matches!(
+            err,
+            SecretsAdapterError::DuplicateRegistration { .. }
+        ));
 
         unsafe {
             std::env::remove_var(V1);

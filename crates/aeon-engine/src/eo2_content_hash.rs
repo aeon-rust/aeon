@@ -178,20 +178,14 @@ mod tests {
 
     #[test]
     fn first_seen_payload_returns_false() {
-        let d = ContentHashDedup::new(
-            ContentHashAlgorithm::Xxhash3_64,
-            Duration::from_secs(60),
-        );
+        let d = ContentHashDedup::new(ContentHashAlgorithm::Xxhash3_64, Duration::from_secs(60));
         assert!(!d.check_and_mark(b"event-1"));
         assert_eq!(d.len(), 1);
     }
 
     #[test]
     fn repeat_payload_within_window_returns_true() {
-        let d = ContentHashDedup::new(
-            ContentHashAlgorithm::Xxhash3_64,
-            Duration::from_secs(60),
-        );
+        let d = ContentHashDedup::new(ContentHashAlgorithm::Xxhash3_64, Duration::from_secs(60));
         assert!(!d.check_and_mark(b"duplicate"));
         assert!(d.check_and_mark(b"duplicate"));
         assert!(d.check_and_mark(b"duplicate"));
@@ -200,10 +194,7 @@ mod tests {
 
     #[test]
     fn distinct_payloads_all_return_false_first_time() {
-        let d = ContentHashDedup::new(
-            ContentHashAlgorithm::Xxhash3_64,
-            Duration::from_secs(60),
-        );
+        let d = ContentHashDedup::new(ContentHashAlgorithm::Xxhash3_64, Duration::from_secs(60));
         for i in 0..100 {
             let p = format!("distinct-{i}");
             assert!(!d.check_and_mark(p.as_bytes()));
@@ -215,10 +206,7 @@ mod tests {
     fn expired_entry_is_swept_and_remarked_fresh() {
         // Inject a clock: use check_and_mark_hash directly so we can
         // fast-forward past the TTL window.
-        let d = ContentHashDedup::new(
-            ContentHashAlgorithm::Xxhash3_64,
-            Duration::from_millis(10),
-        );
+        let d = ContentHashDedup::new(ContentHashAlgorithm::Xxhash3_64, Duration::from_millis(10));
         let t0 = Instant::now();
         assert!(!d.check_and_mark_hash(0xdeadbeef, t0));
         // Still within window.
@@ -229,10 +217,7 @@ mod tests {
 
     #[test]
     fn sweep_expired_shrinks_map() {
-        let d = ContentHashDedup::new(
-            ContentHashAlgorithm::Xxhash3_64,
-            Duration::from_millis(1),
-        );
+        let d = ContentHashDedup::new(ContentHashAlgorithm::Xxhash3_64, Duration::from_millis(1));
         d.check_and_mark(b"a");
         d.check_and_mark(b"b");
         assert_eq!(d.len(), 2);

@@ -31,14 +31,7 @@ fn create_endpoint(
     server_cfg: quinn::ServerConfig,
     client_cfg: quinn::ClientConfig,
 ) -> Arc<QuicEndpoint> {
-    Arc::new(
-        QuicEndpoint::bind(
-            "127.0.0.1:0".parse().unwrap(),
-            server_cfg,
-            client_cfg,
-        )
-        .unwrap(),
-    )
+    Arc::new(QuicEndpoint::bind("127.0.0.1:0".parse().unwrap(), server_cfg, client_cfg).unwrap())
 }
 
 /// Create a Raft node with QUIC transport.
@@ -85,10 +78,7 @@ async fn wait_for_leader(raft: &Raft<AeonRaftConfig>, timeout_secs: u64) -> Opti
 }
 
 /// Get the Raft reference for a leader from a slice of (id, raft) pairs.
-fn leader_raft(
-    leader_id: u64,
-    nodes: &[(u64, Raft<AeonRaftConfig>)],
-) -> &Raft<AeonRaftConfig> {
+fn leader_raft(leader_id: u64, nodes: &[(u64, Raft<AeonRaftConfig>)]) -> &Raft<AeonRaftConfig> {
     nodes
         .iter()
         .find(|(id, _)| *id == leader_id)
@@ -154,7 +144,11 @@ async fn three_node_cluster_formation() {
     assert_eq!(l2, l3, "nodes 2 and 3 should agree on leader");
 
     // Propose via leader
-    let nodes = [(1u64, raft1.clone()), (2, raft2.clone()), (3, raft3.clone())];
+    let nodes = [
+        (1u64, raft1.clone()),
+        (2, raft2.clone()),
+        (3, raft3.clone()),
+    ];
     let leader = leader_raft(leader_id.unwrap(), &nodes);
     let resp = leader
         .client_write(ClusterRequest::AssignPartition {
@@ -199,7 +193,11 @@ async fn three_node_log_replication() {
     raft3.initialize(members).await.unwrap();
 
     let leader_id = wait_for_leader(&raft1, 10).await.unwrap();
-    let nodes = [(1u64, raft1.clone()), (2, raft2.clone()), (3, raft3.clone())];
+    let nodes = [
+        (1u64, raft1.clone()),
+        (2, raft2.clone()),
+        (3, raft3.clone()),
+    ];
     let leader = leader_raft(leader_id, &nodes);
 
     // Propose multiple entries
@@ -222,9 +220,18 @@ async fn three_node_log_replication() {
     let m2 = raft2.metrics().borrow().clone();
     let m3 = raft3.metrics().borrow().clone();
 
-    assert!(m1.last_applied.is_some(), "node 1 should have applied entries");
-    assert!(m2.last_applied.is_some(), "node 2 should have applied entries");
-    assert!(m3.last_applied.is_some(), "node 3 should have applied entries");
+    assert!(
+        m1.last_applied.is_some(),
+        "node 1 should have applied entries"
+    );
+    assert!(
+        m2.last_applied.is_some(),
+        "node 2 should have applied entries"
+    );
+    assert!(
+        m3.last_applied.is_some(),
+        "node 3 should have applied entries"
+    );
 
     shutdown_all(&shutdown, &[raft1, raft2, raft3], &[ep1, ep2, ep3]).await;
 }
@@ -255,7 +262,11 @@ async fn dynamic_add_second_node() {
 
     // Wait for node 1 to become leader
     let leader_id = wait_for_leader(&raft1, 5).await;
-    assert_eq!(leader_id, Some(1), "node 1 should be the leader of single-node cluster");
+    assert_eq!(
+        leader_id,
+        Some(1),
+        "node 1 should be the leader of single-node cluster"
+    );
 
     // Propose an entry before adding the second node
     let resp = raft1
@@ -287,7 +298,10 @@ async fn dynamic_add_second_node() {
     // Verify node 2 has replicated data
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     let m2 = raft2.metrics().borrow().clone();
-    assert!(m2.last_applied.is_some(), "node 2 should have replicated entries");
+    assert!(
+        m2.last_applied.is_some(),
+        "node 2 should have replicated entries"
+    );
 
     // Propose another entry — quorum is 2/2 so both nodes must agree
     let resp = raft1
@@ -373,7 +387,11 @@ async fn dynamic_scale_one_to_three() {
     assert!(l1.is_some());
 
     // Propose via leader — quorum is 2/3
-    let nodes = [(1u64, raft1.clone()), (2, raft2.clone()), (3, raft3.clone())];
+    let nodes = [
+        (1u64, raft1.clone()),
+        (2, raft2.clone()),
+        (3, raft3.clone()),
+    ];
     let leader = leader_raft(l1.unwrap(), &nodes);
     let resp = leader
         .client_write(ClusterRequest::AssignPartition {
@@ -469,12 +487,7 @@ async fn scale_three_to_five() {
         );
     }
 
-    shutdown_all(
-        &shutdown,
-        &rafts,
-        &eps,
-    )
-    .await;
+    shutdown_all(&shutdown, &rafts, &eps).await;
 }
 
 /// Test: Remove a non-leader node from a 3-node cluster.
@@ -510,7 +523,11 @@ async fn remove_node_from_three_node_cluster() {
     raft3.initialize(members).await.unwrap();
 
     let leader_id = wait_for_leader(&raft1, 10).await.unwrap();
-    let nodes = [(1u64, raft1.clone()), (2, raft2.clone()), (3, raft3.clone())];
+    let nodes = [
+        (1u64, raft1.clone()),
+        (2, raft2.clone()),
+        (3, raft3.clone()),
+    ];
     let leader = leader_raft(leader_id, &nodes);
 
     // Pick a non-leader node to remove
@@ -590,17 +607,26 @@ async fn leader_failover() {
         1 => {
             let _ = raft1.shutdown().await;
             ep1.close();
-            (vec![raft2.clone(), raft3.clone()], vec![ep2.clone(), ep3.clone()])
+            (
+                vec![raft2.clone(), raft3.clone()],
+                vec![ep2.clone(), ep3.clone()],
+            )
         }
         2 => {
             let _ = raft2.shutdown().await;
             ep2.close();
-            (vec![raft1.clone(), raft3.clone()], vec![ep1.clone(), ep3.clone()])
+            (
+                vec![raft1.clone(), raft3.clone()],
+                vec![ep1.clone(), ep3.clone()],
+            )
         }
         3 => {
             let _ = raft3.shutdown().await;
             ep3.close();
-            (vec![raft1.clone(), raft2.clone()], vec![ep1.clone(), ep2.clone()])
+            (
+                vec![raft1.clone(), raft2.clone()],
+                vec![ep1.clone(), ep2.clone()],
+            )
         }
         _ => unreachable!(),
     };
@@ -623,12 +649,7 @@ async fn leader_failover() {
         "remaining nodes should elect a new leader (not the failed node {leader_id})"
     );
 
-    shutdown_all(
-        &shutdown,
-        &remaining_rafts,
-        &remaining_eps,
-    )
-    .await;
+    shutdown_all(&shutdown, &remaining_rafts, &remaining_eps).await;
 }
 
 /// Test: Join via RPC (AddNodeRequest message through QUIC).
@@ -685,7 +706,10 @@ async fn join_via_rpc_add_node_request() {
     // Verify node 2 is receiving replication
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     let m2 = raft2.metrics().borrow().clone();
-    assert!(m2.last_applied.is_some(), "node 2 should have replicated entries");
+    assert!(
+        m2.last_applied.is_some(),
+        "node 2 should have replicated entries"
+    );
 
     shutdown_all(&shutdown, &[raft1, raft2], &[ep1, ep2]).await;
 }
@@ -754,15 +778,14 @@ async fn remove_via_rpc() {
     assert_eq!(m.membership_config.membership().voter_ids().count(), 3);
 
     // Remove node 3 via RPC
-    let remove_resp = send_remove_request(
-        &ep1,
-        0,
-        &seed,
-        &RemoveNodeRequest { node_id: 3 },
-    )
-    .await
-    .unwrap();
-    assert!(remove_resp.success, "remove failed: {}", remove_resp.message);
+    let remove_resp = send_remove_request(&ep1, 0, &seed, &RemoveNodeRequest { node_id: 3 })
+        .await
+        .unwrap();
+    assert!(
+        remove_resp.success,
+        "remove failed: {}",
+        remove_resp.message
+    );
 
     // Verify back to 2-node cluster
     let m = raft1.metrics().borrow().clone();
@@ -804,7 +827,11 @@ async fn replication_consistency_across_nodes() {
     raft3.initialize(members).await.unwrap();
 
     let leader_id = wait_for_leader(&raft1, 10).await.unwrap();
-    let nodes = [(1u64, raft1.clone()), (2, raft2.clone()), (3, raft3.clone())];
+    let nodes = [
+        (1u64, raft1.clone()),
+        (2, raft2.clone()),
+        (3, raft3.clone()),
+    ];
     let leader = leader_raft(leader_id, &nodes);
 
     // Propose 20 entries
@@ -905,7 +932,11 @@ async fn g15_join_targets_actual_leader_of_three_node_cluster() {
     );
     assert_eq!(resp.leader_id, Some(leader_id));
 
-    let nodes = [(1u64, raft1.clone()), (2, raft2.clone()), (3, raft3.clone())];
+    let nodes = [
+        (1u64, raft1.clone()),
+        (2, raft2.clone()),
+        (3, raft3.clone()),
+    ];
     let leader = leader_raft(leader_id, &nodes);
     let voter_count = leader
         .metrics()
@@ -916,12 +947,7 @@ async fn g15_join_targets_actual_leader_of_three_node_cluster() {
         .count();
     assert_eq!(voter_count, 4, "cluster should have 4 voters after join");
 
-    shutdown_all(
-        &shutdown,
-        &[raft1, raft2, raft3],
-        &[ep1, ep2, ep3, ep4],
-    )
-    .await;
+    shutdown_all(&shutdown, &[raft1, raft2, raft3], &[ep1, ep2, ep3, ep4]).await;
 }
 
 /// G16 regression — the seed-join loop iterates multiple seed addresses through
@@ -1023,7 +1049,11 @@ async fn g16_multi_seed_join_reaches_each_address_from_single_endpoint() {
         "multi-seed loop from single endpoint must eventually reach the leader (G16); last_msg={last_msg}"
     );
 
-    let nodes = [(1u64, raft1.clone()), (2, raft2.clone()), (3, raft3.clone())];
+    let nodes = [
+        (1u64, raft1.clone()),
+        (2, raft2.clone()),
+        (3, raft3.clone()),
+    ];
     let leader = leader_raft(leader_id, &nodes);
     let voter_count = leader
         .metrics()
@@ -1034,10 +1064,5 @@ async fn g16_multi_seed_join_reaches_each_address_from_single_endpoint() {
         .count();
     assert_eq!(voter_count, 4, "cluster should have 4 voters after join");
 
-    shutdown_all(
-        &shutdown,
-        &[raft1, raft2, raft3],
-        &[ep1, ep2, ep3, ep4],
-    )
-    .await;
+    shutdown_all(&shutdown, &[raft1, raft2, raft3], &[ep1, ep2, ep3, ep4]).await;
 }

@@ -100,10 +100,7 @@ impl QuicEndpoint {
     /// actual leader never leave node A. The uncached path does a fresh
     /// resolve + handshake for each call and lets the returned `Connection`
     /// drop naturally when the one-shot RPC completes.
-    pub async fn connect_uncached(
-        &self,
-        addr: &NodeAddress,
-    ) -> Result<Connection, AeonError> {
+    pub async fn connect_uncached(&self, addr: &NodeAddress) -> Result<Connection, AeonError> {
         let socket_addr = tokio::net::lookup_host(addr.to_string())
             .await
             .map_err(|e| AeonError::Connection {
@@ -163,7 +160,10 @@ impl QuicEndpoint {
                 Err(e) => {
                     let retryable = matches!(
                         &e,
-                        AeonError::Connection { retryable: true, .. }
+                        AeonError::Connection {
+                            retryable: true,
+                            ..
+                        }
                     );
                     if !retryable || attempt == attempts {
                         return Err(e);

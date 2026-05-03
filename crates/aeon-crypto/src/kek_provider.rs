@@ -24,8 +24,7 @@ use crate::kek::{DekBytes, KekDomain, KekHandle, WrappedDek};
 /// dyn-compatible (matches the `PohChainProvider` / `PartitionTransferProvider`
 /// style used elsewhere in the workspace — we do not depend on the
 /// `async_trait` macro crate).
-pub type KekFuture<'a, T> =
-    Pin<Box<dyn Future<Output = Result<T, AeonError>> + Send + 'a>>;
+pub type KekFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, AeonError>> + Send + 'a>>;
 
 /// Source-of-truth for envelope encryption on an Aeon node.
 ///

@@ -203,9 +203,7 @@ impl KekRegistryBuilder {
                     reg.register(provider)?;
                 }
                 KekProviderConfig::Pkcs11(_) => {
-                    return Err(SecretsAdapterError::BackendNotImplemented {
-                        backend: "pkcs11",
-                    });
+                    return Err(SecretsAdapterError::BackendNotImplemented { backend: "pkcs11" });
                 }
             }
         }
@@ -241,11 +239,13 @@ fn parse_domain(s: &str) -> Result<KekDomain, SecretsAdapterError> {
     match s {
         "log_context" | "log-context" => Ok(KekDomain::LogContext),
         "data_context" | "data-context" => Ok(KekDomain::DataContext),
-        other => Err(SecretsAdapterError::Backend(aeon_types::AeonError::Config {
-            message: format!(
-                "unknown KEK domain '{other}' — expected 'log_context' or 'data_context'"
-            ),
-        })),
+        other => Err(SecretsAdapterError::Backend(
+            aeon_types::AeonError::Config {
+                message: format!(
+                    "unknown KEK domain '{other}' — expected 'log_context' or 'data_context'"
+                ),
+            },
+        )),
     }
 }
 
@@ -253,9 +253,11 @@ fn parse_ref(s: &str) -> Result<SecretRef, SecretsAdapterError> {
     match SecretRef::parse(s) {
         Ok(Some(r)) => Ok(r),
         Ok(None) => Ok(SecretRef::literal(s)),
-        Err(e) => Err(SecretsAdapterError::Backend(aeon_types::AeonError::Config {
-            message: e.to_string(),
-        })),
+        Err(e) => Err(SecretsAdapterError::Backend(
+            aeon_types::AeonError::Config {
+                message: e.to_string(),
+            },
+        )),
     }
 }
 
@@ -279,8 +281,7 @@ fn build_local(
 mod tests {
     use super::*;
     use crate::config::{
-        AwsKmsConfig, AwsSmProviderConfig, VaultAuthConfig, VaultProviderConfig,
-        VaultTransitConfig,
+        AwsKmsConfig, AwsSmProviderConfig, VaultAuthConfig, VaultProviderConfig, VaultTransitConfig,
     };
     use aeon_crypto::kek::KekDomain;
 
@@ -299,13 +300,9 @@ mod tests {
         fn scheme(&self) -> aeon_types::SecretScheme {
             aeon_types::SecretScheme::Env
         }
-        fn resolve(
-            &self,
-            path: &str,
-        ) -> Result<aeon_types::SecretBytes, aeon_types::SecretError> {
-            let val = std::env::var(path).map_err(|_| {
-                aeon_types::SecretError::EnvNotSet(path.to_string())
-            })?;
+        fn resolve(&self, path: &str) -> Result<aeon_types::SecretBytes, aeon_types::SecretError> {
+            let val = std::env::var(path)
+                .map_err(|_| aeon_types::SecretError::EnvNotSet(path.to_string()))?;
             let bytes: Vec<u8> = (0..val.len())
                 .step_by(2)
                 .map(|i| u8::from_str_radix(&val[i..i + 2], 16).unwrap())
@@ -324,7 +321,10 @@ mod tests {
 
     #[test]
     fn secret_registry_builder_without_defaults_is_empty() {
-        let reg = SecretRegistryBuilder::new().without_defaults().build().unwrap();
+        let reg = SecretRegistryBuilder::new()
+            .without_defaults()
+            .build()
+            .unwrap();
         assert!(!reg.has_scheme(aeon_types::SecretScheme::Env));
         assert!(!reg.has_scheme(aeon_types::SecretScheme::DotEnv));
     }
@@ -344,7 +344,10 @@ mod tests {
             retry: Default::default(),
             cache_ttl_secs: 0,
         });
-        let err = SecretRegistryBuilder::new().with_config(cfg).build().unwrap_err();
+        let err = SecretRegistryBuilder::new()
+            .with_config(cfg)
+            .build()
+            .unwrap_err();
         assert!(matches!(
             err,
             SecretsAdapterError::BackendFeatureDisabled {
@@ -383,7 +386,10 @@ mod tests {
             retry: Default::default(),
             cache_ttl_secs: 0,
         });
-        let reg = SecretRegistryBuilder::new().with_config(cfg).build().unwrap();
+        let reg = SecretRegistryBuilder::new()
+            .with_config(cfg)
+            .build()
+            .unwrap();
         assert!(reg.has_scheme(aeon_types::SecretScheme::Vault));
 
         let bytes = reg.resolve(&SecretRef::vault("probe")).unwrap();
@@ -396,7 +402,10 @@ mod tests {
             region: "us-east-1".to_string(),
             endpoint: None,
         });
-        let err = SecretRegistryBuilder::new().with_config(cfg).build().unwrap_err();
+        let err = SecretRegistryBuilder::new()
+            .with_config(cfg)
+            .build()
+            .unwrap_err();
         assert!(matches!(
             err,
             SecretsAdapterError::BackendFeatureDisabled {
@@ -542,8 +551,14 @@ mod tests {
     fn parse_domain_accepts_both_spellings() {
         assert_eq!(parse_domain("log_context").unwrap(), KekDomain::LogContext);
         assert_eq!(parse_domain("log-context").unwrap(), KekDomain::LogContext);
-        assert_eq!(parse_domain("data_context").unwrap(), KekDomain::DataContext);
-        assert_eq!(parse_domain("data-context").unwrap(), KekDomain::DataContext);
+        assert_eq!(
+            parse_domain("data_context").unwrap(),
+            KekDomain::DataContext
+        );
+        assert_eq!(
+            parse_domain("data-context").unwrap(),
+            KekDomain::DataContext
+        );
         assert!(parse_domain("unknown").is_err());
     }
 }

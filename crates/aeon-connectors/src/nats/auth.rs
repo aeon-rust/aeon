@@ -67,7 +67,9 @@ fn build_connect_options(
                 // time re-auth can choose.
                 if let Some(creds) = bn.values.get("credentials") {
                     options = options.credentials(creds).map_err(|e| {
-                        AeonError::config(format!("nats broker_native 'credentials' parse failed: {e}"))
+                        AeonError::config(format!(
+                            "nats broker_native 'credentials' parse failed: {e}"
+                        ))
                     })?;
                 } else if let Some(seed) = bn.values.get("nkey_seed") {
                     options = options.nkey(seed.clone());
@@ -213,7 +215,10 @@ mod tests {
         // async_nats credentials() expects JWT+NKey format. A garbage blob
         // must surface as AeonError::config, not panic.
         let mut values = BTreeMap::new();
-        values.insert("credentials".to_string(), "not a valid creds file".to_string());
+        values.insert(
+            "credentials".to_string(),
+            "not a valid creds file".to_string(),
+        );
         let s = signer(OutboundAuthConfig {
             mode: OutboundAuthMode::BrokerNative,
             broker_native: Some(BrokerNativeConfig { values }),

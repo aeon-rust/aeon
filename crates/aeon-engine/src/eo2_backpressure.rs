@@ -122,9 +122,9 @@ impl BackpressureDecision {
     pub fn level(self) -> Option<PressureLevel> {
         match self {
             Self::None => None,
-            Self::PushReject { level }
-            | Self::PullPause { level }
-            | Self::PollSkip { level } => Some(level),
+            Self::PushReject { level } | Self::PullPause { level } | Self::PollSkip { level } => {
+                Some(level)
+            }
         }
     }
 
@@ -305,10 +305,7 @@ mod tests {
     fn unlimited_returns_none_decisions() {
         let pb = PipelineCapacity::new(CapacityLimits::unlimited(), NodeCapacity::new(None));
         pb.adjust(0, 1_000_000);
-        assert_eq!(
-            pb.decide(0, SourceKind::Push),
-            BackpressureDecision::None
-        );
+        assert_eq!(pb.decide(0, SourceKind::Push), BackpressureDecision::None);
     }
 
     #[test]
@@ -323,10 +320,7 @@ mod tests {
             }
         );
         // A different partition with no bytes is unaffected.
-        assert_eq!(
-            pb.decide(1, SourceKind::Push),
-            BackpressureDecision::None
-        );
+        assert_eq!(pb.decide(1, SourceKind::Push), BackpressureDecision::None);
     }
 
     #[test]
@@ -389,10 +383,7 @@ mod tests {
         assert!(pb.decide(0, SourceKind::Push).is_engaged());
         pb.adjust(0, -100);
         assert_eq!(pb.partition_bytes(0), 50);
-        assert_eq!(
-            pb.decide(0, SourceKind::Push),
-            BackpressureDecision::None
-        );
+        assert_eq!(pb.decide(0, SourceKind::Push), BackpressureDecision::None);
     }
 
     #[test]

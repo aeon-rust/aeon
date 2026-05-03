@@ -237,8 +237,8 @@ impl ClusterConfig {
         // at config-load time, not at first partition-transfer. Keeps the
         // crypto crate's parsing logic as the single source of truth.
         match self.poh_verify_mode.trim().to_ascii_lowercase().as_str() {
-            "verify" | "verify_with_key" | "verify-with-key" | "verifywithkey"
-            | "trust_extend" | "trust-extend" | "trustextend" => {}
+            "verify" | "verify_with_key" | "verify-with-key" | "verifywithkey" | "trust_extend"
+            | "trust-extend" | "trustextend" => {}
             other => {
                 return Err(AeonError::Config {
                     message: format!(
@@ -514,7 +514,8 @@ mod tests {
         assert_eq!(t.election_max_ms, 6000);
         t.validate().unwrap();
         // Window must be strictly wider than default to justify the preset.
-        let default_window = RaftTiming::default().election_max_ms - RaftTiming::default().election_min_ms;
+        let default_window =
+            RaftTiming::default().election_max_ms - RaftTiming::default().election_min_ms;
         let prod_window = t.election_max_ms - t.election_min_ms;
         assert!(prod_window > default_window);
     }

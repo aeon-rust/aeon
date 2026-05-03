@@ -765,7 +765,9 @@ async fn e10_http_polling_source_to_memory_sink() {
         shutdown_clone.store(true, std::sync::atomic::Ordering::Relaxed);
     });
 
-    run(&mut source, &processor, &mut sink, &metrics, &shutdown).await.unwrap();
+    run(&mut source, &processor, &mut sink, &metrics, &shutdown)
+        .await
+        .unwrap();
     timer.abort();
 
     let outputs = sink.outputs();
@@ -859,8 +861,8 @@ async fn e11_memory_source_to_http_sink() {
 
 #[tokio::test]
 async fn e12_webtransport_source_to_memory_sink() {
-    use aeon_connectors::webtransport::{WebTransportSource, WebTransportSourceConfig};
     use aeon_connectors::memory::MemorySink;
+    use aeon_connectors::webtransport::{WebTransportSource, WebTransportSourceConfig};
     use aeon_engine::{PassthroughProcessor, PipelineMetrics, run};
     use std::sync::atomic::AtomicBool;
 
@@ -871,8 +873,7 @@ async fn e12_webtransport_source_to_memory_sink() {
     let port = udp.local_addr().unwrap().port();
     drop(udp);
 
-    let identity =
-        wtransport::Identity::self_signed(["localhost"]).expect("self-signed identity");
+    let identity = wtransport::Identity::self_signed(["localhost"]).expect("self-signed identity");
 
     let server_config = wtransport::ServerConfig::builder()
         .with_bind_address(std::net::SocketAddr::from(([127, 0, 0, 1], port)))
@@ -929,7 +930,9 @@ async fn e12_webtransport_source_to_memory_sink() {
         shutdown_clone.store(true, std::sync::atomic::Ordering::Relaxed);
     });
 
-    run(&mut source, &processor, &mut sink, &metrics, &shutdown).await.unwrap();
+    run(&mut source, &processor, &mut sink, &metrics, &shutdown)
+        .await
+        .unwrap();
     timer.abort();
     let _ = client_handle.await;
 
@@ -957,24 +960,22 @@ async fn e12_webtransport_source_to_memory_sink() {
 
 #[tokio::test]
 async fn e13_memory_source_to_webtransport_sink() {
-    use aeon_connectors::webtransport::{WebTransportSink, WebTransportSinkConfig};
     use aeon_connectors::memory::MemorySource;
+    use aeon_connectors::webtransport::{WebTransportSink, WebTransportSinkConfig};
     use aeon_engine::{PassthroughProcessor, PipelineMetrics, run};
     use std::sync::atomic::AtomicBool;
 
     let msg_count = 20;
 
     // Set up a WT server to receive data (mock WT server)
-    let identity =
-        wtransport::Identity::self_signed(["localhost"]).expect("self-signed identity");
+    let identity = wtransport::Identity::self_signed(["localhost"]).expect("self-signed identity");
 
     let server_config = wtransport::ServerConfig::builder()
         .with_bind_address(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
         .with_identity(identity)
         .build();
 
-    let server_endpoint =
-        wtransport::Endpoint::server(server_config).expect("wt server endpoint");
+    let server_endpoint = wtransport::Endpoint::server(server_config).expect("wt server endpoint");
     let port = server_endpoint.local_addr().unwrap().port();
 
     let received = Arc::new(tokio::sync::Mutex::new(Vec::<Vec<u8>>::new()));

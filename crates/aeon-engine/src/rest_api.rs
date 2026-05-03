@@ -120,10 +120,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         // it on dev clusters without mTLS handshakes. Production
         // builds should gate this behind `--features debug-fault-injection`
         // (see follow-up).
-        .route(
-            "/api/v1/test/inject-l3-fault",
-            post(inject_l3_fault),
-        );
+        .route("/api/v1/test/inject-l3-fault", post(inject_l3_fault));
 
     // API routes — auth required when token is configured
     let api_routes = Router::new()
@@ -191,8 +188,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
             post(delivery_retry),
         )
         // Integrity verification
-        .route("/api/v1/pipelines/{name}/verify", get(verify_pipeline))
-        ;
+        .route("/api/v1/pipelines/{name}/verify", get(verify_pipeline));
     // V5 — per-partition PoH chain head. Gated on the same feature
     // union as `PipelineSupervisor::poh_live_chains`. The endpoint
     // surfaces the LivePohChainRegistry CL-6c.4 already maintains and
@@ -661,8 +657,7 @@ async fn inject_l3_fault(
         }
         None => api_error(
             StatusCode::SERVICE_UNAVAILABLE,
-            "fault injector not installed (cmd_serve did not wrap the L3 store)"
-                .to_string(),
+            "fault injector not installed (cmd_serve did not wrap the L3 store)".to_string(),
         )
         .into_response(),
     }
@@ -681,7 +676,9 @@ async fn metrics_prometheus(State(state): State<Arc<AppState>>) -> impl IntoResp
     let pipelines = state.supervisor.metrics_snapshot().await;
 
     // Per-pipeline aggregates
-    out.push_str("# HELP aeon_pipeline_events_received_total Events received by a pipeline's source\n");
+    out.push_str(
+        "# HELP aeon_pipeline_events_received_total Events received by a pipeline's source\n",
+    );
     out.push_str("# TYPE aeon_pipeline_events_received_total counter\n");
     for (name, m) in &pipelines {
         out.push_str(&format!(
@@ -690,7 +687,9 @@ async fn metrics_prometheus(State(state): State<Arc<AppState>>) -> impl IntoResp
         ));
     }
 
-    out.push_str("# HELP aeon_pipeline_events_processed_total Events processed by a pipeline's processor\n");
+    out.push_str(
+        "# HELP aeon_pipeline_events_processed_total Events processed by a pipeline's processor\n",
+    );
     out.push_str("# TYPE aeon_pipeline_events_processed_total counter\n");
     for (name, m) in &pipelines {
         out.push_str(&format!(
@@ -699,7 +698,9 @@ async fn metrics_prometheus(State(state): State<Arc<AppState>>) -> impl IntoResp
         ));
     }
 
-    out.push_str("# HELP aeon_pipeline_outputs_sent_total Outputs the pipeline handed to its sink\n");
+    out.push_str(
+        "# HELP aeon_pipeline_outputs_sent_total Outputs the pipeline handed to its sink\n",
+    );
     out.push_str("# TYPE aeon_pipeline_outputs_sent_total counter\n");
     for (name, m) in &pipelines {
         out.push_str(&format!(
@@ -799,7 +800,9 @@ async fn cluster_status(State(state): State<Arc<AppState>>) -> impl IntoResponse
                         serde_json::json!({ "owner": n, "status": "owned" })
                     }
                     aeon_cluster::types::PartitionOwnership::Transferring {
-                        source, target, ..
+                        source,
+                        target,
+                        ..
                     } => {
                         serde_json::json!({
                             "source": source,
@@ -886,8 +889,7 @@ async fn transfer_partition(
         {
             Ok(s) => s,
             Err(e) => {
-                return api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-                    .into_response();
+                return api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
             }
         };
 
@@ -1033,9 +1035,7 @@ async fn cluster_rebalance(
 /// derives the target `node_id` from the RPC source, not from the body).
 /// The leader cannot remove itself, so if this node is the current leader
 /// the endpoint returns 409 and the operator must transfer leadership first.
-async fn cluster_leave(
-    State(state): State<Arc<AppState>>,
-) -> axum::response::Response {
+async fn cluster_leave(State(state): State<Arc<AppState>>) -> axum::response::Response {
     #[cfg(feature = "cluster")]
     {
         let Some(ref node) = state.cluster_node else {
@@ -1141,10 +1141,7 @@ enum BulkPlan {
 /// outcome is reported in the response so operators can see exactly what
 /// landed and what fought an in-flight transfer.
 #[cfg(feature = "cluster")]
-async fn cluster_bulk_transfer(
-    state: &Arc<AppState>,
-    plan: BulkPlan,
-) -> axum::response::Response {
+async fn cluster_bulk_transfer(state: &Arc<AppState>, plan: BulkPlan) -> axum::response::Response {
     let Some(ref node) = state.cluster_node else {
         return api_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1186,10 +1183,7 @@ async fn cluster_bulk_transfer(
     };
 
     let (op_label, transfers) = match plan {
-        BulkPlan::Drain(target) => (
-            "drain",
-            aeon_cluster::plan_drain(&table, target, &members),
-        ),
+        BulkPlan::Drain(target) => ("drain", aeon_cluster::plan_drain(&table, target, &members)),
         BulkPlan::Rebalance => ("rebalance", aeon_cluster::plan_rebalance(&table, &members)),
     };
 
@@ -1550,8 +1544,9 @@ async fn start_pipeline(
             Ok(aeon_types::RegistryResponse::Error { message }) => {
                 api_error(StatusCode::BAD_REQUEST, message).into_response()
             }
-            Ok(_) => Json(serde_json::json!({"status": "started", "replicated": true}))
-                .into_response(),
+            Ok(_) => {
+                Json(serde_json::json!({"status": "started", "replicated": true})).into_response()
+            }
             Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         };
     }
@@ -1601,8 +1596,9 @@ async fn stop_pipeline(
             Ok(aeon_types::RegistryResponse::Error { message }) => {
                 api_error(StatusCode::BAD_REQUEST, message).into_response()
             }
-            Ok(_) => Json(serde_json::json!({"status": "stopped", "replicated": true}))
-                .into_response(),
+            Ok(_) => {
+                Json(serde_json::json!({"status": "stopped", "replicated": true})).into_response()
+            }
             Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         };
     }
@@ -1693,19 +1689,17 @@ async fn instantiate_processor(
         }
         #[cfg(feature = "native-loader")]
         aeon_types::registry::ProcessorType::NativeSo => {
-            let artifact_path =
-                state
-                    .registry
-                    .artifact_path_for(processor_name, processor_version);
-            let p = crate::native_loader::NativeProcessor::load(&artifact_path, &[]).map_err(
-                |e| {
+            let artifact_path = state
+                .registry
+                .artifact_path_for(processor_name, processor_version);
+            let p =
+                crate::native_loader::NativeProcessor::load(&artifact_path, &[]).map_err(|e| {
                     api_error(
                         StatusCode::BAD_REQUEST,
                         format!("failed to load native processor: {e}"),
                     )
                     .into_response()
-                },
-            )?;
+                })?;
             Ok(Box::new(p))
         }
         other => Err(api_error(
@@ -1751,12 +1745,16 @@ async fn upgrade_pipeline(
     // If a PipelineControl handle exists, perform a real drain→swap→resume.
     // Otherwise, fall back to metadata-only upgrade.
     if let Some(control) = state.pipeline_controls.get(&name) {
-        let new_processor =
-            match instantiate_processor(&state, &req.processor_name, &req.processor_version).await
-            {
-                Ok(p) => p,
-                Err(resp) => return resp,
-            };
+        let new_processor = match instantiate_processor(
+            &state,
+            &req.processor_name,
+            &req.processor_version,
+        )
+        .await
+        {
+            Ok(p) => p,
+            Err(resp) => return resp,
+        };
 
         // Drain→swap→resume
         if let Err(e) = control.drain_and_swap(new_processor).await {
@@ -1776,10 +1774,8 @@ async fn upgrade_pipeline(
     } else {
         // No PipelineControl — metadata-only upgrade
         match state.pipelines.upgrade(&name, proc_ref, "api").await {
-            Ok(()) => {
-                Json(serde_json::json!({"status": "upgraded", "method": "metadata"}))
-                    .into_response()
-            }
+            Ok(()) => Json(serde_json::json!({"status": "upgraded", "method": "metadata"}))
+                .into_response(),
             Err(e) => api_error(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
         }
     }
@@ -1807,12 +1803,12 @@ async fn upgrade_blue_green(
     // If a managed pipeline control exists, instantiate the green processor
     // and start real blue-green shadow mode.
     if let Some(ctrl) = state.pipeline_controls.get(&name) {
-        let green =
-            match instantiate_processor(&state, &req.processor_name, &req.processor_version).await
-            {
-                Ok(p) => p,
-                Err(resp) => return resp,
-            };
+        let green = match instantiate_processor(&state, &req.processor_name, &req.processor_version)
+            .await
+        {
+            Ok(p) => p,
+            Err(resp) => return resp,
+        };
         if let Err(e) = ctrl.start_blue_green(green).await {
             return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1863,12 +1859,16 @@ async fn upgrade_canary(
     // If a managed pipeline control exists, instantiate the canary processor
     // and start real traffic splitting.
     if let Some(ctrl) = state.pipeline_controls.get(&name) {
-        let canary =
-            match instantiate_processor(&state, &req.processor_name, &req.processor_version).await
-            {
-                Ok(p) => p,
-                Err(resp) => return resp,
-            };
+        let canary = match instantiate_processor(
+            &state,
+            &req.processor_name,
+            &req.processor_version,
+        )
+        .await
+        {
+            Ok(p) => p,
+            Err(resp) => return resp,
+        };
         if let Err(e) = ctrl.start_canary(canary, initial_pct).await {
             return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1916,8 +1916,7 @@ async fn rollback_pipeline(
             } else {
                 "metadata"
             };
-            Json(serde_json::json!({"status": "rolled-back", "method": method}))
-                .into_response()
+            Json(serde_json::json!({"status": "rolled-back", "method": method})).into_response()
         }
         Err(e) => api_error(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     }
@@ -1944,8 +1943,7 @@ async fn promote_canary(
             } else {
                 "metadata"
             };
-            Json(serde_json::json!({"status": "promoted", "method": method}))
-                .into_response()
+            Json(serde_json::json!({"status": "promoted", "method": method})).into_response()
         }
         Err(e) => api_error(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     }
@@ -1989,9 +1987,7 @@ async fn reconfigure_source(
         .reconfigure_source(&name, new_source, "api")
         .await
     {
-        Ok(()) => {
-            Json(serde_json::json!({"status": "source-reconfigured"})).into_response()
-        }
+        Ok(()) => Json(serde_json::json!({"status": "source-reconfigured"})).into_response(),
         Err(e) => api_error(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     }
 }
@@ -2006,9 +2002,7 @@ async fn reconfigure_sink(
         .reconfigure_sink(&name, new_sink, "api")
         .await
     {
-        Ok(()) => {
-            Json(serde_json::json!({"status": "sink-reconfigured"})).into_response()
-        }
+        Ok(()) => Json(serde_json::json!({"status": "sink-reconfigured"})).into_response(),
         Err(e) => api_error(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     }
 }
@@ -2028,8 +2022,9 @@ async fn delete_pipeline(
             Ok(aeon_types::RegistryResponse::Error { message }) => {
                 api_error(StatusCode::BAD_REQUEST, message).into_response()
             }
-            Ok(_) => Json(serde_json::json!({"status": "deleted", "replicated": true}))
-                .into_response(),
+            Ok(_) => {
+                Json(serde_json::json!({"status": "deleted", "replicated": true})).into_response()
+            }
             Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         };
     }
@@ -2505,8 +2500,11 @@ async fn pipeline_tail(
 ) -> impl IntoResponse {
     // Verify pipeline exists before upgrading
     if state.pipelines.get(&name).await.is_none() {
-        return api_error(StatusCode::NOT_FOUND, format!("pipeline '{name}' not found"))
-            .into_response();
+        return api_error(
+            StatusCode::NOT_FOUND,
+            format!("pipeline '{name}' not found"),
+        )
+        .into_response();
     }
 
     let pipelines = state.pipelines.clone();
@@ -2605,10 +2603,7 @@ mod tests {
 
     struct StubSink;
     impl Sink for StubSink {
-        async fn write_batch(
-            &mut self,
-            outputs: Vec<Output>,
-        ) -> Result<BatchResult, AeonError> {
+        async fn write_batch(&mut self, outputs: Vec<Output>) -> Result<BatchResult, AeonError> {
             Ok(BatchResult::all_delivered(
                 outputs.iter().map(|_| uuid::Uuid::nil()).collect(),
             ))
@@ -2776,7 +2771,11 @@ mod tests {
         // Build a single-node cluster and plug it into AppState so the /metrics
         // handler reaches cluster_metrics_prometheus().
         let cfg = aeon_cluster::ClusterConfig::single_node(42, 4);
-        let node = Arc::new(aeon_cluster::ClusterNode::bootstrap_single(cfg).await.unwrap());
+        let node = Arc::new(
+            aeon_cluster::ClusterNode::bootstrap_single(cfg)
+                .await
+                .unwrap(),
+        );
 
         // Start from a standard test_state() but swap in the cluster_node field.
         let base = test_state();
@@ -3453,9 +3452,7 @@ mod tests {
             .oneshot(
                 Request::post("/api/v1/pipelines/reconf-sink-api/reconfigure/sink")
                     .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"type":"kafka","topic":"new-output"}"#,
-                    ))
+                    .body(Body::from(r#"{"type":"kafka","topic":"new-output"}"#))
                     .unwrap(),
             )
             .await
@@ -3476,9 +3473,7 @@ mod tests {
             .oneshot(
                 Request::post("/api/v1/pipelines/reconf-cross-api/reconfigure/source")
                     .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"type":"nats","topic":"stream"}"#,
-                    ))
+                    .body(Body::from(r#"{"type":"nats","topic":"stream"}"#))
                     .unwrap(),
             )
             .await
@@ -3495,9 +3490,7 @@ mod tests {
             .oneshot(
                 Request::post("/api/v1/pipelines/ghost/reconfigure/source")
                     .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"type":"kafka","topic":"t"}"#,
-                    ))
+                    .body(Body::from(r#"{"type":"kafka","topic":"t"}"#))
                     .unwrap(),
             )
             .await

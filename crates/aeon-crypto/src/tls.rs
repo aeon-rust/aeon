@@ -1066,14 +1066,10 @@ fn extract_sans_from_extensions(mut ext_seq: &[u8], out: &mut Vec<String>) {
                     16 => {
                         let mut segs = [0u16; 8];
                         for (i, seg) in segs.iter_mut().enumerate() {
-                            *seg = u16::from_be_bytes([
-                                value_body[2 * i],
-                                value_body[2 * i + 1],
-                            ]);
+                            *seg = u16::from_be_bytes([value_body[2 * i], value_body[2 * i + 1]]);
                         }
                         let ip = std::net::Ipv6Addr::new(
-                            segs[0], segs[1], segs[2], segs[3], segs[4], segs[5], segs[6],
-                            segs[7],
+                            segs[0], segs[1], segs[2], segs[3], segs[4], segs[5], segs[6], segs[7],
                         );
                         out.push(format!("IP:{ip}"));
                     }

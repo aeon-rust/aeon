@@ -139,7 +139,9 @@ impl DagGraph {
                     // are a subset of `in_degree`'s keys (both populated from
                     // `self.nodes`). Guaranteed Some.
                     #[allow(clippy::expect_used)]
-                    let deg = in_degree.get_mut(neighbor).expect("invariant: adjacency targets are in in_degree");
+                    let deg = in_degree
+                        .get_mut(neighbor)
+                        .expect("invariant: adjacency targets are in in_degree");
                     *deg -= 1;
                     if *deg == 0 {
                         queue.push_back(neighbor);
@@ -470,24 +472,24 @@ where
 
     match topo {
         Topology::Linear => {
-            let source = sources.first_mut().ok_or_else(|| {
-                AeonError::config("pipeline requires at least one source")
-            })?;
-            let sink = sinks.first_mut().ok_or_else(|| {
-                AeonError::config("pipeline requires at least one sink")
-            })?;
+            let source = sources
+                .first_mut()
+                .ok_or_else(|| AeonError::config("pipeline requires at least one source"))?;
+            let sink = sinks
+                .first_mut()
+                .ok_or_else(|| AeonError::config("pipeline requires at least one sink"))?;
             crate::pipeline::run(source, processor, sink, metrics, shutdown).await
         }
         Topology::FanIn => {
-            let sink = sinks.first_mut().ok_or_else(|| {
-                AeonError::config("fan-in requires at least one sink")
-            })?;
+            let sink = sinks
+                .first_mut()
+                .ok_or_else(|| AeonError::config("fan-in requires at least one sink"))?;
             run_fan_in(sources, processor, sink, metrics, shutdown).await
         }
         Topology::FanOut => {
-            let source = sources.first_mut().ok_or_else(|| {
-                AeonError::config("fan-out requires at least one source")
-            })?;
+            let source = sources
+                .first_mut()
+                .ok_or_else(|| AeonError::config("fan-out requires at least one source"))?;
             run_fan_out(source, processor, sinks, metrics, shutdown).await
         }
         Topology::FanInFanOut => {
@@ -1076,8 +1078,7 @@ mod tests {
         let metrics = PipelineMetrics::new();
         let shutdown = AtomicBool::new(false);
 
-        let result =
-            run_topology(&mut sources, &processor, &mut sinks, &metrics, &shutdown).await;
+        let result = run_topology(&mut sources, &processor, &mut sinks, &metrics, &shutdown).await;
         assert!(result.is_err());
     }
 }

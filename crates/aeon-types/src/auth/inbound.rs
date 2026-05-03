@@ -102,7 +102,10 @@ pub enum AuthRejection {
     /// `skew_seconds` is the absolute difference between request ts
     /// and server `now` at check time.
     #[error("inbound auth: HMAC timestamp skew {skew_seconds}s exceeds window {window_seconds}s")]
-    HmacClockSkew { skew_seconds: i64, window_seconds: i64 },
+    HmacClockSkew {
+        skew_seconds: i64,
+        window_seconds: i64,
+    },
 
     /// HMAC signature didn't match under any accepted secret.
     #[error("inbound auth: HMAC signature did not match")]
@@ -339,10 +342,22 @@ impl std::fmt::Debug for InboundAuthVerifier {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InboundAuthVerifier")
             .field("modes", &self.modes)
-            .field("ip_allowlist_cidrs", &self.ip_allowlist.as_ref().map(|c| c.cidrs.len()))
-            .field("api_key_count", &self.api_key.as_ref().map(|c| c.keys.len()))
-            .field("hmac_secret_count", &self.hmac.as_ref().map(|c| c.secrets.len()))
-            .field("mtls_subjects", &self.mtls.as_ref().map(|c| c.subject_allowlist.len()))
+            .field(
+                "ip_allowlist_cidrs",
+                &self.ip_allowlist.as_ref().map(|c| c.cidrs.len()),
+            )
+            .field(
+                "api_key_count",
+                &self.api_key.as_ref().map(|c| c.keys.len()),
+            )
+            .field(
+                "hmac_secret_count",
+                &self.hmac.as_ref().map(|c| c.secrets.len()),
+            )
+            .field(
+                "mtls_subjects",
+                &self.mtls.as_ref().map(|c| c.subject_allowlist.len()),
+            )
             .finish()
     }
 }
@@ -406,9 +421,10 @@ impl InboundAuthVerifier {
         for mode in &config.modes {
             match mode {
                 InboundAuthMode::IpAllowlist => {
-                    let cfg = config.ip_allowlist.as_ref().ok_or(
-                        InboundAuthBuildError::ModeConfigMissing { mode: *mode },
-                    )?;
+                    let cfg = config
+                        .ip_allowlist
+                        .as_ref()
+                        .ok_or(InboundAuthBuildError::ModeConfigMissing { mode: *mode })?;
                     if cfg.cidrs.is_empty() {
                         return Err(InboundAuthBuildError::IpAllowlistEmpty);
                     }
@@ -417,9 +433,10 @@ impl InboundAuthVerifier {
                     });
                 }
                 InboundAuthMode::ApiKey => {
-                    let cfg = config.api_key.as_ref().ok_or(
-                        InboundAuthBuildError::ModeConfigMissing { mode: *mode },
-                    )?;
+                    let cfg = config
+                        .api_key
+                        .as_ref()
+                        .ok_or(InboundAuthBuildError::ModeConfigMissing { mode: *mode })?;
                     if cfg.keys.is_empty() || cfg.keys.iter().all(|s| s.is_empty()) {
                         return Err(InboundAuthBuildError::ApiKeyEmpty);
                     }
@@ -528,7 +545,9 @@ impl InboundAuthVerifier {
         let Some(cfg) = &self.api_key else {
             return Ok(());
         };
-        let presented = ctx.header(&cfg.header_name).ok_or(AuthRejection::ApiKeyMissing)?;
+        let presented = ctx
+            .header(&cfg.header_name)
+            .ok_or(AuthRejection::ApiKeyMissing)?;
         for key in &cfg.keys {
             if constant_time_eq(presented, key.expose_bytes()) {
                 return Ok(());
@@ -549,7 +568,8 @@ impl InboundAuthVerifier {
             .ok_or(AuthRejection::HmacTimestampMissing)?;
 
         // Parse timestamp; reject non-ASCII or non-decimal early.
-        let ts_str = std::str::from_utf8(ts_bytes).map_err(|_| AuthRejection::HmacTimestampMalformed)?;
+        let ts_str =
+            std::str::from_utf8(ts_bytes).map_err(|_| AuthRejection::HmacTimestampMalformed)?;
         let ts: i64 = ts_str
             .parse()
             .map_err(|_| AuthRejection::HmacTimestampMalformed)?;
@@ -608,7 +628,10 @@ impl InboundAuthVerifier {
             }
         }
         Err(AuthRejection::MtlsSubjectNotAllowed {
-            subject: subjects.first().map(|s| (*s).to_string()).unwrap_or_default(),
+            subject: subjects
+                .first()
+                .map(|s| (*s).to_string())
+                .unwrap_or_default(),
         })
     }
 }
@@ -655,15 +678,19 @@ const fn default_hmac_skew() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::hmac_sig::sign_request;
+    use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     fn v4(s: &str) -> IpAddr {
         IpAddr::V4(s.parse::<Ipv4Addr>().unwrap())
     }
 
-    fn ctx<'a>(peer: IpAddr, headers: &'a [(&'a str, &'a [u8])], body: &'a [u8]) -> AuthContext<'a> {
+    fn ctx<'a>(
+        peer: IpAddr,
+        headers: &'a [(&'a str, &'a [u8])],
+        body: &'a [u8],
+    ) -> AuthContext<'a> {
         AuthContext {
             peer_ip: peer,
             method: "POST",
@@ -715,8 +742,12 @@ mod tests {
             ..Default::default()
         };
         let v = InboundAuthVerifier::build(cfg).unwrap();
-        v.verify(&ctx(IpAddr::V6("fd12::1".parse::<Ipv6Addr>().unwrap()), &[], b""))
-            .unwrap();
+        v.verify(&ctx(
+            IpAddr::V6("fd12::1".parse::<Ipv6Addr>().unwrap()),
+            &[],
+            b"",
+        ))
+        .unwrap();
     }
 
     #[test]
@@ -866,8 +897,10 @@ mod tests {
             b"payload",
         )
         .unwrap();
-        let headers: &[(&str, &[u8])] =
-            &[("X-Aeon-Signature", sig.as_bytes()), ("X-Aeon-Timestamp", ts)];
+        let headers: &[(&str, &[u8])] = &[
+            ("X-Aeon-Signature", sig.as_bytes()),
+            ("X-Aeon-Timestamp", ts),
+        ];
         v.verify(&ctx(v4("10.0.0.1"), headers, b"payload")).unwrap();
     }
 
@@ -942,15 +975,25 @@ mod tests {
         };
         let v = InboundAuthVerifier::build(cfg).unwrap();
         let ts = b"1700000000";
-        let sig = sign_request(HmacAlgorithm::HmacSha256, b"k", b"POST", b"/ingest", ts, b"")
-            .unwrap();
+        let sig = sign_request(
+            HmacAlgorithm::HmacSha256,
+            b"k",
+            b"POST",
+            b"/ingest",
+            ts,
+            b"",
+        )
+        .unwrap();
         let headers: &[(&str, &[u8])] = &[("S", sig.as_bytes()), ("T", ts)];
         let mut c = ctx(v4("10.0.0.1"), headers, b"");
         c.now_unix = 1_700_001_000; // 1000 seconds off, skew = 60
         let err = v.verify(&c).unwrap_err();
         assert!(matches!(
             err,
-            AuthRejection::HmacClockSkew { window_seconds: 60, .. }
+            AuthRejection::HmacClockSkew {
+                window_seconds: 60,
+                ..
+            }
         ));
         assert_eq!(err.reason_tag(), "hmac_clock_skew");
     }
@@ -1011,8 +1054,15 @@ mod tests {
         };
         let v = InboundAuthVerifier::build(cfg).unwrap();
         let ts = b"1700000000";
-        let sig = sign_request(HmacAlgorithm::HmacSha256, b"old", b"POST", b"/ingest", ts, b"x")
-            .unwrap();
+        let sig = sign_request(
+            HmacAlgorithm::HmacSha256,
+            b"old",
+            b"POST",
+            b"/ingest",
+            ts,
+            b"x",
+        )
+        .unwrap();
         let headers: &[(&str, &[u8])] = &[("S", sig.as_bytes()), ("T", ts)];
         v.verify(&ctx(v4("10.0.0.1"), headers, b"x")).unwrap();
     }
@@ -1031,7 +1081,10 @@ mod tests {
             ..Default::default()
         };
         let err = InboundAuthVerifier::build(cfg).unwrap_err();
-        assert!(matches!(err, InboundAuthBuildError::HmacSkewInvalid { got: 0 }));
+        assert!(matches!(
+            err,
+            InboundAuthBuildError::HmacSkewInvalid { got: 0 }
+        ));
     }
 
     // ── Mtls ───────────────────────────────────────────────────────
@@ -1178,13 +1231,20 @@ api_key:
     fn reason_tags_are_stable_labels() {
         // Sanity — all tags are present and non-empty.
         for tag in [
-            AuthRejection::IpNotAllowed { peer_ip: v4("0.0.0.0") }.reason_tag(),
+            AuthRejection::IpNotAllowed {
+                peer_ip: v4("0.0.0.0"),
+            }
+            .reason_tag(),
             AuthRejection::ApiKeyMissing.reason_tag(),
             AuthRejection::ApiKeyInvalid.reason_tag(),
             AuthRejection::HmacSignatureMissing.reason_tag(),
             AuthRejection::HmacTimestampMissing.reason_tag(),
             AuthRejection::HmacTimestampMalformed.reason_tag(),
-            AuthRejection::HmacClockSkew { skew_seconds: 0, window_seconds: 0 }.reason_tag(),
+            AuthRejection::HmacClockSkew {
+                skew_seconds: 0,
+                window_seconds: 0,
+            }
+            .reason_tag(),
             AuthRejection::HmacInvalid.reason_tag(),
             AuthRejection::HmacMalformed.reason_tag(),
             AuthRejection::MtlsMissing.reason_tag(),

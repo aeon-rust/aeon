@@ -34,9 +34,8 @@ impl PohChainProvider for LivePohProvider {
     fn export_state<'a>(
         &'a self,
         _req: &'a PohChainTransferRequest,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Vec<u8>, AeonError>> + Send + 'a>,
-    > {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, AeonError>> + Send + 'a>>
+    {
         Box::pin(async move {
             let chain = self
                 .chain

@@ -146,11 +146,7 @@ impl AuditEvent {
     /// Append a detail key-value. Use `k` as a stable snake_case
     /// identifier (`"pipeline_name"`, `"reason_tag"`). Callers must
     /// redact `v` before calling — values are written verbatim.
-    pub fn with_detail(
-        mut self,
-        k: impl Into<String>,
-        v: impl Into<String>,
-    ) -> Self {
+    pub fn with_detail(mut self, k: impl Into<String>, v: impl Into<String>) -> Self {
         self.detail_fields.push((k.into(), v.into()));
         self
     }
@@ -232,8 +228,14 @@ mod tests {
         );
         let j = serde_json::to_string(&e).unwrap();
         assert!(!j.contains("actor"), "empty actor must be skipped: {j}");
-        assert!(!j.contains("resource"), "empty resource must be skipped: {j}");
-        assert!(!j.contains("detail_fields"), "empty details must be skipped: {j}");
+        assert!(
+            !j.contains("resource"),
+            "empty resource must be skipped: {j}"
+        );
+        assert!(
+            !j.contains("detail_fields"),
+            "empty details must be skipped: {j}"
+        );
     }
 
     #[test]

@@ -229,9 +229,9 @@ impl KafkaSource {
                 // advisory only (broker decides). The pipeline start path must
                 // refuse to attach a Raft-driven partition watcher in this
                 // mode; see `broker_coordinated_partitions()` below.
-                consumer.subscribe(&[&config.topic]).map_err(|e| {
-                    AeonError::connection(format!("kafka subscribe failed: {e}"))
-                })?;
+                consumer
+                    .subscribe(&[&config.topic])
+                    .map_err(|e| AeonError::connection(format!("kafka subscribe failed: {e}")))?;
 
                 tracing::info!(
                     topic = %config.topic,

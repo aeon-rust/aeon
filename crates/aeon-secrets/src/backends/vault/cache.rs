@@ -167,7 +167,10 @@ mod tests {
     #[test]
     fn debug_redacts_values() {
         let c = SecretCache::new(Duration::from_secs(60));
-        c.put("k".to_string(), SecretBytes::new(b"very-secret-value".to_vec()));
+        c.put(
+            "k".to_string(),
+            SecretBytes::new(b"very-secret-value".to_vec()),
+        );
         let dbg = format!("{c:?}");
         assert!(!dbg.contains("very-secret-value"), "leaked: {dbg}");
     }

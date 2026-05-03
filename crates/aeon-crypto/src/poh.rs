@@ -375,9 +375,7 @@ impl std::str::FromStr for PohVerifyMode {
             "verify_with_key" | "verify-with-key" | "verifywithkey" => {
                 Ok(PohVerifyMode::VerifyWithKey)
             }
-            "trust_extend" | "trust-extend" | "trustextend" => {
-                Ok(PohVerifyMode::TrustExtend)
-            }
+            "trust_extend" | "trust-extend" | "trustextend" => Ok(PohVerifyMode::TrustExtend),
             other => Err(format!(
                 "unknown poh_verify_mode '{other}' (valid: verify, verify_with_key, trust_extend)"
             )),
@@ -388,9 +386,7 @@ impl std::str::FromStr for PohVerifyMode {
 /// Errors returned by [`PohChain::verify_state`].
 #[derive(Debug, thiserror::Error)]
 pub enum PohVerifyError {
-    #[error(
-        "poh-verify: partition mismatch: expected {expected:?}, state carries {actual:?}"
-    )]
+    #[error("poh-verify: partition mismatch: expected {expected:?}, state carries {actual:?}")]
     PartitionMismatch {
         expected: PartitionId,
         actual: PartitionId,
@@ -403,9 +399,7 @@ pub enum PohVerifyError {
         /// "== " or "!= " — just a string slot for the message.
         state: &'static str,
     },
-    #[error(
-        "poh-verify: MMR leaf_count {mmr_leaves} exceeds chain sequence {sequence}"
-    )]
+    #[error("poh-verify: MMR leaf_count {mmr_leaves} exceeds chain sequence {sequence}")]
     MmrAheadOfSequence { mmr_leaves: u64, sequence: u64 },
     #[error(
         "poh-verify: MMR internal inconsistency: leaf_count={leaf_count} but {peaks} peaks for that count is invalid"
@@ -887,7 +881,10 @@ mod tests {
     #[test]
     fn verify_mode_parses_common_spellings() {
         use std::str::FromStr;
-        assert_eq!(PohVerifyMode::from_str("verify").unwrap(), PohVerifyMode::Verify);
+        assert_eq!(
+            PohVerifyMode::from_str("verify").unwrap(),
+            PohVerifyMode::Verify
+        );
         assert_eq!(
             PohVerifyMode::from_str("Verify_With_Key").unwrap(),
             PohVerifyMode::VerifyWithKey

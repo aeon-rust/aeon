@@ -98,9 +98,7 @@ fn decode_signing_key_bytes(raw: &[u8], ref_str: &str) -> Result<[u8; 32], AeonE
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aeon_types::{
-        SecretBytes, SecretError, SecretProvider, SecretRef, SecretScheme,
-    };
+    use aeon_types::{SecretBytes, SecretError, SecretProvider, SecretRef, SecretScheme};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     /// Test-only env provider that returns the env var's UTF-8 bytes
@@ -112,8 +110,7 @@ mod tests {
             SecretScheme::Env
         }
         fn resolve(&self, path: &str) -> Result<SecretBytes, SecretError> {
-            let v = std::env::var(path)
-                .map_err(|_| SecretError::EnvNotSet(path.to_string()))?;
+            let v = std::env::var(path).map_err(|_| SecretError::EnvNotSet(path.to_string()))?;
             Ok(SecretBytes::new(v.into_bytes()))
         }
     }
@@ -264,13 +261,15 @@ mod tests {
             // SecretScheme::Vault not registered in the empty registry.
             signing_key_ref: Some("${VAULT:kv/aeon/poh-signing-key}".into()),
         };
-        let err = match resolve_poh_signing_key(&block, Some(&SecretRegistry::empty()))
-        {
+        let err = match resolve_poh_signing_key(&block, Some(&SecretRegistry::empty())) {
             Err(e) => e,
             Ok(_) => panic!("expected hard refusal on unknown scheme"),
         };
         let msg = format!("{err}");
-        assert!(msg.contains("failed to resolve signing_key_ref"), "got {msg}");
+        assert!(
+            msg.contains("failed to resolve signing_key_ref"),
+            "got {msg}"
+        );
     }
 
     #[test]

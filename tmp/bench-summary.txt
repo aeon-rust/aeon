@@ -1,0 +1,139 @@
+=== crypto_bench ===
+sha512/hash/64          time:   [448.38 ns 463.08 ns 476.15 ns]
+sha512/hash/256         time:   [1.2141 µs 1.2570 µs 1.3021 µs]
+sha512/hash/1024        time:   [3.3487 µs 3.4593 µs 3.5695 µs]
+sha512/hash/4096        time:   [12.255 µs 12.779 µs 13.210 µs]
+merkle_tree/build/10    time:   [16.014 µs 16.694 µs 17.267 µs]
+merkle_tree/build/100   time:   [139.87 µs 143.14 µs 145.98 µs]
+merkle_tree/build/1000  time:   [1.3962 ms 1.4245 ms 1.4549 ms]
+merkle_tree/build/10000 time:   [14.396 ms 14.758 ms 15.135 ms]
+                        time:   [345.40 ns 358.69 ns 371.11 ns]
+                        time:   [8.6097 µs 8.8902 µs 9.1565 µs]
+mmr/append_10000        time:   [10.176 ms 10.504 ms 10.846 ms]
+mmr/root_10000          time:   [3.5780 µs 3.6913 µs 3.8111 µs]
+mmr/peaks_10000         time:   [163.09 ns 167.64 ns 171.41 ns]
+                        time:   [148.61 µs 155.20 µs 160.20 µs]
+                        time:   [186.63 µs 191.64 µs 196.63 µs]
+                        time:   [10.584 µs 10.882 µs 11.157 µs]
+ed25519/sign_root       time:   [33.395 µs 33.857 µs 34.442 µs]
+ed25519/verify_root     time:   [59.290 µs 60.403 µs 61.646 µs]
+ed25519/verify_with_key time:   [53.012 µs 53.856 µs 54.709 µs]
+ed25519/keygen          time:   [69.439 µs 72.979 µs 75.456 µs]
+                        time:   [3.4806 µs 3.7625 µs 4.0367 µs]
+                        time:   [3.0985 µs 3.2792 µs 3.4872 µs]
+                        time:   [3.8245 µs 3.9222 µs 3.9991 µs]
+                        time:   [4.1993 µs 4.2545 µs 4.3199 µs]
+                        time:   [5.7707 µs 6.0582 µs 6.4325 µs]
+                        time:   [9.3077 µs 9.7443 µs 10.118 µs]
+                        time:   [29.753 µs 32.004 µs 34.707 µs]
+                        time:   [23.858 µs 27.218 µs 31.507 µs]
+                        time:   [284.91 µs 311.11 µs 333.32 µs]
+                        time:   [238.41 µs 248.23 µs 257.01 µs]
+                        time:   [12.937 µs 13.425 µs 13.842 µs]
+etm_encryption/keygen   time:   [126.96 ns 128.39 ns 129.97 ns]
+=== eo2_durability_bench ===
+                        time:   [30.979 ms 31.104 ms 31.222 ms]
+                        time:   [+605.69% +643.89% +682.78%] (p = 0.00 < 0.05)
+                        time:   [174.08 ms 177.13 ms 180.10 ms]
+                        time:   [+108.82% +117.80% +126.81%] (p = 0.00 < 0.05)
+                        time:   [124.21 ms 126.83 ms 129.52 ms]
+                        time:   [+15.437% +18.251% +20.894%] (p = 0.00 < 0.05)
+                        time:   [128.81 ms 133.17 ms 137.33 ms]
+                        time:   [+16.030% +19.808% +23.679%] (p = 0.01 < 0.05)
+                        time:   [148.90 ms 152.25 ms 155.76 ms]
+                        time:   [+3.9179% +6.3927% +8.8609%] (p = 0.05 > 0.05)
+                        time:   [210.72 ms 219.32 ms 228.84 ms]
+                        time:   [-11.093% -4.1811% +3.5871%] (p = 0.46 > 0.05)
+                        time:   [133.01 ms 136.91 ms 141.04 ms]
+                        time:   [+12.424% +15.689% +19.241%] (p = 0.00 < 0.05)
+                        time:   [144.03 ms 147.94 ms 151.87 ms]
+                        time:   [+4.8899% +8.2352% +11.962%] (p = 0.09 > 0.05)
+                        time:   [177.37 ms 182.64 ms 188.41 ms]
+                        time:   [+9.2831% +12.550% +15.932%] (p = 0.01 < 0.05)
+                        time:   [286.22 ms 296.53 ms 306.32 ms]
+                        time:   [-11.496% -7.1329% -2.7244%] (p = 0.16 > 0.05)
+                        time:   [171.91 ms 175.18 ms 178.13 ms]
+                        time:   [171.40 ms 173.77 ms 176.09 ms]
+                        time:   [170.10 ms 173.28 ms 176.51 ms]
+                        time:   [180.10 ms 184.37 ms 188.51 ms]
+                        time:   [169.59 ms 174.19 ms 178.54 ms]
+                        time:   [167.10 ms 170.66 ms 173.87 ms]
+                        time:   [205.35 µs 209.07 µs 212.55 µs]
+                        time:   [+52.403% +57.443% +62.823%] (p = 0.00 < 0.05)
+                        time:   [96.680 µs 99.452 µs 101.58 µs]
+                        time:   [+57.113% +61.879% +66.411%] (p = 0.00 < 0.05)
+                        time:   [238.36 µs 243.19 µs 248.18 µs]
+                        time:   [+72.921% +79.023% +84.903%] (p = 0.00 < 0.05)
+                        time:   [123.58 µs 125.56 µs 127.77 µs]
+                        time:   [+56.825% +63.309% +69.567%] (p = 0.00 < 0.05)
+                        time:   [296.40 µs 309.66 µs 322.79 µs]
+                        time:   [+60.015% +66.815% +73.240%] (p = 0.00 < 0.05)
+                        time:   [170.55 µs 175.29 µs 179.84 µs]
+                        time:   [+54.492% +60.636% +66.256%] (p = 0.00 < 0.05)
+                        time:   [594.82 µs 616.96 µs 635.56 µs]
+                        time:   [+67.059% +75.843% +84.933%] (p = 0.00 < 0.05)
+                        time:   [366.32 µs 378.01 µs 389.11 µs]
+                        time:   [+68.346% +74.127% +80.131%] (p = 0.00 < 0.05)
+=== multi_partition_blackhole_bench ===
+=== Multi-Partition Scaling Benchmark (Run 5) ===
+  1 partition(s): 100000 events in 72.91ms — 1371505 events/sec
+  2 partition(s): 200000 events in 85.78ms — 2331497 events/sec
+  4 partition(s): 400000 events in 139.52ms — 2866979 events/sec
+  8 partition(s): 800000 events in 223.76ms — 3575240 events/sec
+  Scaling analysis (blackhole):
+  1 partition(s): 100000 outputs in 267.88ms — 373295 events/sec
+  2 partition(s): 200000 outputs in 296.34ms — 674906 events/sec
+  4 partition(s): 400000 outputs in 312.14ms — 1281468 events/sec
+  8 partition(s): 800000 outputs in 472.21ms — 1694177 events/sec
+  Scaling analysis (FileSink):
+  1p: blackhole 1371505/s, filesink 373295/s — filesink is 27.2% of blackhole
+  2p: blackhole 2331497/s, filesink 674906/s — filesink is 28.9% of blackhole
+  4p: blackhole 2866979/s, filesink 1281468/s — filesink is 44.7% of blackhole
+  8p: blackhole 3575240/s, filesink 1694177/s — filesink is 47.4% of blackhole
+=== Acceptance Criteria ===
+  Blackhole 2p >= 1.8x: 1.70x — FAIL
+  Blackhole 4p >= 3.5x: 2.09x — FAIL
+  Blackhole 8p >= 6.0x: 2.61x — FAIL
+  FileSink 2p >= 1.7x: 1.81x — PASS
+  FileSink 4p >= 3.0x: 3.43x — PASS
+  FileSink 8p >= 5.0x: 4.54x — FAIL
+  FileSink/Blackhole gap (4p) > 50%: 44.7% — FAIL
+=== SOME CRITERIA DID NOT PASS — see above ===
+=== pipeline_components_bench ===
+                        time:   [308.65 ns 318.22 ns 325.20 ns]
+                        time:   [+19.274% +41.029% +59.953%] (p = 0.00 < 0.05)
+                        time:   [4.1922 µs 4.2705 µs 4.3412 µs]
+                        time:   [+31.409% +41.153% +48.802%] (p = 0.00 < 0.05)
+                        time:   [15.956 µs 16.266 µs 16.596 µs]
+                        time:   [+37.740% +40.555% +43.018%] (p = 0.00 < 0.05)
+                        time:   [65.596 µs 66.995 µs 68.307 µs]
+                        time:   [+34.789% +38.076% +41.347%] (p = 0.00 < 0.05)
+                        time:   [8.9705 µs 9.1377 µs 9.3299 µs]
+                        time:   [+49.990% +55.854% +61.617%] (p = 0.00 < 0.05)
+                        time:   [33.061 µs 33.623 µs 34.077 µs]
+                        time:   [+45.903% +48.629% +51.148%] (p = 0.00 < 0.05)
+                        time:   [143.86 µs 152.18 µs 158.90 µs]
+                        time:   [+66.645% +71.637% +76.428%] (p = 0.00 < 0.05)
+                        time:   [1.3516 ms 1.3673 ms 1.3851 ms]
+                        time:   [+24.366% +31.862% +39.440%] (p = 0.00 < 0.05)
+                        time:   [26.579 ms 26.943 ms 27.434 ms]
+                        time:   [+8.2482% +11.147% +14.131%] (p = 0.00 < 0.05)
+                        time:   [39.836 ms 40.445 ms 41.129 ms]
+                        time:   [-11.829% -8.8976% -5.5141%] (p = 0.00 < 0.05)
+                        time:   [26.856 ms 27.362 ms 27.858 ms]
+                        time:   [+15.900% +21.907% +28.718%] (p = 0.00 < 0.05)
+                        time:   [26.770 ms 28.813 ms 30.849 ms]
+                        time:   [+19.172% +25.888% +32.934%] (p = 0.00 < 0.05)
+                        time:   [26.438 ms 26.879 ms 27.465 ms]
+                        time:   [+18.058% +23.993% +29.515%] (p = 0.00 < 0.05)
+                        time:   [25.200 ms 25.500 ms 25.948 ms]
+                        time:   [+14.215% +19.216% +24.522%] (p = 0.00 < 0.05)
+                        time:   [42.544 ms 43.304 ms 44.120 ms]
+                        time:   [+14.384% +20.445% +27.104%] (p = 0.00 < 0.05)
+                        time:   [5.3631 µs 5.5220 µs 5.6505 µs]
+                        time:   [+53.990% +68.175% +83.917%] (p = 0.00 < 0.05)
+                        time:   [22.233 µs 22.573 µs 22.927 µs]
+                        time:   [+33.649% +36.729% +39.663%] (p = 0.00 < 0.05)
+                        time:   [89.865 µs 90.733 µs 91.636 µs]
+                        time:   [+35.008% +38.349% +41.769%] (p = 0.00 < 0.05)
+=== done ===

@@ -19,43 +19,41 @@ compile_error!(
 );
 
 pub mod affinity;
-#[cfg(feature = "cluster")]
-pub mod cluster_applier;
-#[cfg(feature = "cluster")]
-pub mod engine_cutover;
-#[cfg(feature = "cluster")]
-pub mod partition_ownership;
-#[cfg(all(feature = "cluster", feature = "processor-auth"))]
-pub mod partition_install;
-#[cfg(all(feature = "cluster", feature = "processor-auth"))]
-pub mod engine_providers;
 pub mod batch_tuner;
 pub mod batch_wire;
 pub mod checkpoint;
-pub mod debug_fault;
 pub mod circuit_breaker;
+#[cfg(feature = "cluster")]
+pub mod cluster_applier;
 pub mod compliance_validator;
 pub mod connector_registry;
 pub mod dag;
+pub mod debug_fault;
 pub mod delivery;
 pub mod delivery_ledger;
 pub mod dlq;
+pub mod encryption_probe;
+#[cfg(feature = "cluster")]
+pub mod engine_cutover;
+#[cfg(all(feature = "cluster", feature = "processor-auth"))]
+pub mod engine_providers;
 pub mod eo2;
 pub mod eo2_backpressure;
 pub mod eo2_content_hash;
 pub mod eo2_metrics;
-pub mod encryption_probe;
 pub mod eo2_recovery;
 pub mod erasure_policy;
 pub mod erasure_probe;
 pub mod erasure_store;
-pub mod retention_probe;
 pub mod health;
 pub mod identity_store;
 pub mod l2_body;
 pub mod l2_transfer;
-pub mod subject_export;
 pub mod metrics_server;
+#[cfg(all(feature = "cluster", feature = "processor-auth"))]
+pub mod partition_install;
+#[cfg(feature = "cluster")]
+pub mod partition_ownership;
 pub mod pipeline;
 pub mod pipeline_manager;
 pub mod pipeline_supervisor;
@@ -63,8 +61,10 @@ pub mod pipeline_supervisor;
 pub mod poh_probe;
 pub mod processor;
 pub mod registry;
+pub mod retention_probe;
 pub mod retry;
 pub mod shutdown;
+pub mod subject_export;
 pub mod transport;
 pub mod write_gate;
 
@@ -97,7 +97,9 @@ pub use connector_registry::{
     BoxedSinkAdapter, BoxedSourceAdapter, ConnectorRegistry, DynSink, DynSource,
     PartitionOwnershipResolver, SinkFactory, SourceFactory,
 };
-pub use dag::{DagGraph, NodeKind, Topology, run_chain, run_fan_in, run_fan_out, run_routed, run_topology};
+pub use dag::{
+    DagGraph, NodeKind, Topology, run_chain, run_fan_in, run_fan_out, run_routed, run_topology,
+};
 pub use delivery::{CheckpointBackend, CheckpointConfig, DeliveryConfig, FlushStrategy};
 pub use delivery_ledger::{DeliveryLedger, DeliveryState, FailedEntry, LedgerEntry};
 pub use dlq::{DeadLetterQueue, DlqConfig, DlqRecord};
@@ -110,19 +112,19 @@ pub use pipeline::{
 };
 #[cfg(feature = "processor-auth")]
 pub use pipeline::{PohConfig, PohState, create_poh_state};
-#[cfg(feature = "processor-auth")]
-pub use poh_probe::resolve_poh_signing_key;
 pub use pipeline_manager::PipelineManager;
 pub use pipeline_supervisor::{IDENTITY_PROCESSOR, PipelineSupervisor};
+#[cfg(feature = "processor-auth")]
+pub use poh_probe::resolve_poh_signing_key;
 pub use processor::PassthroughProcessor;
 pub use registry::ProcessorRegistry;
 pub use retry::{RetryConfig, RetryOutcome, backoff_delay, retry_async, retry_sync};
 pub use shutdown::{ShutdownConfig, ShutdownCoordinator};
 pub use transport::InProcessTransport;
-pub use write_gate::{DrainError, DrainGuard, GateState, WriteGate, WriteGateRegistry};
 pub use transport::{
     AwppSession, BatchInflight, ControlChannel, HandshakeConfig, PipelineResolver, SessionState,
 };
+pub use write_gate::{DrainError, DrainGuard, GateState, WriteGate, WriteGateRegistry};
 
 #[cfg(feature = "native-loader")]
 pub use native_loader::NativeProcessor;

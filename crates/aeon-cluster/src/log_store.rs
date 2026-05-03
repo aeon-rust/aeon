@@ -131,8 +131,8 @@ impl L3RaftLogStore {
         let mut new_last: Option<LogId<u64>> = *self.cache.last_log_id.read().await;
         for entry in entries {
             let key = log_key(entry.log_id.index);
-            let value = bincode::serialize(&entry)
-                .map_err(|e| storage_err_write(e, ErrorSubject::Logs))?;
+            let value =
+                bincode::serialize(&entry).map_err(|e| storage_err_write(e, ErrorSubject::Logs))?;
             new_last = Some(match new_last {
                 Some(prev) if prev.index >= entry.log_id.index => prev,
                 _ => entry.log_id,
@@ -192,8 +192,8 @@ impl L3RaftLogStore {
             .scan_prefix(LOG_PREFIX)
             .map_err(|e| storage_err_read(e, ErrorSubject::Logs))?;
         if let Some((_, bytes)) = entries.last() {
-            let entry: Entry<AeonRaftConfig> = bincode::deserialize(bytes)
-                .map_err(|e| storage_err_read(e, ErrorSubject::Logs))?;
+            let entry: Entry<AeonRaftConfig> =
+                bincode::deserialize(bytes).map_err(|e| storage_err_read(e, ErrorSubject::Logs))?;
             *cache.last_log_id.write().await = Some(entry.log_id);
         }
 
@@ -235,8 +235,8 @@ impl RaftLogReader<AeonRaftConfig> for L3RaftLogStore {
             if !(lower_ok && upper_ok) {
                 continue;
             }
-            let entry: Entry<AeonRaftConfig> = bincode::deserialize(&v)
-                .map_err(|e| storage_err_read(e, ErrorSubject::Logs))?;
+            let entry: Entry<AeonRaftConfig> =
+                bincode::deserialize(&v).map_err(|e| storage_err_read(e, ErrorSubject::Logs))?;
             out.push(entry);
         }
         Ok(out)
@@ -314,8 +314,8 @@ impl RaftLogStorage<AeonRaftConfig> for L3RaftLogStore {
         let mut new_last: Option<LogId<u64>> = *self.cache.last_log_id.read().await;
         for entry in entries {
             let key = log_key(entry.log_id.index);
-            let value = bincode::serialize(&entry)
-                .map_err(|e| storage_err_write(e, ErrorSubject::Logs))?;
+            let value =
+                bincode::serialize(&entry).map_err(|e| storage_err_write(e, ErrorSubject::Logs))?;
             new_last = Some(match new_last {
                 Some(prev) if prev.index >= entry.log_id.index => prev,
                 _ => entry.log_id,
@@ -437,10 +437,7 @@ mod tests {
             self.data.lock().unwrap().remove(key);
             Ok(())
         }
-        fn write_batch(
-            &self,
-            ops: &[aeon_types::BatchEntry],
-        ) -> Result<(), aeon_types::AeonError> {
+        fn write_batch(&self, ops: &[aeon_types::BatchEntry]) -> Result<(), aeon_types::AeonError> {
             let mut d = self.data.lock().unwrap();
             for (op, k, v) in ops {
                 match op {
@@ -454,10 +451,7 @@ mod tests {
             }
             Ok(())
         }
-        fn scan_prefix(
-            &self,
-            prefix: &[u8],
-        ) -> Result<aeon_types::KvPairs, aeon_types::AeonError> {
+        fn scan_prefix(&self, prefix: &[u8]) -> Result<aeon_types::KvPairs, aeon_types::AeonError> {
             let d = self.data.lock().unwrap();
             Ok(d.range(prefix.to_vec()..)
                 .take_while(|(k, _)| k.starts_with(prefix))
@@ -509,9 +503,7 @@ mod tests {
         assert_eq!(store.read_vote().await.unwrap(), Some(vote));
 
         // Reopen against the same L3 — vote must survive.
-        let mut reopened = L3RaftLogStore::open(l3 as Arc<dyn L3Store>)
-            .await
-            .unwrap();
+        let mut reopened = L3RaftLogStore::open(l3 as Arc<dyn L3Store>).await.unwrap();
         assert_eq!(reopened.read_vote().await.unwrap(), Some(vote));
     }
 
@@ -538,9 +530,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut reopened = L3RaftLogStore::open(l3 as Arc<dyn L3Store>)
-            .await
-            .unwrap();
+        let mut reopened = L3RaftLogStore::open(l3 as Arc<dyn L3Store>).await.unwrap();
         let state = reopened.get_log_state().await.unwrap();
         assert_eq!(state.last_log_id.unwrap().index, 2);
 
@@ -585,9 +575,7 @@ mod tests {
         assert_eq!(all[0].log_id.index, 3);
 
         // Marker must survive reopen.
-        let mut reopened = L3RaftLogStore::open(l3 as Arc<dyn L3Store>)
-            .await
-            .unwrap();
+        let mut reopened = L3RaftLogStore::open(l3 as Arc<dyn L3Store>).await.unwrap();
         let state = reopened.get_log_state().await.unwrap();
         assert_eq!(state.last_purged_log_id.unwrap().index, 2);
     }
@@ -595,10 +583,7 @@ mod tests {
     #[tokio::test]
     async fn save_committed_clears_when_none() {
         let (_l3, mut store) = mk_store().await;
-        store
-            .save_committed(Some(mk_log_id(5, 1)))
-            .await
-            .unwrap();
+        store.save_committed(Some(mk_log_id(5, 1))).await.unwrap();
         assert_eq!(store.read_committed().await.unwrap().unwrap().index, 5);
 
         store.save_committed(None).await.unwrap();

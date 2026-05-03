@@ -66,14 +66,12 @@ pub use error::{AeonError, Result};
 pub use event::{Event, Output};
 pub use event_time::EventTime;
 pub use interner::StringInterner;
-pub use l2_transfer::{
-    DEFAULT_CHUNK_BYTES, SegmentChunk, SegmentEntry, SegmentManifest,
-};
+pub use l2_transfer::{DEFAULT_CHUNK_BYTES, SegmentChunk, SegmentEntry, SegmentManifest};
 pub use manifest::{
-    BackpressureConfig, CheckpointBackendDecl, CheckpointBlock, ContentHashConfig,
-    DurabilityBlock, FlushBlock, IdentityConfig, PipelineManifest, ProcessorManifest,
-    SinkManifest, SinkTierDecl, SourceManifest, SubjectExtractConfig,
-    validate_pipeline_shape, validate_sink_tier, validate_source_shape,
+    BackpressureConfig, CheckpointBackendDecl, CheckpointBlock, ContentHashConfig, DurabilityBlock,
+    FlushBlock, IdentityConfig, PipelineManifest, ProcessorManifest, SinkManifest, SinkTierDecl,
+    SourceManifest, SubjectExtractConfig, validate_pipeline_shape, validate_sink_tier,
+    validate_source_shape,
 };
 pub use oauth::OAuthConfig;
 pub use partition::PartitionId;

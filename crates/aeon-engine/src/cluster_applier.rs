@@ -60,9 +60,7 @@ impl RegistryApplier for ClusterRegistryApplier {
     fn apply(
         &self,
         cmd: RegistryCommand,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = RegistryResponse> + Send + '_>,
-    > {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = RegistryResponse> + Send + '_>> {
         let registry = Arc::clone(&self.registry);
         let pipelines = Arc::clone(&self.pipelines);
         let supervisor = self.supervisor.clone();

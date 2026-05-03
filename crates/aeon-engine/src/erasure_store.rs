@@ -22,9 +22,7 @@
 //! Future backends (e.g. a cluster-replicated store) implement the
 //! trait without changing call sites.
 
-use aeon_types::{
-    AeonError, BatchEntry, BatchOp, ErasureTombstone, L3Store, TombstoneState,
-};
+use aeon_types::{AeonError, BatchEntry, BatchOp, ErasureTombstone, L3Store, TombstoneState};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -137,7 +135,10 @@ impl ErasureStore for L3ErasureStore {
 
     fn list_pending(&self) -> Result<Vec<ErasureTombstone>, AeonError> {
         let all = self.list_all()?;
-        Ok(all.into_iter().filter(|t| t.state == TombstoneState::Pending).collect())
+        Ok(all
+            .into_iter()
+            .filter(|t| t.state == TombstoneState::Pending)
+            .collect())
     }
 
     fn get(&self, id: &Uuid) -> Result<Option<ErasureTombstone>, AeonError> {
@@ -197,7 +198,10 @@ mod tests {
             Ok(self.data.lock().unwrap().get(key).cloned())
         }
         fn put(&self, key: &[u8], value: &[u8]) -> Result<(), AeonError> {
-            self.data.lock().unwrap().insert(key.to_vec(), value.to_vec());
+            self.data
+                .lock()
+                .unwrap()
+                .insert(key.to_vec(), value.to_vec());
             Ok(())
         }
         fn delete(&self, key: &[u8]) -> Result<(), AeonError> {

@@ -133,7 +133,13 @@ impl MqttSource {
         let source_name = config.source_name;
 
         let uuid_gen = CoreLocalUuidGenerator::new(0);
-        let handle = tokio::spawn(mqtt_reader(eventloop, tx, source_name, config.backoff, uuid_gen));
+        let handle = tokio::spawn(mqtt_reader(
+            eventloop,
+            tx,
+            source_name,
+            config.backoff,
+            uuid_gen,
+        ));
 
         Ok(Self {
             rx,

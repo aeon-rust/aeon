@@ -100,7 +100,10 @@ pub struct DurabilityBlock {
     /// S5: optional per-tier retention overrides. Defaults to inert
     /// (ack-driven GC only, keep-all checkpoint history) so existing
     /// manifests behave identically.
-    #[serde(default, skip_serializing_if = "crate::retention::RetentionBlock::is_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "crate::retention::RetentionBlock::is_default"
+    )]
     pub retention: crate::retention::RetentionBlock,
 }
 
@@ -242,8 +245,7 @@ impl SubjectExtractConfig {
                 validate_namespace_for_wildcard(namespace)?;
                 if path.trim().is_empty() {
                     return Err(crate::AeonError::config(
-                        "subject_extract.json_path: path must not be empty"
-                            .to_string(),
+                        "subject_extract.json_path: path must not be empty".to_string(),
                     ));
                 }
                 Ok(())
@@ -252,8 +254,7 @@ impl SubjectExtractConfig {
                 validate_namespace_for_wildcard(namespace)?;
                 if name.trim().is_empty() {
                     return Err(crate::AeonError::config(
-                        "subject_extract.header: name must not be empty"
-                            .to_string(),
+                        "subject_extract.header: name must not be empty".to_string(),
                     ));
                 }
                 Ok(())
@@ -630,12 +631,14 @@ mod tests {
 
     #[test]
     fn tier_match_passes() {
-        assert!(validate_sink_tier(
-            "s",
-            SinkTierDecl::T2TransactionalStream,
-            SinkEosTier::TransactionalStream
-        )
-        .is_ok());
+        assert!(
+            validate_sink_tier(
+                "s",
+                SinkTierDecl::T2TransactionalStream,
+                SinkEosTier::TransactionalStream
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -667,28 +670,32 @@ mod tests {
 
     #[test]
     fn broker_time_with_support_passes() {
-        assert!(validate_source_shape(
-            "kafka",
-            SourceKind::Pull,
-            &IdentityConfig::Native,
-            &EventTime::Broker,
-            true
-        )
-        .is_ok());
+        assert!(
+            validate_source_shape(
+                "kafka",
+                SourceKind::Pull,
+                &IdentityConfig::Native,
+                &EventTime::Broker,
+                true
+            )
+            .is_ok()
+        );
     }
 
     #[test]
     fn header_time_never_needs_broker_support() {
-        assert!(validate_source_shape(
-            "webhook",
-            SourceKind::Push,
-            &IdentityConfig::Random,
-            &EventTime::Header {
-                name: "X-Ts".into()
-            },
-            false
-        )
-        .is_ok());
+        assert!(
+            validate_source_shape(
+                "webhook",
+                SourceKind::Push,
+                &IdentityConfig::Random,
+                &EventTime::Header {
+                    name: "X-Ts".into()
+                },
+                false
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -719,17 +726,19 @@ mod tests {
 
     #[test]
     fn poll_with_compound_identity_ok() {
-        assert!(validate_source_shape(
-            "weather",
-            SourceKind::Poll,
-            &IdentityConfig::Compound {
-                cursor_path: Some("$.cursor".into()),
-                content_hash: None,
-            },
-            &EventTime::AeonIngest,
-            false,
-        )
-        .is_ok());
+        assert!(
+            validate_source_shape(
+                "weather",
+                SourceKind::Poll,
+                &IdentityConfig::Compound {
+                    cursor_path: Some("$.cursor".into()),
+                    content_hash: None,
+                },
+                &EventTime::AeonIngest,
+                false,
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -791,8 +800,14 @@ mod tests {
         };
         let err = validate_pipeline_shape(&m).unwrap_err();
         let msg = format!("{err}");
-        assert!(msg.contains("selectors[0].path"), "expected selector error: {msg}");
-        assert!(msg.contains("'orders'"), "expected pipeline name prefix: {msg}");
+        assert!(
+            msg.contains("selectors[0].path"),
+            "expected selector error: {msg}"
+        );
+        assert!(
+            msg.contains("'orders'"),
+            "expected pipeline name prefix: {msg}"
+        );
     }
 
     // ── YAML-adjacent round-trips via serde_json ────────────────────────
@@ -876,10 +891,7 @@ mod tests {
 
         // Flat: two entries, both reachable by their intended keys.
         assert_eq!(f.config.len(), 2);
-        assert_eq!(
-            f.config.get("count").and_then(|v| v.as_str()),
-            Some("0")
-        );
+        assert_eq!(f.config.get("count").and_then(|v| v.as_str()), Some("0"));
         assert_eq!(
             f.config.get("payload_size").and_then(|v| v.as_str()),
             Some("256")
@@ -1001,10 +1013,7 @@ mod tests {
         let def = m.to_pipeline_definition();
         assert!(def.poh.enabled);
         assert_eq!(def.poh.max_recent_entries, 8192);
-        assert_eq!(
-            def.poh.signing_key_ref.as_deref(),
-            Some("data-context/v1")
-        );
+        assert_eq!(def.poh.signing_key_ref.as_deref(), Some("data-context/v1"));
     }
 
     // ── S6.7 SubjectExtractConfig ──────────────────────────────────────

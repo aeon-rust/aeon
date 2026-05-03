@@ -419,9 +419,7 @@ impl Sink for KafkaSink {
 
         // The actual produce path — wrapped so a transactional envelope can
         // turn any error into `abort_transaction` without 3× duplicated code.
-        let outcome = self
-            .produce_inner(&outputs, count, event_ids.clone())
-            .await;
+        let outcome = self.produce_inner(&outputs, count, event_ids.clone()).await;
 
         if manage_txn {
             match &outcome {
@@ -432,9 +430,7 @@ impl Sink for KafkaSink {
                     self.producer
                         .commit_transaction(self.config.flush_timeout)
                         .map_err(|e| {
-                            AeonError::connection(format!(
-                                "kafka commit_transaction failed: {e}"
-                            ))
+                            AeonError::connection(format!("kafka commit_transaction failed: {e}"))
                         })?;
                 }
                 Err(_) => {
@@ -521,9 +517,9 @@ impl TransactionalSink for KafkaSink {
             // by tracking state here.
             return Ok(());
         }
-        self.producer.begin_transaction().map_err(|e| {
-            AeonError::connection(format!("kafka begin_transaction failed: {e}"))
-        })?;
+        self.producer
+            .begin_transaction()
+            .map_err(|e| AeonError::connection(format!("kafka begin_transaction failed: {e}")))?;
         self.in_outer_txn = true;
         Ok(())
     }
@@ -537,9 +533,7 @@ impl TransactionalSink for KafkaSink {
         }
         self.producer
             .commit_transaction(self.config.flush_timeout)
-            .map_err(|e| {
-                AeonError::connection(format!("kafka commit_transaction failed: {e}"))
-            })?;
+            .map_err(|e| AeonError::connection(format!("kafka commit_transaction failed: {e}")))?;
         self.in_outer_txn = false;
         Ok(())
     }
@@ -555,9 +549,7 @@ impl TransactionalSink for KafkaSink {
         self.in_outer_txn = false;
         self.producer
             .abort_transaction(self.config.flush_timeout)
-            .map_err(|e| {
-                AeonError::connection(format!("kafka abort_transaction failed: {e}"))
-            })?;
+            .map_err(|e| AeonError::connection(format!("kafka abort_transaction failed: {e}")))?;
         Ok(())
     }
 }
@@ -602,8 +594,9 @@ mod tests {
 
         let counter = Arc::new(AtomicUsize::new(0));
         let counter_for_cb = Arc::clone(&counter);
-        let cb: SinkAckCallback =
-            Arc::new(move |n| { counter_for_cb.fetch_add(n, Ordering::Relaxed); });
+        let cb: SinkAckCallback = Arc::new(move |n| {
+            counter_for_cb.fetch_add(n, Ordering::Relaxed);
+        });
         Sink::on_ack_callback(&mut sink, cb);
         assert!(sink.ack_callback.is_some(), "callback must be stored");
 

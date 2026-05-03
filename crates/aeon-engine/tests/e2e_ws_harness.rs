@@ -980,8 +980,17 @@ pub fn setup_composer_project(project_name: &str, packages: &[&str]) -> Option<s
     let prefix = composer_command()?;
     let dir = std::env::temp_dir().join(format!("aeon-e2e-{project_name}"));
     let autoload = dir.join("vendor").join("autoload.php");
-    if autoload.exists() {
+    // Cache reuse guard: a previous interrupted run can leave autoload.php
+    // present while vendor/composer/ClassLoader.php (which autoload.php
+    // requires at runtime) is missing. Verify both before short-circuiting,
+    // otherwise PHP fatals at "Failed to open stream" inside the test.
+    let class_loader = dir.join("vendor").join("composer").join("ClassLoader.php");
+    if autoload.exists() && class_loader.exists() {
         return Some(dir);
+    }
+    // Half-installed cache: wipe and reinstall.
+    if dir.exists() {
+        let _ = std::fs::remove_dir_all(&dir);
     }
     let _ = std::fs::create_dir_all(&dir);
 

@@ -46,10 +46,7 @@ impl ClusterPartitionOwnership {
     /// typically obtain this from `ClusterNode::watch_owned_partitions()`
     /// immediately after bootstrap. Chainable so `cmd_serve` can build the
     /// resolver in one expression.
-    pub fn with_watch(
-        mut self,
-        rx: watch::Receiver<Vec<PartitionId>>,
-    ) -> Self {
+    pub fn with_watch(mut self, rx: watch::Receiver<Vec<PartitionId>>) -> Self {
         self.owned_partitions_rx = Some(rx);
         self
     }
@@ -86,11 +83,7 @@ impl PartitionOwnershipResolver for ClusterPartitionOwnership {
         // allocation beyond the re-shaped `Vec<u16>`. Returning `None`
         // means the caller should fall back to the polling resolver.
         let mut upstream = self.owned_partitions_rx.as_ref()?.clone();
-        let initial: Vec<u16> = upstream
-            .borrow()
-            .iter()
-            .map(|p| p.as_u16())
-            .collect();
+        let initial: Vec<u16> = upstream.borrow().iter().map(|p| p.as_u16()).collect();
         let (tx, rx) = watch::channel(initial);
         tokio::spawn(async move {
             while upstream.changed().await.is_ok() {

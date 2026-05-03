@@ -39,11 +39,12 @@ pub(super) fn resolve_config(
     conn_string: &str,
     signer: Option<&Arc<OutboundAuthSigner>>,
 ) -> Result<(Config, Option<rustls::ClientConfig>), AeonError> {
-    let mut config = Config::from_str(conn_string).map_err(|e| {
-        AeonError::config(format!("postgres connection string parse failed: {e}"))
-    })?;
+    let mut config = Config::from_str(conn_string)
+        .map_err(|e| AeonError::config(format!("postgres connection string parse failed: {e}")))?;
 
-    let Some(s) = signer else { return Ok((config, None)) };
+    let Some(s) = signer else {
+        return Ok((config, None));
+    };
     let mut tls: Option<rustls::ClientConfig> = None;
     match s.mode() {
         OutboundAuthMode::None => { /* pass-through */ }
@@ -78,16 +79,14 @@ pub(super) fn resolve_config(
         }
         OutboundAuthMode::Mtls => {
             let cert_pem = s.mtls_cert_pem().ok_or_else(|| {
-                AeonError::config(
-                    "postgres CDC mTLS: signer is in Mtls mode but missing cert PEM",
-                )
+                AeonError::config("postgres CDC mTLS: signer is in Mtls mode but missing cert PEM")
             })?;
             let key_pem = s.mtls_key_pem().ok_or_else(|| {
-                AeonError::config(
-                    "postgres CDC mTLS: signer is in Mtls mode but missing key PEM",
-                )
+                AeonError::config("postgres CDC mTLS: signer is in Mtls mode but missing key PEM")
             })?;
-            tls = Some(crate::mtls_pem::build_mtls_client_config(cert_pem, key_pem)?);
+            tls = Some(crate::mtls_pem::build_mtls_client_config(
+                cert_pem, key_pem,
+            )?);
         }
         OutboundAuthMode::Bearer
         | OutboundAuthMode::Basic
@@ -122,11 +121,8 @@ mod tests {
 
     #[test]
     fn no_signer_uses_string_verbatim() {
-        let (cfg, tls) = resolve_config(
-            "host=localhost user=aeon password=pw dbname=a",
-            None,
-        )
-        .unwrap();
+        let (cfg, tls) =
+            resolve_config("host=localhost user=aeon password=pw dbname=a", None).unwrap();
         assert_eq!(cfg.get_user(), Some("aeon"));
         assert_eq!(cfg.get_dbname(), Some("a"));
         assert!(tls.is_none(), "no signer must not produce a TLS config");

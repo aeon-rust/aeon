@@ -689,10 +689,7 @@ mod tests {
             self.data.lock().unwrap().remove(key);
             Ok(())
         }
-        fn write_batch(
-            &self,
-            ops: &[aeon_types::BatchEntry],
-        ) -> Result<(), AeonError> {
+        fn write_batch(&self, ops: &[aeon_types::BatchEntry]) -> Result<(), AeonError> {
             let mut d = self.data.lock().unwrap();
             for (op, k, v) in ops {
                 match op {
@@ -706,10 +703,7 @@ mod tests {
             }
             Ok(())
         }
-        fn scan_prefix(
-            &self,
-            prefix: &[u8],
-        ) -> Result<aeon_types::KvPairs, AeonError> {
+        fn scan_prefix(&self, prefix: &[u8]) -> Result<aeon_types::KvPairs, AeonError> {
             let d = self.data.lock().unwrap();
             Ok(d.range(prefix.to_vec()..)
                 .take_while(|(k, _)| k.starts_with(prefix))
@@ -789,8 +783,9 @@ mod tests {
     #[test]
     fn s5_l3_max_records_caps_history() {
         let l3: Arc<dyn L3Store> = Arc::new(MemL3::default());
-        let mut store =
-            L3CheckpointStore::open(Arc::clone(&l3)).unwrap().with_max_records(Some(3));
+        let mut store = L3CheckpointStore::open(Arc::clone(&l3))
+            .unwrap()
+            .with_max_records(Some(3));
 
         for _ in 0..10u64 {
             let mut rec = CheckpointRecord::new(0, HashMap::new(), vec![], 0, 0);

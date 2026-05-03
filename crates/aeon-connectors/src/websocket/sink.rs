@@ -81,12 +81,12 @@ impl WebSocketSink {
         // - HTTP-style modes are handled by `build_ws_request`.
         let mtls_connector = match config.auth.as_deref() {
             Some(signer) if matches!(signer.mode(), OutboundAuthMode::Mtls) => {
-                let cert_pem = signer.mtls_cert_pem().ok_or_else(|| {
-                    AeonError::config("websocket mTLS: signer missing cert pem")
-                })?;
-                let key_pem = signer.mtls_key_pem().ok_or_else(|| {
-                    AeonError::config("websocket mTLS: signer missing key pem")
-                })?;
+                let cert_pem = signer
+                    .mtls_cert_pem()
+                    .ok_or_else(|| AeonError::config("websocket mTLS: signer missing cert pem"))?;
+                let key_pem = signer
+                    .mtls_key_pem()
+                    .ok_or_else(|| AeonError::config("websocket mTLS: signer missing key pem"))?;
                 Some(build_mtls_connector(cert_pem, key_pem)?)
             }
             Some(signer) if matches!(signer.mode(), OutboundAuthMode::BrokerNative) => {
@@ -106,13 +106,8 @@ impl WebSocketSink {
         // The default path (no connector) still works for ws:// plaintext
         // and wss:// with public webpki roots.
         let connect_result = if mtls_connector.is_some() {
-            tokio_tungstenite::connect_async_tls_with_config(
-                request,
-                None,
-                false,
-                mtls_connector,
-            )
-            .await
+            tokio_tungstenite::connect_async_tls_with_config(request, None, false, mtls_connector)
+                .await
         } else {
             tokio_tungstenite::connect_async(request).await
         };

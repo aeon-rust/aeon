@@ -89,15 +89,14 @@ where
     FC: FnMut(&mut W, SegmentChunk) -> Result<(), AeonError>,
     FF: FnMut(W, PartitionTransferEnd) -> Result<(), AeonError>,
 {
-    let (mut send, mut recv) =
-        connection
-            .open_bi()
-            .await
-            .map_err(|e| AeonError::Connection {
-                message: format!("partition-transfer: open_bi: {e}"),
-                source: None,
-                retryable: true,
-            })?;
+    let (mut send, mut recv) = connection
+        .open_bi()
+        .await
+        .map_err(|e| AeonError::Connection {
+            message: format!("partition-transfer: open_bi: {e}"),
+            source: None,
+            retryable: true,
+        })?;
 
     let req_bytes = bincode::serialize(req).map_err(|e| AeonError::Serialization {
         message: format!("serialize PartitionTransferRequest: {e}"),
@@ -110,9 +109,7 @@ where
     let (mt, payload) = framing::read_frame(&mut recv).await?;
     if mt != MessageType::PartitionTransferManifestFrame {
         return Err(AeonError::Connection {
-            message: format!(
-                "partition-transfer: expected manifest frame, got {mt:?}"
-            ),
+            message: format!("partition-transfer: expected manifest frame, got {mt:?}"),
             source: None,
             retryable: false,
         });
@@ -137,12 +134,11 @@ where
                 on_chunk(&mut writer_state, chunk)?;
             }
             MessageType::PartitionTransferEndFrame => {
-                let end: PartitionTransferEnd = bincode::deserialize(&payload).map_err(|e| {
-                    AeonError::Serialization {
+                let end: PartitionTransferEnd =
+                    bincode::deserialize(&payload).map_err(|e| AeonError::Serialization {
                         message: format!("deserialize PartitionTransferEnd: {e}"),
                         source: None,
-                    }
-                })?;
+                    })?;
                 on_finish(writer_state, end)?;
                 return Ok(());
             }
@@ -219,7 +215,12 @@ where
             let throttle = provider.throttle();
             let metrics = provider.metrics();
             if let Some(m) = metrics {
-                m.record_total(&req.pipeline, req.partition, TransferRole::Source, total_bytes);
+                m.record_total(
+                    &req.pipeline,
+                    req.partition,
+                    TransferRole::Source,
+                    total_bytes,
+                );
             }
             let mut stream_err: Option<String> = None;
             loop {
@@ -273,10 +274,7 @@ where
     Ok(())
 }
 
-async fn write_end(
-    send: &mut quinn::SendStream,
-    err: Option<String>,
-) -> Result<(), AeonError> {
+async fn write_end(send: &mut quinn::SendStream, err: Option<String>) -> Result<(), AeonError> {
     let end = match err {
         None => PartitionTransferEnd {
             success: true,
@@ -329,10 +327,12 @@ pub async fn drive_partition_transfer<F>(
 where
     F: FnMut(&SegmentChunk) -> Result<(), AeonError>,
 {
-    tracker.begin(source, target).map_err(|e| AeonError::State {
-        message: format!("partition-transfer: begin: {e}"),
-        source: None,
-    })?;
+    tracker
+        .begin(source, target)
+        .map_err(|e| AeonError::State {
+            message: format!("partition-transfer: begin: {e}"),
+            source: None,
+        })?;
 
     // Local accumulators — we can't borrow `tracker` through the async
     // request because the inner closures are synchronous and we need the
@@ -347,7 +347,12 @@ where
         |manifest| {
             total_bytes = manifest.total_bytes();
             if let Some(m) = metrics {
-                m.record_total(&req.pipeline, req.partition, TransferRole::Target, total_bytes);
+                m.record_total(
+                    &req.pipeline,
+                    req.partition,
+                    TransferRole::Target,
+                    total_bytes,
+                );
             }
             Ok::<(), AeonError>(())
         },
@@ -393,7 +398,10 @@ where
         retryable: false,
     })?;
     if !end.success {
-        let reason = format!("partition-transfer: remote reported failure: {}", end.message);
+        let reason = format!(
+            "partition-transfer: remote reported failure: {}",
+            end.message
+        );
         let _ = tracker.abort(reason.clone());
         if let Some(m) = metrics {
             m.clear(&req.pipeline, req.partition, TransferRole::Target);
@@ -688,10 +696,7 @@ mod tests {
                 &self,
                 _req: &PartitionTransferRequest,
             ) -> Result<(SegmentManifest, ChunkIter<'static>), AeonError> {
-                Ok((
-                    SegmentManifest { entries: vec![] },
-                    Box::new(|| Ok(None)),
-                ))
+                Ok((SegmentManifest { entries: vec![] }, Box::new(|| Ok(None))))
             }
         }
 
@@ -848,7 +853,10 @@ mod tests {
         assert!(
             matches!(
                 &tracker.state,
-                TransferState::Aborted { reverted_to: 11, .. }
+                TransferState::Aborted {
+                    reverted_to: 11,
+                    ..
+                }
             ),
             "expected Aborted with reverted_to=11, got {:?}",
             tracker.state

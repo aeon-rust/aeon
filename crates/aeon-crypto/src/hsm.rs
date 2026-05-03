@@ -180,7 +180,9 @@ mod tests {
     fn stub_wrap_returns_not_implemented() {
         let p = Pkcs11Provider::new("/usr/lib/softhsm2.so", 0);
         let dek = DekBytes::generate();
-        let err = p.wrap_dek(KekDomain::DataContext, "kek-v1", &dek).unwrap_err();
+        let err = p
+            .wrap_dek(KekDomain::DataContext, "kek-v1", &dek)
+            .unwrap_err();
         assert!(
             format!("{err}").contains("PKCS#11 driver not yet implemented"),
             "error should name the missing driver: {err}"
@@ -201,7 +203,10 @@ mod tests {
     fn provision_kek_default_is_none() {
         let p = Pkcs11Provider::new("/usr/lib/softhsm2.so", 0);
         let out = p.provision_kek(KekDomain::DataContext).unwrap();
-        assert!(out.is_none(), "default provision returns None until a driver opts in");
+        assert!(
+            out.is_none(),
+            "default provision returns None until a driver opts in"
+        );
     }
 
     #[test]

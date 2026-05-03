@@ -45,7 +45,9 @@ pub(super) async fn resolve_options(
         .await
         .map_err(|e| AeonError::config(format!("mongodb uri parse failed: {e}")))?;
 
-    let Some(s) = signer else { return Ok((options, None)) };
+    let Some(s) = signer else {
+        return Ok((options, None));
+    };
     match s.mode() {
         OutboundAuthMode::None => Ok((options, None)),
         OutboundAuthMode::BrokerNative => {
@@ -80,14 +82,10 @@ pub(super) async fn resolve_options(
         }
         OutboundAuthMode::Mtls => {
             let cert_pem = s.mtls_cert_pem().ok_or_else(|| {
-                AeonError::config(
-                    "mongodb CDC mTLS: signer is in Mtls mode but missing cert PEM",
-                )
+                AeonError::config("mongodb CDC mTLS: signer is in Mtls mode but missing cert PEM")
             })?;
             let key_pem = s.mtls_key_pem().ok_or_else(|| {
-                AeonError::config(
-                    "mongodb CDC mTLS: signer is in Mtls mode but missing key PEM",
-                )
+                AeonError::config("mongodb CDC mTLS: signer is in Mtls mode but missing key PEM")
             })?;
             let tempfile = SecureMtlsTempFile::write_pem(cert_pem, key_pem)?;
             let mut tls = TlsOptions::default();
@@ -139,10 +137,9 @@ mod tests {
 
     #[tokio::test]
     async fn no_signer_uses_uri_verbatim() {
-        let (opts, tmp) =
-            resolve_options("mongodb://aeon:pw@127.0.0.1:27017/mydb", None)
-                .await
-                .unwrap();
+        let (opts, tmp) = resolve_options("mongodb://aeon:pw@127.0.0.1:27017/mydb", None)
+            .await
+            .unwrap();
         let c = cred(&opts);
         assert_eq!(c.username.as_deref(), Some("aeon"));
         assert_eq!(c.password.as_deref(), Some("pw"));
@@ -160,12 +157,10 @@ mod tests {
             broker_native: Some(BrokerNativeConfig { values }),
             ..Default::default()
         });
-        let (opts, tmp) = resolve_options(
-            "mongodb://url-user:url-pw@127.0.0.1:27017/url-db",
-            Some(&s),
-        )
-        .await
-        .unwrap();
+        let (opts, tmp) =
+            resolve_options("mongodb://url-user:url-pw@127.0.0.1:27017/url-db", Some(&s))
+                .await
+                .unwrap();
         let c = cred(&opts);
         assert_eq!(c.username.as_deref(), Some("signer-user"));
         assert_eq!(c.password.as_deref(), Some("signer-pw"));
@@ -200,10 +195,9 @@ mod tests {
             broker_native: Some(BrokerNativeConfig { values }),
             ..Default::default()
         });
-        let (opts, _) =
-            resolve_options("mongodb://u:old-pw@127.0.0.1:27017/d", Some(&s))
-                .await
-                .unwrap();
+        let (opts, _) = resolve_options("mongodb://u:old-pw@127.0.0.1:27017/d", Some(&s))
+            .await
+            .unwrap();
         let c = cred(&opts);
         assert_eq!(c.username.as_deref(), Some("u"));
         assert_eq!(c.password.as_deref(), Some("new-pw"));
@@ -268,7 +262,9 @@ mod tests {
 
     #[tokio::test]
     async fn bad_uri_is_rejected() {
-        let err = resolve_options("not-a-mongodb-uri", None).await.unwrap_err();
+        let err = resolve_options("not-a-mongodb-uri", None)
+            .await
+            .unwrap_err();
         assert!(format!("{err}").to_lowercase().contains("mongodb"));
     }
 

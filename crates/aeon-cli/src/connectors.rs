@@ -34,20 +34,22 @@
 use std::sync::Arc;
 
 use aeon_connectors::{
-    BlackholeSink, StdoutSink, StreamingMemorySource,
+    BlackholeSink,
+    StdoutSink,
+    StreamingMemorySource,
     file::{FileSink, FileSinkConfig, FileSource, FileSourceConfig},
     http::{
         HttpPollingSource, HttpPollingSourceConfig, HttpSink, HttpSinkConfig, HttpWebhookSource,
         HttpWebhookSourceConfig,
     },
     kafka::{KafkaSink, KafkaSinkConfig, KafkaSource, KafkaSourceConfig},
-    push_buffer::PushBufferConfig,
     // P5.c — additional connector imports for WebSocket / Redis / NATS /
     // Postgres-CDC / MySQL-CDC / MongoDB-CDC factories.
     mongodb_cdc::{MongoDbCdcSource, MongoDbCdcSourceConfig},
     mysql_cdc::{MysqlCdcSource, MysqlCdcSourceConfig},
     nats::{NatsSink, NatsSinkConfig, NatsSource, NatsSourceConfig},
     postgres_cdc::{PostgresCdcSource, PostgresCdcSourceConfig},
+    push_buffer::PushBufferConfig,
     redis_streams::{
         RedisSink as RedisStreamsSink, RedisSinkConfig as RedisStreamsSinkConfig,
         RedisSource as RedisStreamsSource, RedisSourceConfig as RedisStreamsSourceConfig,
@@ -333,14 +335,20 @@ impl SourceFactory for HttpPollingSourceFactory {
             .get("url")
             .ok_or_else(|| AeonError::config("http-polling source requires config.url"))?;
 
-        let mut pcfg = HttpPollingSourceConfig::new(url)
-            .with_ssrf_policy(parse_ssrf_policy(&cfg.config)?);
+        let mut pcfg =
+            HttpPollingSourceConfig::new(url).with_ssrf_policy(parse_ssrf_policy(&cfg.config)?);
 
         if let Some(v) = cfg.config.get("interval_ms") {
-            pcfg = pcfg.with_interval(std::time::Duration::from_millis(parse_u64(Some(v), 10_000)?));
+            pcfg = pcfg.with_interval(std::time::Duration::from_millis(parse_u64(
+                Some(v),
+                10_000,
+            )?));
         }
         if let Some(v) = cfg.config.get("timeout_ms") {
-            pcfg = pcfg.with_timeout(std::time::Duration::from_millis(parse_u64(Some(v), 30_000)?));
+            pcfg = pcfg.with_timeout(std::time::Duration::from_millis(parse_u64(
+                Some(v),
+                30_000,
+            )?));
         }
         if let Some(name) = cfg.config.get("source_name") {
             pcfg = pcfg.with_source_name(Arc::<str>::from(name.as_str()));
@@ -387,7 +395,10 @@ impl SinkFactory for HttpSinkFactory {
         let mut scfg = HttpSinkConfig::new(url).with_ssrf_policy(parse_ssrf_policy(&cfg.config)?);
 
         if let Some(v) = cfg.config.get("timeout_ms") {
-            scfg = scfg.with_timeout(std::time::Duration::from_millis(parse_u64(Some(v), 30_000)?));
+            scfg = scfg.with_timeout(std::time::Duration::from_millis(parse_u64(
+                Some(v),
+                30_000,
+            )?));
         }
         for (k, v) in &cfg.config {
             if let Some(header_name) = k.strip_prefix("header.") {
@@ -502,10 +513,8 @@ impl SourceFactory for WebSocketSourceFactory {
             wcfg = wcfg.with_channel_capacity(parse_usize(Some(v), 8192)?);
         }
         if let Some(v) = cfg.config.get("poll_timeout_ms") {
-            wcfg = wcfg.with_poll_timeout(std::time::Duration::from_millis(parse_u64(
-                Some(v),
-                1_000,
-            )?));
+            wcfg = wcfg
+                .with_poll_timeout(std::time::Duration::from_millis(parse_u64(Some(v), 1_000)?));
         }
         if let Some(signer) = build_outbound_auth_signer(&cfg.config)? {
             wcfg = wcfg.with_auth(signer);
@@ -1058,9 +1067,8 @@ fn parse_inbound_auth_config(
         let skew_seconds = cfg
             .get("auth_hmac_skew_seconds")
             .map(|v| {
-                v.parse::<i64>().map_err(|e| {
-                    AeonError::config(format!("auth_hmac_skew_seconds '{v}': {e}"))
-                })
+                v.parse::<i64>()
+                    .map_err(|e| AeonError::config(format!("auth_hmac_skew_seconds '{v}': {e}")))
             })
             .transpose()?
             .unwrap_or(300);
@@ -1408,10 +1416,7 @@ mod tests {
     #[test]
     fn inbound_auth_parses_all_modes() {
         let mut cfg = BTreeMap::new();
-        cfg.insert(
-            "auth_modes".into(),
-            "ip_allowlist,api_key,hmac,mtls".into(),
-        );
+        cfg.insert("auth_modes".into(), "ip_allowlist,api_key,hmac,mtls".into());
         cfg.insert("auth_ip_cidrs".into(), "10.0.0.0/8".into());
         cfg.insert("auth_api_keys".into(), "key-a,key-b".into());
         cfg.insert("auth_hmac_secrets".into(), "sec-a".into());
@@ -1997,7 +2002,10 @@ mod tests {
         let mut cfg = BTreeMap::new();
         cfg.insert("ssrf_allow_loopback".into(), "true".into());
         cfg.insert("ssrf_allow_private".into(), "false".into());
-        cfg.insert("ssrf_extra_deny".into(), "10.0.0.0/8, 192.168.0.0/16".into());
+        cfg.insert(
+            "ssrf_extra_deny".into(),
+            "10.0.0.0/8, 192.168.0.0/16".into(),
+        );
         cfg.insert("ssrf_extra_allow".into(), "127.0.0.0/8".into());
         let p = parse_ssrf_policy(&cfg).unwrap();
         assert!(p.allow_loopback);

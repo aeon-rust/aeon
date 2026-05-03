@@ -131,8 +131,8 @@ pub fn resolve_erasure_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aeon_types::{AtRestEncryption, DEFAULT_ERASURE_MAX_DELAY_HOURS, ErasureConfig};
     use aeon_types::compliance::{DataClass, PayloadFormat, PiiSelector};
+    use aeon_types::{AtRestEncryption, DEFAULT_ERASURE_MAX_DELAY_HOURS, ErasureConfig};
 
     fn plan_off() -> EncryptionPlan {
         EncryptionPlan {

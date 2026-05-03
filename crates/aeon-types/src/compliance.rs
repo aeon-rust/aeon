@@ -223,8 +223,7 @@ impl ComplianceBlock {
 
         if self.erasure.max_delay_hours == 0 {
             return Err(crate::AeonError::state(
-                "compliance.erasure.max_delay_hours must be > 0; pick a value >= 1"
-                    .to_string(),
+                "compliance.erasure.max_delay_hours must be > 0; pick a value >= 1".to_string(),
             ));
         }
 
@@ -408,7 +407,9 @@ mod tests {
 
     #[test]
     fn erasure_config_roundtrip() {
-        let c = ErasureConfig { max_delay_hours: 72 };
+        let c = ErasureConfig {
+            max_delay_hours: 72,
+        };
         let j = serde_json::to_string(&c).unwrap();
         let back: ErasureConfig = serde_json::from_str(&j).unwrap();
         assert_eq!(back, c);
@@ -464,7 +465,9 @@ mod tests {
                 format: PayloadFormat::Json,
                 class: DataClass::Pii,
             }],
-            erasure: ErasureConfig { max_delay_hours: 12 },
+            erasure: ErasureConfig {
+                max_delay_hours: 12,
+            },
         };
         assert!(b.validate_shape().is_ok());
     }
@@ -503,7 +506,9 @@ mod tests {
             regime: ComplianceRegime::Gdpr,
             enforcement: EnforcementLevel::Strict,
             selectors: vec![],
-            erasure: ErasureConfig { max_delay_hours: 24 * 31 },
+            erasure: ErasureConfig {
+                max_delay_hours: 24 * 31,
+            },
         };
         let err = b.validate_shape().unwrap_err();
         assert!(format!("{err}").contains("30-day SLA"));
@@ -517,7 +522,9 @@ mod tests {
             regime: ComplianceRegime::Gdpr,
             enforcement: EnforcementLevel::Warn,
             selectors: vec![],
-            erasure: ErasureConfig { max_delay_hours: 24 * 31 },
+            erasure: ErasureConfig {
+                max_delay_hours: 24 * 31,
+            },
         };
         assert!(b.validate_shape().is_ok());
     }
@@ -529,7 +536,9 @@ mod tests {
             regime: ComplianceRegime::Pci,
             enforcement: EnforcementLevel::Strict,
             selectors: vec![],
-            erasure: ErasureConfig { max_delay_hours: 24 * 90 },
+            erasure: ErasureConfig {
+                max_delay_hours: 24 * 90,
+            },
         };
         assert!(b.validate_shape().is_ok());
     }

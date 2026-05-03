@@ -363,10 +363,7 @@ mod tests {
         };
         let id = uuid::Uuid::now_v7();
         let t = req.into_tombstone(0, id);
-        assert_eq!(
-            t.hard_delete_after_nanos,
-            Some(3_600_000_000_000_i64)
-        );
+        assert_eq!(t.hard_delete_after_nanos, Some(3_600_000_000_000_i64));
         assert!(!t.is_ripe(0));
         assert!(!t.is_ripe(3_600_000_000_000 - 1));
         assert!(t.is_ripe(3_600_000_000_000));

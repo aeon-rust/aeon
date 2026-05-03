@@ -164,12 +164,7 @@ impl PartitionTransferMetrics {
         out
     }
 
-    fn slot(
-        &self,
-        pipeline: &str,
-        partition: PartitionId,
-        role: TransferRole,
-    ) -> Arc<Entry> {
+    fn slot(&self, pipeline: &str, partition: PartitionId, role: TransferRole) -> Arc<Entry> {
         self.entries
             .entry((pipeline.to_string(), partition, role))
             .or_insert_with(|| Arc::new(Entry::default()))

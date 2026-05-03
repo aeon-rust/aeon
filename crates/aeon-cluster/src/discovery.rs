@@ -70,9 +70,8 @@ pub fn k8s_peers(
         .filter(|&i| i != self_ordinal)
         .map(|i| {
             let node_id = (i as NodeId) + 1;
-            let hostname = format!(
-                "{statefulset_name}-{i}.{service_name}.{namespace}.svc.cluster.local"
-            );
+            let hostname =
+                format!("{statefulset_name}-{i}.{service_name}.{namespace}.svc.cluster.local");
             (node_id, NodeAddress::new(hostname, quic_port))
         })
         .collect()
@@ -91,9 +90,8 @@ pub fn k8s_members(
     (0..replicas)
         .map(|i| {
             let node_id = (i as NodeId) + 1;
-            let hostname = format!(
-                "{statefulset_name}-{i}.{service_name}.{namespace}.svc.cluster.local"
-            );
+            let hostname =
+                format!("{statefulset_name}-{i}.{service_name}.{namespace}.svc.cluster.local");
             (node_id, NodeAddress::new(hostname, quic_port))
         })
         .collect()
@@ -116,7 +114,10 @@ pub fn from_k8s_env() -> Option<K8sDiscovery> {
     let service = std::env::var("AEON_CLUSTER_SERVICE").ok()?;
     let replicas: u32 = std::env::var("AEON_CLUSTER_REPLICAS").ok()?.parse().ok()?;
     let quic_port: u16 = std::env::var("AEON_CLUSTER_QUIC_PORT").ok()?.parse().ok()?;
-    let partitions: u16 = std::env::var("AEON_CLUSTER_PARTITIONS").ok()?.parse().ok()?;
+    let partitions: u16 = std::env::var("AEON_CLUSTER_PARTITIONS")
+        .ok()?
+        .parse()
+        .ok()?;
     let node_id = node_id_from_pod_name(&pod_name)?;
 
     // Extract StatefulSet name (pod name without the ordinal suffix)
@@ -225,7 +226,7 @@ impl K8sDiscovery {
             num_partitions: self.partitions,
             peers,
             seed_nodes: Vec::new(),
-            tls: None, // File-based TLS configured separately via Helm values
+            tls: None,      // File-based TLS configured separately via Helm values
             auto_tls: true, // Use ephemeral self-signed certs for dev/testing
             initial_members,
             advertise_addr: None,
@@ -363,10 +364,12 @@ mod tests {
         assert_eq!(members[2].0, 3);
 
         // Verify FQDN format
-        assert!(members[0]
-            .1
-            .to_string()
-            .contains("aeon-0.aeon-headless.prod.svc.cluster.local"));
+        assert!(
+            members[0]
+                .1
+                .to_string()
+                .contains("aeon-0.aeon-headless.prod.svc.cluster.local")
+        );
     }
 
     #[test]
@@ -429,9 +432,11 @@ mod tests {
         assert!(seeds[0].to_string().contains("aeon-0.aeon-headless"));
         assert!(seeds[2].to_string().contains("aeon-2.aeon-headless"));
         // Self is NOT in the seed list — we're joining, not bootstrapping.
-        assert!(!seeds
-            .iter()
-            .any(|a| a.to_string().contains("aeon-3.aeon-headless")));
+        assert!(
+            !seeds
+                .iter()
+                .any(|a| a.to_string().contains("aeon-3.aeon-headless"))
+        );
     }
 
     #[test]
@@ -439,13 +444,19 @@ mod tests {
         let disc = scale_up_disc(3, 3);
         let cfg = disc.to_join_config();
         assert_eq!(cfg.node_id, 4);
-        assert!(cfg.initial_members.is_empty(),
-            "scale-up path must not carry initial_members (no bootstrap)");
+        assert!(
+            cfg.initial_members.is_empty(),
+            "scale-up path must not carry initial_members (no bootstrap)"
+        );
         assert_eq!(cfg.seed_nodes.len(), 3, "seeds = initial cohort");
-        assert!(cfg.advertise_addr.is_some(),
-            "leader needs our FQDN to write into Raft membership");
-        assert!(cfg.peers.is_empty(),
-            "peers is for static bootstrap — scale-up uses seed_nodes");
+        assert!(
+            cfg.advertise_addr.is_some(),
+            "leader needs our FQDN to write into Raft membership"
+        );
+        assert!(
+            cfg.peers.is_empty(),
+            "peers is for static bootstrap — scale-up uses seed_nodes"
+        );
         // auto_tls satisfies the multi-node TLS requirement for seed_nodes.
         cfg.validate().expect("join config must validate");
     }
@@ -455,6 +466,9 @@ mod tests {
         let disc = scale_up_disc(4, 3);
         let cfg = disc.to_join_config();
         let addr = cfg.advertise_addr.expect("advertise_addr set");
-        assert!(addr.to_string().contains("aeon-4.aeon-headless.default.svc.cluster.local"));
+        assert!(
+            addr.to_string()
+                .contains("aeon-4.aeon-headless.default.svc.cluster.local")
+        );
     }
 }

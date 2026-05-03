@@ -540,7 +540,9 @@ mod tests {
 
     #[test]
     fn parse_aws_kms_ref() {
-        let r = SecretRef::parse("${AWS_KMS:alias/aeon-kek}").unwrap().unwrap();
+        let r = SecretRef::parse("${AWS_KMS:alias/aeon-kek}")
+            .unwrap()
+            .unwrap();
         assert_eq!(r.scheme, SecretScheme::AwsKms);
     }
 
@@ -625,8 +627,14 @@ mod tests {
         writeln!(file, "SINGLE='bye world'").unwrap();
         file.flush().unwrap();
         let p = DotEnvProvider::with_path(file.path().to_path_buf());
-        assert_eq!(p.resolve("DOUBLE").unwrap().expose_str().unwrap(), "hello world");
-        assert_eq!(p.resolve("SINGLE").unwrap().expose_str().unwrap(), "bye world");
+        assert_eq!(
+            p.resolve("DOUBLE").unwrap().expose_str().unwrap(),
+            "hello world"
+        );
+        assert_eq!(
+            p.resolve("SINGLE").unwrap().expose_str().unwrap(),
+            "bye world"
+        );
     }
 
     #[test]
@@ -710,7 +718,10 @@ mod tests {
     fn registry_scheme_not_registered_errors() {
         let r = SecretRegistry::empty();
         let err = r.resolve(&SecretRef::vault("any/path")).unwrap_err();
-        assert!(matches!(err, SecretError::SchemeNotRegistered(SecretScheme::Vault)));
+        assert!(matches!(
+            err,
+            SecretError::SchemeNotRegistered(SecretScheme::Vault)
+        ));
     }
 
     #[test]
@@ -735,7 +746,9 @@ mod tests {
         const VAR: &str = "AEON_TEST_SECRET_INTERP_1";
         unsafe { std::env::set_var(VAR, "bar") };
         let r = SecretRegistry::default_local();
-        let out = r.interpolate_str("${ENV:AEON_TEST_SECRET_INTERP_1}").unwrap();
+        let out = r
+            .interpolate_str("${ENV:AEON_TEST_SECRET_INTERP_1}")
+            .unwrap();
         assert_eq!(out, "bar");
         unsafe { std::env::remove_var(VAR) };
     }
@@ -750,7 +763,9 @@ mod tests {
         }
         let r = SecretRegistry::default_local();
         let out = r
-            .interpolate_str("user=${ENV:AEON_TEST_SECRET_INTERP_2A};peer=${ENV:AEON_TEST_SECRET_INTERP_2B}")
+            .interpolate_str(
+                "user=${ENV:AEON_TEST_SECRET_INTERP_2A};peer=${ENV:AEON_TEST_SECRET_INTERP_2B}",
+            )
             .unwrap();
         assert_eq!(out, "user=alice;peer=bob");
         unsafe {
@@ -791,7 +806,10 @@ mod tests {
     fn interpolate_unregistered_scheme_errors() {
         let r = SecretRegistry::default_local(); // no Vault registered
         let err = r.interpolate_str("x=${VAULT:secret/foo}").unwrap_err();
-        assert!(matches!(err, SecretError::SchemeNotRegistered(SecretScheme::Vault)));
+        assert!(matches!(
+            err,
+            SecretError::SchemeNotRegistered(SecretScheme::Vault)
+        ));
     }
 
     // — AeonError conversion ——————————————————————————————————

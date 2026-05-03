@@ -133,9 +133,7 @@ impl RegistryApplier for CountingApplier {
     fn apply(
         &self,
         cmd: RegistryCommand,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = RegistryResponse> + Send + '_>,
-    > {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = RegistryResponse> + Send + '_>> {
         let calls = Arc::clone(&self.calls);
         let last = Arc::clone(&self.last_pipeline_name);
         Box::pin(async move {

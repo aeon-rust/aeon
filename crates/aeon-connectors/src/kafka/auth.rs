@@ -136,11 +136,7 @@ mod tests {
                 .unwrap()
                 .contains("BEGIN CERTIFICATE")
         );
-        assert!(
-            cc.get("ssl.key.pem")
-                .unwrap()
-                .contains("BEGIN PRIVATE KEY")
-        );
+        assert!(cc.get("ssl.key.pem").unwrap().contains("BEGIN PRIVATE KEY"));
     }
 
     #[test]

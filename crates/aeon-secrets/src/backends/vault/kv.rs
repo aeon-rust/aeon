@@ -15,9 +15,7 @@
 //! suffix on the path (`secret/aeon/db#password`), or `value` by
 //! default.
 
-use aeon_types::{
-    SecretBytes, SecretError, SecretProvider, SecretRegistry, SecretScheme,
-};
+use aeon_types::{SecretBytes, SecretError, SecretProvider, SecretRegistry, SecretScheme};
 use reqwest::blocking::Response;
 use serde::Deserialize;
 use std::time::Duration;
@@ -76,11 +74,7 @@ impl VaultKvProvider {
     }
 
     fn fetch_kv(&self, path: &str, field: &str) -> Result<SecretBytes, SecretError> {
-        let url_path = format!(
-            "/v1/{}/data/{}",
-            self.mount,
-            path.trim_start_matches('/'),
-        );
+        let url_path = format!("/v1/{}/data/{}", self.mount, path.trim_start_matches('/'),);
 
         let mut attempt: u32 = 0;
         let mut auth_retried = false;
@@ -100,9 +94,7 @@ impl VaultKvProvider {
                         attempt += 1;
                         continue;
                     }
-                    return Err(provider_err(format!(
-                        "vault GET {url_path} send: {e}"
-                    )));
+                    return Err(provider_err(format!("vault GET {url_path} send: {e}")));
                 }
             };
 
@@ -154,9 +146,11 @@ fn decode_response(resp: Response, field: &str) -> Result<SecretBytes, SecretErr
     let parsed: ReadResp = resp
         .json()
         .map_err(|e| provider_err(format!("vault response parse: {e}")))?;
-    let value = parsed.data.data.get(field).ok_or_else(|| {
-        provider_err(format!("vault KV-v2 path missing field '{field}'"))
-    })?;
+    let value = parsed
+        .data
+        .data
+        .get(field)
+        .ok_or_else(|| provider_err(format!("vault KV-v2 path missing field '{field}'")))?;
     let bytes = match value {
         serde_json::Value::String(s) => s.as_bytes().to_vec(),
         other => other.to_string().into_bytes(),
@@ -261,10 +255,7 @@ mod tests {
             .match_header("X-Vault-Token", "literal-token")
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(
-                json!({ "data": { "data": { "value": "shh-it-is-a-secret" } } })
-                    .to_string(),
-            )
+            .with_body(json!({ "data": { "data": { "value": "shh-it-is-a-secret" } } }).to_string())
             .create();
 
         let provider = VaultKvProvider::from_config(
@@ -328,11 +319,9 @@ mod tests {
             .with_body(json!({ "data": { "data": { "value": "k1" } } }).to_string())
             .create();
 
-        let provider = VaultKvProvider::from_config(
-            &token_cfg(&server.url(), "kv-prod", "t"),
-            &bootstrap(),
-        )
-        .unwrap();
+        let provider =
+            VaultKvProvider::from_config(&token_cfg(&server.url(), "kv-prod", "t"), &bootstrap())
+                .unwrap();
         provider.resolve("api/keys").unwrap();
         m.assert();
     }
@@ -377,10 +366,7 @@ mod tests {
             .mock("POST", "/v1/auth/approle/login")
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(
-                json!({ "auth": { "client_token": "approle-issued-token" } })
-                    .to_string(),
-            )
+            .with_body(json!({ "auth": { "client_token": "approle-issued-token" } }).to_string())
             .create();
         let read = server
             .mock("GET", "/v1/secret/data/x")
@@ -426,9 +412,7 @@ mod tests {
             .mock("POST", "/v1/auth/approle/login")
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(
-                json!({ "auth": { "client_token": "fresh-token" } }).to_string(),
-            )
+            .with_body(json!({ "auth": { "client_token": "fresh-token" } }).to_string())
             .expect(2)
             .create();
         let _denied = server

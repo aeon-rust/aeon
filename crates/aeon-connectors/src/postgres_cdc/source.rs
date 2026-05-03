@@ -151,9 +151,10 @@ async fn establish(
 
     let (client, conn_handle) = if let Some(rustls_config) = tls {
         let tls_connector = tokio_postgres_rustls::MakeRustlsConnect::new(rustls_config);
-        let (client, connection) = pg_config.connect(tls_connector).await.map_err(|e| {
-            AeonError::connection(format!("postgres mTLS connect failed: {e}"))
-        })?;
+        let (client, connection) = pg_config
+            .connect(tls_connector)
+            .await
+            .map_err(|e| AeonError::connection(format!("postgres mTLS connect failed: {e}")))?;
         let conn_handle = tokio::spawn(async move {
             if let Err(e) = connection.await {
                 tracing::error!(error = %e, "postgres connection error");
@@ -161,9 +162,10 @@ async fn establish(
         });
         (client, conn_handle)
     } else {
-        let (client, connection) = pg_config.connect(NoTls).await.map_err(|e| {
-            AeonError::connection(format!("postgres connect failed: {e}"))
-        })?;
+        let (client, connection) = pg_config
+            .connect(NoTls)
+            .await
+            .map_err(|e| AeonError::connection(format!("postgres connect failed: {e}")))?;
         let conn_handle = tokio::spawn(async move {
             if let Err(e) = connection.await {
                 tracing::error!(error = %e, "postgres connection error");

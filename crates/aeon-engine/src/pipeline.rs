@@ -16,13 +16,12 @@ use crate::checkpoint::{
 use crate::delivery::{CheckpointBackend, DeliveryConfig};
 use crate::delivery_ledger::DeliveryLedger;
 use aeon_types::{
-    AeonError, BatchFailurePolicy, Event, Output, PartitionId, Processor, Sink, Source,
-    SourceKind,
+    AeonError, BatchFailurePolicy, Event, Output, PartitionId, Processor, Sink, Source, SourceKind,
 };
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify};
 
@@ -1180,11 +1179,7 @@ fn build_sink_task_ctx(config: &PipelineConfig, core: Option<usize>) -> SinkTask
         })
     };
 
-    let primary: Option<Box<dyn CheckpointPersist>> = match config
-        .delivery
-        .checkpoint
-        .backend
-    {
+    let primary: Option<Box<dyn CheckpointPersist>> = match config.delivery.checkpoint.backend {
         CheckpointBackend::Wal => {
             let wal_path = checkpoint_dir().join("pipeline.wal");
             match WalCheckpointStore::open(&wal_path) {
@@ -1193,7 +1188,9 @@ fn build_sink_task_ctx(config: &PipelineConfig, core: Option<usize>) -> SinkTask
                     Some(Box::new(writer) as Box<dyn CheckpointPersist>)
                 }
                 Err(e) => {
-                    tracing::warn!("Checkpoint WAL init failed: {e}, continuing without checkpoints");
+                    tracing::warn!(
+                        "Checkpoint WAL init failed: {e}, continuing without checkpoints"
+                    );
                     None
                 }
             }
@@ -1249,9 +1246,7 @@ fn build_sink_task_ctx(config: &PipelineConfig, core: Option<usize>) -> SinkTask
             // /metrics. Discovered 2026-05-02 during F3 live cluster
             // proof: 7 checkpoint writes + 100 armed faults produced
             // engage_fallback calls but no metric ticks.
-            let mut store = crate::eo2_recovery::FallbackCheckpointStore::new(
-                p, wal_path,
-            );
+            let mut store = crate::eo2_recovery::FallbackCheckpointStore::new(p, wal_path);
             if let Some(m) = config.eo2_metrics.as_ref() {
                 store = store.with_metrics(Arc::clone(m));
             }
@@ -1272,15 +1267,8 @@ fn build_sink_task_ctx(config: &PipelineConfig, core: Option<usize>) -> SinkTask
         max_retries: config.delivery.max_retries,
         retry_backoff: config.delivery.retry_backoff,
         checkpoint_writer,
-        eo2_ack_tracker: if config.delivery.durability
-            != aeon_types::DurabilityMode::None
-        {
-            Some(
-                config
-                    .eo2_shared_ack_tracker
-                    .clone()
-                    .unwrap_or_default(),
-            )
+        eo2_ack_tracker: if config.delivery.durability != aeon_types::DurabilityMode::None {
+            Some(config.eo2_shared_ack_tracker.clone().unwrap_or_default())
         } else {
             None
         },
@@ -1360,9 +1348,10 @@ where
 
         // Per-partition config: override core pinning with resolved assignment
         let partition_id = PartitionId::new(u16::try_from(i).unwrap_or(u16::MAX));
-        let write_gate = config.gate_registry.as_ref().map(|reg| {
-            reg.get_or_create(&config.pipeline.pipeline_name, partition_id)
-        });
+        let write_gate = config
+            .gate_registry
+            .as_ref()
+            .map(|reg| reg.get_or_create(&config.pipeline.pipeline_name, partition_id));
         let mut partition_config = PipelineConfig {
             source_buffer_capacity: config.pipeline.source_buffer_capacity,
             sink_buffer_capacity: config.pipeline.sink_buffer_capacity,
@@ -1596,15 +1585,16 @@ async fn run_sink_task<K: Sink + Send + 'static>(
 
                 // EO-2 P4: capture (event_id → l2_seq) map before write_batch
                 // moves the outputs. Only when the pipeline tracks acks.
-                let l2_seq_by_id: Option<HashMap<uuid::Uuid, u64>> = ack_tracker.as_ref().map(|_| {
-                    outputs
-                        .iter()
-                        .filter_map(|o| match (o.source_event_id, o.l2_seq) {
-                            (Some(id), Some(seq)) => Some((id, seq)),
-                            _ => None,
-                        })
-                        .collect()
-                });
+                let l2_seq_by_id: Option<HashMap<uuid::Uuid, u64>> =
+                    ack_tracker.as_ref().map(|_| {
+                        outputs
+                            .iter()
+                            .filter_map(|o| match (o.source_event_id, o.l2_seq) {
+                                (Some(id), Some(seq)) => Some((id, seq)),
+                                _ => None,
+                            })
+                            .collect()
+                    });
 
                 match sink.write_batch(outputs).await {
                     Ok(batch_result) => {
@@ -4049,7 +4039,10 @@ mod tests {
     }
 
     impl Sink for SharedMemorySink {
-        async fn write_batch(&mut self, outputs: Vec<Output>) -> Result<aeon_types::BatchResult, AeonError> {
+        async fn write_batch(
+            &mut self,
+            outputs: Vec<Output>,
+        ) -> Result<aeon_types::BatchResult, AeonError> {
             let ids = outputs.iter().filter_map(|o| o.source_event_id).collect();
             self.outputs.lock().unwrap().extend(outputs);
             Ok(aeon_types::BatchResult::all_delivered(ids))
@@ -4147,8 +4140,7 @@ mod tests {
         // Set up a continuous source and a prefixed processor "A:"
         let source_shutdown = Arc::new(AtomicBool::new(false));
         let source = ContinuousSource::new(10, Arc::clone(&source_shutdown));
-        let processor_a: Box<dyn Processor + Send + Sync> =
-            Box::new(PrefixProcessor::new("A:"));
+        let processor_a: Box<dyn Processor + Send + Sync> = Box::new(PrefixProcessor::new("A:"));
         let sink = SharedMemorySink::new();
         let metrics = Arc::new(PipelineMetrics::new());
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -4182,11 +4174,13 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         let pre_swap_count = metrics.events_processed.load(Ordering::Relaxed);
-        assert!(pre_swap_count > 0, "should have processed events before swap");
+        assert!(
+            pre_swap_count > 0,
+            "should have processed events before swap"
+        );
 
         // Hot-swap to processor B
-        let processor_b: Box<dyn Processor + Send + Sync> =
-            Box::new(PrefixProcessor::new("B:"));
+        let processor_b: Box<dyn Processor + Send + Sync> = Box::new(PrefixProcessor::new("B:"));
         control.drain_and_swap(processor_b).await.unwrap();
 
         // Wait until B-prefixed outputs appear in the sink (proof that swap worked)
@@ -4392,7 +4386,10 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        assert!(sink_b_reader.len() > 0, "sink B should have collected outputs after swap");
+        assert!(
+            sink_b_reader.len() > 0,
+            "sink B should have collected outputs after swap"
+        );
 
         // Sink A should have stopped growing
         let sink_a_final = sink_a.len();
@@ -4404,7 +4401,10 @@ mod tests {
         let _ = pipeline_handle.await;
 
         // Both sinks received outputs, sink A stopped after swap
-        assert!(sink_a_final >= sink_a_count, "sink A count should be stable after swap");
+        assert!(
+            sink_a_final >= sink_a_count,
+            "sink A count should be stable after swap"
+        );
         assert!(sink_b_reader.len() > 0, "sink B received outputs");
 
         // Total outputs should match total processed
@@ -4431,26 +4431,37 @@ mod tests {
         let metrics2 = Arc::clone(&metrics);
         let shutdown2 = Arc::clone(&shutdown);
 
-
         let pipeline_handle = tokio::spawn(async move {
             run_buffered_managed(
-                source, processor_a, sink, config, metrics2,
-                shutdown2, None, control2,
-            ).await
+                source,
+                processor_a,
+                sink,
+                config,
+                metrics2,
+                shutdown2,
+                None,
+                control2,
+            )
+            .await
         });
 
         // Wait for A outputs
         for _ in 0..200 {
-            if metrics.events_processed.load(Ordering::Relaxed) > 0 { break; }
+            if metrics.events_processed.load(Ordering::Relaxed) > 0 {
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         assert!(metrics.events_processed.load(Ordering::Relaxed) > 0);
 
         // Verify A-prefixed outputs
         let outputs_before = sink_reader.lock().unwrap().clone();
-        assert!(outputs_before.iter().all(|o| {
-            String::from_utf8_lossy(&o.payload).starts_with("A:")
-        }), "all outputs before cutover should be A-prefixed");
+        assert!(
+            outputs_before
+                .iter()
+                .all(|o| { String::from_utf8_lossy(&o.payload).starts_with("A:") }),
+            "all outputs before cutover should be A-prefixed"
+        );
 
         // Install green processor (B:) — no pause, no drain
         let processor_b = Box::new(PrefixProcessor::new("B:"));
@@ -4459,31 +4470,40 @@ mod tests {
         // Wait for more A outputs (green is shadow, not yet active)
         let count_after_install = sink_reader.lock().unwrap().len();
         for _ in 0..200 {
-            if sink_reader.lock().unwrap().len() > count_after_install + 5 { break; }
+            if sink_reader.lock().unwrap().len() > count_after_install + 5 {
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         // All new outputs should still be A-prefixed
         let outputs_mid = sink_reader.lock().unwrap().clone();
-        assert!(outputs_mid.iter().all(|o| {
-            String::from_utf8_lossy(&o.payload).starts_with("A:")
-        }), "all outputs during shadow should be A-prefixed");
+        assert!(
+            outputs_mid
+                .iter()
+                .all(|o| { String::from_utf8_lossy(&o.payload).starts_with("A:") }),
+            "all outputs during shadow should be A-prefixed"
+        );
 
         // Cutover to green
         control.cutover_blue_green().await.unwrap();
 
         // Wait for B outputs to appear
         for _ in 0..200 {
-            let has_b = sink_reader.lock().unwrap().iter().any(|o| {
-                String::from_utf8_lossy(&o.payload).starts_with("B:")
-            });
-            if has_b { break; }
+            let has_b = sink_reader
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|o| String::from_utf8_lossy(&o.payload).starts_with("B:"));
+            if has_b {
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
 
         let outputs_after = sink_reader.lock().unwrap().clone();
-        let has_b = outputs_after.iter().any(|o| {
-            String::from_utf8_lossy(&o.payload).starts_with("B:")
-        });
+        let has_b = outputs_after
+            .iter()
+            .any(|o| String::from_utf8_lossy(&o.payload).starts_with("B:"));
         assert!(has_b, "should have B-prefixed outputs after cutover");
 
         // Shut down
@@ -4509,17 +4529,25 @@ mod tests {
         let metrics2 = Arc::clone(&metrics);
         let shutdown2 = Arc::clone(&shutdown);
 
-
         let pipeline_handle = tokio::spawn(async move {
             run_buffered_managed(
-                source, processor_a, sink, config, metrics2,
-                shutdown2, None, control2,
-            ).await
+                source,
+                processor_a,
+                sink,
+                config,
+                metrics2,
+                shutdown2,
+                None,
+                control2,
+            )
+            .await
         });
 
         // Wait for initial outputs
         for _ in 0..200 {
-            if metrics.events_processed.load(Ordering::Relaxed) > 0 { break; }
+            if metrics.events_processed.load(Ordering::Relaxed) > 0 {
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
 
@@ -4531,15 +4559,20 @@ mod tests {
         // Wait for more outputs after rollback
         let count_after = sink_reader.lock().unwrap().len();
         for _ in 0..200 {
-            if sink_reader.lock().unwrap().len() > count_after + 20 { break; }
+            if sink_reader.lock().unwrap().len() > count_after + 20 {
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
 
         // All outputs should be A-prefixed (no B ever appeared)
         let outputs = sink_reader.lock().unwrap().clone();
-        assert!(outputs.iter().all(|o| {
-            String::from_utf8_lossy(&o.payload).starts_with("A:")
-        }), "all outputs after rollback should be A-prefixed");
+        assert!(
+            outputs
+                .iter()
+                .all(|o| { String::from_utf8_lossy(&o.payload).starts_with("A:") }),
+            "all outputs after rollback should be A-prefixed"
+        );
 
         source_shutdown.store(true, Ordering::Release);
         shutdown.store(true, Ordering::Release);
@@ -4565,14 +4598,23 @@ mod tests {
 
         let pipeline_handle = tokio::spawn(async move {
             run_buffered_managed(
-                source, processor_a, sink, config, metrics2,
-                shutdown2, None, control2,
-            ).await
+                source,
+                processor_a,
+                sink,
+                config,
+                metrics2,
+                shutdown2,
+                None,
+                control2,
+            )
+            .await
         });
 
         // Wait for initial A outputs
         for _ in 0..200 {
-            if metrics.events_processed.load(Ordering::Relaxed) > 0 { break; }
+            if metrics.events_processed.load(Ordering::Relaxed) > 0 {
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
 
@@ -4584,24 +4626,37 @@ mod tests {
         // Wait for enough outputs with both A and B
         for _ in 0..200 {
             let len = sink_reader.lock().unwrap().len();
-            if len > 200 { break; }
+            if len > 200 {
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
 
         let outputs = sink_reader.lock().unwrap().clone();
-        let a_count = outputs.iter().filter(|o| {
-            String::from_utf8_lossy(&o.payload).starts_with("A:")
-        }).count();
-        let b_count = outputs.iter().filter(|o| {
-            String::from_utf8_lossy(&o.payload).starts_with("B:")
-        }).count();
+        let a_count = outputs
+            .iter()
+            .filter(|o| String::from_utf8_lossy(&o.payload).starts_with("A:"))
+            .count();
+        let b_count = outputs
+            .iter()
+            .filter(|o| String::from_utf8_lossy(&o.payload).starts_with("B:"))
+            .count();
 
-        assert!(a_count > 0, "baseline A should have outputs (got {a_count})");
+        assert!(
+            a_count > 0,
+            "baseline A should have outputs (got {a_count})"
+        );
         assert!(b_count > 0, "canary B should have outputs (got {b_count})");
         // With 50% split over many events, both should be non-trivial
         let total = a_count + b_count;
-        assert!(a_count as f64 / total as f64 > 0.2, "A should have >20% of traffic");
-        assert!(b_count as f64 / total as f64 > 0.2, "B should have >20% of traffic");
+        assert!(
+            a_count as f64 / total as f64 > 0.2,
+            "A should have >20% of traffic"
+        );
+        assert!(
+            b_count as f64 / total as f64 > 0.2,
+            "B should have >20% of traffic"
+        );
 
         source_shutdown.store(true, Ordering::Release);
         shutdown.store(true, Ordering::Release);
@@ -4627,14 +4682,23 @@ mod tests {
 
         let pipeline_handle = tokio::spawn(async move {
             run_buffered_managed(
-                source, processor_a, sink, config, metrics2,
-                shutdown2, None, control2,
-            ).await
+                source,
+                processor_a,
+                sink,
+                config,
+                metrics2,
+                shutdown2,
+                None,
+                control2,
+            )
+            .await
         });
 
         // Wait for initial outputs
         for _ in 0..200 {
-            if metrics.events_processed.load(Ordering::Relaxed) > 0 { break; }
+            if metrics.events_processed.load(Ordering::Relaxed) > 0 {
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
 
@@ -4648,15 +4712,23 @@ mod tests {
         // Clear sink and collect new outputs
         sink_reader.lock().unwrap().clear();
         for _ in 0..200 {
-            if sink_reader.lock().unwrap().len() > 50 { break; }
+            if sink_reader.lock().unwrap().len() > 50 {
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
 
         let outputs = sink_reader.lock().unwrap().clone();
-        assert!(!outputs.is_empty(), "should have outputs after canary complete");
-        assert!(outputs.iter().all(|o| {
-            String::from_utf8_lossy(&o.payload).starts_with("B:")
-        }), "all outputs after canary complete should be B-prefixed");
+        assert!(
+            !outputs.is_empty(),
+            "should have outputs after canary complete"
+        );
+        assert!(
+            outputs
+                .iter()
+                .all(|o| { String::from_utf8_lossy(&o.payload).starts_with("B:") }),
+            "all outputs after canary complete should be B-prefixed"
+        );
 
         source_shutdown.store(true, Ordering::Release);
         shutdown.store(true, Ordering::Release);
@@ -4850,11 +4922,7 @@ mod tests {
             );
             let mut src_chain = aeon_crypto::poh::PohChain::new(PartitionId::new(3), 64);
             for i in 0..5i64 {
-                src_chain.append_batch(
-                    &[format!("evt-{i}").as_bytes()],
-                    (i + 1) * 1000,
-                    None,
-                );
+                src_chain.append_batch(&[format!("evt-{i}").as_bytes()], (i + 1) * 1000, None);
             }
             let state_bytes = src_chain.export_state().to_bytes().unwrap();
             let req = PohChainTransferRequest {
@@ -4903,9 +4971,10 @@ mod tests {
 
         #[tokio::test]
         async fn poh_append_batch_helper_works() {
-            let poh = Arc::new(Mutex::new(
-                aeon_crypto::poh::PohChain::new(PartitionId::new(0), 64),
-            ));
+            let poh = Arc::new(Mutex::new(aeon_crypto::poh::PohChain::new(
+                PartitionId::new(0),
+                64,
+            )));
             let metrics = PipelineMetrics::new();
 
             let dest: Arc<str> = Arc::from("output");
@@ -4945,9 +5014,10 @@ mod tests {
 
         #[tokio::test]
         async fn poh_append_empty_batch_noop() {
-            let poh = Arc::new(Mutex::new(
-                aeon_crypto::poh::PohChain::new(PartitionId::new(0), 64),
-            ));
+            let poh = Arc::new(Mutex::new(aeon_crypto::poh::PohChain::new(
+                PartitionId::new(0),
+                64,
+            )));
             let metrics = PipelineMetrics::new();
 
             poh_append_batch(&poh, &[], &None, &metrics).await;
@@ -5040,11 +5110,18 @@ mod tests {
             let metrics = Arc::new(PipelineMetrics::new());
             let shutdown = Arc::new(AtomicBool::new(false));
 
-            let stopper =
-                shutdown_after_target(Arc::clone(&metrics), Arc::clone(&shutdown), 50);
-            run_buffered(source, processor, sink, config, metrics.clone(), shutdown, None)
-                .await
-                .unwrap();
+            let stopper = shutdown_after_target(Arc::clone(&metrics), Arc::clone(&shutdown), 50);
+            run_buffered(
+                source,
+                processor,
+                sink,
+                config,
+                metrics.clone(),
+                shutdown,
+                None,
+            )
+            .await
+            .unwrap();
             stopper.await.unwrap();
 
             assert_eq!(metrics.events_received.load(Ordering::Relaxed), 50);
@@ -5055,9 +5132,7 @@ mod tests {
             assert_eq!(*part, PartitionId::new(0));
 
             // Open a second reader to confirm events were actually persisted.
-            let store_handle = registry
-                .open("eo2-push-test", PartitionId::new(0))
-                .unwrap();
+            let store_handle = registry.open("eo2-push-test", PartitionId::new(0)).unwrap();
             let guard = store_handle.lock().unwrap();
             // next_seq = head+1 after every append; 50 events ⇒ next_seq ≥ 50.
             assert!(
@@ -5090,9 +5165,17 @@ mod tests {
 
             // Pull source: MemorySource returns empty when drained, which the
             // engine still treats as EOF, so no watcher is required here.
-            run_buffered(source, processor, sink, config, metrics.clone(), shutdown, None)
-                .await
-                .unwrap();
+            run_buffered(
+                source,
+                processor,
+                sink,
+                config,
+                metrics.clone(),
+                shutdown,
+                None,
+            )
+            .await
+            .unwrap();
 
             assert_eq!(metrics.events_received.load(Ordering::Relaxed), 30);
             // Pull sources must not touch the registry.
@@ -5124,11 +5207,18 @@ mod tests {
             let metrics = Arc::new(PipelineMetrics::new());
             let shutdown = Arc::new(AtomicBool::new(false));
 
-            let stopper =
-                shutdown_after_target(Arc::clone(&metrics), Arc::clone(&shutdown), 20);
-            run_buffered(source, processor, sink, config, metrics.clone(), shutdown, None)
-                .await
-                .unwrap();
+            let stopper = shutdown_after_target(Arc::clone(&metrics), Arc::clone(&shutdown), 20);
+            run_buffered(
+                source,
+                processor,
+                sink,
+                config,
+                metrics.clone(),
+                shutdown,
+                None,
+            )
+            .await
+            .unwrap();
             stopper.await.unwrap();
 
             assert_eq!(metrics.events_received.load(Ordering::Relaxed), 20);
@@ -5164,20 +5254,25 @@ mod tests {
             let metrics = Arc::new(PipelineMetrics::new());
             let shutdown = Arc::new(AtomicBool::new(false));
 
-            let stopper =
-                shutdown_after_target(Arc::clone(&metrics), Arc::clone(&shutdown), 30);
-            run_buffered(source, processor, sink, config, metrics.clone(), shutdown, None)
-                .await
-                .unwrap();
+            let stopper = shutdown_after_target(Arc::clone(&metrics), Arc::clone(&shutdown), 30);
+            run_buffered(
+                source,
+                processor,
+                sink,
+                config,
+                metrics.clone(),
+                shutdown,
+                None,
+            )
+            .await
+            .unwrap();
             stopper.await.unwrap();
 
             assert_eq!(metrics.events_received.load(Ordering::Relaxed), 30);
             assert_eq!(metrics.outputs_sent.load(Ordering::Relaxed), 30);
 
             // Registry must have been opened for partition 0.
-            let store_handle = registry
-                .open("eo2-gc-test", PartitionId::new(0))
-                .unwrap();
+            let store_handle = registry.open("eo2-gc-test", PartitionId::new(0)).unwrap();
             let guard = store_handle.lock().unwrap();
             // next_seq reflects the total appended; after GC the ack watermark
             // should have advanced to the final seq so disk can be reclaimed.
@@ -5216,11 +5311,18 @@ mod tests {
             let metrics = Arc::new(PipelineMetrics::new());
             let shutdown = Arc::new(AtomicBool::new(false));
 
-            let stopper =
-                shutdown_after_target(Arc::clone(&metrics), Arc::clone(&shutdown), 30);
-            run_buffered(source, processor, sink, config, metrics.clone(), shutdown, None)
-                .await
-                .unwrap();
+            let stopper = shutdown_after_target(Arc::clone(&metrics), Arc::clone(&shutdown), 30);
+            run_buffered(
+                source,
+                processor,
+                sink,
+                config,
+                metrics.clone(),
+                shutdown,
+                None,
+            )
+            .await
+            .unwrap();
             stopper.await.unwrap();
 
             let rendered = eo2_metrics.render_prometheus();
@@ -5249,11 +5351,7 @@ mod tests {
             });
 
             let node = crate::eo2_backpressure::NodeCapacity::new(None);
-            let caps = crate::eo2_backpressure::CapacityLimits::from_config(
-                None,
-                Some(512),
-                1,
-            );
+            let caps = crate::eo2_backpressure::CapacityLimits::from_config(None, Some(512), 1);
             let capacity = crate::eo2_backpressure::PipelineCapacity::new(caps, node);
             let eo2_metrics = Arc::new(crate::eo2_metrics::Eo2Metrics::new());
 
@@ -5273,11 +5371,18 @@ mod tests {
             let metrics = Arc::new(PipelineMetrics::new());
             let shutdown = Arc::new(AtomicBool::new(false));
 
-            let stopper =
-                shutdown_after_target(Arc::clone(&metrics), Arc::clone(&shutdown), 30);
-            run_buffered(source, processor, sink, config, metrics.clone(), shutdown, None)
-                .await
-                .unwrap();
+            let stopper = shutdown_after_target(Arc::clone(&metrics), Arc::clone(&shutdown), 30);
+            run_buffered(
+                source,
+                processor,
+                sink,
+                config,
+                metrics.clone(),
+                shutdown,
+                None,
+            )
+            .await
+            .unwrap();
             stopper.await.unwrap();
 
             assert_eq!(metrics.events_received.load(Ordering::Relaxed), 30);
@@ -5337,15 +5442,10 @@ mod tests {
                 .unwrap(),
             ) as Arc<dyn aeon_types::L3Store>;
             {
-                let mut store = crate::checkpoint::L3CheckpointStore::open(Arc::clone(&l3))
-                    .unwrap();
-                let mut rec = crate::checkpoint::CheckpointRecord::new(
-                    0,
-                    HashMap::new(),
-                    vec![],
-                    10,
-                    0,
-                );
+                let mut store =
+                    crate::checkpoint::L3CheckpointStore::open(Arc::clone(&l3)).unwrap();
+                let mut rec =
+                    crate::checkpoint::CheckpointRecord::new(0, HashMap::new(), vec![], 10, 0);
                 let mut sinks = HashMap::new();
                 sinks.insert("sink".to_string(), 42u64);
                 rec = rec.with_per_sink_ack_seq(sinks);
@@ -5365,18 +5465,24 @@ mod tests {
             let mut config = PipelineConfig::default();
             config.pipeline_name = "eo2-recovery-test".into();
             config.delivery.durability = DurabilityMode::OrderedBatch;
-            config.delivery.checkpoint.backend =
-                crate::delivery::CheckpointBackend::StateStore;
+            config.delivery.checkpoint.backend = crate::delivery::CheckpointBackend::StateStore;
             config.l3_checkpoint_store = Some(l3);
 
             let metrics = Arc::new(PipelineMetrics::new());
             let shutdown = Arc::new(AtomicBool::new(false));
 
-            let stopper =
-                shutdown_after_target(Arc::clone(&metrics), Arc::clone(&shutdown), 3);
-            run_buffered(source, processor, sink, config, metrics.clone(), shutdown, None)
-                .await
-                .unwrap();
+            let stopper = shutdown_after_target(Arc::clone(&metrics), Arc::clone(&shutdown), 3);
+            run_buffered(
+                source,
+                processor,
+                sink,
+                config,
+                metrics.clone(),
+                shutdown,
+                None,
+            )
+            .await
+            .unwrap();
             stopper.await.unwrap();
 
             assert_eq!(
@@ -5405,11 +5511,18 @@ mod tests {
             let metrics = Arc::new(PipelineMetrics::new());
             let shutdown = Arc::new(AtomicBool::new(false));
 
-            let stopper =
-                shutdown_after_target(Arc::clone(&metrics), Arc::clone(&shutdown), 15);
-            run_buffered(source, processor, sink, config, metrics.clone(), shutdown, None)
-                .await
-                .unwrap();
+            let stopper = shutdown_after_target(Arc::clone(&metrics), Arc::clone(&shutdown), 15);
+            run_buffered(
+                source,
+                processor,
+                sink,
+                config,
+                metrics.clone(),
+                shutdown,
+                None,
+            )
+            .await
+            .unwrap();
             stopper.await.unwrap();
 
             assert_eq!(metrics.events_received.load(Ordering::Relaxed), 15);
@@ -5493,6 +5606,5 @@ mod tests {
             // Tracker B is isolated — must not see A's ack.
             assert_eq!(tracker_b.snapshot().get("a"), None);
         }
-
     }
 }

@@ -409,20 +409,18 @@ mod tests {
 
     #[test]
     fn default_consumer_mode_is_single_and_uses_config_group() {
-        let cfg =
-            RedisSourceConfig::new("redis://localhost", "stream", "group-a", "consumer-1");
+        let cfg = RedisSourceConfig::new("redis://localhost", "stream", "group-a", "consumer-1");
         assert_eq!(cfg.consumer_mode, ConsumerMode::Single);
         assert_eq!(cfg.effective_group(), "group-a");
     }
 
     #[test]
     fn group_mode_overrides_effective_group() {
-        let cfg =
-            RedisSourceConfig::new("redis://localhost", "stream", "group-a", "consumer-1")
-                .with_consumer_mode(ConsumerMode::Group {
-                    group_id: "shared-group".to_string(),
-                    broker_commit: false,
-                });
+        let cfg = RedisSourceConfig::new("redis://localhost", "stream", "group-a", "consumer-1")
+            .with_consumer_mode(ConsumerMode::Group {
+                group_id: "shared-group".to_string(),
+                broker_commit: false,
+            });
         assert!(cfg.consumer_mode.is_broker_coordinated());
         assert_eq!(cfg.effective_group(), "shared-group");
     }
