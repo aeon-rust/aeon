@@ -191,7 +191,7 @@ This wedge is defensible because retrofitting any one piece (crypto chain, compl
 |---|---|---|
 | **Session B throughput ceiling on AWS EKS** | Session B | Current numbers are DOKS floor, not ceiling — need NVMe + 10 Gbps to cite a real number |
 | **SQL authoring interface** | Large (6–12 months) | Both Flink and Arroyo have this; Aeon doesn't |
-| **Windowing / CEP primitives** | Revised: F1+F2 ~3 months together (see [`WINDOWING-WATERMARKS-DESIGN.md`](WINDOWING-WATERMARKS-DESIGN.md)) | Flink's differentiator; Aeon has none built-in. Watermark shrinks to 3–4 wks by reusing the `AckSeqTracker` pattern; windowing itself is the bulk of the work. |
+| **Windowing / CEP primitives** | Reframed 2026-05-03 as Layer 6 of the integrated trajectory (see [`STATEFUL-PROCESSING-EVOLUTION.md`](STATEFUL-PROCESSING-EVOLUTION.md)). Layer 4 (sequence-bounded processor lifecycle, "Path 2") opens NOW and ships in v0.1; Layer 5 (`WatermarkView` façade over existing PoH + `AckSeqTracker`) opens after Layer 4; Layer 6 (windowing F1+F2, ~3 months) keeps the original prerequisites in [`WINDOWING-WATERMARKS-DESIGN.md`](WINDOWING-WATERMARKS-DESIGN.md) § 9. | Flink's differentiator; Aeon's path composes on the EO-2 substrate rather than introducing a parallel state backend. |
 | **Connector ecosystem (pull + push + SaaS)** | Continuous | 4 today → target 20+ for credible demos |
 | **Benchmarks vs competitors on identical hardware** | Medium | Same infrastructure, same workload, verifiable numbers |
 | **Production deployments outside of dev/test** | Whenever first user lands | No case study yet |

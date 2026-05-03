@@ -1,10 +1,41 @@
-# Aeon Windowing + Watermarks — Design Sketch (Deferred)
+# Aeon Windowing + Watermarks — Design Sketch (Deferred — Layer 6 of the integrated path)
 
-> **Captured 2026-04-19 from discussion; not a commitment.** This is a
+> **⚠️ Framing updated 2026-05-03.** This document remains the authoritative
+> design sketch for **F1 (windowing primitives) + F2 (watermarks +
+> event-time)** — what's in it about scope, primitive reuse, and effort
+> estimates is unchanged. **What changed is how F1+F2 fit into Aeon's
+> broader stateful-processing trajectory.**
+>
+> See [`STATEFUL-PROCESSING-EVOLUTION.md`](STATEFUL-PROCESSING-EVOLUTION.md)
+> for the integrated layered plan. In that plan:
+> - This document's F1+F2 work = **Layer 6** (window-keyed state +
+>   assigner + trigger). Still gated on the prerequisites in § 9 below
+>   (Gate 2 close + Session B + v0.1 cut + concrete user demand).
+> - **Layer 4** (sequence-bounded processor lifecycle = "Path 2") is
+>   the next architectural step and is NO LONGER deferred — it ships as
+>   part of v0.1 because it closes a real cluster-correctness gap (G9.c
+>   follow-up surfaced 2026-05-03).
+> - **Layer 5** (per-partition `WatermarkView` façade exposing PoH
+>   chain head + `AckSeqTracker`) opens once Layer 4 lands. It composes
+>   on signals that already exist; the F2 work in § 5 of this doc is
+>   reframed as a thin façade rather than new infrastructure.
+>
+> The **structural analogue** between `AckSeqTracker` and a future
+> watermark tracker (§ 4.3 of this doc) remains the load-bearing insight
+> for Layer 5's API shape. The rest of the doc — § 1 scope, § 2 primitives,
+> § 3 the real gap, § 5 minimum new work, § 6 effort estimates, § 7
+> trade-offs, § 8 known not-doing — applies to Layer 6 and is current.
+>
+> ---
+>
+> **Original 2026-04-19 framing** (kept verbatim for context — still
+> valid for Layer 6, superseded for Layer 4/5):
+>
+> Captured 2026-04-19 from discussion; not a commitment. This is a
 > thinking document — a precise record of where Aeon stands relative to
 > Flink's windowing + event-time story, and what the minimum addition
-> would look like if we chose to close the gap. **Parked until Gate 2
-> closes and Session B produces a ceiling number.** Re-open then.
+> would look like if we chose to close the gap. Parked until Gate 2
+> closes and Session B produces a ceiling number. Re-open then.
 >
 > Source of the idea: `docs/POSITIONING.md` § 6 lists "Windowing / CEP"
 > and "SQL authoring" as the two largest Flink-parity gaps. The
