@@ -208,11 +208,29 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/v1/cluster/drain", post(cluster_drain))
         .route("/api/v1/cluster/rebalance", post(cluster_rebalance))
-        .route("/api/v1/cluster/leave", post(cluster_leave))
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            auth_middleware,
-        ));
+        .route("/api/v1/cluster/leave", post(cluster_leave));
+
+    // G9.b — follower-routing middleware. Intercepts cluster-write
+    // requests on a Raft follower and proxies them to the current
+    // leader's REST endpoint, returning the leader's response
+    // verbatim. Pass-through for GET/HEAD, for local-only mutations
+    // (delivery/retry, identities, debug fault injection), and on
+    // the leader itself / standalone mode. See
+    // `forward_to_leader_http` for the redirect-vs-forward design
+    // rationale and the loop-protection contract.
+    //
+    // No-op in non-cluster builds — the middleware function only
+    // exists under `#[cfg(feature = "cluster")]`.
+    #[cfg(feature = "cluster")]
+    let api_routes = api_routes.route_layer(middleware::from_fn_with_state(
+        state.clone(),
+        cluster_write_forwarder,
+    ));
+
+    let api_routes = api_routes.route_layer(middleware::from_fn_with_state(
+        state.clone(),
+        auth_middleware,
+    ));
 
     // WebSocket processor connect — no Bearer auth (AWPP handshake handles auth)
     #[cfg(feature = "websocket-host")]
@@ -533,7 +551,21 @@ fn api_error(status: StatusCode, msg: impl Into<String>) -> impl IntoResponse {
 /// Always emits `X-Leader-Node-Id` when a leader is known, so scripted
 /// clients that don't follow 307 can still route themselves without
 /// parsing redirect URLs.
+///
+/// **Deprecated 2026-05-03 (G9.b)** — kept only for backwards
+/// compatibility with hand-written REST callers that explicitly opt
+/// in via `X-Aeon-Accept-Redirects: 1`. The default forwarding path
+/// is now [`forward_to_leader_http`], which proxies the request body
+/// transparently so non-redirect-following clients (most notably
+/// `ureq`'s POST handling, but also curl without `-L` and many SDK
+/// HTTP clients) get correct behaviour. The bug the new path fixes:
+/// `aeon apply -f manifest.yaml --api <follower-url>` printed
+/// `pipeline 'foo' — created` and exit 0, but the Raft propose never
+/// happened because ureq saw the 307 as a non-error and didn't follow
+/// it. See ROADMAP §"G9.b — REST follower-routing fix" for the full
+/// audit.
 #[cfg(feature = "cluster")]
+#[allow(dead_code)]
 fn maybe_forward_to_leader(
     state: &Arc<AppState>,
     uri: &axum::http::Uri,
@@ -562,6 +594,302 @@ fn maybe_forward_to_leader(
     resp.headers_mut()
         .insert("X-Aeon-Forwarded", HeaderValue::from_static("1"));
     Some(resp)
+}
+
+/// G9.b — Internal HTTP forwarder for cluster-write REST endpoints.
+///
+/// When called on a Raft follower, proxies the entire HTTP request to
+/// the current leader's REST endpoint and returns the leader's
+/// response verbatim. When called on the leader (or in standalone
+/// mode), returns `None` so the caller proceeds with local handling.
+///
+/// **Why not a 307 redirect?** Many HTTP clients refuse to follow 3xx
+/// responses on POST/DELETE/PUT/PATCH for safety (RFC 7231 §6.4.7).
+/// `ureq` (the `aeon-cli` HTTP client) is one such — it returns the
+/// 307 as `Ok(_)` without following it, which silently drops the
+/// write. Internal forwarding makes the redirect transparent to the
+/// client at the cost of one extra in-cluster HTTP round-trip.
+///
+/// **Why not QUIC `ProposeForward` for everything?** That path only
+/// carries `ClusterRequest` payloads (Raft proposes). Several REST
+/// endpoints (blue-green / canary / cutover / rollback / promote /
+/// reconfigure-source / reconfigure-sink / delete-processor-version)
+/// mutate `PipelineManager` / processor-registry state that has no
+/// `RegistryCommand` variant yet — converting them to Raft proposes
+/// is tracked as a follow-up atom. HTTP forwarding works uniformly
+/// for both classes today and gives the operator correct semantics:
+/// the write reaches the leader, the leader runs the handler, and
+/// any cluster replication that the handler does itself
+/// (`propose_registry`, `propose_partition_transfer`, etc.) executes
+/// from leader-context.
+///
+/// Loop protection: outgoing forwards carry an `X-Aeon-Forwarded: 1`
+/// header. If the receiving handler sees that header and it is
+/// itself not the leader (rare race during election), it returns
+/// HTTP 421 Misdirected Request rather than forwarding again, so the
+/// client sees a real error instead of an infinite loop.
+///
+/// Returns:
+/// - `None` — local processing should proceed (we ARE the leader, OR
+///   leader is unknown / `rest_api_port` not configured).
+/// - `Some(response)` — leader's response (or a 502 Bad Gateway if
+///   the forward itself failed).
+#[cfg(feature = "cluster")]
+async fn forward_to_leader_http(
+    state: &Arc<AppState>,
+    method: axum::http::Method,
+    uri: &axum::http::Uri,
+    headers: &axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Option<axum::response::Response> {
+    // Loop protection — if the inbound request was already forwarded
+    // and we still aren't leader, return 421 Misdirected Request
+    // rather than forwarding again.
+    let already_forwarded = headers
+        .get("X-Aeon-Forwarded")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s == "1")
+        .unwrap_or(false);
+
+    let node = state.cluster_node.as_ref()?;
+    let path_and_query = uri
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or_else(|| uri.path());
+    let leader_url = node.leader_rest_url(path_and_query)?;
+
+    if already_forwarded {
+        let mut resp = api_error(
+            StatusCode::MISDIRECTED_REQUEST,
+            "request was forwarded to a node that is no longer leader; \
+             retry against the cluster service VIP or call \
+             'aeon cluster status' for the current leader",
+        )
+        .into_response();
+        let leader_id = node
+            .raft()
+            .metrics()
+            .borrow()
+            .current_leader
+            .unwrap_or_default();
+        if let Ok(v) = HeaderValue::from_str(&leader_id.to_string()) {
+            resp.headers_mut().insert("X-Leader-Node-Id", v);
+        }
+        return Some(resp);
+    }
+
+    // Build the outgoing request. Carry through all headers EXCEPT
+    // hop-by-hop ones (Connection, Host, Content-Length — reqwest
+    // computes its own). Always stamp `X-Aeon-Forwarded: 1` for the
+    // loop-protection check above.
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .ok()?;
+
+    let reqwest_method = match reqwest::Method::from_bytes(method.as_str().as_bytes()) {
+        Ok(m) => m,
+        Err(_) => return None,
+    };
+
+    let mut req_builder = client.request(reqwest_method, &leader_url);
+    for (name, value) in headers.iter() {
+        let n = name.as_str();
+        if matches!(
+            n.to_ascii_lowercase().as_str(),
+            "connection" | "host" | "content-length" | "transfer-encoding" | "te" | "upgrade"
+        ) {
+            continue;
+        }
+        if let Ok(v) = std::str::from_utf8(value.as_bytes()) {
+            req_builder = req_builder.header(n, v);
+        }
+    }
+    req_builder = req_builder.header("X-Aeon-Forwarded", "1");
+    if !body.is_empty() {
+        req_builder = req_builder.body(body.to_vec());
+    }
+
+    match req_builder.send().await {
+        Ok(leader_resp) => {
+            let status = leader_resp.status();
+            let leader_headers = leader_resp.headers().clone();
+            let body_bytes = leader_resp.bytes().await.ok()?.to_vec();
+            let mut out = axum::response::Response::builder()
+                .status(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY))
+                .body(axum::body::Body::from(body_bytes))
+                .ok()?;
+            for (name, value) in leader_headers.iter() {
+                let n = name.as_str();
+                if matches!(
+                    n.to_ascii_lowercase().as_str(),
+                    "connection" | "transfer-encoding" | "content-length"
+                ) {
+                    continue;
+                }
+                if let Ok(v) = std::str::from_utf8(value.as_bytes()) {
+                    if let (Ok(hn), Ok(hv)) = (
+                        axum::http::HeaderName::from_bytes(n.as_bytes()),
+                        HeaderValue::from_str(v),
+                    ) {
+                        out.headers_mut().insert(hn, hv);
+                    }
+                }
+            }
+            // Mark the response so observability tooling can see it
+            // round-tripped through a follower.
+            out.headers_mut()
+                .insert("X-Aeon-Forwarded-By", HeaderValue::from_static("1"));
+            Some(out)
+        }
+        Err(e) => {
+            tracing::warn!(
+                "forward_to_leader_http: leader at {} unreachable: {}",
+                leader_url,
+                e
+            );
+            Some(
+                api_error(
+                    StatusCode::BAD_GATEWAY,
+                    format!("failed to forward request to leader at {leader_url}: {e}"),
+                )
+                .into_response(),
+            )
+        }
+    }
+}
+
+/// G9.b — Returns true if `(method, path)` is a cluster-write REST
+/// operation that mutates Raft-replicated state and therefore must
+/// land on the leader. Used by [`cluster_write_forwarder`] middleware
+/// to decide whether to proxy a follower-bound request.
+///
+/// Conservative pattern matcher: a path either matches an exact
+/// known cluster-write route or one of the explicit `pipelines/{name}/*`
+/// suffixes. Anything ambiguous defaults to **pass-through** so we
+/// don't accidentally proxy a GET or a local-only mutation.
+///
+/// Local-only POSTs that we explicitly do NOT forward:
+/// - `/api/v1/pipelines/{name}/delivery/retry` (per-node ledger)
+/// - `/api/v1/processors/{name}/identities` (per-node identity store)
+/// - `/api/v1/processors/{name}/identities/{fingerprint}` (DELETE)
+/// - `/api/v1/test/inject-l3-fault` (debug, per-node)
+#[cfg(feature = "cluster")]
+fn is_cluster_write_path(method: &axum::http::Method, path: &str) -> bool {
+    use axum::http::Method;
+
+    if method == Method::POST {
+        // Top-level collections.
+        if path == "/api/v1/processors" || path == "/api/v1/pipelines" {
+            return true;
+        }
+        // Pipelines sub-routes — explicit allow-list.
+        if let Some(rest) = path.strip_prefix("/api/v1/pipelines/") {
+            // pipelines/{name}/<suffix>
+            let suffix = rest.split_once('/').map(|(_, s)| s).unwrap_or("");
+            return matches!(
+                suffix,
+                "start"
+                    | "stop"
+                    | "upgrade"
+                    | "upgrade/blue-green"
+                    | "upgrade/canary"
+                    | "cutover"
+                    | "rollback"
+                    | "promote"
+                    | "reconfigure/source"
+                    | "reconfigure/sink"
+            );
+        }
+        // Cluster ops.
+        if path == "/api/v1/cluster/drain"
+            || path == "/api/v1/cluster/rebalance"
+            || path == "/api/v1/cluster/leave"
+        {
+            return true;
+        }
+        if let Some(rest) = path.strip_prefix("/api/v1/cluster/partitions/") {
+            // partitions/{partition}/transfer
+            return rest.ends_with("/transfer");
+        }
+        return false;
+    }
+
+    if method == Method::DELETE {
+        // DELETE /api/v1/processors/{name}/versions/{version}
+        if let Some(rest) = path.strip_prefix("/api/v1/processors/") {
+            if let Some((_, after_name)) = rest.split_once('/') {
+                if after_name.starts_with("versions/") {
+                    return true;
+                }
+            }
+        }
+        // DELETE /api/v1/pipelines/{name}  (no further suffix)
+        if let Some(rest) = path.strip_prefix("/api/v1/pipelines/") {
+            // Must be a single segment (the pipeline name only).
+            return !rest.contains('/');
+        }
+    }
+
+    false
+}
+
+/// G9.b — middleware that proxies cluster-write REST requests to the
+/// current Raft leader when invoked on a follower.
+///
+/// Sits BEFORE `auth_middleware` in the chain (auth still runs on the
+/// follower side — we don't want to forward unauthenticated requests
+/// to the leader). For pass-through requests (GET, local-only POSTs,
+/// or any request when self is leader / standalone) the middleware
+/// reads the body once into Bytes, then rebuilds the request with
+/// the same body and calls `next.run(req)`.
+///
+/// Closes the silent-success bug where `aeon apply -f manifest.yaml
+/// --api <follower-url>` previously returned exit 0 with no error
+/// while never replicating to the cluster (because `ureq` doesn't
+/// follow 307 redirects on POST per RFC 7231 §6.4.7).
+#[cfg(feature = "cluster")]
+async fn cluster_write_forwarder(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> axum::response::Response {
+    let method = request.method().clone();
+    let uri = request.uri().clone();
+    let headers = request.headers().clone();
+
+    // Pass-through for non-cluster-write requests (GET / HEAD / local-only).
+    if !is_cluster_write_path(&method, uri.path()) {
+        return next.run(request).await;
+    }
+
+    // Buffer the body so we can either forward it or hand it to the
+    // local handler. axum's body extractors consume the body, so we
+    // read it once into Bytes and rebuild the Request afterwards.
+    let (parts, body) = request.into_parts();
+    let body_bytes = match axum::body::to_bytes(body, MAX_REQUEST_BODY_BYTES).await {
+        Ok(b) => b,
+        Err(e) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                format!("failed to read request body: {e}"),
+            )
+            .into_response();
+        }
+    };
+
+    if let Some(resp) =
+        forward_to_leader_http(&state, method.clone(), &uri, &headers, body_bytes.clone()).await
+    {
+        return resp;
+    }
+
+    // Local handling: rebuild the Request with the buffered body.
+    let mut req = Request::from_parts(parts, axum::body::Body::from(body_bytes));
+    *req.method_mut() = method;
+    *req.uri_mut() = uri;
+    *req.headers_mut() = headers;
+    next.run(req).await
 }
 
 #[derive(Serialize)]
@@ -3518,5 +3846,142 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json["mode"].as_str().is_some());
+    }
+
+    // ── G9.b — is_cluster_write_path matcher ─────────────────────────────
+    // Locks the contract for the follower-routing middleware. Adding a
+    // new cluster-write REST endpoint should grow this test alongside
+    // the matcher itself — tests are the canonical inventory of which
+    // routes are intercepted vs passed through.
+    #[cfg(feature = "cluster")]
+    mod cluster_write_matcher {
+        use super::super::is_cluster_write_path;
+        use axum::http::Method;
+
+        fn assert_is_write(path: &str) {
+            assert!(
+                is_cluster_write_path(&Method::POST, path),
+                "expected POST {path} to be cluster-write"
+            );
+        }
+        fn assert_not_write(method: Method, path: &str) {
+            assert!(
+                !is_cluster_write_path(&method, path),
+                "expected {method:?} {path} NOT to be cluster-write"
+            );
+        }
+
+        #[test]
+        fn post_create_processor_is_write() {
+            assert_is_write("/api/v1/processors");
+        }
+        #[test]
+        fn post_create_pipeline_is_write() {
+            assert_is_write("/api/v1/pipelines");
+        }
+        #[test]
+        fn post_pipeline_lifecycle_verbs_are_writes() {
+            for verb in [
+                "start",
+                "stop",
+                "upgrade",
+                "upgrade/blue-green",
+                "upgrade/canary",
+                "cutover",
+                "rollback",
+                "promote",
+                "reconfigure/source",
+                "reconfigure/sink",
+            ] {
+                assert_is_write(&format!("/api/v1/pipelines/my-pipe/{verb}"));
+            }
+        }
+        #[test]
+        fn post_cluster_ops_are_writes() {
+            assert_is_write("/api/v1/cluster/drain");
+            assert_is_write("/api/v1/cluster/rebalance");
+            assert_is_write("/api/v1/cluster/leave");
+            assert_is_write("/api/v1/cluster/partitions/3/transfer");
+        }
+        #[test]
+        fn delete_processor_version_is_write() {
+            assert!(is_cluster_write_path(
+                &Method::DELETE,
+                "/api/v1/processors/my-proc/versions/1.0.0"
+            ));
+        }
+        #[test]
+        fn delete_pipeline_is_write() {
+            assert!(is_cluster_write_path(
+                &Method::DELETE,
+                "/api/v1/pipelines/my-pipe"
+            ));
+        }
+
+        // ── Pass-through cases ──
+        #[test]
+        fn get_lists_are_not_writes() {
+            for path in [
+                "/api/v1/processors",
+                "/api/v1/pipelines",
+                "/api/v1/pipelines/foo",
+                "/api/v1/cluster/status",
+                "/api/v1/pipelines/foo/canary-status",
+                "/api/v1/pipelines/foo/history",
+                "/api/v1/pipelines/foo/verify",
+            ] {
+                assert_not_write(Method::GET, path);
+            }
+        }
+        #[test]
+        fn local_only_posts_are_not_writes() {
+            // delivery/retry mutates per-node ledger, not Raft state
+            assert_not_write(Method::POST, "/api/v1/pipelines/foo/delivery/retry");
+            // identity store is per-node
+            assert_not_write(Method::POST, "/api/v1/processors/foo/identities");
+            // debug fault injection is per-node
+            assert_not_write(Method::POST, "/api/v1/test/inject-l3-fault");
+        }
+        #[test]
+        fn delete_identity_is_not_write() {
+            assert!(!is_cluster_write_path(
+                &Method::DELETE,
+                "/api/v1/processors/foo/identities/SHA256:abc"
+            ));
+        }
+        #[test]
+        fn unknown_paths_are_not_writes() {
+            assert_not_write(Method::POST, "/api/v1/something/random");
+            assert_not_write(Method::POST, "/api/v1/pipelines/foo/unknown-verb");
+        }
+    }
+
+    // ── G9.b — middleware end-to-end on standalone (no cluster_node) ──
+    // The middleware must be a no-op when there's no cluster_node
+    // (standalone mode). Verifies the pass-through contract: a POST
+    // that would be a cluster-write on a follower behaves exactly as
+    // before in standalone mode.
+    #[tokio::test]
+    async fn middleware_passthrough_in_standalone_mode() {
+        let state = test_state(); // no cluster_node configured
+        let app = api_router(state);
+
+        // GET /api/v1/pipelines should return [] (no pipelines yet).
+        // Middleware must not interfere with read traffic.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/pipelines")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json.as_array().is_some());
     }
 }

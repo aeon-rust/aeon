@@ -424,6 +424,51 @@ Node 2 (Follower):  P5  P6  P7  P8  P9
 Node 3 (Follower):  P10 P11 P12 P13 P14
 ```
 
+### 3.2.1 Operator: write to any pod, leader-routing is automatic
+
+**Cluster-write REST endpoints** (CREATE / DELETE / START / STOP /
+upgrade / cutover / rollback / promote / reconfigure / cluster-ops)
+work against **any pod** in the cluster, not just the leader. A
+follower transparently proxies the request to the current leader and
+returns the leader's response. Concretely:
+
+```bash
+# Both work identically, regardless of which pod is the current leader:
+kubectl exec -i aeon-0 -- /usr/local/bin/aeon apply -f - < pipeline.yaml
+kubectl exec -i aeon-2 -- /usr/local/bin/aeon apply -f - < pipeline.yaml
+
+# So does the round-robin service VIP:
+kubectl port-forward svc/aeon 4471:4471 &
+curl -sS -X POST http://127.0.0.1:4471/api/v1/pipelines \
+  -H 'Content-Type: application/json' -d @pipeline-request.json
+```
+
+**Why this matters** — before the G9.b fix (2026-05-03), a follower
+returned HTTP `307 Temporary Redirect` with `Location: <leader-url>`.
+The redirect is RFC-correct but several common HTTP clients refuse
+to follow 3xx on POST per RFC 7231 §6.4.7 — most notably `ureq` (the
+`aeon-cli` client), which printed `pipeline 'foo' — created` and
+exited 0 despite the request never reaching the leader. The current
+implementation buffers the request body and proxies it server-side
+(see `crates/aeon-engine/src/rest_api.rs::cluster_write_forwarder`),
+so any HTTP client gets correct semantics with no special handling.
+
+**Local-only endpoints** that are intentionally NOT proxied (they
+mutate per-pod state, not Raft-replicated state):
+- `POST /api/v1/pipelines/{name}/delivery/retry` — per-node delivery ledger
+- `POST /api/v1/processors/{name}/identities` — per-node T3/T4 identity store
+- `DELETE /api/v1/processors/{name}/identities/{fingerprint}` — same
+- `POST /api/v1/test/inject-l3-fault` — debug fault injection (per-node)
+
+**Loop protection**: forwarded requests carry an `X-Aeon-Forwarded: 1`
+header. If the forward arrives at a node that has since lost
+leadership (rare during election), it returns HTTP 421 Misdirected
+Request rather than re-forwarding, so the client sees a real error
+instead of an infinite chain.
+
+**Inspection**: forwarded responses carry `X-Aeon-Forwarded-By: 1`
+on the way back, useful for tracing how a write traversed the cluster.
+
 ### 3.3 mTLS certificate setup
 
 All inter-node QUIC connections require mutual TLS (mTLS). Each node presents its own

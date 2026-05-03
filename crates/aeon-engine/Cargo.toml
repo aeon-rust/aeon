@@ -78,6 +78,12 @@ rustls = { workspace = true, optional = true }
 
 # T4 WebSocket uses axum (via rest-api feature) — no extra deps needed
 
+# G9.b — REST follower-routing middleware (cluster_write_forwarder)
+# proxies cluster-write HTTP requests to the current Raft leader.
+# Always-on; the helper itself is gated on `cfg(feature = "cluster")`
+# so non-cluster builds compile without the proxy code path.
+reqwest = { workspace = true }
+
 [dev-dependencies]
 aeon-connectors = { workspace = true, features = ["kafka", "file", "http", "websocket", "redis-streams", "nats", "rabbitmq", "mqtt", "quic", "webtransport", "postgres-cdc", "mysql-cdc", "mongodb-cdc"] }
 aeon-observability = { path = "../aeon-observability" }
