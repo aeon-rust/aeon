@@ -705,6 +705,169 @@ impl PipelineSupervisor {
         self.running.lock().await.contains_key(name)
     }
 
+    // ── G9.c — Cluster-replicated lifecycle ops ─────────────────────────
+    //
+    // The cluster_applier calls these on every node after a Raft commit
+    // of the matching `RegistryCommand` variant. Each method looks up
+    // the local `RunningPipeline` and drives the appropriate
+    // `PipelineControl` method. Pipelines NOT running on this node
+    // (e.g. tests, single-pipeline-per-pod setups, or partition-owner
+    // mismatch) are no-ops — the declarative state already replicated
+    // via PipelineManager, so non-owning nodes correctly track the
+    // upgrade in metadata without needing to drive a runtime swap they
+    // can't perform.
+    //
+    // Methods that do NOT need processor/connector instantiation (the
+    // bookkeeping ops — cutover, rollback, promote) are fully
+    // implemented here. Methods that DO need instantiation (start
+    // blue-green, start canary, upgrade-running, reconfigure
+    // source/sink) currently emit a warn and rely on the leader's REST
+    // handler for the runtime side-effect — declarative state still
+    // replicates correctly. Full instantiation-on-every-node is
+    // tracked as G9.d (the Layer 4 sequence-bounded transitions atom).
+
+    /// G9.c — Look up the local PipelineControl handle for `pipeline`.
+    /// Returns `None` if the pipeline isn't running on this node, which
+    /// is a valid case for cluster_applier dispatch (declarative state
+    /// already replicated via PipelineManager).
+    async fn cluster_local_control(&self, name: &str) -> Option<Arc<PipelineControl>> {
+        self.running
+            .lock()
+            .await
+            .get(name)
+            .map(|rp| Arc::clone(&rp.control))
+    }
+
+    /// G9.c — Cut over a blue-green upgrade on the local pipeline task.
+    /// Triggered on every node after the Raft commit of
+    /// `RegistryCommand::BlueGreenCutover`.
+    pub async fn cluster_blue_green_cutover(&self, name: &str) -> Result<(), AeonError> {
+        let Some(control) = self.cluster_local_control(name).await else {
+            return Ok(());
+        };
+        control.cutover_blue_green().await
+    }
+
+    /// G9.c — Roll back an in-flight upgrade on the local pipeline.
+    pub async fn cluster_rollback_upgrade(&self, name: &str) -> Result<(), AeonError> {
+        let Some(control) = self.cluster_local_control(name).await else {
+            return Ok(());
+        };
+        control.rollback_upgrade().await
+    }
+
+    /// G9.c — Promote a canary upgrade by one step. Declarative-only
+    /// today (PipelineManager tracks the canary step %); the runtime
+    /// traffic-split-by-percentage behaviour on PipelineControl is
+    /// part of the deferred G9.d Layer-4 work.
+    pub async fn cluster_promote_canary(&self, name: &str) -> Result<(), AeonError> {
+        if self.cluster_local_control(name).await.is_none() {
+            return Ok(());
+        }
+        tracing::info!(
+            pipeline = %name,
+            "promote_canary — declarative state replicated; per-node \
+             traffic-split runtime change deferred to G9.d"
+        );
+        Ok(())
+    }
+
+    /// G9.c — Start a blue-green upgrade on the local pipeline. Today
+    /// this is a placeholder on follower nodes: the new processor is
+    /// instantiated and swapped on the leader's pod via the REST
+    /// handler path, and followers track the upgrade declaratively
+    /// only. Full per-node instantiation is tracked as G9.d.
+    pub async fn cluster_blue_green_start(&self, name: &str) -> Result<(), AeonError> {
+        if self.cluster_local_control(name).await.is_none() {
+            return Ok(());
+        }
+        tracing::info!(
+            pipeline = %name,
+            "blue-green start — declarative state replicated; per-node \
+             processor instantiation deferred to G9.d (sequence-bounded \
+             transitions atom)"
+        );
+        Ok(())
+    }
+
+    /// G9.c — Start a canary upgrade on the local pipeline. Same
+    /// declarative-only deferral as `cluster_blue_green_start`.
+    pub async fn cluster_canary_start(&self, name: &str) -> Result<(), AeonError> {
+        if self.cluster_local_control(name).await.is_none() {
+            return Ok(());
+        }
+        tracing::info!(
+            pipeline = %name,
+            "canary start — declarative state replicated; per-node \
+             processor instantiation deferred to G9.d"
+        );
+        Ok(())
+    }
+
+    /// G9.c — Hot-reconfigure the source connector on the local
+    /// pipeline. Today the new connector is instantiated and swapped
+    /// on the leader's pod via the REST handler; followers track the
+    /// new SourceConfig declaratively only. Full per-node
+    /// re-instantiation deferred to G9.d.
+    pub async fn cluster_reconfigure_source(
+        &self,
+        name: &str,
+        _new_source: aeon_types::registry::SourceConfig,
+    ) -> Result<(), AeonError> {
+        if self.cluster_local_control(name).await.is_none() {
+            return Ok(());
+        }
+        tracing::info!(
+            pipeline = %name,
+            "reconfigure_source — declarative state replicated; per-node \
+             connector re-instantiation deferred to G9.d"
+        );
+        Ok(())
+    }
+
+    /// G9.c — Hot-reconfigure the sink connector on the local
+    /// pipeline. Same declarative-only deferral as
+    /// `cluster_reconfigure_source`.
+    pub async fn cluster_reconfigure_sink(
+        &self,
+        name: &str,
+        _new_sink: aeon_types::registry::SinkConfig,
+    ) -> Result<(), AeonError> {
+        if self.cluster_local_control(name).await.is_none() {
+            return Ok(());
+        }
+        tracing::info!(
+            pipeline = %name,
+            "reconfigure_sink — declarative state replicated; per-node \
+             connector re-instantiation deferred to G9.d"
+        );
+        Ok(())
+    }
+
+    /// G9.c.4 — Backfill: upgrade the running processor on the local
+    /// pipeline after Raft commits `RegistryCommand::UpgradePipeline`.
+    /// Same declarative-only deferral pattern: follower nodes track
+    /// the new ProcessorRef declaratively, but the runtime swap on
+    /// follower pods waits for G9.d. Today only the leader's REST
+    /// handler instantiates + swaps via `state.pipeline_controls` —
+    /// this method exists so the cluster_applier dispatch is
+    /// symmetric and the future per-node swap has a wiring point.
+    pub async fn upgrade_running(
+        &self,
+        name: &str,
+        _new_processor: aeon_types::registry::ProcessorRef,
+    ) -> Result<(), AeonError> {
+        if self.cluster_local_control(name).await.is_none() {
+            return Ok(());
+        }
+        tracing::info!(
+            pipeline = %name,
+            "upgrade_running — declarative state replicated; per-node \
+             processor instantiation deferred to G9.d"
+        );
+        Ok(())
+    }
+
     /// Names of all currently-running pipelines.
     pub async fn list_running(&self) -> Vec<String> {
         let running = self.running.lock().await;

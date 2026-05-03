@@ -46,6 +46,80 @@ impl PipelineManager {
                 new_processor,
             } => self.apply_upgrade(&name, new_processor).await,
             RegistryCommand::DeletePipeline { name } => self.apply_delete(&name).await,
+            // G9.c — Raft-replicated lifecycle ops. Each delegates to the
+            // existing direct method; the cluster_applier triggers the
+            // matching supervisor side-effect on every node after this
+            // returns Ok, so runtime convergence follows the declarative
+            // commit on each pod.
+            RegistryCommand::BlueGreenStart {
+                name,
+                new_processor,
+                actor,
+            } => match self.upgrade_blue_green(&name, new_processor, &actor).await {
+                Ok(()) => RegistryResponse::Ok,
+                Err(e) => RegistryResponse::Error {
+                    message: e.to_string(),
+                },
+            },
+            RegistryCommand::BlueGreenCutover { name, actor } => {
+                match self.cutover(&name, &actor).await {
+                    Ok(()) => RegistryResponse::Ok,
+                    Err(e) => RegistryResponse::Error {
+                        message: e.to_string(),
+                    },
+                }
+            }
+            RegistryCommand::RollbackUpgrade { name, actor } => {
+                match self.rollback_upgrade(&name, &actor).await {
+                    Ok(()) => RegistryResponse::Ok,
+                    Err(e) => RegistryResponse::Error {
+                        message: e.to_string(),
+                    },
+                }
+            }
+            RegistryCommand::CanaryStart {
+                name,
+                new_processor,
+                steps,
+                thresholds,
+                actor,
+            } => match self
+                .upgrade_canary(&name, new_processor, steps, thresholds, &actor)
+                .await
+            {
+                Ok(()) => RegistryResponse::Ok,
+                Err(e) => RegistryResponse::Error {
+                    message: e.to_string(),
+                },
+            },
+            RegistryCommand::CanaryPromote { name, actor } => {
+                match self.promote_canary(&name, &actor).await {
+                    Ok(()) => RegistryResponse::Ok,
+                    Err(e) => RegistryResponse::Error {
+                        message: e.to_string(),
+                    },
+                }
+            }
+            RegistryCommand::ReconfigureSource {
+                name,
+                new_source,
+                actor,
+            } => match self.reconfigure_source(&name, new_source, &actor).await {
+                Ok(()) => RegistryResponse::Ok,
+                Err(e) => RegistryResponse::Error {
+                    message: e.to_string(),
+                },
+            },
+            RegistryCommand::ReconfigureSink {
+                name,
+                new_sink,
+                actor,
+            } => match self.reconfigure_sink(&name, new_sink, &actor).await {
+                Ok(()) => RegistryResponse::Ok,
+                Err(e) => RegistryResponse::Error {
+                    message: e.to_string(),
+                },
+            },
             // Processor commands are handled by ProcessorRegistry
             _ => RegistryResponse::Error {
                 message: "command not handled by PipelineManager".into(),

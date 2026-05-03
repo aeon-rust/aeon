@@ -2148,16 +2148,54 @@ async fn upgrade_blue_green(
         req.processor_name.clone(),
         req.processor_version.clone(),
     );
+
+    // G9.c — replicate the declarative state via Raft so every node
+    // converges on "pipeline X is in blue-green upgrade with green Y."
+    // The cluster_applier on every node also calls
+    // `supervisor.cluster_blue_green_start()` which is declarative-only
+    // on follower nodes today (per-node processor instantiation is
+    // tracked as G9.d). The leader-side runtime swap below still fires
+    // on this node (the one that holds the PipelineControl handle in
+    // `state.pipeline_controls`).
+    #[cfg(feature = "cluster")]
+    if let Some(node) = state.cluster_node.as_ref() {
+        let cmd = aeon_types::RegistryCommand::BlueGreenStart {
+            name: name.clone(),
+            new_processor: proc_ref.clone(),
+            actor: "api".into(),
+        };
+        match node.propose_registry(cmd).await {
+            Ok(aeon_types::RegistryResponse::Error { message }) => {
+                return api_error(StatusCode::BAD_REQUEST, message).into_response();
+            }
+            Ok(_) => {}
+            Err(e) => {
+                return api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+            }
+        }
+    } else {
+        // Standalone mode — direct local update.
+        if let Err(e) = state
+            .pipelines
+            .upgrade_blue_green(&name, proc_ref.clone(), "api")
+            .await
+        {
+            return api_error(StatusCode::BAD_REQUEST, e.to_string()).into_response();
+        }
+    }
+
+    #[cfg(not(feature = "cluster"))]
     if let Err(e) = state
         .pipelines
-        .upgrade_blue_green(&name, proc_ref, "api")
+        .upgrade_blue_green(&name, proc_ref.clone(), "api")
         .await
     {
         return api_error(StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
 
-    // If a managed pipeline control exists, instantiate the green processor
-    // and start real blue-green shadow mode.
+    // Leader-local runtime side-effect — instantiate green and start
+    // shadow mode on the pod that holds the PipelineControl handle.
+    // Other pods see the upgrade declaratively only (G9.d follow-up).
     if let Some(ctrl) = state.pipeline_controls.get(&name) {
         let green = match instantiate_processor(&state, &req.processor_name, &req.processor_version)
             .await
@@ -2172,11 +2210,19 @@ async fn upgrade_blue_green(
             )
             .into_response();
         }
-        Json(serde_json::json!({"status": "blue-green-started", "method": "managed"}))
-            .into_response()
+        Json(serde_json::json!({
+            "status": "blue-green-started",
+            "method": "managed",
+            "replicated": cfg!(feature = "cluster"),
+        }))
+        .into_response()
     } else {
-        Json(serde_json::json!({"status": "blue-green-started", "method": "metadata"}))
-            .into_response()
+        Json(serde_json::json!({
+            "status": "blue-green-started",
+            "method": "metadata",
+            "replicated": cfg!(feature = "cluster"),
+        }))
+        .into_response()
     }
 }
 
@@ -2204,16 +2250,60 @@ async fn upgrade_canary(
         req.processor_version.clone(),
     );
     let initial_pct = req.steps.first().copied().unwrap_or(10);
-    if let Err(e) = state
+
+    // G9.c — Raft-replicate declarative canary state. cluster_applier
+    // calls supervisor.cluster_canary_start on every node (declarative
+    // only on followers — per-node instantiation deferred to G9.d).
+    #[cfg(feature = "cluster")]
+    if let Some(node) = state.cluster_node.as_ref() {
+        let cmd = aeon_types::RegistryCommand::CanaryStart {
+            name: name.clone(),
+            new_processor: proc_ref.clone(),
+            steps: req.steps.clone(),
+            thresholds: req.thresholds,
+            actor: "api".into(),
+        };
+        match node.propose_registry(cmd).await {
+            Ok(aeon_types::RegistryResponse::Error { message }) => {
+                return api_error(StatusCode::BAD_REQUEST, message).into_response();
+            }
+            Ok(_) => {}
+            Err(e) => {
+                return api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+            }
+        }
+    } else if let Err(e) = state
         .pipelines
-        .upgrade_canary(&name, proc_ref, req.steps, req.thresholds, "api")
+        .upgrade_canary(
+            &name,
+            proc_ref.clone(),
+            req.steps.clone(),
+            req.thresholds,
+            "api",
+        )
         .await
     {
         return api_error(StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
 
-    // If a managed pipeline control exists, instantiate the canary processor
-    // and start real traffic splitting.
+    #[cfg(not(feature = "cluster"))]
+    if let Err(e) = state
+        .pipelines
+        .upgrade_canary(
+            &name,
+            proc_ref.clone(),
+            req.steps.clone(),
+            req.thresholds,
+            "api",
+        )
+        .await
+    {
+        return api_error(StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+
+    // Leader-local runtime side-effect — instantiate canary processor
+    // and start real traffic splitting on the pod with the local
+    // PipelineControl handle.
     if let Some(ctrl) = state.pipeline_controls.get(&name) {
         let canary = match instantiate_processor(
             &state,
@@ -2232,9 +2322,19 @@ async fn upgrade_canary(
             )
             .into_response();
         }
-        Json(serde_json::json!({"status": "canary-started", "method": "managed"})).into_response()
+        Json(serde_json::json!({
+            "status": "canary-started",
+            "method": "managed",
+            "replicated": cfg!(feature = "cluster"),
+        }))
+        .into_response()
     } else {
-        Json(serde_json::json!({"status": "canary-started", "method": "metadata"})).into_response()
+        Json(serde_json::json!({
+            "status": "canary-started",
+            "method": "metadata",
+            "replicated": cfg!(feature = "cluster"),
+        }))
+        .into_response()
     }
 }
 
@@ -2242,11 +2342,31 @@ async fn cutover_pipeline(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
+    // G9.c — Raft-replicate the cutover. cluster_applier on every node
+    // calls supervisor.cluster_blue_green_cutover (which fully drives
+    // PipelineControl::cutover_blue_green on whichever pod owns the
+    // local control handle — no instantiation needed for cutover).
+    #[cfg(feature = "cluster")]
+    if let Some(node) = state.cluster_node.as_ref() {
+        let cmd = aeon_types::RegistryCommand::BlueGreenCutover {
+            name: name.clone(),
+            actor: "api".into(),
+        };
+        return match node.propose_registry(cmd).await {
+            Ok(aeon_types::RegistryResponse::Error { message }) => {
+                api_error(StatusCode::BAD_REQUEST, message).into_response()
+            }
+            Ok(_) => Json(serde_json::json!({
+                "status": "cutover-complete",
+                "replicated": true,
+            }))
+            .into_response(),
+            Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        };
+    }
+
     match state.pipelines.cutover(&name, "api").await {
         Ok(()) => {
-            // If a managed pipeline control handle exists, trigger the actual
-            // processor cutover (green → active). This is a no-op if blue-green
-            // wasn't started via PipelineControl (metadata-only mode).
             let method = if let Some(ctrl) = state.pipeline_controls.get(&name) {
                 let _ = ctrl.cutover_blue_green().await;
                 "managed"
@@ -2264,6 +2384,26 @@ async fn rollback_pipeline(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
+    // G9.c — Raft-replicate the rollback. Same pattern as cutover.
+    #[cfg(feature = "cluster")]
+    if let Some(node) = state.cluster_node.as_ref() {
+        let cmd = aeon_types::RegistryCommand::RollbackUpgrade {
+            name: name.clone(),
+            actor: "api".into(),
+        };
+        return match node.propose_registry(cmd).await {
+            Ok(aeon_types::RegistryResponse::Error { message }) => {
+                api_error(StatusCode::BAD_REQUEST, message).into_response()
+            }
+            Ok(_) => Json(serde_json::json!({
+                "status": "rolled-back",
+                "replicated": true,
+            }))
+            .into_response(),
+            Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        };
+    }
+
     match state.pipelines.rollback_upgrade(&name, "api").await {
         Ok(()) => {
             let method = if let Some(ctrl) = state.pipeline_controls.get(&name) {
@@ -2282,27 +2422,54 @@ async fn promote_canary(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    match state.pipelines.promote_canary(&name, "api").await {
-        Ok(()) => {
-            // If managed, check whether the canary is now at 100% and complete it,
-            // or just advance the canary percentage to the next step.
-            let method = if let Some(ctrl) = state.pipeline_controls.get(&name) {
-                // Check if canary is complete (promoted to 100%)
-                if let Some(cs) = state.pipelines.canary_status(&name).await {
-                    if cs.traffic_pct >= 100 {
-                        let _ = ctrl.complete_canary().await;
-                    } else {
-                        let _ = ctrl.set_canary_pct(cs.traffic_pct).await;
-                    }
-                }
-                "managed"
-            } else {
-                "metadata"
-            };
-            Json(serde_json::json!({"status": "promoted", "method": method})).into_response()
+    // G9.c — Raft-replicate the canary promotion. cluster_applier
+    // calls supervisor.cluster_promote_canary on every node
+    // (declarative-only on followers — per-pod traffic-split runtime
+    // change deferred to G9.d). Leader-local runtime traffic-split
+    // change still fires below via pipeline_controls.
+    #[cfg(feature = "cluster")]
+    if let Some(node) = state.cluster_node.as_ref() {
+        let cmd = aeon_types::RegistryCommand::CanaryPromote {
+            name: name.clone(),
+            actor: "api".into(),
+        };
+        match node.propose_registry(cmd).await {
+            Ok(aeon_types::RegistryResponse::Error { message }) => {
+                return api_error(StatusCode::BAD_REQUEST, message).into_response();
+            }
+            Ok(_) => {}
+            Err(e) => {
+                return api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+            }
         }
-        Err(e) => api_error(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    } else if let Err(e) = state.pipelines.promote_canary(&name, "api").await {
+        return api_error(StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
+
+    #[cfg(not(feature = "cluster"))]
+    if let Err(e) = state.pipelines.promote_canary(&name, "api").await {
+        return api_error(StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+
+    // Leader-local runtime traffic-split change.
+    let method = if let Some(ctrl) = state.pipeline_controls.get(&name) {
+        if let Some(cs) = state.pipelines.canary_status(&name).await {
+            if cs.traffic_pct >= 100 {
+                let _ = ctrl.complete_canary().await;
+            } else {
+                let _ = ctrl.set_canary_pct(cs.traffic_pct).await;
+            }
+        }
+        "managed"
+    } else {
+        "metadata"
+    };
+    Json(serde_json::json!({
+        "status": "promoted",
+        "method": method,
+        "replicated": cfg!(feature = "cluster"),
+    }))
+    .into_response()
 }
 
 async fn canary_status(
@@ -2338,6 +2505,29 @@ async fn reconfigure_source(
     Path(name): Path<String>,
     Json(new_source): Json<aeon_types::registry::SourceConfig>,
 ) -> impl IntoResponse {
+    // G9.c — Raft-replicate the new SourceConfig. cluster_applier
+    // calls supervisor.cluster_reconfigure_source (declarative-only on
+    // followers — per-pod connector re-instantiation deferred to G9.d).
+    #[cfg(feature = "cluster")]
+    if let Some(node) = state.cluster_node.as_ref() {
+        let cmd = aeon_types::RegistryCommand::ReconfigureSource {
+            name: name.clone(),
+            new_source,
+            actor: "api".into(),
+        };
+        return match node.propose_registry(cmd).await {
+            Ok(aeon_types::RegistryResponse::Error { message }) => {
+                api_error(StatusCode::BAD_REQUEST, message).into_response()
+            }
+            Ok(_) => Json(serde_json::json!({
+                "status": "source-reconfigured",
+                "replicated": true,
+            }))
+            .into_response(),
+            Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        };
+    }
+
     match state
         .pipelines
         .reconfigure_source(&name, new_source, "api")
@@ -2353,6 +2543,28 @@ async fn reconfigure_sink(
     Path(name): Path<String>,
     Json(new_sink): Json<aeon_types::registry::SinkConfig>,
 ) -> impl IntoResponse {
+    // G9.c — Raft-replicate the new SinkConfig. Same pattern as
+    // reconfigure_source.
+    #[cfg(feature = "cluster")]
+    if let Some(node) = state.cluster_node.as_ref() {
+        let cmd = aeon_types::RegistryCommand::ReconfigureSink {
+            name: name.clone(),
+            new_sink,
+            actor: "api".into(),
+        };
+        return match node.propose_registry(cmd).await {
+            Ok(aeon_types::RegistryResponse::Error { message }) => {
+                api_error(StatusCode::BAD_REQUEST, message).into_response()
+            }
+            Ok(_) => Json(serde_json::json!({
+                "status": "sink-reconfigured",
+                "replicated": true,
+            }))
+            .into_response(),
+            Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        };
+    }
+
     match state
         .pipelines
         .reconfigure_sink(&name, new_sink, "api")

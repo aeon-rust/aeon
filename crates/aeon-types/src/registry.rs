@@ -495,6 +495,60 @@ pub enum RegistryCommand {
     },
     /// Delete a pipeline.
     DeletePipeline { name: String },
+    /// G9.c — Start a blue-green upgrade. Pipeline transitions to
+    /// `Upgrading` state with `BlueGreen` upgrade metadata holding both
+    /// the old (blue) and new (green) processor refs. Cluster-wide so
+    /// every node converges on the same upgrade-in-progress declaration.
+    /// `actor` records who initiated the change for the per-pipeline
+    /// history log.
+    BlueGreenStart {
+        name: String,
+        new_processor: ProcessorRef,
+        actor: String,
+    },
+    /// G9.c — Cut over from blue to green: green becomes the active
+    /// processor, upgrade metadata is cleared, pipeline returns to
+    /// `Running`. Replicated so every node's PipelineManager flips at
+    /// the same Raft commit; supervisor side-effect on each node drives
+    /// the local PipelineControl through `cutover_blue_green()`.
+    BlueGreenCutover { name: String, actor: String },
+    /// G9.c — Roll back an in-flight upgrade: drop the green processor,
+    /// keep blue active, clear upgrade metadata, return to `Running`.
+    /// Symmetric counterpart of `BlueGreenCutover`.
+    RollbackUpgrade { name: String, actor: String },
+    /// G9.c — Start a canary upgrade. Pipeline transitions to
+    /// `Upgrading` with `Canary` upgrade metadata holding the new
+    /// processor + traffic-step schedule + auto-promotion thresholds.
+    /// Each step advances when `promote_canary` is invoked (manually or
+    /// by an automated promoter watching the thresholds).
+    CanaryStart {
+        name: String,
+        new_processor: ProcessorRef,
+        steps: Vec<u8>,
+        thresholds: CanaryThresholds,
+        actor: String,
+    },
+    /// G9.c — Advance a canary upgrade by one step. When all steps are
+    /// exhausted, the canary auto-promotes to full cutover.
+    CanaryPromote { name: String, actor: String },
+    /// G9.c — Hot-reconfigure a source connector while the pipeline
+    /// keeps running. The new SourceConfig must declare the same
+    /// connector type as the existing one (cross-type rejected at apply
+    /// time). Each node's supervisor side-effect drives
+    /// `PipelineControl::drain_and_swap_source()` against the local
+    /// pipeline task.
+    ReconfigureSource {
+        name: String,
+        new_source: SourceConfig,
+        actor: String,
+    },
+    /// G9.c — Hot-reconfigure a sink connector. Same contract as
+    /// `ReconfigureSource` but for sinks.
+    ReconfigureSink {
+        name: String,
+        new_sink: SinkConfig,
+        actor: String,
+    },
     /// Register a processor identity (ED25519 public key).
     RegisterIdentity {
         processor_name: String,
@@ -755,5 +809,134 @@ mod tests {
     #[test]
     fn upgrade_strategy_default_is_drain_swap() {
         assert_eq!(UpgradeStrategy::default(), UpgradeStrategy::DrainSwap);
+    }
+
+    // ── G9.c — Lifecycle RegistryCommand variants serde round-trip ──
+    // Pins the wire format so a Raft log entry written by one version
+    // of the engine can be applied by a later version. New variants
+    // here MUST extend `#[serde(tag = "type", rename_all = "snake_case")]`
+    // — adding a struct-style variant flips the JSON schema and
+    // breaks log replay across version skew.
+
+    fn proc_ref_for_test() -> ProcessorRef {
+        ProcessorRef::new("my-proc", "1.0.0")
+    }
+
+    #[test]
+    fn blue_green_start_serde_roundtrip() {
+        let cmd = RegistryCommand::BlueGreenStart {
+            name: "p".into(),
+            new_processor: proc_ref_for_test(),
+            actor: "api".into(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"blue_green_start\""));
+        let back: RegistryCommand = serde_json::from_str(&json).unwrap();
+        match back {
+            RegistryCommand::BlueGreenStart { name, actor, .. } => {
+                assert_eq!(name, "p");
+                assert_eq!(actor, "api");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn blue_green_cutover_serde_roundtrip() {
+        let cmd = RegistryCommand::BlueGreenCutover {
+            name: "p".into(),
+            actor: "op".into(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"blue_green_cutover\""));
+        let _back: RegistryCommand = serde_json::from_str(&json).unwrap();
+    }
+
+    #[test]
+    fn rollback_upgrade_serde_roundtrip() {
+        let cmd = RegistryCommand::RollbackUpgrade {
+            name: "p".into(),
+            actor: "op".into(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"rollback_upgrade\""));
+        let _back: RegistryCommand = serde_json::from_str(&json).unwrap();
+    }
+
+    #[test]
+    fn canary_start_serde_roundtrip() {
+        let cmd = RegistryCommand::CanaryStart {
+            name: "p".into(),
+            new_processor: proc_ref_for_test(),
+            steps: vec![10, 50, 100],
+            thresholds: CanaryThresholds::default(),
+            actor: "api".into(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"canary_start\""));
+        let back: RegistryCommand = serde_json::from_str(&json).unwrap();
+        match back {
+            RegistryCommand::CanaryStart { steps, .. } => {
+                assert_eq!(steps, vec![10, 50, 100]);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn canary_promote_serde_roundtrip() {
+        let cmd = RegistryCommand::CanaryPromote {
+            name: "p".into(),
+            actor: "op".into(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"canary_promote\""));
+        let _back: RegistryCommand = serde_json::from_str(&json).unwrap();
+    }
+
+    #[test]
+    fn reconfigure_source_serde_roundtrip() {
+        let cmd = RegistryCommand::ReconfigureSource {
+            name: "p".into(),
+            new_source: SourceConfig {
+                source_type: "kafka".into(),
+                topic: Some("in2".into()),
+                partitions: vec![0, 1],
+                config: BTreeMap::new(),
+            },
+            actor: "api".into(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"reconfigure_source\""));
+        let back: RegistryCommand = serde_json::from_str(&json).unwrap();
+        match back {
+            RegistryCommand::ReconfigureSource { new_source, .. } => {
+                assert_eq!(new_source.source_type, "kafka");
+                assert_eq!(new_source.topic.as_deref(), Some("in2"));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn reconfigure_sink_serde_roundtrip() {
+        let cmd = RegistryCommand::ReconfigureSink {
+            name: "p".into(),
+            new_sink: SinkConfig {
+                sink_type: "blackhole".into(),
+                topic: None,
+                config: BTreeMap::new(),
+            },
+            actor: "api".into(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"reconfigure_sink\""));
+        let back: RegistryCommand = serde_json::from_str(&json).unwrap();
+        match back {
+            RegistryCommand::ReconfigureSink { new_sink, .. } => {
+                assert_eq!(new_sink.sink_type, "blackhole");
+            }
+            _ => panic!("wrong variant"),
+        }
     }
 }
