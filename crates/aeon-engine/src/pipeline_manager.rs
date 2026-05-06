@@ -51,38 +51,50 @@ impl PipelineManager {
             // matching supervisor side-effect on every node after this
             // returns Ok, so runtime convergence follows the declarative
             // commit on each pod.
+            //
+            // G9.d — variants now carry a `boundaries` per-partition PoH
+            // sequence map. PipelineManager tracks declarative state only,
+            // so it ignores the field; the cluster_applier reads it and
+            // passes it to PipelineControl::drain_partitions_at_seq before
+            // driving the runtime side-effect on each node.
             RegistryCommand::BlueGreenStart {
                 name,
                 new_processor,
                 actor,
+                boundaries: _,
             } => match self.upgrade_blue_green(&name, new_processor, &actor).await {
                 Ok(()) => RegistryResponse::Ok,
                 Err(e) => RegistryResponse::Error {
                     message: e.to_string(),
                 },
             },
-            RegistryCommand::BlueGreenCutover { name, actor } => {
-                match self.cutover(&name, &actor).await {
-                    Ok(()) => RegistryResponse::Ok,
-                    Err(e) => RegistryResponse::Error {
-                        message: e.to_string(),
-                    },
-                }
-            }
-            RegistryCommand::RollbackUpgrade { name, actor } => {
-                match self.rollback_upgrade(&name, &actor).await {
-                    Ok(()) => RegistryResponse::Ok,
-                    Err(e) => RegistryResponse::Error {
-                        message: e.to_string(),
-                    },
-                }
-            }
+            RegistryCommand::BlueGreenCutover {
+                name,
+                actor,
+                boundaries: _,
+            } => match self.cutover(&name, &actor).await {
+                Ok(()) => RegistryResponse::Ok,
+                Err(e) => RegistryResponse::Error {
+                    message: e.to_string(),
+                },
+            },
+            RegistryCommand::RollbackUpgrade {
+                name,
+                actor,
+                boundaries: _,
+            } => match self.rollback_upgrade(&name, &actor).await {
+                Ok(()) => RegistryResponse::Ok,
+                Err(e) => RegistryResponse::Error {
+                    message: e.to_string(),
+                },
+            },
             RegistryCommand::CanaryStart {
                 name,
                 new_processor,
                 steps,
                 thresholds,
                 actor,
+                boundaries: _,
             } => match self
                 .upgrade_canary(&name, new_processor, steps, thresholds, &actor)
                 .await
@@ -92,18 +104,21 @@ impl PipelineManager {
                     message: e.to_string(),
                 },
             },
-            RegistryCommand::CanaryPromote { name, actor } => {
-                match self.promote_canary(&name, &actor).await {
-                    Ok(()) => RegistryResponse::Ok,
-                    Err(e) => RegistryResponse::Error {
-                        message: e.to_string(),
-                    },
-                }
-            }
+            RegistryCommand::CanaryPromote {
+                name,
+                actor,
+                boundaries: _,
+            } => match self.promote_canary(&name, &actor).await {
+                Ok(()) => RegistryResponse::Ok,
+                Err(e) => RegistryResponse::Error {
+                    message: e.to_string(),
+                },
+            },
             RegistryCommand::ReconfigureSource {
                 name,
                 new_source,
                 actor,
+                boundaries: _,
             } => match self.reconfigure_source(&name, new_source, &actor).await {
                 Ok(()) => RegistryResponse::Ok,
                 Err(e) => RegistryResponse::Error {
@@ -114,6 +129,7 @@ impl PipelineManager {
                 name,
                 new_sink,
                 actor,
+                boundaries: _,
             } => match self.reconfigure_sink(&name, new_sink, &actor).await {
                 Ok(()) => RegistryResponse::Ok,
                 Err(e) => RegistryResponse::Error {

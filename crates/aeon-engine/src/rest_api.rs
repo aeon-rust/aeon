@@ -2159,10 +2159,14 @@ async fn upgrade_blue_green(
     // `state.pipeline_controls`).
     #[cfg(feature = "cluster")]
     if let Some(node) = state.cluster_node.as_ref() {
+        // G9.d — Per-partition sequence-bounded boundaries are computed
+        // here (leader-side, pre-propose) when LivePohChainRegistry is
+        // installed; an empty map preserves G9.c immediate-on-apply.
         let cmd = aeon_types::RegistryCommand::BlueGreenStart {
             name: name.clone(),
             new_processor: proc_ref.clone(),
             actor: "api".into(),
+            boundaries: std::collections::BTreeMap::new(),
         };
         match node.propose_registry(cmd).await {
             Ok(aeon_types::RegistryResponse::Error { message }) => {
@@ -2256,12 +2260,15 @@ async fn upgrade_canary(
     // only on followers — per-node instantiation deferred to G9.d).
     #[cfg(feature = "cluster")]
     if let Some(node) = state.cluster_node.as_ref() {
+        // G9.d — boundaries empty for now; sequence-bounded transitions
+        // are computed once LivePohChainRegistry is wired here.
         let cmd = aeon_types::RegistryCommand::CanaryStart {
             name: name.clone(),
             new_processor: proc_ref.clone(),
             steps: req.steps.clone(),
             thresholds: req.thresholds,
             actor: "api".into(),
+            boundaries: std::collections::BTreeMap::new(),
         };
         match node.propose_registry(cmd).await {
             Ok(aeon_types::RegistryResponse::Error { message }) => {
@@ -2348,9 +2355,12 @@ async fn cutover_pipeline(
     // local control handle — no instantiation needed for cutover).
     #[cfg(feature = "cluster")]
     if let Some(node) = state.cluster_node.as_ref() {
+        // G9.d — boundaries empty until per-partition sequence-bounded
+        // cutover lands.
         let cmd = aeon_types::RegistryCommand::BlueGreenCutover {
             name: name.clone(),
             actor: "api".into(),
+            boundaries: std::collections::BTreeMap::new(),
         };
         return match node.propose_registry(cmd).await {
             Ok(aeon_types::RegistryResponse::Error { message }) => {
@@ -2387,9 +2397,11 @@ async fn rollback_pipeline(
     // G9.c — Raft-replicate the rollback. Same pattern as cutover.
     #[cfg(feature = "cluster")]
     if let Some(node) = state.cluster_node.as_ref() {
+        // G9.d — boundaries empty for now.
         let cmd = aeon_types::RegistryCommand::RollbackUpgrade {
             name: name.clone(),
             actor: "api".into(),
+            boundaries: std::collections::BTreeMap::new(),
         };
         return match node.propose_registry(cmd).await {
             Ok(aeon_types::RegistryResponse::Error { message }) => {
@@ -2429,9 +2441,12 @@ async fn promote_canary(
     // change still fires below via pipeline_controls.
     #[cfg(feature = "cluster")]
     if let Some(node) = state.cluster_node.as_ref() {
+        // G9.d — boundaries empty until per-pod traffic-split runtime
+        // change is sequence-bounded.
         let cmd = aeon_types::RegistryCommand::CanaryPromote {
             name: name.clone(),
             actor: "api".into(),
+            boundaries: std::collections::BTreeMap::new(),
         };
         match node.propose_registry(cmd).await {
             Ok(aeon_types::RegistryResponse::Error { message }) => {
@@ -2510,10 +2525,13 @@ async fn reconfigure_source(
     // followers — per-pod connector re-instantiation deferred to G9.d).
     #[cfg(feature = "cluster")]
     if let Some(node) = state.cluster_node.as_ref() {
+        // G9.d — boundaries empty until per-pod connector
+        // re-instantiation is sequence-bounded.
         let cmd = aeon_types::RegistryCommand::ReconfigureSource {
             name: name.clone(),
             new_source,
             actor: "api".into(),
+            boundaries: std::collections::BTreeMap::new(),
         };
         return match node.propose_registry(cmd).await {
             Ok(aeon_types::RegistryResponse::Error { message }) => {
@@ -2547,10 +2565,12 @@ async fn reconfigure_sink(
     // reconfigure_source.
     #[cfg(feature = "cluster")]
     if let Some(node) = state.cluster_node.as_ref() {
+        // G9.d — boundaries empty for now.
         let cmd = aeon_types::RegistryCommand::ReconfigureSink {
             name: name.clone(),
             new_sink,
             actor: "api".into(),
+            boundaries: std::collections::BTreeMap::new(),
         };
         return match node.propose_registry(cmd).await {
             Ok(aeon_types::RegistryResponse::Error { message }) => {

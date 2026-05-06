@@ -188,9 +188,7 @@ impl RegistryApplier for ClusterRegistryApplier {
                     resp
                 }
                 RegistryCommand::ReconfigureSource {
-                    name,
-                    new_source,
-                    ..
+                    name, new_source, ..
                 } => {
                     let target_name = name.clone();
                     let new_src = new_source.clone();
@@ -210,11 +208,7 @@ impl RegistryApplier for ClusterRegistryApplier {
                     }
                     resp
                 }
-                RegistryCommand::ReconfigureSink {
-                    name,
-                    new_sink,
-                    ..
-                } => {
+                RegistryCommand::ReconfigureSink { name, new_sink, .. } => {
                     let target_name = name.clone();
                     let new_sk = new_sink.clone();
                     let resp = pipelines.apply(cmd).await;

@@ -3,10 +3,73 @@
 //! These types are Raft-replicated — every node in the cluster holds the
 //! same registry and pipeline state. Serialized via serde for Raft log entries.
 
+use crate::partition::PartitionId;
 use crate::processor_identity::ProcessorIdentity;
 use crate::processor_transport::{ProcessorBinding, ProcessorConnectionConfig};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+
+/// G9.d — Per-partition Raft-committed sequence boundaries for
+/// processor lifecycle transitions.
+///
+/// Carries `(partition → PoH sequence)` pairs that name *exactly* the
+/// in-stream point at which a per-partition transition must apply.
+/// Set by the leader before propose (read from
+/// `LivePohChainRegistry::sequence()` per partition); honoured on every
+/// node by `PipelineControl::drain_partitions_at_seq` after Raft commit.
+///
+/// Empty (the default) preserves G9.c behaviour: the variant transitions
+/// immediately on apply with no per-partition draining. v0.1 log entries
+/// without this field deserialise to an empty map via `#[serde(default)]`,
+/// so log replay across the v0.1 → v0.2 boundary stays correct.
+///
+/// `BTreeMap` (not `HashMap`) so the on-wire ordering is deterministic —
+/// two engines applying the same Raft entry must produce byte-identical
+/// state-machine snapshots.
+pub type PartitionBoundaries = BTreeMap<PartitionId, u64>;
+
+/// G9.d — Custom serde for [`PartitionBoundaries`] that survives the
+/// JSON map-key constraint.
+///
+/// JSON object keys must be strings, but `PartitionId` is a
+/// `#[derive(Serialize, Deserialize)]` newtype around `u16` — its
+/// `Deserialize` impl rejects strings. Without this helper, a JSON
+/// round-trip of any non-empty boundary map fails at `from_str` time
+/// with `invalid type: string "0", expected u16`.
+///
+/// The helper stringifies the `u16` on the way out and parses it back on
+/// the way in, leaving bincode (the wire format used by Raft log
+/// entries in production) untouched on the value type.
+mod boundaries_serde {
+    use super::PartitionBoundaries;
+    use crate::partition::PartitionId;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::collections::BTreeMap;
+
+    pub fn serialize<S>(b: &PartitionBoundaries, s: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let stringified: BTreeMap<String, u64> = b
+            .iter()
+            .map(|(p, seq)| (p.as_u16().to_string(), *seq))
+            .collect();
+        stringified.serialize(s)
+    }
+
+    pub fn deserialize<'de, D>(d: D) -> Result<PartitionBoundaries, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let stringified: BTreeMap<String, u64> = BTreeMap::deserialize(d)?;
+        let mut out = PartitionBoundaries::new();
+        for (k, v) in stringified {
+            let id: u16 = k.parse().map_err(serde::de::Error::custom)?;
+            out.insert(PartitionId::new(id), v);
+        }
+        Ok(out)
+    }
+}
 
 // ── Processor Registry ─────────────────────────────────────────────────
 
@@ -501,53 +564,133 @@ pub enum RegistryCommand {
     /// every node converges on the same upgrade-in-progress declaration.
     /// `actor` records who initiated the change for the per-pipeline
     /// history log.
+    ///
+    /// G9.d — `boundaries` names the per-partition PoH sequence at
+    /// which the green processor takes over reading. Empty map
+    /// preserves G9.c immediate-on-apply semantics; non-empty triggers
+    /// `PipelineControl::drain_partitions_at_seq` on every node.
     BlueGreenStart {
         name: String,
         new_processor: ProcessorRef,
         actor: String,
+        #[serde(
+            default,
+            skip_serializing_if = "BTreeMap::is_empty",
+            with = "boundaries_serde"
+        )]
+        boundaries: PartitionBoundaries,
     },
     /// G9.c — Cut over from blue to green: green becomes the active
     /// processor, upgrade metadata is cleared, pipeline returns to
     /// `Running`. Replicated so every node's PipelineManager flips at
     /// the same Raft commit; supervisor side-effect on each node drives
     /// the local PipelineControl through `cutover_blue_green()`.
-    BlueGreenCutover { name: String, actor: String },
+    ///
+    /// G9.d — `boundaries` names the per-partition PoH sequence at
+    /// which the cut-over actually applies. Empty preserves G9.c
+    /// immediate-on-apply.
+    BlueGreenCutover {
+        name: String,
+        actor: String,
+        #[serde(
+            default,
+            skip_serializing_if = "BTreeMap::is_empty",
+            with = "boundaries_serde"
+        )]
+        boundaries: PartitionBoundaries,
+    },
     /// G9.c — Roll back an in-flight upgrade: drop the green processor,
     /// keep blue active, clear upgrade metadata, return to `Running`.
     /// Symmetric counterpart of `BlueGreenCutover`.
-    RollbackUpgrade { name: String, actor: String },
+    ///
+    /// G9.d — `boundaries` names the per-partition PoH sequence at
+    /// which the rollback applies on each node. Empty preserves G9.c
+    /// immediate-on-apply.
+    RollbackUpgrade {
+        name: String,
+        actor: String,
+        #[serde(
+            default,
+            skip_serializing_if = "BTreeMap::is_empty",
+            with = "boundaries_serde"
+        )]
+        boundaries: PartitionBoundaries,
+    },
     /// G9.c — Start a canary upgrade. Pipeline transitions to
     /// `Upgrading` with `Canary` upgrade metadata holding the new
     /// processor + traffic-step schedule + auto-promotion thresholds.
     /// Each step advances when `promote_canary` is invoked (manually or
     /// by an automated promoter watching the thresholds).
+    ///
+    /// G9.d — `boundaries` names the per-partition PoH sequence at
+    /// which the canary processor begins receiving its traffic split.
+    /// Empty preserves G9.c immediate-on-apply.
     CanaryStart {
         name: String,
         new_processor: ProcessorRef,
         steps: Vec<u8>,
         thresholds: CanaryThresholds,
         actor: String,
+        #[serde(
+            default,
+            skip_serializing_if = "BTreeMap::is_empty",
+            with = "boundaries_serde"
+        )]
+        boundaries: PartitionBoundaries,
     },
     /// G9.c — Advance a canary upgrade by one step. When all steps are
     /// exhausted, the canary auto-promotes to full cutover.
-    CanaryPromote { name: String, actor: String },
+    ///
+    /// G9.d — `boundaries` names the per-partition PoH sequence at
+    /// which the new traffic split applies. Empty preserves G9.c
+    /// immediate-on-apply.
+    CanaryPromote {
+        name: String,
+        actor: String,
+        #[serde(
+            default,
+            skip_serializing_if = "BTreeMap::is_empty",
+            with = "boundaries_serde"
+        )]
+        boundaries: PartitionBoundaries,
+    },
     /// G9.c — Hot-reconfigure a source connector while the pipeline
     /// keeps running. The new SourceConfig must declare the same
     /// connector type as the existing one (cross-type rejected at apply
     /// time). Each node's supervisor side-effect drives
     /// `PipelineControl::drain_and_swap_source()` against the local
     /// pipeline task.
+    ///
+    /// G9.d — `boundaries` names the per-partition PoH sequence at
+    /// which the new source takes over fetching. Empty preserves G9.c
+    /// immediate-on-apply.
     ReconfigureSource {
         name: String,
         new_source: SourceConfig,
         actor: String,
+        #[serde(
+            default,
+            skip_serializing_if = "BTreeMap::is_empty",
+            with = "boundaries_serde"
+        )]
+        boundaries: PartitionBoundaries,
     },
     /// G9.c — Hot-reconfigure a sink connector. Same contract as
     /// `ReconfigureSource` but for sinks.
+    ///
+    /// G9.d — `boundaries` names the per-partition PoH sequence at
+    /// which the new sink takes over writing. Empty preserves G9.c
+    /// immediate-on-apply.
     ReconfigureSink {
         name: String,
         new_sink: SinkConfig,
         actor: String,
+        #[serde(
+            default,
+            skip_serializing_if = "BTreeMap::is_empty",
+            with = "boundaries_serde"
+        )]
+        boundaries: PartitionBoundaries,
     },
     /// Register a processor identity (ED25519 public key).
     RegisterIdentity {
@@ -828,14 +971,24 @@ mod tests {
             name: "p".into(),
             new_processor: proc_ref_for_test(),
             actor: "api".into(),
+            boundaries: PartitionBoundaries::new(),
         };
         let json = serde_json::to_string(&cmd).unwrap();
         assert!(json.contains("\"type\":\"blue_green_start\""));
+        // Empty boundaries must NOT appear on the wire — preserves
+        // byte-identical output with v0.1 log entries.
+        assert!(!json.contains("boundaries"));
         let back: RegistryCommand = serde_json::from_str(&json).unwrap();
         match back {
-            RegistryCommand::BlueGreenStart { name, actor, .. } => {
+            RegistryCommand::BlueGreenStart {
+                name,
+                actor,
+                boundaries,
+                ..
+            } => {
                 assert_eq!(name, "p");
                 assert_eq!(actor, "api");
+                assert!(boundaries.is_empty());
             }
             _ => panic!("wrong variant"),
         }
@@ -846,9 +999,11 @@ mod tests {
         let cmd = RegistryCommand::BlueGreenCutover {
             name: "p".into(),
             actor: "op".into(),
+            boundaries: PartitionBoundaries::new(),
         };
         let json = serde_json::to_string(&cmd).unwrap();
         assert!(json.contains("\"type\":\"blue_green_cutover\""));
+        assert!(!json.contains("boundaries"));
         let _back: RegistryCommand = serde_json::from_str(&json).unwrap();
     }
 
@@ -857,6 +1012,7 @@ mod tests {
         let cmd = RegistryCommand::RollbackUpgrade {
             name: "p".into(),
             actor: "op".into(),
+            boundaries: PartitionBoundaries::new(),
         };
         let json = serde_json::to_string(&cmd).unwrap();
         assert!(json.contains("\"type\":\"rollback_upgrade\""));
@@ -871,6 +1027,7 @@ mod tests {
             steps: vec![10, 50, 100],
             thresholds: CanaryThresholds::default(),
             actor: "api".into(),
+            boundaries: PartitionBoundaries::new(),
         };
         let json = serde_json::to_string(&cmd).unwrap();
         assert!(json.contains("\"type\":\"canary_start\""));
@@ -888,6 +1045,7 @@ mod tests {
         let cmd = RegistryCommand::CanaryPromote {
             name: "p".into(),
             actor: "op".into(),
+            boundaries: PartitionBoundaries::new(),
         };
         let json = serde_json::to_string(&cmd).unwrap();
         assert!(json.contains("\"type\":\"canary_promote\""));
@@ -905,6 +1063,7 @@ mod tests {
                 config: BTreeMap::new(),
             },
             actor: "api".into(),
+            boundaries: PartitionBoundaries::new(),
         };
         let json = serde_json::to_string(&cmd).unwrap();
         assert!(json.contains("\"type\":\"reconfigure_source\""));
@@ -928,6 +1087,7 @@ mod tests {
                 config: BTreeMap::new(),
             },
             actor: "api".into(),
+            boundaries: PartitionBoundaries::new(),
         };
         let json = serde_json::to_string(&cmd).unwrap();
         assert!(json.contains("\"type\":\"reconfigure_sink\""));
@@ -935,6 +1095,134 @@ mod tests {
         match back {
             RegistryCommand::ReconfigureSink { new_sink, .. } => {
                 assert_eq!(new_sink.sink_type, "blackhole");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    // ── G9.d — Boundary-map backward + forward compatibility ──
+    // A v0.1 Raft log entry (G9.c shape, no `boundaries` field) MUST
+    // deserialize cleanly into the v0.2 shape with an empty map. A v0.2
+    // entry with a populated map MUST round-trip its keys and values
+    // intact. Each test pins the wire shape for one of the seven
+    // lifecycle variants — drift here breaks log replay across the
+    // version skew that an in-place rolling upgrade introduces.
+
+    /// G9.c-shape JSON (no `boundaries` key) replays into the v0.2
+    /// variant with an empty `PartitionBoundaries`.
+    #[test]
+    fn g9c_blue_green_start_replays_into_v2_with_empty_boundaries() {
+        let v01_json = r#"{
+            "type": "blue_green_start",
+            "name": "p",
+            "new_processor": { "name": "my-proc", "version": "1.0.0" },
+            "actor": "api"
+        }"#;
+        let cmd: RegistryCommand = serde_json::from_str(v01_json).unwrap();
+        match cmd {
+            RegistryCommand::BlueGreenStart { boundaries, .. } => {
+                assert!(boundaries.is_empty());
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    /// Same backward-compat assertion across the other six variants.
+    #[test]
+    fn g9c_lifecycle_variants_all_replay_with_empty_boundaries() {
+        let cases = [
+            (
+                r#"{"type": "blue_green_cutover", "name": "p", "actor": "api"}"#,
+                "blue_green_cutover",
+            ),
+            (
+                r#"{"type": "rollback_upgrade", "name": "p", "actor": "api"}"#,
+                "rollback_upgrade",
+            ),
+            (
+                r#"{
+                    "type": "canary_start",
+                    "name": "p",
+                    "new_processor": { "name": "my-proc", "version": "1.0.0" },
+                    "steps": [10, 50, 100],
+                    "thresholds": {},
+                    "actor": "api"
+                }"#,
+                "canary_start",
+            ),
+            (
+                r#"{"type": "canary_promote", "name": "p", "actor": "api"}"#,
+                "canary_promote",
+            ),
+            (
+                r#"{
+                    "type": "reconfigure_source",
+                    "name": "p",
+                    "new_source": {
+                        "type": "kafka",
+                        "topic": "in",
+                        "partitions": [0, 1],
+                        "config": {}
+                    },
+                    "actor": "api"
+                }"#,
+                "reconfigure_source",
+            ),
+            (
+                r#"{
+                    "type": "reconfigure_sink",
+                    "name": "p",
+                    "new_sink": { "type": "blackhole", "config": {} },
+                    "actor": "api"
+                }"#,
+                "reconfigure_sink",
+            ),
+        ];
+        for (json, label) in cases {
+            let cmd: RegistryCommand = serde_json::from_str(json)
+                .unwrap_or_else(|e| panic!("{label} v0.1 replay failed: {e}"));
+            let boundaries = match cmd {
+                RegistryCommand::BlueGreenCutover { boundaries, .. }
+                | RegistryCommand::RollbackUpgrade { boundaries, .. }
+                | RegistryCommand::CanaryStart { boundaries, .. }
+                | RegistryCommand::CanaryPromote { boundaries, .. }
+                | RegistryCommand::ReconfigureSource { boundaries, .. }
+                | RegistryCommand::ReconfigureSink { boundaries, .. } => boundaries,
+                _ => panic!("{label}: unexpected variant"),
+            };
+            assert!(
+                boundaries.is_empty(),
+                "{label}: empty boundaries on v0.1 replay"
+            );
+        }
+    }
+
+    /// A v0.2 entry with a populated `boundaries` map round-trips its
+    /// (partition → sequence) pairs intact. BTreeMap iteration order is
+    /// deterministic so the on-wire bytes are stable across runs.
+    #[test]
+    fn g9d_populated_boundaries_round_trip() {
+        let mut boundaries = PartitionBoundaries::new();
+        boundaries.insert(PartitionId::new(0), 1234);
+        boundaries.insert(PartitionId::new(7), u64::MAX);
+        let cmd = RegistryCommand::BlueGreenCutover {
+            name: "p".into(),
+            actor: "api".into(),
+            boundaries: boundaries.clone(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        // Non-empty map MUST appear on the wire (skip-if-empty toggles off).
+        assert!(json.contains("boundaries"));
+        let back: RegistryCommand = serde_json::from_str(&json).unwrap();
+        match back {
+            RegistryCommand::BlueGreenCutover {
+                boundaries: round_tripped,
+                ..
+            } => {
+                assert_eq!(round_tripped, boundaries);
+                assert_eq!(round_tripped.len(), 2);
+                assert_eq!(round_tripped.get(&PartitionId::new(0)), Some(&1234));
+                assert_eq!(round_tripped.get(&PartitionId::new(7)), Some(&u64::MAX));
             }
             _ => panic!("wrong variant"),
         }
