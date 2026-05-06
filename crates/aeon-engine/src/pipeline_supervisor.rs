@@ -34,7 +34,7 @@ use std::sync::{Arc, OnceLock};
 use aeon_crypto::kek::KekHandle;
 use aeon_types::durability::DurabilityMode;
 use aeon_types::error::AeonError;
-use aeon_types::registry::PipelineDefinition;
+use aeon_types::registry::{PartitionBoundaries, PipelineDefinition};
 use aeon_types::traits::Sink;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
@@ -717,6 +717,15 @@ impl PipelineSupervisor {
     // upgrade in metadata without needing to drive a runtime swap they
     // can't perform.
     //
+    // G9.d.c.1 — every method now accepts a `boundaries:
+    // &PartitionBoundaries` arg. When non-empty, `drain_at_boundaries`
+    // calls `cluster_boundaries::drain_partitions_at_seq` to await each
+    // partition's PoH chain crossing its target sequence and then
+    // freeze the per-partition write gate, so the runtime side-effect
+    // applies at exactly the same logical point on every node. Empty
+    // map (G9.c default + v0.1 log replay) preserves
+    // immediate-on-apply.
+    //
     // Methods that do NOT need processor/connector instantiation (the
     // bookkeeping ops — cutover, rollback, promote) are fully
     // implemented here. Methods that DO need instantiation (start
@@ -724,7 +733,7 @@ impl PipelineSupervisor {
     // source/sink) currently emit a warn and rely on the leader's REST
     // handler for the runtime side-effect — declarative state still
     // replicates correctly. Full instantiation-on-every-node is
-    // tracked as G9.d (the Layer 4 sequence-bounded transitions atom).
+    // tracked as G9.d.c.2 (the per-pod processor build atom).
 
     /// G9.c — Look up the local PipelineControl handle for `pipeline`.
     /// Returns `None` if the pipeline isn't running on this node, which
@@ -738,10 +747,54 @@ impl PipelineSupervisor {
             .map(|rp| Arc::clone(&rp.control))
     }
 
+    /// G9.d.c.1 — Drive the per-partition sequence-bounded drain
+    /// before a runtime side-effect applies on this node. Empty
+    /// `boundaries` is a no-op (G9.c immediate-on-apply path); a
+    /// populated map waits for each `chain.sequence() >= target_seq`
+    /// then freezes the per-partition write gate.
+    ///
+    /// Conditional on `cluster + processor-auth` because the
+    /// underlying registries (`LivePohChainRegistry`,
+    /// `WriteGateRegistry`) only exist when partition-aware
+    /// transitions are wired in. Without those features, boundaries
+    /// can't carry meaning anyway — single-node / non-cluster builds
+    /// silently ignore the field.
+    async fn drain_at_boundaries(
+        &self,
+        pipeline: &str,
+        boundaries: &PartitionBoundaries,
+    ) -> Result<(), AeonError> {
+        #[cfg(all(feature = "processor-auth", feature = "cluster"))]
+        {
+            crate::cluster_boundaries::drain_partitions_at_seq(
+                pipeline,
+                boundaries,
+                &self.poh_live_chains,
+                Arc::clone(&self.gate_registry),
+                crate::cluster_boundaries::DEFAULT_DRAIN_WAIT,
+            )
+            .await?;
+        }
+        #[cfg(not(all(feature = "processor-auth", feature = "cluster")))]
+        {
+            // Boundaries are meaningless without the registries that
+            // make a sequence-bounded transition possible; preserve
+            // immediate-on-apply for the single-node / non-cluster
+            // build path.
+            let _ = (pipeline, boundaries);
+        }
+        Ok(())
+    }
+
     /// G9.c — Cut over a blue-green upgrade on the local pipeline task.
     /// Triggered on every node after the Raft commit of
     /// `RegistryCommand::BlueGreenCutover`.
-    pub async fn cluster_blue_green_cutover(&self, name: &str) -> Result<(), AeonError> {
+    pub async fn cluster_blue_green_cutover(
+        &self,
+        name: &str,
+        boundaries: &PartitionBoundaries,
+    ) -> Result<(), AeonError> {
+        self.drain_at_boundaries(name, boundaries).await?;
         let Some(control) = self.cluster_local_control(name).await else {
             return Ok(());
         };
@@ -749,7 +802,12 @@ impl PipelineSupervisor {
     }
 
     /// G9.c — Roll back an in-flight upgrade on the local pipeline.
-    pub async fn cluster_rollback_upgrade(&self, name: &str) -> Result<(), AeonError> {
+    pub async fn cluster_rollback_upgrade(
+        &self,
+        name: &str,
+        boundaries: &PartitionBoundaries,
+    ) -> Result<(), AeonError> {
+        self.drain_at_boundaries(name, boundaries).await?;
         let Some(control) = self.cluster_local_control(name).await else {
             return Ok(());
         };
@@ -759,15 +817,20 @@ impl PipelineSupervisor {
     /// G9.c — Promote a canary upgrade by one step. Declarative-only
     /// today (PipelineManager tracks the canary step %); the runtime
     /// traffic-split-by-percentage behaviour on PipelineControl is
-    /// part of the deferred G9.d Layer-4 work.
-    pub async fn cluster_promote_canary(&self, name: &str) -> Result<(), AeonError> {
+    /// part of the deferred G9.d.c.2 per-pod work.
+    pub async fn cluster_promote_canary(
+        &self,
+        name: &str,
+        boundaries: &PartitionBoundaries,
+    ) -> Result<(), AeonError> {
+        self.drain_at_boundaries(name, boundaries).await?;
         if self.cluster_local_control(name).await.is_none() {
             return Ok(());
         }
         tracing::info!(
             pipeline = %name,
             "promote_canary — declarative state replicated; per-node \
-             traffic-split runtime change deferred to G9.d"
+             traffic-split runtime change deferred to G9.d.c.2"
         );
         Ok(())
     }
@@ -776,30 +839,40 @@ impl PipelineSupervisor {
     /// this is a placeholder on follower nodes: the new processor is
     /// instantiated and swapped on the leader's pod via the REST
     /// handler path, and followers track the upgrade declaratively
-    /// only. Full per-node instantiation is tracked as G9.d.
-    pub async fn cluster_blue_green_start(&self, name: &str) -> Result<(), AeonError> {
+    /// only. Full per-node instantiation is tracked as G9.d.c.2.
+    pub async fn cluster_blue_green_start(
+        &self,
+        name: &str,
+        boundaries: &PartitionBoundaries,
+    ) -> Result<(), AeonError> {
+        self.drain_at_boundaries(name, boundaries).await?;
         if self.cluster_local_control(name).await.is_none() {
             return Ok(());
         }
         tracing::info!(
             pipeline = %name,
             "blue-green start — declarative state replicated; per-node \
-             processor instantiation deferred to G9.d (sequence-bounded \
-             transitions atom)"
+             processor instantiation deferred to G9.d.c.2 (per-pod \
+             processor build atom)"
         );
         Ok(())
     }
 
     /// G9.c — Start a canary upgrade on the local pipeline. Same
     /// declarative-only deferral as `cluster_blue_green_start`.
-    pub async fn cluster_canary_start(&self, name: &str) -> Result<(), AeonError> {
+    pub async fn cluster_canary_start(
+        &self,
+        name: &str,
+        boundaries: &PartitionBoundaries,
+    ) -> Result<(), AeonError> {
+        self.drain_at_boundaries(name, boundaries).await?;
         if self.cluster_local_control(name).await.is_none() {
             return Ok(());
         }
         tracing::info!(
             pipeline = %name,
             "canary start — declarative state replicated; per-node \
-             processor instantiation deferred to G9.d"
+             processor instantiation deferred to G9.d.c.2"
         );
         Ok(())
     }
@@ -808,19 +881,21 @@ impl PipelineSupervisor {
     /// pipeline. Today the new connector is instantiated and swapped
     /// on the leader's pod via the REST handler; followers track the
     /// new SourceConfig declaratively only. Full per-node
-    /// re-instantiation deferred to G9.d.
+    /// re-instantiation deferred to G9.d.c.2.
     pub async fn cluster_reconfigure_source(
         &self,
         name: &str,
         _new_source: aeon_types::registry::SourceConfig,
+        boundaries: &PartitionBoundaries,
     ) -> Result<(), AeonError> {
+        self.drain_at_boundaries(name, boundaries).await?;
         if self.cluster_local_control(name).await.is_none() {
             return Ok(());
         }
         tracing::info!(
             pipeline = %name,
             "reconfigure_source — declarative state replicated; per-node \
-             connector re-instantiation deferred to G9.d"
+             connector re-instantiation deferred to G9.d.c.2"
         );
         Ok(())
     }
@@ -832,14 +907,16 @@ impl PipelineSupervisor {
         &self,
         name: &str,
         _new_sink: aeon_types::registry::SinkConfig,
+        boundaries: &PartitionBoundaries,
     ) -> Result<(), AeonError> {
+        self.drain_at_boundaries(name, boundaries).await?;
         if self.cluster_local_control(name).await.is_none() {
             return Ok(());
         }
         tracing::info!(
             pipeline = %name,
             "reconfigure_sink — declarative state replicated; per-node \
-             connector re-instantiation deferred to G9.d"
+             connector re-instantiation deferred to G9.d.c.2"
         );
         Ok(())
     }
@@ -848,22 +925,30 @@ impl PipelineSupervisor {
     /// pipeline after Raft commits `RegistryCommand::UpgradePipeline`.
     /// Same declarative-only deferral pattern: follower nodes track
     /// the new ProcessorRef declaratively, but the runtime swap on
-    /// follower pods waits for G9.d. Today only the leader's REST
+    /// follower pods waits for G9.d.c.2. Today only the leader's REST
     /// handler instantiates + swaps via `state.pipeline_controls` —
     /// this method exists so the cluster_applier dispatch is
     /// symmetric and the future per-node swap has a wiring point.
+    ///
+    /// G9.d.c.1 — `UpgradePipeline` does not (yet) carry a boundary
+    /// map on the wire; callers pass `&PartitionBoundaries::new()`
+    /// and the drain is a no-op. Adding boundaries to UpgradePipeline
+    /// is a follow-up wire-shape change once G9.d.c.2 lands and the
+    /// per-node runtime swap can actually consume them.
     pub async fn upgrade_running(
         &self,
         name: &str,
         _new_processor: aeon_types::registry::ProcessorRef,
+        boundaries: &PartitionBoundaries,
     ) -> Result<(), AeonError> {
+        self.drain_at_boundaries(name, boundaries).await?;
         if self.cluster_local_control(name).await.is_none() {
             return Ok(());
         }
         tracing::info!(
             pipeline = %name,
             "upgrade_running — declarative state replicated; per-node \
-             processor instantiation deferred to G9.d"
+             processor instantiation deferred to G9.d.c.2"
         );
         Ok(())
     }

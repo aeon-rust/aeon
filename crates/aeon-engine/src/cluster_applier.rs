@@ -76,6 +76,12 @@ impl RegistryApplier for ClusterRegistryApplier {
                 // leader's pod ran the runtime swap; followers updated
                 // declarative state but kept the old processor alive
                 // in their PipelineControl.
+                //
+                // G9.d.c.1 — UpgradePipeline does not yet carry a
+                // boundary map on the wire (G9.c shape unchanged);
+                // pass an empty PartitionBoundaries so the drain
+                // primitive is a no-op and behaviour is identical to
+                // pre-G9.d.c.1.
                 RegistryCommand::UpgradePipeline {
                     name,
                     new_processor,
@@ -87,7 +93,8 @@ impl RegistryApplier for ClusterRegistryApplier {
                         return resp;
                     }
                     if let Some(sup) = supervisor.as_ref() {
-                        if let Err(e) = sup.upgrade_running(&target_name, new_proc).await {
+                        let bounds = aeon_types::registry::PartitionBoundaries::new();
+                        if let Err(e) = sup.upgrade_running(&target_name, new_proc, &bounds).await {
                             tracing::warn!(
                                 pipeline = %target_name,
                                 error = %e,
@@ -102,14 +109,28 @@ impl RegistryApplier for ClusterRegistryApplier {
                 // local supervisor side-effect on every node. Same
                 // best-effort runtime convergence pattern as
                 // SetPipelineState::Running.
-                RegistryCommand::BlueGreenStart { name, .. } => {
+                //
+                // G9.d.c.1 — the new `boundaries` field on each variant
+                // is cloned out before `pipelines.apply(cmd).await`
+                // moves the variant into the manager. An empty map
+                // (G9.c default + v0.1 log replay) yields a no-op
+                // drain; a populated map drives `drain_partitions_at_-
+                // seq` inside each supervisor method before the
+                // runtime side-effect.
+                RegistryCommand::BlueGreenStart {
+                    name, boundaries, ..
+                } => {
                     let target_name = name.clone();
+                    let target_bounds = boundaries.clone();
                     let resp = pipelines.apply(cmd).await;
                     if matches!(&resp, RegistryResponse::Error { .. }) {
                         return resp;
                     }
                     if let Some(sup) = supervisor.as_ref() {
-                        if let Err(e) = sup.cluster_blue_green_start(&target_name).await {
+                        if let Err(e) = sup
+                            .cluster_blue_green_start(&target_name, &target_bounds)
+                            .await
+                        {
                             tracing::warn!(
                                 pipeline = %target_name,
                                 error = %e,
@@ -119,14 +140,20 @@ impl RegistryApplier for ClusterRegistryApplier {
                     }
                     resp
                 }
-                RegistryCommand::BlueGreenCutover { name, .. } => {
+                RegistryCommand::BlueGreenCutover {
+                    name, boundaries, ..
+                } => {
                     let target_name = name.clone();
+                    let target_bounds = boundaries.clone();
                     let resp = pipelines.apply(cmd).await;
                     if matches!(&resp, RegistryResponse::Error { .. }) {
                         return resp;
                     }
                     if let Some(sup) = supervisor.as_ref() {
-                        if let Err(e) = sup.cluster_blue_green_cutover(&target_name).await {
+                        if let Err(e) = sup
+                            .cluster_blue_green_cutover(&target_name, &target_bounds)
+                            .await
+                        {
                             tracing::warn!(
                                 pipeline = %target_name,
                                 error = %e,
@@ -136,14 +163,20 @@ impl RegistryApplier for ClusterRegistryApplier {
                     }
                     resp
                 }
-                RegistryCommand::RollbackUpgrade { name, .. } => {
+                RegistryCommand::RollbackUpgrade {
+                    name, boundaries, ..
+                } => {
                     let target_name = name.clone();
+                    let target_bounds = boundaries.clone();
                     let resp = pipelines.apply(cmd).await;
                     if matches!(&resp, RegistryResponse::Error { .. }) {
                         return resp;
                     }
                     if let Some(sup) = supervisor.as_ref() {
-                        if let Err(e) = sup.cluster_rollback_upgrade(&target_name).await {
+                        if let Err(e) = sup
+                            .cluster_rollback_upgrade(&target_name, &target_bounds)
+                            .await
+                        {
                             tracing::warn!(
                                 pipeline = %target_name,
                                 error = %e,
@@ -153,14 +186,18 @@ impl RegistryApplier for ClusterRegistryApplier {
                     }
                     resp
                 }
-                RegistryCommand::CanaryStart { name, .. } => {
+                RegistryCommand::CanaryStart {
+                    name, boundaries, ..
+                } => {
                     let target_name = name.clone();
+                    let target_bounds = boundaries.clone();
                     let resp = pipelines.apply(cmd).await;
                     if matches!(&resp, RegistryResponse::Error { .. }) {
                         return resp;
                     }
                     if let Some(sup) = supervisor.as_ref() {
-                        if let Err(e) = sup.cluster_canary_start(&target_name).await {
+                        if let Err(e) = sup.cluster_canary_start(&target_name, &target_bounds).await
+                        {
                             tracing::warn!(
                                 pipeline = %target_name,
                                 error = %e,
@@ -170,14 +207,20 @@ impl RegistryApplier for ClusterRegistryApplier {
                     }
                     resp
                 }
-                RegistryCommand::CanaryPromote { name, .. } => {
+                RegistryCommand::CanaryPromote {
+                    name, boundaries, ..
+                } => {
                     let target_name = name.clone();
+                    let target_bounds = boundaries.clone();
                     let resp = pipelines.apply(cmd).await;
                     if matches!(&resp, RegistryResponse::Error { .. }) {
                         return resp;
                     }
                     if let Some(sup) = supervisor.as_ref() {
-                        if let Err(e) = sup.cluster_promote_canary(&target_name).await {
+                        if let Err(e) = sup
+                            .cluster_promote_canary(&target_name, &target_bounds)
+                            .await
+                        {
                             tracing::warn!(
                                 pipeline = %target_name,
                                 error = %e,
@@ -188,16 +231,22 @@ impl RegistryApplier for ClusterRegistryApplier {
                     resp
                 }
                 RegistryCommand::ReconfigureSource {
-                    name, new_source, ..
+                    name,
+                    new_source,
+                    boundaries,
+                    ..
                 } => {
                     let target_name = name.clone();
                     let new_src = new_source.clone();
+                    let target_bounds = boundaries.clone();
                     let resp = pipelines.apply(cmd).await;
                     if matches!(&resp, RegistryResponse::Error { .. }) {
                         return resp;
                     }
                     if let Some(sup) = supervisor.as_ref() {
-                        if let Err(e) = sup.cluster_reconfigure_source(&target_name, new_src).await
+                        if let Err(e) = sup
+                            .cluster_reconfigure_source(&target_name, new_src, &target_bounds)
+                            .await
                         {
                             tracing::warn!(
                                 pipeline = %target_name,
@@ -208,15 +257,24 @@ impl RegistryApplier for ClusterRegistryApplier {
                     }
                     resp
                 }
-                RegistryCommand::ReconfigureSink { name, new_sink, .. } => {
+                RegistryCommand::ReconfigureSink {
+                    name,
+                    new_sink,
+                    boundaries,
+                    ..
+                } => {
                     let target_name = name.clone();
                     let new_sk = new_sink.clone();
+                    let target_bounds = boundaries.clone();
                     let resp = pipelines.apply(cmd).await;
                     if matches!(&resp, RegistryResponse::Error { .. }) {
                         return resp;
                     }
                     if let Some(sup) = supervisor.as_ref() {
-                        if let Err(e) = sup.cluster_reconfigure_sink(&target_name, new_sk).await {
+                        if let Err(e) = sup
+                            .cluster_reconfigure_sink(&target_name, new_sk, &target_bounds)
+                            .await
+                        {
                             tracing::warn!(
                                 pipeline = %target_name,
                                 error = %e,
