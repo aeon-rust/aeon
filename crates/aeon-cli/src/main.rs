@@ -734,6 +734,26 @@ fn cmd_serve(addr: &str, artifact_dir: &str) -> Result<()> {
         let connectors = Arc::new(connectors);
         let supervisor = Arc::new(aeon_engine::PipelineSupervisor::new(Arc::clone(&connectors)));
 
+        // G9.d.c.2.a: install the ProcessorRegistry on the supervisor
+        // so cluster_applier-driven lifecycle ops (blue-green start /
+        // canary start / upgrade) can build the new processor on every
+        // node — not just the leader's pod via state.pipeline_controls.
+        // Without this install, supervisor.cluster_blue_green_start /
+        // cluster_canary_start / upgrade_running fall back to
+        // declarative-only with a warn log (the pre-G9.d.c.2.a shape).
+        if let Err(e) = supervisor.set_processor_registry(Arc::clone(&registry)) {
+            tracing::warn!(
+                error = %e,
+                "supervisor processor registry install failed (already set?) — \
+                 cluster lifecycle ops will skip per-pod runtime swap"
+            );
+        } else {
+            tracing::info!(
+                "supervisor processor registry installed (per-pod blue-green / \
+                 canary / upgrade runtime swap active on every node)"
+            );
+        }
+
         // EO-2: install the L2 body root so durability modes that
         // require L2 persistence engage. Same path the cluster crate's
         // L2SegmentTransferProvider reads (built later via

@@ -93,6 +93,9 @@ impl RegistryApplier for ClusterRegistryApplier {
                         return resp;
                     }
                     if let Some(sup) = supervisor.as_ref() {
+                        // G9.d.c.2.a — supervisor.upgrade_running now does
+                        // a per-pod drain_and_swap (not just declarative)
+                        // when the processor registry is installed.
                         let bounds = aeon_types::registry::PartitionBoundaries::new();
                         if let Err(e) = sup.upgrade_running(&target_name, new_proc, &bounds).await {
                             tracing::warn!(
@@ -118,9 +121,16 @@ impl RegistryApplier for ClusterRegistryApplier {
                 // seq` inside each supervisor method before the
                 // runtime side-effect.
                 RegistryCommand::BlueGreenStart {
-                    name, boundaries, ..
+                    name,
+                    new_processor,
+                    boundaries,
+                    ..
                 } => {
+                    // G9.d.c.2.a — supervisor.cluster_blue_green_start
+                    // now builds the green processor on every node and
+                    // drives PipelineControl::start_blue_green.
                     let target_name = name.clone();
+                    let target_proc = new_processor.clone();
                     let target_bounds = boundaries.clone();
                     let resp = pipelines.apply(cmd).await;
                     if matches!(&resp, RegistryResponse::Error { .. }) {
@@ -128,7 +138,7 @@ impl RegistryApplier for ClusterRegistryApplier {
                     }
                     if let Some(sup) = supervisor.as_ref() {
                         if let Err(e) = sup
-                            .cluster_blue_green_start(&target_name, &target_bounds)
+                            .cluster_blue_green_start(&target_name, &target_proc, &target_bounds)
                             .await
                         {
                             tracing::warn!(
@@ -187,16 +197,35 @@ impl RegistryApplier for ClusterRegistryApplier {
                     resp
                 }
                 RegistryCommand::CanaryStart {
-                    name, boundaries, ..
+                    name,
+                    new_processor,
+                    steps,
+                    boundaries,
+                    ..
                 } => {
+                    // G9.d.c.2.a — supervisor.cluster_canary_start now
+                    // builds the canary processor on every node and
+                    // drives PipelineControl::start_canary with the
+                    // first step's traffic percentage. Mirrors the
+                    // leader REST handler's `steps.first().unwrap_or(10)`
+                    // computation.
                     let target_name = name.clone();
+                    let target_proc = new_processor.clone();
                     let target_bounds = boundaries.clone();
+                    let initial_pct = steps.first().copied().unwrap_or(10);
                     let resp = pipelines.apply(cmd).await;
                     if matches!(&resp, RegistryResponse::Error { .. }) {
                         return resp;
                     }
                     if let Some(sup) = supervisor.as_ref() {
-                        if let Err(e) = sup.cluster_canary_start(&target_name, &target_bounds).await
+                        if let Err(e) = sup
+                            .cluster_canary_start(
+                                &target_name,
+                                &target_proc,
+                                initial_pct,
+                                &target_bounds,
+                            )
+                            .await
                         {
                             tracing::warn!(
                                 pipeline = %target_name,

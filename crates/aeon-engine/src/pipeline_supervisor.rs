@@ -45,6 +45,7 @@ use crate::encryption_probe::resolve_encryption_plan;
 use crate::erasure_probe::resolve_erasure_plan;
 use crate::pipeline::{PipelineConfig, PipelineControl, PipelineMetrics, run_buffered_managed};
 use crate::processor::PassthroughProcessor;
+use crate::registry::ProcessorRegistry;
 use crate::retention_probe::resolve_retention_plan;
 use crate::write_gate::WriteGateRegistry;
 use aeon_types::partition::PartitionId;
@@ -174,6 +175,17 @@ pub struct PipelineSupervisor {
     /// fires inside the FallbackCheckpointStore but the only path to
     /// observe it was unit tests.
     eo2_metrics: Arc<crate::eo2_metrics::Eo2Metrics>,
+    /// G9.d.c.2.a: node-wide `ProcessorRegistry` handle. Installed
+    /// once by `cmd_serve` (same instance held inside `AppState`).
+    /// Read by `build_processor` so the cluster_applier-driven
+    /// lifecycle methods (`cluster_blue_green_start`,
+    /// `cluster_canary_start`, `upgrade_running`) can instantiate the
+    /// new processor on every node — not just the leader. Without
+    /// this installed, those methods log a warn and skip the runtime
+    /// swap (declarative state still replicates correctly via
+    /// PipelineManager). Tests / benches that don't exercise
+    /// per-node instantiation leave it unset.
+    processor_registry: OnceLock<Arc<ProcessorRegistry>>,
 }
 
 impl PipelineSupervisor {
@@ -194,6 +206,95 @@ impl PipelineSupervisor {
             l3_checkpoint_store: OnceLock::new(),
             fault_injector_handle: OnceLock::new(),
             eo2_metrics: Arc::new(crate::eo2_metrics::Eo2Metrics::new()),
+            processor_registry: OnceLock::new(),
+        }
+    }
+
+    /// G9.d.c.2.a: install the node-wide `ProcessorRegistry` so the
+    /// supervisor's cluster_* methods can instantiate processors on
+    /// every node (not just the leader). Intended to be called once
+    /// by `cmd_serve` after the registry is constructed; tests /
+    /// benches that don't exercise per-node instantiation leave it
+    /// unset and the cluster_* methods fall back to declarative-only
+    /// (the pre-G9.d.c.2.a behaviour). Returns `Err` if already
+    /// installed — startup ordering bug, not a runtime condition.
+    pub fn set_processor_registry(
+        &self,
+        registry: Arc<ProcessorRegistry>,
+    ) -> Result<(), AeonError> {
+        self.processor_registry.set(registry).map_err(|_| {
+            AeonError::state("PipelineSupervisor: processor registry already installed")
+        })
+    }
+
+    /// G9.d.c.2.a: build a processor instance from the installed
+    /// `ProcessorRegistry`. Mirrors `instantiate_processor` from
+    /// `rest_api.rs` but operates on the supervisor's
+    /// engine-internal handle, so it's reachable from
+    /// `cluster_applier` post-Raft-commit on every node.
+    ///
+    /// Errors:
+    /// - registry not installed → `AeonError::State` ("processor
+    ///   registry not installed")
+    /// - artifact missing / version unknown → `AeonError::NotFound`
+    /// - Wasm compile / native dlopen failure → `AeonError::State`
+    /// - T3/T4 (WebTransport / WebSocket) processor types →
+    ///   `AeonError::Config` ("hot-swap not supported for type X")
+    ///
+    /// Native processor support is gated behind the `native-loader`
+    /// feature; without it, `NativeSo` types surface the same
+    /// "type not supported" error.
+    pub async fn build_processor(
+        &self,
+        name: &str,
+        version: &str,
+    ) -> Result<Box<dyn aeon_types::traits::Processor + Send + Sync>, AeonError> {
+        let registry = self.processor_registry.get().ok_or_else(|| {
+            AeonError::state(
+                "PipelineSupervisor: processor registry not installed; cannot build processor",
+            )
+        })?;
+        let artifact_bytes = registry.load_artifact(name, version).await?;
+        let proc_type = match registry.get(name).await {
+            Some(record) => match record.get_version(version) {
+                Some(ver) => ver.processor_type,
+                None => {
+                    return Err(AeonError::not_found(format!(
+                        "processor version {name}:{version} not found"
+                    )));
+                }
+            },
+            None => {
+                return Err(AeonError::not_found(format!(
+                    "processor '{name}' not found"
+                )));
+            }
+        };
+        match proc_type {
+            aeon_types::registry::ProcessorType::Wasm => {
+                let module = aeon_wasm::WasmModule::from_bytes(
+                    &artifact_bytes,
+                    aeon_wasm::WasmConfig::default(),
+                )
+                .map_err(|e| AeonError::state(format!("failed to compile Wasm module: {e}")))?;
+                let p =
+                    aeon_wasm::WasmProcessor::new(std::sync::Arc::new(module)).map_err(|e| {
+                        AeonError::state(format!("failed to create Wasm processor: {e}"))
+                    })?;
+                Ok(Box::new(p))
+            }
+            #[cfg(feature = "native-loader")]
+            aeon_types::registry::ProcessorType::NativeSo => {
+                let artifact_path = registry.artifact_path_for(name, version);
+                let p = crate::native_loader::NativeProcessor::load(&artifact_path, &[]).map_err(
+                    |e| AeonError::state(format!("failed to load native processor: {e}")),
+                )?;
+                Ok(Box::new(p))
+            }
+            other => Err(AeonError::config(format!(
+                "hot-swap not supported for processor type '{other}' — \
+                 T3/T4 processors are managed externally"
+            ))),
         }
     }
 
@@ -835,46 +936,70 @@ impl PipelineSupervisor {
         Ok(())
     }
 
-    /// G9.c — Start a blue-green upgrade on the local pipeline. Today
-    /// this is a placeholder on follower nodes: the new processor is
-    /// instantiated and swapped on the leader's pod via the REST
-    /// handler path, and followers track the upgrade declaratively
-    /// only. Full per-node instantiation is tracked as G9.d.c.2.
+    /// G9.c — Start a blue-green upgrade on the local pipeline.
+    ///
+    /// G9.d.c.2.a — when the processor registry is installed and the
+    /// pipeline runs on this node, builds the green processor via
+    /// `build_processor` and calls `PipelineControl::start_blue_green`,
+    /// closing the leader-only gap. If the registry isn't installed
+    /// (tests / benches), declarative state still replicates and the
+    /// runtime swap is logged-and-skipped — same back-compat shape as
+    /// pre-G9.d.c.2.a callers expect.
     pub async fn cluster_blue_green_start(
         &self,
         name: &str,
+        new_processor: &aeon_types::registry::ProcessorRef,
         boundaries: &PartitionBoundaries,
     ) -> Result<(), AeonError> {
         self.drain_at_boundaries(name, boundaries).await?;
-        if self.cluster_local_control(name).await.is_none() {
+        let Some(control) = self.cluster_local_control(name).await else {
+            return Ok(());
+        };
+        if self.processor_registry.get().is_none() {
+            tracing::warn!(
+                pipeline = %name,
+                "blue_green_start — processor registry not installed; \
+                 declarative state replicated, runtime swap skipped"
+            );
             return Ok(());
         }
-        tracing::info!(
-            pipeline = %name,
-            "blue-green start — declarative state replicated; per-node \
-             processor instantiation deferred to G9.d.c.2 (per-pod \
-             processor build atom)"
-        );
-        Ok(())
+        let green = self
+            .build_processor(&new_processor.name, &new_processor.version)
+            .await?;
+        control.start_blue_green(green).await
     }
 
-    /// G9.c — Start a canary upgrade on the local pipeline. Same
-    /// declarative-only deferral as `cluster_blue_green_start`.
+    /// G9.c — Start a canary upgrade on the local pipeline.
+    ///
+    /// G9.d.c.2.a — when the processor registry is installed and the
+    /// pipeline runs on this node, builds the canary processor and
+    /// calls `PipelineControl::start_canary` with the first step's
+    /// traffic percentage. `steps` matches the variant payload's
+    /// `steps: Vec<u8>`; `initial_pct` is `steps.first().unwrap_or(10)`
+    /// computed at the call site (cluster_applier).
     pub async fn cluster_canary_start(
         &self,
         name: &str,
+        new_processor: &aeon_types::registry::ProcessorRef,
+        initial_pct: u8,
         boundaries: &PartitionBoundaries,
     ) -> Result<(), AeonError> {
         self.drain_at_boundaries(name, boundaries).await?;
-        if self.cluster_local_control(name).await.is_none() {
+        let Some(control) = self.cluster_local_control(name).await else {
+            return Ok(());
+        };
+        if self.processor_registry.get().is_none() {
+            tracing::warn!(
+                pipeline = %name,
+                "canary_start — processor registry not installed; \
+                 declarative state replicated, runtime swap skipped"
+            );
             return Ok(());
         }
-        tracing::info!(
-            pipeline = %name,
-            "canary start — declarative state replicated; per-node \
-             processor instantiation deferred to G9.d.c.2"
-        );
-        Ok(())
+        let canary = self
+            .build_processor(&new_processor.name, &new_processor.version)
+            .await?;
+        control.start_canary(canary, initial_pct).await
     }
 
     /// G9.c — Hot-reconfigure the source connector on the local
@@ -923,34 +1048,41 @@ impl PipelineSupervisor {
 
     /// G9.c.4 — Backfill: upgrade the running processor on the local
     /// pipeline after Raft commits `RegistryCommand::UpgradePipeline`.
-    /// Same declarative-only deferral pattern: follower nodes track
-    /// the new ProcessorRef declaratively, but the runtime swap on
-    /// follower pods waits for G9.d.c.2. Today only the leader's REST
-    /// handler instantiates + swaps via `state.pipeline_controls` —
-    /// this method exists so the cluster_applier dispatch is
-    /// symmetric and the future per-node swap has a wiring point.
     ///
-    /// G9.d.c.1 — `UpgradePipeline` does not (yet) carry a boundary
-    /// map on the wire; callers pass `&PartitionBoundaries::new()`
-    /// and the drain is a no-op. Adding boundaries to UpgradePipeline
-    /// is a follow-up wire-shape change once G9.d.c.2 lands and the
-    /// per-node runtime swap can actually consume them.
+    /// G9.d.c.2.a — when the processor registry is installed and the
+    /// pipeline runs on this node, builds the new processor and
+    /// calls `PipelineControl::drain_and_swap`, so the runtime swap
+    /// happens on every node (not just the leader's pod that holds
+    /// `state.pipeline_controls`). If the registry isn't installed,
+    /// declarative state replicates and the runtime swap is
+    /// logged-and-skipped.
+    ///
+    /// `UpgradePipeline` does not (yet) carry a boundary map on the
+    /// wire; callers pass `&PartitionBoundaries::new()` and the drain
+    /// is a no-op. Adding boundaries to UpgradePipeline is a
+    /// follow-up wire-shape change.
     pub async fn upgrade_running(
         &self,
         name: &str,
-        _new_processor: aeon_types::registry::ProcessorRef,
+        new_processor: aeon_types::registry::ProcessorRef,
         boundaries: &PartitionBoundaries,
     ) -> Result<(), AeonError> {
         self.drain_at_boundaries(name, boundaries).await?;
-        if self.cluster_local_control(name).await.is_none() {
+        let Some(control) = self.cluster_local_control(name).await else {
+            return Ok(());
+        };
+        if self.processor_registry.get().is_none() {
+            tracing::warn!(
+                pipeline = %name,
+                "upgrade_running — processor registry not installed; \
+                 declarative state replicated, runtime swap skipped"
+            );
             return Ok(());
         }
-        tracing::info!(
-            pipeline = %name,
-            "upgrade_running — declarative state replicated; per-node \
-             processor instantiation deferred to G9.d.c.2"
-        );
-        Ok(())
+        let new = self
+            .build_processor(&new_processor.name, &new_processor.version)
+            .await?;
+        control.drain_and_swap(new).await
     }
 
     /// Names of all currently-running pipelines.
