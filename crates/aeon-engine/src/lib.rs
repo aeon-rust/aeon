@@ -25,6 +25,8 @@ pub mod checkpoint;
 pub mod circuit_breaker;
 #[cfg(feature = "cluster")]
 pub mod cluster_applier;
+#[cfg(all(feature = "cluster", feature = "processor-auth"))]
+pub mod cluster_boundaries;
 pub mod compliance_validator;
 pub mod connector_registry;
 pub mod dag;
